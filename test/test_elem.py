@@ -14,6 +14,7 @@ print("=" * 50)
 module = forward()
 print(module)
 
+print("linalg text:", end="\n\n")
 lowered = lower_to_linalg_text(str(module))
 print(lowered)
 

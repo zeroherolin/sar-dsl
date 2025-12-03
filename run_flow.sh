@@ -7,6 +7,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC
 log()  { echo -e "${BLUE}[INFO]${NC} $*"; }
 ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
 die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+header() { echo -e "\n${YELLOW}========== $* ==========${NC}"; }
 
 # ---------- Set dir ----------
 ROOT_DIR=$(pwd)
@@ -30,8 +31,8 @@ run_tests() {
     mkdir -p "$ROOT_DIR/test/MLIR"
     mkdir -p "$ROOT_DIR/test/emitHLS"
 
-    # Generate MLIR
-    log "Generating MLIR ..."
+    # 1. Test generate mlir
+    header "Test generate mlir"
 
     log "Generating test_gen_elem.mlir ..."
     if command -v test-gen-elem >/dev/null 2>&1; then
@@ -57,9 +58,9 @@ run_tests() {
     fi
     ok "test_shape_mismatch passed."
 
-    ok "MLIR generation done."
+    # 2. Lowering to Linalg
+    header "Lowering to Linalg"
 
-    # Lowering
     log "Lowering SAR to Linalg ..."
     if command -v sar-opt >/dev/null 2>&1; then
         sar-opt "$ROOT_DIR/test/MLIR/test_gen_elem.mlir" \
@@ -70,7 +71,9 @@ run_tests() {
     fi
     ok "SAR to Linalg done."
 
-    # LLVM test chain
+    # 3. Test LLVM output
+    header "Test LLVM output"
+
     log "Lowering to LLVM ..."
     if command -v mlir-opt >/dev/null 2>&1 && command -v mlir-translate >/dev/null 2>&1; then
         mlir-opt "$ROOT_DIR/test/MLIR/test_gen_elem_output.mlir" \
@@ -98,32 +101,46 @@ run_tests() {
     "$ROOT_DIR/test/ir_test"
     ok "Executable run done."
 
-    # ScaleHLS tests
-    log "Running ScaleHLS tests ..."
+    # 4. Test ScaleHLS-HIDA
+    header "Test ScaleHLS-HIDA"
+
     if command -v scalehls-opt >/dev/null 2>&1 && command -v scalehls-translate >/dev/null 2>&1; then
+        log "Running ScaleHLS-HIDA affine_matmul ..."
         scalehls-opt "$ROOT_DIR/test/test-scalehls-hida/affine_matmul.mlir" \
             -hida-pytorch-pipeline="top-func=affine_matmul" \
             | scalehls-translate -scalehls-emit-hlscpp -emit-vitis-directives \
             > "$ROOT_DIR/test/emitHLS/hls_affine_matmul.cpp"
+        ok "ScaleHLS-HIDA affine_matmul done."
+    else
+        die "scalehls-opt/scalehls-translate not found in PATH"
+    fi
 
+    # 5. Test emit SAR to HLS
+    header "Test emit SAR to HLS"
+
+    if command -v scalehls-opt >/dev/null 2>&1 && command -v scalehls-translate >/dev/null 2>&1; then
+        log "Emitting SAR to HLS ..."
         scalehls-opt "$ROOT_DIR/test/MLIR/test_gen_elem_output.mlir" \
             -hida-pytorch-pipeline="top-func=forward loop-tile-size=8 loop-unroll-factor=4" \
             | scalehls-translate -scalehls-emit-hlscpp -emit-vitis-directives \
             > "$ROOT_DIR/test/emitHLS/hls_output.cpp"
+        ok "Emit SAR to HLS done."
     else
         die "scalehls-opt/scalehls-translate not found in PATH"
     fi
-    ok "ScaleHLS tests done."
 
-    # Python frontend tests
+    # 6. Test python frontend
+    header "Test python frontend"
+
     log "Running Python frontend tests ..."
     python3 "$ROOT_DIR/test/test_debug.py"
     python3 "$ROOT_DIR/test/test_elem.py"
     python3 "$ROOT_DIR/test/test_fft.py"
     python3 "$ROOT_DIR/test/test_compr.py"
+    python3 "$ROOT_DIR/test/sar_domain/test_filter.py"
     ok "Python frontend tests done."
 
-    log "All tests done."
+    header "All tests done."
 }
 
 run_tests
