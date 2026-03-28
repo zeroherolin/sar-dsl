@@ -1,0 +1,28 @@
+{
+    "mlir.pdll_server_path": "externals/llvm-project/build/bin/mlir-pdll-lsp-server",
+    "mlir.server_path": "externals/llvm-project/build/bin/mlir-lsp-server",
+    "mlir.tablegen_server_path": "externals/llvm-project/build/bin/tblgen-lsp-server",
+    "clangd.path": "/usr/bin/clangd",
+    "clangd.arguments": [
+        "--compile-commands-dir=build",
+        // "--query-driver=/usr/bin/clang",
+        "--query-driver=externals/llvm-project/build/bin/clang",
+        "--log=verbose",
+        "--background-index",
+        "--clang-tidy",
+        "--completion-style=detailed",
+        "--header-insertion=iwyu"
+    ],
+    "clangd.fallbackFlags": [
+        "-Iinclude",
+        "-I/usr/local/include",
+        "-I/usr/include",
+        "-I/usr/include/c++/11",
+        "-I/usr/include/x86_64-linux-gnu",
+        "-I/usr/include/x86_64-linux-gnu/c++/11",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/11/include",
+        "-I/usr/include/c++/11/backward"
+    ],
+    "editor.semanticHighlighting.enabled": true,
+    "C_Cpp.intelliSenseEngine": "Disabled"
+}

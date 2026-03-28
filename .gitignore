@@ -4,8 +4,6 @@
 /test/*.o
 /test/*.ll
 /test/ir_test
-.vscode
-.clangd
 .cache
 .cursorignore
 pyrightconfig.json
