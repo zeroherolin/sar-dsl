@@ -1,13 +1,13 @@
-add_mlir_dialect_library(MLIRSARDialect
+add_mlir_dialect_library(SARDialect
   SARDialect.cpp
-  SARTypes.cpp
-  SAROps.cpp
+
+  ADDITIONAL_HEADER_DIRS
+  ${PROJECT_SOURCE_DIR}/include/sar/Dialect/SAR/IR
 
   DEPENDS
-  MLIRSARDialectIncGen
+  SARDialectIncGen
 
   LINK_LIBS PUBLIC
   MLIRIR
-  MLIRAsmParser
-  MLIRTensorDialect
+  MLIRSupport
 )

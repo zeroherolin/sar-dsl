@@ -1,9 +1,34 @@
-/build
-/test/MLIR
-/test/emitHLS
-/test/*.o
-/test/*.ll
-/test/ir_test
-.cache
-.cursorignore
-pyrightconfig.json
+# Build artifacts
+build/
+*.o
+*.so
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+.pytest_cache/
+python/sar/_build_config.py
+# backend plugins are linked/copied in from third_party/
+python/sar/backends/*
+!python/sar/backends/__init__.py
+!python/sar/backends/base.py
+
+# Editors (shared VS Code settings are committed; user state is not)
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.cache/
+
+# Example outputs / large data
+examples/wka/data/ALPSRP*
+examples/wka/*.bin
+examples/wka/*.npy
+examples/wka/*.bmp
+wka_synthetic.png
+san_francisco_wka.png
+
+# OS
+.DS_Store

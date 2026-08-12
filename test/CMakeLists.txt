@@ -1,35 +1,18 @@
-add_executable(test-gen-elem test_gen_elem.cpp)
-
-target_link_libraries(test-gen-elem PRIVATE
-  MLIRIR
-  MLIRSARDialect
-  MLIRFuncDialect
-  MLIRSCFDialect
-  MLIRLinalgDialect
-  MLIRParser
-  MLIRPass
+configure_lit_site_cfg(
+  ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
+  ${CMAKE_CURRENT_BINARY_DIR}/lit.site.cfg.py
+  MAIN_CONFIG
+  ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
 )
 
-add_executable(test-shape-mismatch test_shape_mismatch.cpp)
-
-target_link_libraries(test-shape-mismatch PRIVATE
-  MLIRIR
-  MLIRSARDialect
-  MLIRFuncDialect
-  MLIRSCFDialect
-  MLIRLinalgDialect
-  MLIRParser
-  MLIRPass
+set(SAR_DSL_TEST_DEPENDS
+  FileCheck
+  sar-opt
+  sar_runtime
 )
 
-add_executable(test-gen-fft test_gen_fft.cpp)
-
-target_link_libraries(test-gen-fft PRIVATE
-  MLIRIR
-  MLIRSARDialect
-  MLIRFuncDialect
-  MLIRSCFDialect
-  MLIRLinalgDialect
-  MLIRParser
-  MLIRPass
+add_lit_testsuite(check-sar-lit "Running the SAR-DSL lit tests"
+  ${CMAKE_CURRENT_BINARY_DIR}
+  DEPENDS ${SAR_DSL_TEST_DEPENDS}
 )
+set_target_properties(check-sar-lit PROPERTIES FOLDER "Tests")

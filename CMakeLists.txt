@@ -1,68 +1,84 @@
-cmake_minimum_required(VERSION 3.15)
-project(mlir-sar LANGUAGES C CXX)
+# ===----------------------------------------------------------------------===
+# SAR-DSL: an MLIR-based compiler for SAR imaging pipelines.
+# ===----------------------------------------------------------------------===
 
-if(POLICY CMP0116)
-  cmake_policy(SET CMP0116 NEW)
-endif()
-if(POLICY CMP0114)
-  cmake_policy(SET CMP0114 NEW)
-endif()
-if(POLICY CMP0148)
-  cmake_policy(SET CMP0148 NEW)
-endif()
+cmake_minimum_required(VERSION 3.20)
+project(sar-dsl LANGUAGES C CXX)
 
-set(CMAKE_C_STANDARD 17)
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_BUILD_TYPE "Debug" CACHE STRING " " FORCE)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options(-fPIC)
-add_compile_options(-fno-rtti)
-
-find_package(pybind11 REQUIRED)
-
-set(LLVM_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/externals/llvm-project/build")
-
-if(NOT EXISTS "${LLVM_BUILD_DIR}")
-  message(FATAL_ERROR "LLVM build directory not found: ${LLVM_BUILD_DIR}")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-set(LLVM_DIR "${LLVM_BUILD_DIR}/lib/cmake/llvm")
-set(MLIR_DIR "${LLVM_BUILD_DIR}/lib/cmake/mlir")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
 
-if(NOT EXISTS "${LLVM_DIR}/LLVMConfig.cmake")
-  message(FATAL_ERROR "LLVMConfig.cmake not found in: ${LLVM_DIR}")
+# ------------------------------------------------------------------------- #
+# MLIR / LLVM
+#
+# By default the in-tree submodule build is used; override MLIR_DIR / LLVM_DIR
+# to build against an external installation.
+# ------------------------------------------------------------------------- #
+set(SAR_DSL_LLVM_BUILD_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/externals/llvm-project/build"
+    CACHE PATH "LLVM build/install tree providing LLVM and MLIR")
+
+if(NOT DEFINED MLIR_DIR)
+  set(MLIR_DIR "${SAR_DSL_LLVM_BUILD_DIR}/lib/cmake/mlir")
+endif()
+if(NOT DEFINED LLVM_DIR)
+  set(LLVM_DIR "${SAR_DSL_LLVM_BUILD_DIR}/lib/cmake/llvm")
 endif()
 
-if(NOT EXISTS "${MLIR_DIR}/MLIRConfig.cmake")
-  message(FATAL_ERROR "MLIRConfig.cmake not found in: ${MLIR_DIR}")
-endif()
+find_package(MLIR REQUIRED CONFIG)
+message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
-list(APPEND CMAKE_MODULE_PATH ${LLVM_DIR})
-list(APPEND CMAKE_MODULE_PATH ${MLIR_DIR})
+list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 
-include(LLVMConfig)
-include(MLIRConfig)
 include(TableGen)
 include(AddLLVM)
 include(AddMLIR)
-include(AddMLIRPython)
+include(HandleLLVMOptions)
 
-include_directories(${LLVM_INCLUDE_DIRS})
-include_directories(${MLIR_INCLUDE_DIRS})
+include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+include_directories(${PROJECT_SOURCE_DIR}/include)
+include_directories(${PROJECT_BINARY_DIR}/include)
+link_directories(${LLVM_BUILD_LIBRARY_DIR})
+add_definitions(${LLVM_DEFINITIONS})
 
-get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
-get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
-get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
-
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
-
-add_subdirectory(include)
+# ------------------------------------------------------------------------- #
+# Subdirectories
+# ------------------------------------------------------------------------- #
+add_subdirectory(include/sar)
 add_subdirectory(lib)
+add_subdirectory(runtime)
 add_subdirectory(tools)
-add_subdirectory(test)
 
-if(MLIR_ENABLE_BINDINGS_PYTHON)
-  add_subdirectory(python)
+option(SAR_DSL_ENABLE_TESTS "Build SAR-DSL lit tests" ON)
+if(SAR_DSL_ENABLE_TESTS)
+  add_subdirectory(test)
 endif()
+
+# ------------------------------------------------------------------------- #
+# Python build configuration
+#
+# Generates python/sar/_build_config.py so the Python driver can locate the
+# freshly built tools without any environment setup.
+# ------------------------------------------------------------------------- #
+set(SAR_DSL_TOOL_DIR "${PROJECT_BINARY_DIR}/bin")
+set(SAR_DSL_RUNTIME_LIB "${PROJECT_BINARY_DIR}/lib/libsar_runtime.so")
+set(SAR_DSL_LLVM_TOOL_DIR "${SAR_DSL_LLVM_BUILD_DIR}/bin")
+set(SAR_DSL_SCALEHLS_TOOL_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/externals/ScaleHLS-HIDA/build/bin"
+    CACHE PATH "Directory containing scalehls-opt / scalehls-translate")
+
+configure_file(
+  ${PROJECT_SOURCE_DIR}/cmake/_build_config.py.in
+  ${PROJECT_SOURCE_DIR}/python/sar/_build_config.py
+  @ONLY)

@@ -1,28 +1,21 @@
 {
-    "mlir.pdll_server_path": "externals/llvm-project/build/bin/mlir-pdll-lsp-server",
-    "mlir.server_path": "externals/llvm-project/build/bin/mlir-lsp-server",
-    "mlir.tablegen_server_path": "externals/llvm-project/build/bin/tblgen-lsp-server",
-    "clangd.path": "/usr/bin/clangd",
+    // C++: clangd against the project compilation database (see .clangd).
     "clangd.arguments": [
         "--compile-commands-dir=build",
-        // "--query-driver=/usr/bin/clang",
-        "--query-driver=externals/llvm-project/build/bin/clang",
-        "--log=verbose",
+        "--query-driver=externals/llvm-project/build/bin/clang*",
         "--background-index",
-        "--clang-tidy",
         "--completion-style=detailed",
         "--header-insertion=iwyu"
     ],
-    "clangd.fallbackFlags": [
-        "-Iinclude",
-        "-I/usr/local/include",
-        "-I/usr/include",
-        "-I/usr/include/c++/11",
-        "-I/usr/include/x86_64-linux-gnu",
-        "-I/usr/include/x86_64-linux-gnu/c++/11",
-        "-I/usr/lib/gcc/x86_64-linux-gnu/11/include",
-        "-I/usr/include/c++/11/backward"
+    "C_Cpp.intelliSenseEngine": "disabled",
+
+    // TableGen / MLIR / PDLL language servers from the in-tree LLVM build.
+    "mlir.server_path": "externals/llvm-project/build/bin/mlir-lsp-server",
+    "mlir.tablegen_server_path": "externals/llvm-project/build/bin/tblgen-lsp-server",
+    "mlir.pdll_server_path": "externals/llvm-project/build/bin/mlir-pdll-lsp-server",
+    "mlir.tablegen_compilation_databases": [
+        "${workspaceFolder}/build/tablegen_compile_commands.yml"
     ],
-    "editor.semanticHighlighting.enabled": true,
-    "C_Cpp.intelliSenseEngine": "Disabled"
+
+    "python.analysis.extraPaths": ["python"]
 }
