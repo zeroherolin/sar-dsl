@@ -2,12 +2,12 @@
 """Chirp Scaling on the CPU backend with the real ALOS-1 dataset.
 
 Prerequisites: extract the raw echoes once with
-`python ../wka/data/extract_alos.py`. CSA operates directly on the
+`python ../data/extract_alos.py`. CSA operates directly on the
 uncompressed chirp (range compression happens inside the algorithm), so
 this is a full raw-to-image run without interpolation.
 
 Usage:
-    python run_alos.py [--bin ../wka/alos_raw_16384x16384.bin]
+    python run_alos.py [--bin ../data/alos_raw_16384x16384.bin]
 """
 
 import argparse
@@ -26,7 +26,7 @@ from csa.algorithm import build_kernel, make_inputs  # noqa: E402
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin",
-                        default=str(_EXAMPLES / "wka"
+                        default=str(_EXAMPLES / "data"
                                     / "alos_raw_16384x16384.bin"))
     parser.add_argument("--output", default="san_francisco_csa.png")
     args = parser.parse_args()

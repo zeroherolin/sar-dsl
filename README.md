@@ -17,7 +17,7 @@ them to native CPU code or synthesizable FPGA designs.
      alt="San Francisco Bay, ALOS-1 raw echoes focused by the SAR-DSL omega-K kernel"/>
 
 *San Francisco Bay: 16384 x 16384 raw ALOS-1 echoes focused by a single
-compiled omega-K kernel in 3.6 seconds.*
+compiled omega-K kernel in 3.7 seconds.*
 
 </div>
 
@@ -116,9 +116,9 @@ Full omega-K imaging chain, 240-core x86-64 server
 
 | Scene | SAR-DSL (cpu) | NumPy reference | Speedup |
 |-------|--------------:|----------------:|--------:|
-| 1024 x 1024 synthetic | 0.21 s | 0.46 s | 2.2x |
-| 4096 x 4096 synthetic | 0.78 s | 6.25 s | 8.0x |
-| 16384 x 16384 ALOS-1 | 3.6 s | ~15 min* | ~250x |
+| 1024 x 1024 synthetic | 0.23 s | 0.46 s | 2.0x |
+| 4096 x 4096 synthetic | 0.74 s | 6.34 s | 8.6x |
+| 16384 x 16384 ALOS-1 | 3.7 s | ~15 min* | ~240x |
 
 <sup>* extrapolated; the reference Stolt loop is impractical at this
 size.</sup>
@@ -150,12 +150,11 @@ applies two small upstream fixes
 ([scripts/patches/](scripts/patches/scalehls-hida-fixes.patch)).
 
 To reproduce the San Francisco image, place the ALOS-1 CEOS product under
-`examples/wka/data/` and run:
+`examples/data/` and run:
 
 ```bash
-cd examples/wka
-python data/extract_alos.py     # CEOS L1.0 -> alos_raw_16384x16384.bin
-python run_alos.py
+python examples/data/extract_alos.py   # CEOS L1.0 -> alos_raw_16384x16384.bin
+python examples/wka/run_alos.py
 ```
 
 ## Documentation

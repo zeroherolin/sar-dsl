@@ -18,7 +18,6 @@
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/SCFToOpenMP/SCFToOpenMP.h"
-#include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -62,6 +61,9 @@ void mlir::sar::buildSARToLLVMPipeline(OpPassManager &pm) {
 
   bufferization::BufferResultsToOutParamsPassOptions outParamsOptions;
   outParamsOptions.hoistStaticAllocs = true;
+  // Kernel entry points are public; their results must still become
+  // out-arguments (the launcher ABI is destination-passing style).
+  outParamsOptions.modifyPublicFunctions = true;
   pm.addPass(
       bufferization::createBufferResultsToOutParamsPass(outParamsOptions));
 
@@ -104,6 +106,7 @@ void mlir::sar::buildSARToAffinePipeline(OpPassManager &pm) {
 
   bufferization::BufferResultsToOutParamsPassOptions outParamsOptions;
   outParamsOptions.hoistStaticAllocs = true;
+  outParamsOptions.modifyPublicFunctions = true;
   pm.addPass(
       bufferization::createBufferResultsToOutParamsPass(outParamsOptions));
 

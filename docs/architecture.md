@@ -87,7 +87,7 @@ The `sar-to-llvm` pipeline (registered in `sar-opt`) does the entire descent:
    conversions with `-O3 -march=native` codegen.
 
    Measured effect on the full 16384x16384 ALOS-1 omega-K chain:
-   55.4 s -> 3.6 s.
+   55.4 s -> 3.7 s.
 
 The Python launcher allocates result arrays with numpy and invokes
 `_mlir_ciface_<kernel>` via ctypes with strided memref descriptors.

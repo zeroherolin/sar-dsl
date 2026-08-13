@@ -17,6 +17,9 @@ target_link_libraries(sar-opt PRIVATE
   ${dialect_libs}
   ${conversion_libs}
   ${extension_libs}
+  MLIRRegisterAllDialects
+  MLIRRegisterAllExtensions
+  MLIRRegisterAllPasses
   MLIROptLib
 )
 llvm_update_compile_flags(sar-opt)

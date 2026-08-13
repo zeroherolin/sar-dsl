@@ -365,8 +365,8 @@ struct SARDecomplexifyPass
       builder.setInsertionPoint(func);
       FunctionDecomplexifier rewriter(func, builder);
       std::string name = func.getName().str();
-      // The replacement is created adjacent to the original; the original
-      // is erased first so the symbol name stays unique.
+      // Rename the original out of the way so the replacement can take its
+      // symbol name; the original is erased once the rewrite succeeds.
       func.setName(name + "__complex_orig");
       FailureOr<func::FuncOp> replacement = rewriter.run();
       if (failed(replacement)) {

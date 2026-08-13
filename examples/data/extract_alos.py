@@ -63,14 +63,13 @@ def extract_alos_raw(input_file, output_file, target_na=16384,
 
 
 if __name__ == "__main__":
-    # Input sits next to this script; output goes to examples/wka/ where
-    # run_alos.py expects it.
+    # Input and output both live next to this script, where the per-algorithm
+    # run_alos.py runners expect them.
     here = os.path.dirname(os.path.abspath(__file__))
     extract_alos_raw(
         input_file=os.path.join(
             here, "ALPSRP275140740-L1.0", "IMG-HH-ALPSRP275140740-H1.0__A"),
-        output_file=os.path.join(here, os.pardir,
-                                 "alos_raw_16384x16384.bin"),
+        output_file=os.path.join(here, "alos_raw_16384x16384.bin"),
         target_na=16384,
         target_nr=16384,
         start_line=14000,

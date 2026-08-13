@@ -35,15 +35,15 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
         # numpy.fft's promotion behaviour in the reference implementation.
         data = sar.cast(raw, sar.c128)
 
-        # -- 2-D forward spectrum (range FFT, corner turn, azimuth FFT) ----
+        # 2-D forward spectrum: range FFT, corner turn, azimuth FFT.
         data = sar.fftshift(sar.fft(data, dim=1), dim=1)
         data = sar.transpose(data)
         data = sar.fftshift(sar.fft(data, dim=1), dim=1)
         data = sar.transpose(data)
 
-        # -- bulk compression ----------------------------------------------
-        # phase = (4 pi R0 / c) * (sqrt((fc + fr)^2 - (c fa / 2 vr)^2)
-        #          - (fc + fr)) + pi fr^2 / Kr
+        # Bulk compression:
+        #   phase = (4 pi R0 / c) * (sqrt((fc + fr)^2 - (c fa / 2 vr)^2)
+        #           - (fc + fr)) + pi fr^2 / Kr
         fa2 = sar.broadcast(fa, (N, N), dim=0)   # varies along azimuth rows
         fr2 = sar.broadcast(fr, (N, N), dim=1)   # varies along range cols
         fr_shifted = fr2 + p.fc
@@ -55,17 +55,16 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
                  + (fr2 * fr2) * (math.pi / p.kr))
         data = data * sar.expj(phase)
 
-        # -- Stolt interpolation ---------------------------------------------
         data = sar.stolt_interp(data, fa, fr, c=p.c, fc=p.fc, vr=p.vr,
                                 t_shift=p.t_shift)
 
-        # -- windowing (range, then azimuth via corner turn) -----------------
+        # Windowing: range, then azimuth via a corner turn.
         data = data * sar.cast(sar.broadcast(win_r, (N, N), dim=1), sar.c128)
         data = sar.transpose(data)
         data = data * sar.cast(sar.broadcast(win_a, (N, N), dim=1), sar.c128)
         data = sar.transpose(data)
 
-        # -- back to the image domain ----------------------------------------
+        # Back to the image domain.
         data = sar.ifft(sar.ifftshift(data, dim=1), dim=1)
         data = sar.transpose(data)
         data = sar.ifft(sar.ifftshift(data, dim=1), dim=1)

@@ -15,14 +15,11 @@ for the `scalehls` backend and its tests; they self-skip otherwise).
 
 ## Editor setup
 
-C++ navigation works through clangd with the compilation database the
-build generates (`build/compile_commands.json`); the committed `.clangd`
-points clangd at it, so any clangd-based editor works after `make build`.
-For VS Code, `.vscode/extensions.json` recommends the clangd and MLIR
-extensions and `.vscode/settings.json` wires up the TableGen/MLIR/PDLL
-language servers from the in-tree LLVM build (`.td`/`.mlir` files get
-navigation and diagnostics too). All committed editor settings use
-repository-relative paths only.
+`make llvm` builds clangd, `make build` generates the compilation
+database; the committed `.clangd` and `.vscode/` wire them up (plus the
+TableGen/MLIR LSP servers), so navigation and diagnostics work out of
+the box in VS Code. Other editors: use the in-tree
+`externals/llvm-project/build/bin/clangd`.
 
 ## Repository conventions
 

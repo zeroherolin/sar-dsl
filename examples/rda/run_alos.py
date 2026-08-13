@@ -2,12 +2,12 @@
 """Range-Doppler on the CPU backend with the real ALOS-1 dataset.
 
 Prerequisites: extract the raw echoes once with
-`python ../wka/data/extract_alos.py`. Note the basic RDA here omits
+`python ../data/extract_alos.py`. Note the basic RDA here omits
 secondary range compression, so range focus degrades slightly at the
 Doppler band edges compared to omega-K / chirp scaling.
 
 Usage:
-    python run_alos.py [--bin ../wka/alos_raw_16384x16384.bin]
+    python run_alos.py [--bin ../data/alos_raw_16384x16384.bin]
 """
 
 import argparse
@@ -26,7 +26,7 @@ from rda.algorithm import build_kernel, make_inputs  # noqa: E402
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin",
-                        default=str(_EXAMPLES / "wka"
+                        default=str(_EXAMPLES / "data"
                                     / "alos_raw_16384x16384.bin"))
     parser.add_argument("--output", default="san_francisco_rda.png")
     args = parser.parse_args()

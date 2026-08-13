@@ -15,12 +15,12 @@ SIZE = 16384
 
 
 def load_raw(path: str) -> np.ndarray:
-    """Loads the extracted raw echoes (see wka/data/extract_alos.py)."""
+    """Loads the extracted raw echoes (see examples/data/extract_alos.py)."""
     bin_path = Path(path)
     if not bin_path.exists():
         raise SystemExit(
             f"{bin_path} not found -- extract the CEOS product first with "
-            "`python examples/wka/data/extract_alos.py`")
+            "`python examples/data/extract_alos.py`")
     return np.fromfile(bin_path, dtype=np.complex64).reshape((SIZE, SIZE))
 
 

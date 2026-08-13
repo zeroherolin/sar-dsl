@@ -2,11 +2,11 @@
 """omega-K on the CPU backend with the real ALOS-1 San Francisco dataset.
 
 Prerequisites: extract the raw echoes once with
-`python data/extract_alos.py` (produces `alos_raw_16384x16384.bin`,
+`python ../data/extract_alos.py` (produces `alos_raw_16384x16384.bin`,
 complex64, 2 GiB). Running needs tens of GiB of RAM at full size.
 
 Usage:
-    python run_alos.py [--bin alos_raw_16384x16384.bin]
+    python run_alos.py [--bin ../data/alos_raw_16384x16384.bin]
 """
 
 import argparse
@@ -24,7 +24,9 @@ from wka.algorithm import build_kernel, make_inputs  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bin", default="alos_raw_16384x16384.bin")
+    parser.add_argument("--bin",
+                        default=str(_EXAMPLES / "data"
+                                    / "alos_raw_16384x16384.bin"))
     parser.add_argument("--output", default="san_francisco_wka.png")
     args = parser.parse_args()
 

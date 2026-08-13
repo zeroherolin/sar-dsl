@@ -42,29 +42,29 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
             tau: sar.f64[N], win_a: sar.f64[N]) -> sar.f32[N, N]:
         data = sar.cast(raw, sar.c128)
 
-        # -- range compression (windowed matched filter; the range window
-        #    is folded into range_ref on the host) -------------------------
+        # Range compression (the window is folded into range_ref on the
+        # host).
         spectrum = sar.fft(data, dim=1)
         spectrum = spectrum * sar.broadcast(range_ref, (N, N), dim=1)
         data = sar.ifft(spectrum, dim=1)
 
-        # -- into the range-Doppler domain ---------------------------------
+        # Into the range-Doppler domain.
         data = sar.fftshift(sar.fft(data, dim=0), dim=0)
 
-        # -- range-dependent factors: fa^2 (rows) x tau (columns) ----------
+        # Range-dependent factors: fa^2 (rows) x tau (columns).
         fa2_tau = (sar.broadcast(fa * fa, (N, N), dim=0)
                    * sar.broadcast(tau, (N, N), dim=1))
 
-        # -- RCMC: positions = column index + migration shift(fa, R) -------
+        # RCMC: positions = column index + migration shift(fa, R).
         positions = (sar.broadcast(sar.constant(grid), (N, N), dim=1)
                      + fa2_tau * rcmc_scale)
         data = sar.interp1d(data, positions)
 
-        # -- azimuth compression + window -----------------------------------
+        # Azimuth compression + window.
         data = data * sar.expj(fa2_tau * az_phase_scale)
         data = data * sar.cast(sar.broadcast(win_a, (N, N), dim=0), sar.c128)
 
-        # -- back to the image domain ---------------------------------------
+        # Back to the image domain.
         data = sar.ifft(sar.ifftshift(data, dim=0), dim=0)
         return sar.cast(sar.absolute(data), sar.f32)
 

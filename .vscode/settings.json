@@ -1,15 +1,12 @@
 {
-    // C++: clangd against the project compilation database (see .clangd).
+    "clangd.path": "${workspaceFolder}/externals/llvm-project/build/bin/clangd",
     "clangd.arguments": [
-        "--compile-commands-dir=build",
-        "--query-driver=externals/llvm-project/build/bin/clang*",
         "--background-index",
         "--completion-style=detailed",
         "--header-insertion=iwyu"
     ],
     "C_Cpp.intelliSenseEngine": "disabled",
 
-    // TableGen / MLIR / PDLL language servers from the in-tree LLVM build.
     "mlir.server_path": "externals/llvm-project/build/bin/mlir-lsp-server",
     "mlir.tablegen_server_path": "externals/llvm-project/build/bin/tblgen-lsp-server",
     "mlir.pdll_server_path": "externals/llvm-project/build/bin/mlir-pdll-lsp-server",
@@ -17,5 +14,7 @@
         "${workspaceFolder}/build/tablegen_compile_commands.yml"
     ],
 
-    "python.analysis.extraPaths": ["python"]
+    "python.analysis.extraPaths": [
+        "python"
+    ]
 }

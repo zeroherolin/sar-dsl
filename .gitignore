@@ -24,13 +24,11 @@ python/sar/backends/*
 
 # Example outputs / large data (committed assets under examples/*/assets
 # are unaffected: generated outputs land in the working directory)
-examples/wka/data/ALPSRP*
-examples/wka/*.bin
-examples/wka/*.npy
-examples/wka/*.bmp
+examples/data/ALPSRP*
+examples/data/*.bin
 *_cpu.png
 *_hls.cpp
-/san_francisco_wka.png
+/san_francisco_*.png
 
 # OS
 .DS_Store

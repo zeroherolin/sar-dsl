@@ -14,7 +14,7 @@ from pathlib import Path
 
 __all__ = ["KernelCache"]
 
-_VERSION = "1"  # bump to invalidate all caches
+_VERSION = "2"  # bump to invalidate all caches
 
 
 def _default_cache_root() -> Path:

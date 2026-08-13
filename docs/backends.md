@@ -34,8 +34,8 @@ Options: `opt_level` (default 3), `native_codegen` (default True).
 
 ## ScaleHLS backend (`third_party/scalehls`)
 
-Stages: `check` (subset validation + flow selection) -> `lower` -> `hls`
-(scalehls-opt HIDA + scalehls-translate). Returns an `HLSDesign` handle
+Stages: `select-flow` -> `lower` -> `hls` (scalehls-opt HIDA +
+scalehls-translate). Returns an `HLSDesign` handle
 (`.cpp_path`, `.source()`, `.flow`); it is not executable.
 
 Two lowering flows, selected automatically:

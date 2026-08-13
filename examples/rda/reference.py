@@ -50,6 +50,8 @@ class RDAProcessor:
         self.win_azimuth = np.hanning(n)
 
     # ------------------------------------------------------------------ #
+    # Stages
+    # ------------------------------------------------------------------ #
 
     def range_compress(self, data: np.ndarray) -> np.ndarray:
         spectrum = np.fft.fft(data, axis=1) * self.range_ref[np.newaxis, :]
@@ -95,6 +97,8 @@ class RDAProcessor:
         inv_ka = -self.wavelength * r_gate / (2.0 * p.vr ** 2)
         return np.exp(1j * np.pi * self.fa[:, np.newaxis] ** 2 * inv_ka)
 
+    # ------------------------------------------------------------------ #
+    # Full pipeline
     # ------------------------------------------------------------------ #
 
     def process_complex(self, raw: np.ndarray) -> np.ndarray:

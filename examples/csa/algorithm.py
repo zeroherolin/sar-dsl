@@ -49,32 +49,32 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
 
         data = sar.cast(raw, sar.c128)
 
-        # 1. azimuth FFT
+        # 1. Azimuth FFT.
         data = sar.fftshift(sar.fft(data, dim=0), dim=0)
 
-        # 2. chirp scaling
+        # 2. Chirp scaling.
         tau_diff = tau2 - inv_d * tau_ref_scale
         phi1 = km * (inv_d - ones) * (tau_diff * tau_diff) * math.pi
         data = data * sar.expj(phi1)
 
-        # 3. range FFT
+        # 3. Range FFT.
         data = sar.fftshift(sar.fft(data, dim=1), dim=1)
 
-        # 4. range compression + SRC + bulk RCMC (+ range window)
+        # 4. Range compression + SRC + bulk RCMC (+ range window).
         phi2 = ((fr2 * fr2) * d / km * math.pi
                 + (inv_d - ones) * fr2 * rcmc_scale)
         data = data * sar.expj(phi2)
         data = data * sar.cast(sar.broadcast(win_r, (N, N), dim=1), sar.c128)
 
-        # 5. range IFFT
+        # 5. Range IFFT.
         data = sar.ifft(sar.ifftshift(data, dim=1), dim=1)
 
-        # 6. azimuth compression (+ azimuth window)
+        # 6. Azimuth compression (+ azimuth window).
         phi3 = tau2 * (d - ones) * (az_scale * p.c / 2.0)
         data = data * sar.expj(phi3)
         data = data * sar.cast(sar.broadcast(win_a, (N, N), dim=0), sar.c128)
 
-        # 7. azimuth IFFT
+        # 7. Azimuth IFFT.
         data = sar.ifft(sar.ifftshift(data, dim=0), dim=0)
         return sar.cast(sar.absolute(data), sar.f32)
 

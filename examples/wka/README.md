@@ -11,7 +11,6 @@ demonstrated on both synthetic point targets and a real ALOS-1 dataset.
 | `run_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
 | `run_scalehls.py` | Full scalehls-backend flow: emit a Vitis HLS C++ design |
 | `run_alos.py` | Focus the real ALOS-1 San Francisco dataset (16384x16384) |
-| `data/` | CEOS L1.0 extraction tooling + raw ALOS product |
 | `assets/` | Reference imagery |
 
 ## Processing chain
@@ -44,12 +43,12 @@ Each simulated point target focuses to roughly one resolution cell:
 ## Real data (ALOS-1)
 
 ```bash
-cd examples/wka
-python data/extract_alos.py     # CEOS L1.0 -> alos_raw_16384x16384.bin (2 GiB)
-python run_alos.py              # tens of GiB of RAM at full size
+# from the repository root; the dataset is shared by all three algorithms
+python examples/data/extract_alos.py   # CEOS L1.0 -> alos_raw_...bin (2 GiB)
+python examples/wka/run_alos.py        # tens of GiB of RAM at full size
 ```
 
-The full 16384x16384 scene focuses in about 3.6 seconds on a large
+The full 16384x16384 scene focuses in about 3.7 seconds on a large
 multi-core machine (fused element-wise kernels under OpenMP; multithreaded
 FFT/Stolt runtime). The effective radar velocity in `ALOS_PARAMS` is
 autofocus-calibrated by image-contrast maximization over the urban area:

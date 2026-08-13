@@ -11,8 +11,12 @@ if [[ ! -f "$LLVM_DIR/llvm/CMakeLists.txt" ]]; then
   exit 1
 fi
 
+# clang-tools-extra provides clangd for editor integration (see .clangd);
+# the openmp runtime provides the libomp.so the CPU backend links against.
 cmake -G Ninja -S "$LLVM_DIR/llvm" -B "$LLVM_DIR/build" \
-  -DLLVM_ENABLE_PROJECTS="mlir;clang" \
+  -DLLVM_ENABLE_PROJECTS="mlir;clang;clang-tools-extra" \
+  -DLLVM_ENABLE_RUNTIMES=openmp \
+  -DOPENMP_ENABLE_LIBOMPTARGET=OFF \
   -DLLVM_TARGETS_TO_BUILD=host \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_ASSERTIONS=ON \
@@ -25,4 +29,10 @@ cmake -G Ninja -S "$LLVM_DIR/llvm" -B "$LLVM_DIR/build" \
   -DLLVM_INCLUDE_EXAMPLES=OFF
 
 ninja -C "$LLVM_DIR/build" -j "$JOBS"
+
+# The runtimes build leaves libomp.so in its own subtree; stage it next to
+# the toolchain libraries where the CPU backend expects it.
+cp -f "$LLVM_DIR/build/runtimes/runtimes-bins/openmp/runtime/src/libomp.so" \
+  "$LLVM_DIR/build/lib/"
+
 echo "LLVM/MLIR/Clang toolchain ready: $LLVM_DIR/build/bin"

@@ -10,6 +10,7 @@ examples/
 │   ├── simulate.py    point-target echo simulator
 │   ├── plot.py        dB-scale image saving
 │   └── alos.py        ALOS-1 raw loading and scene post-processing
+├── data/              shared dataset: CEOS extraction tooling + ALOS product
 ├── wka/               omega-K (wavenumber domain)
 ├── rda/               Range-Doppler
 └── csa/               Chirp Scaling (interpolation-free)
@@ -35,7 +36,7 @@ python examples/csa/run_scalehls.py
 ```
 
 All three algorithms also process the real ALOS-1 San Francisco dataset
-(16384 x 16384 raw echoes, extracted once via `wka/data/extract_alos.py`):
+(16384 x 16384 raw echoes, extracted once via `data/extract_alos.py`):
 each directory has a `run_alos.py`. Urban-area image contrast at full
 size: omega-K 131.6, Range-Doppler 130.3, Chirp Scaling 126.1 -- all
 focus the scene in ~3.5 s on a large multi-core CPU.
