@@ -49,9 +49,9 @@ Two lowering flows, selected automatically:
   (re, im).
 
 Every SAR operation has a lowering in the affine flow, so complete
-imaging chains (omega-K, range-Doppler) emit as single HLS designs; the
-identical IR is validated numerically on the CPU through
-`--sar-affine-to-llvm-pipeline`.
+imaging chains (omega-K, range-Doppler, chirp scaling) emit as single
+HLS designs; the identical IR is validated numerically on the CPU
+through `--sar-affine-to-llvm-pipeline`.
 
 Options: `flow` ("auto"), `top_func`, `loop_tile_size` (8),
 `loop_unroll_factor` (4).

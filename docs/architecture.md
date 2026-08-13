@@ -153,8 +153,8 @@ path (`sar-to-affine-pipeline`):
    (`-hida-cpp-pipeline`), then `scalehls-translate` emits Vitis HLS C++.
 
 With that, every SAR operation lowers in the affine flow and complete
-imaging chains (omega-K, range-Doppler) emit as single HLS designs. The
-identical affine IR is compiled to native code by
+imaging chains (omega-K, range-Doppler, chirp scaling) emit as single
+HLS designs. The identical affine IR is compiled to native code by
 `--sar-affine-to-llvm-pipeline` and checked against numpy, so the HLS
 lowering's arithmetic is validated without an HLS simulator (the full
 omega-K chain matches the NumPy reference bit-for-bit at f32 output

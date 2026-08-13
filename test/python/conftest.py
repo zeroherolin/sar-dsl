@@ -5,7 +5,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
-sys.path.insert(0, str(REPO_ROOT / "examples" / "wka"))
+sys.path.insert(0, str(REPO_ROOT / "examples"))
 
 import sar  # noqa: E402
 

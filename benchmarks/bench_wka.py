@@ -17,11 +17,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "python"))
-sys.path.insert(0, str(REPO / "examples" / "wka"))
+sys.path.insert(0, str(REPO / "examples"))
 
-from synthetic import demo_scene, synthetic_params        # noqa: E402
-from wka_dsl import build_wka_kernel, make_kernel_inputs  # noqa: E402
-from wka_numpy import WKAProcessor                        # noqa: E402
+from common.params import synthetic_params            # noqa: E402
+from common.simulate import demo_scene                 # noqa: E402
+from wka.algorithm import build_kernel, make_inputs    # noqa: E402
+from wka.reference import WKAProcessor                 # noqa: E402
 
 
 def bench(fn, repeats):
@@ -47,10 +48,10 @@ def main():
     for n in args.sizes:
         params = synthetic_params(n)
         raw, _ = demo_scene(n, params)
-        fa, fr, wr, wa = make_kernel_inputs(n, params)
+        fa, fr, wr, wa = make_inputs(n, params)
 
         t0 = time.perf_counter()
-        kernel = build_wka_kernel(n, params).compile("cpu")
+        kernel = build_kernel(n, params).compile("cpu")
         compile_s = time.perf_counter() - t0
 
         best, mean = bench(lambda: kernel(raw, fa, fr, wr, wa),

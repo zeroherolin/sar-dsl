@@ -1,9 +1,8 @@
 """The omega-K (WKA) imaging algorithm expressed in SAR-DSL.
 
-`build_wka_kernel` traces the *entire* imaging chain -- range/azimuth FFTs,
-bulk compression, Stolt interpolation, windowing and the inverse transforms
--- into a single `sar` dialect kernel that compiles to native code on the
-CPU backend.
+`build_kernel` traces the *entire* imaging chain -- range/azimuth FFTs,
+bulk compression, Stolt interpolation, windowing and the inverse
+transforms -- into a single `sar` dialect kernel.
 
 Host responsibilities are limited to acquisition metadata: frequency axes
 (`fftfreq`) and window vectors are precomputed with numpy and passed as
@@ -19,12 +18,12 @@ import numpy as np
 
 import sar
 
-from wka_numpy import WKAParams
+from common.params import RadarParams
 
-__all__ = ["build_wka_kernel", "make_kernel_inputs"]
+__all__ = ["build_kernel", "make_inputs"]
 
 
-def build_wka_kernel(n: int, p: WKAParams) -> sar.Kernel:
+def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
     """Builds an `n x n` WKA imaging kernel for the given parameters."""
 
     N = int(n)
@@ -77,17 +76,9 @@ def build_wka_kernel(n: int, p: WKAParams) -> sar.Kernel:
     return wka
 
 
-def make_kernel_inputs(n: int, p: WKAParams):
-    """Returns the host-precomputed inputs (fa, fr, win_r, win_a)."""
+def make_inputs(n: int, p: RadarParams):
+    """Host-precomputed inputs: (fa, fr, win_r, win_a)."""
     fa = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / p.prf))
     fr = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / p.fs))
     win = np.hanning(n)
     return fa, fr, win.copy(), win.copy()
-
-
-if __name__ == "__main__":
-    from wka_numpy import ALOS_PARAMS
-
-    n = 256
-    kernel = build_wka_kernel(n, ALOS_PARAMS)
-    print(kernel.to_mlir())

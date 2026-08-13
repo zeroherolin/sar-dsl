@@ -6,9 +6,10 @@ import pytest
 
 from conftest import requires_cpu
 
-from synthetic import demo_scene, single_target_scene, synthetic_params
-from wka_dsl import build_wka_kernel, make_kernel_inputs
-from wka_numpy import ALOS_PARAMS, WKAProcessor
+from common.params import ALOS_PARAMS, synthetic_params
+from common.simulate import demo_scene, single_target_scene
+from wka.algorithm import build_kernel, make_inputs
+from wka.reference import WKAProcessor
 
 pytestmark = requires_cpu
 
@@ -18,7 +19,7 @@ N = 128
 @pytest.fixture(scope="module")
 def compiled_kernel():
     params = synthetic_params(N)
-    kernel = build_wka_kernel(N, params)
+    kernel = build_kernel(N, params)
     return kernel, params
 
 
@@ -27,7 +28,7 @@ def test_wka_matches_numpy_reference(compiled_kernel):
     raw, _ = demo_scene(N, params)
 
     ref = WKAProcessor(N, params).process(raw)
-    fa, fr, wr, wa = make_kernel_inputs(N, params)
+    fa, fr, wr, wa = make_inputs(N, params)
     out = kernel(raw, fa, fr, wr, wa)
 
     peak = float(ref.max())
@@ -38,7 +39,7 @@ def test_wka_focuses_point_target(compiled_kernel):
     kernel, params = compiled_kernel
     raw = single_target_scene(N, params)
 
-    fa, fr, wr, wa = make_kernel_inputs(N, params)
+    fa, fr, wr, wa = make_inputs(N, params)
     image = kernel(raw, fa, fr, wr, wa).astype(np.float64)
 
     # The scene-center scatterer must focus at the raster center...
@@ -63,8 +64,8 @@ def test_wka_with_alos_parameters():
     geometry does not focus at N=128, so only algebraic equivalence with the
     reference is checked)."""
     n = 64
-    kernel = build_wka_kernel(n, ALOS_PARAMS)
-    fa, fr, wr, wa = make_kernel_inputs(n, ALOS_PARAMS)
+    kernel = build_kernel(n, ALOS_PARAMS)
+    fa, fr, wr, wa = make_inputs(n, ALOS_PARAMS)
 
     rng = np.random.default_rng(11)
     raw = (rng.standard_normal((n, n))

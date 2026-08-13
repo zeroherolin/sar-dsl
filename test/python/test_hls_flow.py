@@ -8,20 +8,17 @@ Two complementary checks per algorithm:
    kernel (skipped when the ScaleHLS toolchain is absent).
 """
 
-import sys
-
 import numpy as np
 import pytest
 
-from conftest import REPO_ROOT, requires_cpu, requires_scalehls
+from conftest import requires_cpu, requires_scalehls
 from test_affine_fft import _compile_split_kernel, _run_split
 
-sys.path.insert(0, str(REPO_ROOT / "examples" / "wka"))
-sys.path.insert(0, str(REPO_ROOT / "examples" / "rda"))
-
-from synthetic import demo_scene, synthetic_params      # noqa: E402
-from wka_dsl import build_wka_kernel, make_kernel_inputs  # noqa: E402
-from wka_numpy import WKAProcessor                       # noqa: E402
+from common.params import synthetic_params
+from common.simulate import demo_scene
+from wka.algorithm import build_kernel as build_wka_kernel
+from wka.algorithm import make_inputs as wka_inputs
+from wka.reference import WKAProcessor
 
 N = 128
 
@@ -123,7 +120,7 @@ def test_wka_affine_ir_matches_numpy(scene, tmp_path):
     lib, fn = _compile_split_kernel(kernel.to_mlir(), "wka", tmp_path,
                                     pipeline="--sar-affine-to-llvm-pipeline")
 
-    fa, fr, wr, wa = make_kernel_inputs(N, params)
+    fa, fr, wr, wa = wka_inputs(N, params)
     re = np.ascontiguousarray(raw.real)
     im = np.ascontiguousarray(raw.imag)
     (out,) = _run_split(fn, [re, im, fa, fr, wr, wa], [(N, N)], np.float32)
@@ -148,7 +145,7 @@ def test_wka_emits_hls_design(scene):
 
 @requires_scalehls
 def test_rda_emits_hls_design():
-    from rda_dsl import build_rda_kernel
+    from rda.algorithm import build_kernel as build_rda_kernel
 
     n = 64
     design = build_rda_kernel(n, synthetic_params(n)).compile(

@@ -33,7 +33,7 @@ test-python:              ## Python frontend + backend tests
 	PYTHONPATH=python python3 -m pytest test/python -q
 
 examples:                 ## Focus a synthetic scene end-to-end
-	PYTHONPATH=python python3 examples/wka/run_synthetic.py --n 512
+	PYTHONPATH=python python3 examples/wka/run_cpu.py --n 512
 
 bench:                    ## WKA performance benchmark
 	PYTHONPATH=python python3 benchmarks/bench_wka.py --sizes 1024 4096 --numpy

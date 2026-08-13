@@ -28,8 +28,8 @@ examples/wka/data/ALPSRP*
 examples/wka/*.bin
 examples/wka/*.npy
 examples/wka/*.bmp
-examples/wka/*.cpp
-/wka_synthetic.png
+*_cpu.png
+*_hls.cpp
 /san_francisco_wka.png
 
 # OS

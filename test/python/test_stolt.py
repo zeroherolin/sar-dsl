@@ -27,7 +27,7 @@ def _stolt_reference(data, fa, fr, c, fc, vr, t_shift):
             d = idxf - idx
             w = np.sinc(d) * (0.5 + 0.5 * np.cos(np.pi * d / 4.0))
             acc += np.where(valid, smooth[i, idxs] * w, 0)
-        out[i] = acc * np.exp(-1j * 2 * np.pi * frq * t_shift)
+        out[i] = acc * np.exp(-1j * 2 * np.pi * fr * t_shift)
     return out
 
 

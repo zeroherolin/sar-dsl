@@ -342,11 +342,14 @@ def SAR_StoltInterpOp : SAR_Op<"stolt_interp", [Pure]> {
     For every output sample `(i, j)`:
     ```
     f_q  = sqrt(max((fr[j] + fc)^2 + (c * fa[i] / (2 vr))^2, 1e-10)) - fc
-    out[i, j] = exp(-2 pi j f_q t_shift) *
+    out[i, j] = exp(-2 pi j fr[j] t_shift) *
                 sum_{k=-3}^{4} data[i, k'] * exp(2 pi j fr[k'] t_shift) * w(d)
     ```
     where `k' = floor((f_q - fr[0]) / dfr) + k`, `d` is the fractional
     distance to tap `k'`, and `w(d) = sinc(d) * (0.5 + 0.5 cos(pi d / 4))`.
+    The smoothing ramp re-references fast time to the scene center before
+    the nonlinear remapping; the de-smoothing ramp is applied on the
+    output-grid frequency `fr[j]`.
   }];
   let arguments = (ins SAR_ComplexTensor:$data,
                        SAR_FloatTensor:$fa,

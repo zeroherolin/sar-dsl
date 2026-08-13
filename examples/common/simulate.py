@@ -1,47 +1,20 @@
 """Synthetic stripmap SAR echo simulation for point targets.
 
-Generates raw echoes compatible with the WKA processing chain: a linear-FM
-chirp in fast time and the hyperbolic range migration in slow time. Useful
-for demos and focusing-quality tests without the multi-hundred-MB ALOS
-dataset.
+Generates raw echoes compatible with all imaging chains: a linear-FM chirp
+in fast time and the hyperbolic range migration in slow time.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
-from wka_numpy import WKAParams
+from .params import RadarParams
 
-__all__ = ["PointTarget", "simulate_point_targets", "synthetic_params",
-           "demo_scene"]
-
-
-def synthetic_params(n: int) -> WKAParams:
-    """Derives a self-consistent airborne C-band geometry for an `n x n`
-    raster, so that point targets focus to roughly one resolution cell.
-
-    - The chirp occupies half the sampled range window with ~70% of the
-      sampling bandwidth (range resolution ~1.4 bins).
-    - The platform velocity is chosen so the Doppler history of a full
-      synthetic aperture spans ~70% of the PRF (azimuth resolution ~1.4
-      bins, no Doppler aliasing).
-    """
-    c = 299792458.0
-    fc = 5.3e9
-    fs = 32.0e6
-    prf = 400.0
-    r0 = 20000.0
-    wavelength = c / fc
-
-    pulse_len = 0.5 * n / fs
-    kr = -0.7 * fs / pulse_len
-    vr = prf * np.sqrt(0.7 * wavelength * r0 / (2.0 * n))
-
-    return WKAParams(c=c, fc=fc, fs=fs, prf=prf, vr=vr, r0=r0, kr=kr,
-                     t_shift=0.0)
+__all__ = ["PointTarget", "simulate_point_targets", "demo_scene",
+           "single_target_scene"]
 
 
 @dataclass(frozen=True)
@@ -54,16 +27,14 @@ class PointTarget:
     rcs: float = 1.0
 
 
-def simulate_point_targets(n: int, p: WKAParams,
+def simulate_point_targets(n: int, p: RadarParams,
                            targets: Sequence[PointTarget]) -> np.ndarray:
     """Simulates an `n x n` raw echo raster (azimuth x range, complex64)."""
-    # Fast time: window centered on the reference range.
-    tau = 2.0 * p.r0 / p.c + (np.arange(n) - n / 2) / p.fs
+    # Fast time: window positioned so R0 sits at offset t_shift.
+    tau = 2.0 * p.r0 / p.c - p.t_shift + np.arange(n) / p.fs
     # Slow time: aperture centered on scene center.
     eta = (np.arange(n) - n / 2) / p.prf
-
-    # Chirp duration: half the sampled window keeps the pulse inside it.
-    pulse_len = 0.5 * n / p.fs
+    pulse_len = p.pulse_len
 
     raw = np.zeros((n, n), dtype=np.complex128)
     for target in targets:
@@ -83,7 +54,8 @@ def simulate_point_targets(n: int, p: WKAParams,
     return raw.astype(np.complex64)
 
 
-def demo_scene(n: int, p: WKAParams) -> Tuple[np.ndarray, list]:
+def demo_scene(n: int, p: RadarParams) -> Tuple[np.ndarray,
+                                                List[PointTarget]]:
     """A small constellation of point targets plus the raw echoes."""
     swath = n / p.fs * p.c / 2.0          # slant-range extent (m)
     strip = n / p.prf * p.vr              # along-track extent (m)
@@ -95,6 +67,6 @@ def demo_scene(n: int, p: WKAParams) -> Tuple[np.ndarray, list]:
     return simulate_point_targets(n, p, targets), targets
 
 
-def single_target_scene(n: int, p: WKAParams) -> np.ndarray:
+def single_target_scene(n: int, p: RadarParams) -> np.ndarray:
     """Raw echoes of a lone scene-center scatterer (focus-quality tests)."""
     return simulate_point_targets(n, p, [PointTarget(0.0, 0.0, 1.0)])

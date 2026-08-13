@@ -16,44 +16,17 @@ the `sar.fftshift` conventions of the DSL kernel.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 
-__all__ = ["WKAParams", "WKAProcessor", "ALOS_PARAMS"]
+from common.params import RadarParams
 
-
-@dataclass(frozen=True)
-class WKAParams:
-    """Radar/platform parameters of a stripmap acquisition."""
-
-    c: float    # propagation speed (m/s)
-    fc: float   # carrier frequency (Hz)
-    fs: float   # range sampling rate (Hz)
-    prf: float  # pulse repetition frequency (Hz)
-    vr: float   # effective radar velocity (m/s)
-    r0: float   # reference slant range (m)
-    kr: float   # range chirp rate (Hz/s)
-    t_shift: float  # reference fast-time shift used by Stolt interpolation (s)
-
-
-#: ALOS-1 PALSAR parameters used by the San Francisco dataset.
-ALOS_PARAMS = WKAParams(
-    c=299792458.0,
-    fc=1269999750.06,
-    fs=32000000.00,
-    prf=2155.172,
-    vr=7155.0,
-    r0=843013.994,
-    kr=-1.037e12,
-    t_shift=4800.0 / 32000000.00,
-)
+__all__ = ["WKAProcessor"]
 
 
 class WKAProcessor:
     """Reference omega-K processor for square `n x n` rasters."""
 
-    def __init__(self, n: int, params: WKAParams):
+    def __init__(self, n: int, params: RadarParams):
         self.n = n
         self.p = params
         # Azimuth / range frequency axes in fftshift layout.
@@ -111,7 +84,9 @@ class WKAProcessor:
                 weight = np.sinc(dist) * (0.5 + 0.5 * np.cos(np.pi * dist
                                                              / 4.0))
                 acc += np.where(valid, smooth[i, idx_safe] * weight, 0.0)
-            out[i] = acc * np.exp(-1j * 2.0 * np.pi * fr_query * p.t_shift)
+            # De-smoothing on the output-grid frequency (not fr_query:
+            # that would add an fa^2 phase, i.e. an azimuth defocus).
+            out[i] = acc * np.exp(-1j * 2.0 * np.pi * fr * p.t_shift)
         return out
 
     # ------------------------------------------------------------------ #

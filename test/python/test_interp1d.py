@@ -96,8 +96,8 @@ def test_stolt_expressible_via_interp1d():
                                        1e-10)) - fc
         positions = (f_query - f_start) / df
         remapped = sar.interp1d(smoothed, positions)
-        # De-smoothing ramp exp(-2 pi j f_query t_shift).
-        return remapped * sar.expj(f_query * (-2.0 * math.pi * t_shift))
+        # De-smoothing ramp on the output-grid frequency.
+        return remapped * sar.expj(fr2 * (-2.0 * math.pi * t_shift))
 
     a = dedicated(data, fa, fr)
     b = composed(data, fa, fr)

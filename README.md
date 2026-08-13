@@ -25,10 +25,11 @@ compiled omega-K kernel in 3.6 seconds.*
 
 ## Highlights
 
-- **Two complete imaging algorithms.** omega-K (WKA) and Range-Doppler
-  (RDA) chains, each a single compiled kernel, validated numerically
-  against NumPy references and demonstrated on real satellite data
-  ([examples/wka](examples/wka/), [examples/rda](examples/rda/)).
+- **Three complete imaging algorithms.** omega-K (WKA), Range-Doppler
+  (RDA) and Chirp Scaling (CSA) chains, each a single compiled kernel,
+  validated numerically against NumPy references, cross-checked against
+  each other on point targets, and demonstrated on real satellite data
+  ([examples/](examples/)).
 - **Multi-backend by construction.** A `cpu` backend executes kernels
   natively (linalg fusion, OpenMP, `libsar_runtime` FFT); a `scalehls`
   backend emits Vitis HLS C++ through
@@ -130,6 +131,7 @@ with numpy (matplotlib for the examples).
 ```bash
 git clone <repo> && cd sar-dsl
 git submodule update --init externals/llvm-project
+pip install numpy matplotlib pytest   # matplotlib/pytest: examples & tests
 
 make llvm        # 1. in-tree LLVM/MLIR/Clang toolchain (one-time, long)
 make build       # 2. sar-opt, libsar_runtime, tests
@@ -140,8 +142,11 @@ make test        # lit + pytest, everything should pass
 make examples    # focus a 512x512 synthetic scene, writes a PNG
 ```
 
+The example runners insert `python/` into `sys.path` themselves, so they
+also work without the `PYTHONPATH` export.
+
 Step 3 fetches ScaleHLS' pinned LLVM via the polygeist submodule and
-applies a small upstream CMake fix
+applies two small upstream fixes
 ([scripts/patches/](scripts/patches/scalehls-hida-fixes.patch)).
 
 To reproduce the San Francisco image, place the ALOS-1 CEOS product under
@@ -162,6 +167,7 @@ python run_alos.py
 | [docs/backends.md](docs/backends.md) | Backend guide: cpu, scalehls, adding your own |
 | [examples/wka/README.md](examples/wka/README.md) | omega-K walkthrough (synthetic + real data) |
 | [examples/rda/README.md](examples/rda/README.md) | Range-Doppler walkthrough |
+| [examples/csa/README.md](examples/csa/README.md) | Chirp Scaling walkthrough (interpolation-free) |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and conventions |
 
 ## Project layout
@@ -172,7 +178,7 @@ runtime/                 libsar_runtime (FFT, sinc interpolation; C ABI)
 tools/sar-opt/           optimizer / pipeline driver
 python/sar/              Python package: language, ir, compiler, runtime, backends
 third_party/             backend plugins (cpu, scalehls)
-examples/                omega-K and Range-Doppler algorithms
+examples/                omega-K, Range-Doppler and Chirp Scaling algorithms
 benchmarks/              performance suite and reference numbers
 test/                    lit suites (MLIR) and pytest suites (Python, e2e, fuzz)
 externals/               submodules: llvm-project, ScaleHLS-HIDA

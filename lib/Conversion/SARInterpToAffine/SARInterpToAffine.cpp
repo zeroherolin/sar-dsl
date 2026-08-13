@@ -299,7 +299,9 @@ struct StoltInterpSplitLowering : OpRewritePattern<StoltInterpSplitOp> {
       auto [accRe, accIm] =
           emitWindowedSincGather(s, smoothRe, smoothIm, i, pos, cols);
 
-      Value phase = s.mul(negTwoPiT, frq);
+      // De-smoothing ramp on the output-grid frequency fr[j] (using the
+      // mapped frequency would introduce an fa^2 azimuth defocus).
+      Value phase = s.mul(negTwoPiT, frj);
       Value cs = s.cos(phase), sn = s.sin(phase);
       Value resRe = s.sub(s.mul(accRe, cs), s.mul(accIm, sn));
       Value resIm = s.add(s.mul(accRe, sn), s.mul(accIm, cs));

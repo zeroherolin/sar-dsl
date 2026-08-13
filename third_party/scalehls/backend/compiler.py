@@ -17,7 +17,7 @@ top function takes each complex tensor as two adjacent float arrays
 (re, im), inputs first, then one output array per result plane.
 
 Every SAR operation has an HLS lowering, so complete imaging chains
-(omega-K, range-Doppler) emit as single designs.
+(omega-K, range-Doppler, chirp scaling) emit as single designs.
 
 Options:
     flow               -- "auto" (default), "linalg" or "affine"

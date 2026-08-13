@@ -273,7 +273,11 @@ void stolt2d(const MemRefDescriptor<std::complex<Scalar>, 2> *data,
 
         std::complex<double> acc =
             sampleWindowedSinc(row.data(), cols, idxFloat);
-        double phase = -2.0 * M_PI * frQuery * tShift;
+        // De-smoothing uses the *output-grid* frequency fr[j]: after the
+        // remapping the sample lives at fr[j] on the new axis, so the
+        // window-reference ramp is restored there. Using frQuery instead
+        // would add a phase proportional to fa^2 (an azimuth defocus).
+        double phase = -2.0 * M_PI * frj * tShift;
         acc *= std::complex<double>(std::cos(phase), std::sin(phase));
         out->at(i, j) =
             std::complex<Scalar>(static_cast<Scalar>(acc.real()),
