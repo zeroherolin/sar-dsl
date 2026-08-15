@@ -17,30 +17,26 @@ namespace sar {
 /// Options shared by the pipelines that bufferize a kernel.
 struct SARBufferPipelineOptions
     : public PassPipelineOptions<SARBufferPipelineOptions> {
-  /// Buffers holding at least this many elements are shared between
-  /// non-overlapping lifetimes rather than allocated one per intermediate.
-  /// Give it the threshold the backend uses to place buffers off chip: below
-  /// it a buffer acts as a dataflow channel and distinct producers are what
-  /// let the backend pipeline the stages, at and above it the buffer is
-  /// memory and sharing is free. Zero shares every buffer it can.
+  /// Below this size a buffer acts as a dataflow channel, where distinct
+  /// producers are what let a backend pipeline the stages; at and above it
+  /// the buffer is memory, where sharing costs nothing. Zero shares
+  /// everything it can.
   Option<uint64_t> reuseBufferMinElements{
       *this, "reuse-buffer-min-elements",
       llvm::cl::desc("Only share buffers holding at least this many elements"),
       llvm::cl::init(0)};
 
-  /// Element count above which a producer is fused into every consumer
-  /// rather than stored. Recomputing costs an arithmetic unit; storing
-  /// costs a buffer and the DRAM traffic through it. Zero recomputes
-  /// everything it can.
+  /// Above this size a producer is fused into every consumer rather than
+  /// stored: recomputing costs an arithmetic unit, storing costs a buffer
+  /// and the traffic through it. Zero recomputes everything it can.
   Option<uint64_t> recomputeMinElements{
       *this, "recompute-min-elements",
       llvm::cl::desc("Recompute rather than store results of at least this "
                      "many elements"),
       llvm::cl::init(0)};
 
-  /// On-chip bytes a transposing loop nest may stage per block. Zero leaves
-  /// transposes as plain copies, where one side of every access strides by a
-  /// whole row.
+  /// On-chip bytes a transposing nest may stage per block. Zero leaves
+  /// transposes as plain copies, where one side strides by a whole row.
   Option<unsigned> transposeBlockBytes{
       *this, "transpose-block-bytes",
       llvm::cl::desc("On-chip bytes a staged transpose block may occupy"),

@@ -3,20 +3,6 @@
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
-//
-// Upstream's elementwise fusion declines to fuse a producer that has several
-// consumers: each of them would recompute it, and on a CPU that is usually
-// the worse trade. Here it is the opposite. Declining materializes the
-// producer's result, and at scene scale that result is a whole raster --
-// gigabytes written to DRAM and read back, against the cost of one more
-// arithmetic unit on the device.
-//
-// So the trade is made by size: above `min-elements` a producer is fused
-// however many consumers it has, below it upstream's judgement stands. The
-// pattern this rescues is the one every imaging chain ends with -- a phase
-// ramp whose sine and cosine each feed both halves of a complex multiply.
-//
-//===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"

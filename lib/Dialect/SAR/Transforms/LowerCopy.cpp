@@ -4,16 +4,9 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// `memref.copy` lowers to a call into the MLIR runtime support library. A
-// kernel this project emits links against neither that library (the CPU
-// backend loads a bare shared object) nor anything like it (an HLS target
-// has no runtime at all), so the call would only surface as an unresolved
-// symbol at load time.
-//
-// Bufferization introduces the op wherever a value has to change layout --
-// a strided view reaching a consumer that wants its own buffer. Expanding
-// it into a loop nest keeps that case working and, on the HLS path, leaves
-// a sweep the backend can pipeline rather than an opaque call.
+// `memref.copy` is a call into the MLIR runtime support library, which
+// neither the standalone kernel nor an HLS target links against, so it
+// is expanded into a loop nest here.
 //
 //===----------------------------------------------------------------------===//
 

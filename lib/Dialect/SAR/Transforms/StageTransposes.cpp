@@ -4,18 +4,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// A transposing loop nest reads one buffer along its rows and writes the
-// other along its columns. Whichever loop is innermost, one of the two
-// strides by a whole row, so that side gets a fresh memory transaction per
-// element: on an AXI master a 512-bit beat carries one useful double
-// instead of eight.
-//
-// Both sides can be contiguous at once if a square block is staged in
-// between: read a tile row-wise into on-chip memory, write it out column-
-// wise. The block is the only thing that strides, and it is small enough to
-// be a block RAM. For the corner turns of an imaging chain -- the step that
-// takes a range-compressed raster into the azimuth domain -- this is the
-// difference between a burst per element and a burst per tile row.
+// A transposing nest strides one of its two buffers by a whole row.
+// Staging a square block in between makes both sides contiguous: the
+// block is filled row-wise and drained column-wise, and it is the only
+// thing left striding.
 //
 //===----------------------------------------------------------------------===//
 

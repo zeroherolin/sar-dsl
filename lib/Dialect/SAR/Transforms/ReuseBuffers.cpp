@@ -4,19 +4,9 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Bufferization gives every intermediate tensor its own allocation. An
-// imaging chain is a sequence of whole-raster passes, so that comes to
-// dozens of full rasters -- over a hundred gigabytes at the ALOS size --
-// even though only a handful are ever live at the same time.
-//
-// This pass runs a linear scan over the function body: a buffer whose last
-// use precedes another buffer's allocation can carry that one too. Only
-// buffers of at least `minElements` take part. Below that size a buffer is a
-// dataflow channel, where distinct producers are what let a backend pipeline
-// the stages; at and above it the buffer is memory, where sharing costs
-// nothing and saves the capacity that decides whether a design fits at all.
-// Passing the same threshold the backend uses to place buffers off chip
-// keeps the two decisions consistent.
+// A linear scan over the function body: a buffer whose last use has
+// passed can carry a later one of the same type. See the pass
+// description in Passes.td for what the threshold selects.
 //
 //===----------------------------------------------------------------------===//
 
