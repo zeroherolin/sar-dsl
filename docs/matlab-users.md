@@ -37,7 +37,7 @@ Where they differ:
 | Matlab | SAR-DSL | Note |
 |--------|---------|------|
 | `[~, i] = max(x)` | `sar.argmax(x, axis=...)` | index only |
-| `[~, i] = min(x)` | `sar.argmin(x, axis=...)` | index only |
+| `[~, i] = min(x)` | `sar.argmin(x, axis=...)` | index only; composition over `argmax` |
 | `interp1` | `sar.interp1d` | kernel selectable (`sinc`, `cubic`, ...) |
 | `cat(2, a, b)` | `sar.concat([a, b], axis=1)` | also spelled `concatenate` |
 | `padarray` | `sar.pad` | |

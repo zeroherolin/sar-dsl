@@ -90,8 +90,7 @@ flowchart TB
     K --> IR
 
     IR -- "sar-to-llvm-pipeline" --> CPU1
-    IR -- "sar-to-linalg-pipeline<br/><sub>float elementwise, opt-in</sub>" --> H1
-    IR -- "sar-to-affine-pipeline<br/><sub>default: complex / FFT</sub>" --> H2
+    IR -- "sar-to-affine-pipeline" --> H1
 
     subgraph CPU["cpu backend · native execution"]
         direction TB

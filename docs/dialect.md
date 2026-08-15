@@ -87,11 +87,10 @@ Passes:
   linalg-on-tensors. Signal ops are illegal here.
 - `--convert-sar-signal-to-runtime`: `fft`/`ifft`/`interp1d` to
   `libsar_runtime` calls (`_mlir_ciface_sar_rt_*`).
-- `--convert-sar-fft-to-affine`: `fft_split` to radix-2 **Stockham** affine
-  loop nests with constant twiddle globals (no bit-reversal, fully affine
-  accesses -- HLS-friendly); non-power-of-two sizes go through
-  **Bluestein**'s chirp-z reduction, whose chirp and kernel spectrum are
-  folded into constants at compile time.
+- `--convert-sar-fft-to-affine`: `fft_split` to radix-2 Stockham affine
+  loop nests; non-power-of-two sizes go through Bluestein's chirp-z
+  reduction. Why those two algorithms:
+  [architecture.md](architecture.md#6-hls-backend).
 - `--convert-sar-interp-to-affine`: `interp1d_split` to affine loops
   with the interpolation taps statically unrolled (the Kaiser window's
   Bessel `I0` expands into a straight-line power series); gathers use
@@ -101,14 +100,27 @@ Passes:
 - `--sar-emit-c-interface`: attaches `llvm.emit_c_interface` to public
   functions (kernel entry points) so the ctypes launcher finds the
   `_mlir_ciface_*` wrappers; private declarations keep plain C symbols.
+- `--sar-reuse-buffers` (Transforms): lets a buffer whose last use has
+  passed carry a later one of the same type. `min-elements` selects which
+  buffers take part -- below it a buffer is a dataflow channel, at and
+  above it it is memory.
+- `--sar-fuse-elementwise` (Transforms): fuses an element-wise producer
+  into every consumer above `min-elements`, recomputing rather than
+  materialising a whole raster.
+- `--sar-stage-transposes` (Transforms): stages a transposing loop nest
+  through an on-chip block so both sides sweep contiguously. `block-bytes`
+  bounds the block.
+- `--sar-lower-copy` (Transforms): expands `memref.copy`, which lowers to
+  a runtime-library call neither backend links, into an affine sweep.
 
 Registered pipelines (see `lib/Pipelines/`):
 
 - `--sar-to-llvm-pipeline`: CPU execution path (runtime calls + linalg
   fusion + OpenMP parallel loops + LLVM dialect).
-- `--sar-to-linalg-pipeline`: linalg-on-tensors hand-off (HLS, float
-  element-wise kernels).
-- `--sar-to-affine-pipeline`: split-complex affine/memref hand-off (HLS
-  kernels with complex arithmetic and FFTs).
+- `--sar-to-linalg-pipeline`: linalg-on-tensors hand-off, for backends
+  that run their own bufferization and loop transformations. The in-tree
+  HLS backend does not use it -- it takes the affine hand-off below.
+- `--sar-to-affine-pipeline`: split-complex affine/memref hand-off; this
+  is what the HLS backend compiles from.
 - `--sar-affine-to-llvm-pipeline`: the affine path continued to LLVM, used
   to validate the Stockham lowering numerically on CPU.

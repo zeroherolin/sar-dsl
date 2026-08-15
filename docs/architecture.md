@@ -89,9 +89,6 @@ The `sar-to-llvm` pipeline (registered in `sar-opt`) does the entire descent:
    against LLVM's libomp), complex->standard, and the usual LLVM
    conversions with `-O3 -march=native` codegen.
 
-   Measured effect on the full 16384x16384 ALOS-1 omega-K chain:
-   55.4 s -> 3.6 s.
-
 The Python launcher allocates result arrays with numpy and invokes
 `_mlir_ciface_<kernel>` via ctypes with strided memref descriptors.
 
@@ -201,9 +198,9 @@ backend needs to say about a design that MLIR's own dialects cannot:
 dataflow structure (`schedule`, `node`, `buffer`, `stream`), where a
 buffer lives (`#hls.mem<dram>`, `bram_t2p`, ...), how an array is banked
 (`#hls.partition`), and what an interface looks like (`axi.bundle`,
-`axi.port`). Its passes derive from
-[ScaleHLS-HIDA](https://github.com/UIUC-ChenLab/ScaleHLS-HIDA); see
-[NOTICE](../NOTICE).
+`axi.port`). It began as a fork of
+[ScaleHLS-HIDA](https://github.com/UIUC-ChenLab/ScaleHLS-HIDA) and is now
+maintained here; see [NOTICE](../NOTICE).
 
 Keeping it in-tree means one LLVM build and one set of tools:
 `sar-opt` runs every pass from SAR down to scheduled HLS IR, and

@@ -35,7 +35,7 @@ Options: `opt_level` (default 3), `native_codegen` (default True).
 ## HLS backend (`sar.backends.hls`)
 
 Stages: `lower` (`sar-opt --sar-to-affine-pipeline`) -> `hls`
-(`sar-opt -hls-pipeline` then `sar-translate -hls-emit-hlscpp`). Returns
+(`sar-opt --hls-pipeline` then `sar-translate --hls-emit-hlscpp`). Returns
 an `HLSDesign` handle (`.cpp_path`, `.source()`); it is not executable.
 
 The kernel is decomplexified (complex tensors become re/im float planes),
@@ -186,6 +186,7 @@ Tools are located in this order:
 | Variable | Effect |
 |----------|--------|
 | `SAR_DSL_TOOL_<NAME>` | Absolute path to one tool, overriding discovery |
+| `SAR_DSL_TOOL_DIR` | Build-tree `bin` directory (written by CMake into `sar/_build_config.py`; set it to run against another build) |
 | `SAR_DSL_TOOL_PATH` | Extra directories to search for tools |
 | `SAR_DSL_RUNTIME_LIB` | Path to `libsar_runtime.so` |
 | `SAR_DSL_BACKEND_PATH` | Extra directories to search for backend packages |

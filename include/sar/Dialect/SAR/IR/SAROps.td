@@ -400,6 +400,10 @@ def SAR_FFTSplitOp : SAR_Op<"fft_split", [Pure,
     `sar-decomplexify` pass for targets without complex arithmetic (HLS).
     Semantics match `sar.fft` (`sar.ifft` with the `inverse` flag) with the
     complex tensor represented as separate real and imaginary planes.
+
+    Compiler-internal: the frontend never emits this op, and only the
+    affine pipeline lowers it. Write `sar.fft` and let decomplexify
+    produce it.
   }];
   let arguments = (ins SAR_FloatTensor:$re, SAR_FloatTensor:$im,
                        I64Attr:$dim, UnitAttr:$inverse);
@@ -468,6 +472,10 @@ def SAR_Interp1DSplitOp : SAR_Op<"interp1d_split", [Pure,
     `sar-decomplexify` for targets without complex arithmetic. Semantics
     match `sar.interp1d` with the complex tensor represented as separate
     real and imaginary planes.
+
+    Compiler-internal: the frontend never emits this op, and only the
+    affine pipeline lowers it. Write `sar.interp1d` and let decomplexify
+    produce it.
   }];
   let arguments = (ins SAR_FloatTensor:$re, SAR_FloatTensor:$im,
                        SAR_FloatTensor:$positions,

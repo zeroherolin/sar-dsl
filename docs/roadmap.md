@@ -39,26 +39,16 @@ language compiles to every backend.
   warns on double FFTs, inverse transforms of centered spectra and
   mixed-domain arithmetic (`sar.DomainWarning`).
 - **HLS designs csim bit-exact.** All four imaging chains pass their
-  generated C-simulation testbenches. Two bugs in the derived HLS passes were
-  root-caused and fixed in our fork: the HLS C++ emitter printed
-  floating-point constants with 6 decimals (quantizing FFT twiddles
-  and flushing small phase coefficients to zero), and multi-consumer
-  forking redirected reads across buffer redefinitions to stale data.
+  generated C-simulation testbenches.
 - **Scene size bounded by DRAM, not by the device.** The full
   16384 x 16384 ALOS raster emits as a single design
   (`examples/wka/run_alos_hls.py`). The backend budgets on-chip
   memory itself: buffers stay resident while the working set fits
   `on_chip_budget`, and past it the full-size planes -- including the
   FFT scratch -- move behind AXI masters, leaving only the constant
-  tables on chip. Getting there took four fixes in the fork: subview
-  types now follow their source's memory space through buffer
-  placement, the unfinished DRAM depth/tap path gave way to the general
-  buffer chain, loop tiling was re-enabled in the C++ pipeline, and AXI
-  ports of one element type now share a bundle instead of each taking
-  its own. The Stockham lowering also lost its copy-in and copy-out
-  passes, reading the input and writing the result directly.
+  tables on chip.
 - **The HLS dialect moved in-tree.** What the pipeline actually uses --
-  the dialect, 32 passes and the C++ emitter -- now lives under
+  the dialect, its transform passes and the C++ emitter -- now lives under
   `lib/Dialect/HLS` and `lib/Target/HLS`, built by the same CMake as the
   rest. The TOSA and PyTorch frontends, design-space exploration and QoR
   estimation went with the submodule; `sar-opt` and `sar-translate`

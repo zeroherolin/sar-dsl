@@ -16,8 +16,12 @@ The body composes existing ops:
   fusion barrier, and it compiles to **every backend**.
 - Outside a kernel it runs directly on numpy arrays (specialized and
   JIT-compiled per argument shapes, numba/Triton style).
-- For emission backends pin a signature first:
-  `range_compress.func.specialize(sar.c64[512, 512], ...)`.
+- For emission backends (`hls`, and any backend whose `.compile()` produces an
+  artifact rather than a callable), pin a signature first:
+  `range_compress.specialize(sar.c64[512, 512], sar.c64[512, 512])`.
+  (`@sar.op`-decorated functions also expose `.func.specialize(...)` for
+  pinning through the inner kernel object; `@sar.func` functions call
+  `.specialize(...)` directly.)
 
 This form covers more than op chaining. With `sar.where` and tensor
 comparisons, data-dependent per-element logic is ordinary Python --
