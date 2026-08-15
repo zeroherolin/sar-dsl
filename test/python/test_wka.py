@@ -4,7 +4,7 @@ reference implementation, and it must actually focus point targets."""
 import numpy as np
 import pytest
 
-from conftest import requires_cpu
+from conftest import requires_cpu, requires_hls
 
 from common.params import ALOS_PARAMS, synthetic_params
 from common.simulate import demo_scene, single_target_scene
@@ -75,3 +75,16 @@ def test_wka_with_alos_parameters():
     out = kernel(raw, wr, wa)
     peak = float(ref.max())
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-6 * peak)
+
+
+@requires_hls
+def test_wka_emits_hls_design():
+    """The full omega-K chain, FFTs and all, must emit as a single design."""
+    import re
+
+    kernel = build_kernel(N, synthetic_params(N))
+    design = kernel.compile(backend="hls")
+    source = design.source()
+    assert "void wka" in source
+    assert "#pragma HLS" in source
+    assert not re.findall(r"\b(malloc|free|printf|std::cout)\b", source)

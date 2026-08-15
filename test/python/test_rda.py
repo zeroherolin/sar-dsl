@@ -8,7 +8,7 @@ test locks in.
 import numpy as np
 import pytest
 
-from conftest import requires_cpu
+from conftest import requires_cpu, requires_hls
 
 from common.params import synthetic_params
 from common.simulate import single_target_scene
@@ -75,3 +75,16 @@ def test_rda_and_wka_agree_on_point_target(setup):
     wka_peak = np.unravel_index(np.argmax(wka_img), wka_img.shape)
     assert abs(rda_peak[0] - wka_peak[0]) <= 1
     assert abs(rda_peak[1] - wka_peak[1]) <= 1
+
+
+@requires_hls
+def test_rda_emits_hls_design():
+    """The full range-Doppler chain must emit as a single design."""
+    import re
+
+    kernel = build_rda_kernel(N, synthetic_params(N))
+    design = kernel.compile(backend="hls")
+    source = design.source()
+    assert "void rda" in source
+    assert "#pragma HLS" in source
+    assert not re.findall(r"\b(malloc|free|printf|std::cout)\b", source)
