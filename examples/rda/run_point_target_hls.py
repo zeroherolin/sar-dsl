@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Range-Doppler on the ScaleHLS backend: emit a Vitis HLS C++ design
+"""Range-Doppler on the HLS backend: emit a Vitis HLS C++ design
 and a C-simulation package with golden data from the NumPy reference
 
 

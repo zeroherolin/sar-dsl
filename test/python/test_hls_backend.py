@@ -1,4 +1,4 @@
-"""ScaleHLS backend tests: HLS C++ emission and subset diagnostics."""
+"""HLS backend tests: HLS C++ emission and subset diagnostics."""
 
 import pytest
 

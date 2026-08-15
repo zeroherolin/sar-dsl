@@ -5,8 +5,8 @@ Two complementary checks per algorithm:
    the CPU
    through `sar-affine-to-llvm-pipeline` and compared against the NumPy
    reference;
-2. emission: the ScaleHLS backend produces Vitis HLS C++ for the full
-   kernel (skipped when the ScaleHLS toolchain is absent).
+2. emission: the HLS backend produces Vitis HLS C++ for the full
+   kernel (skipped when the HLS toolchain is absent).
 """
 
 import numpy as np

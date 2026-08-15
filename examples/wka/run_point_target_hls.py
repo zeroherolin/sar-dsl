@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""omega-K on the ScaleHLS backend, end to end: trace the complete kernel,
+"""omega-K on the HLS backend, end to end: trace the complete kernel,
 emit a Vitis HLS C++ design and a C-simulation package with golden data
 from the NumPy reference.
 

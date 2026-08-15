@@ -21,7 +21,7 @@ requires_cpu = pytest.mark.skipif(
 
 requires_hls = pytest.mark.skipif(
     not _backend_available("hls"),
-    reason="ScaleHLS toolchain not available")
+    reason="HLS toolchain not available")
 
 
 # Shared utilities for split-complex affine/HLS testing

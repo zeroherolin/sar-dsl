@@ -12,6 +12,7 @@ exercises the pure phase-multiply path of the compiler on both backends.
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
 | `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 | `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset |
+| `run_alos_hls.py` | Emit a synthesizable design at the full ALOS raster |
 
 ## Processing chain (zero Doppler centroid)
 

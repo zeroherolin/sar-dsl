@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chirp Scaling on the ScaleHLS backend: emit a Vitis HLS C++ design
+"""Chirp Scaling on the HLS backend: emit a Vitis HLS C++ design
 and a C-simulation package with golden data from the NumPy reference
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""omega-K on the HLS backend at the full ALOS-1 scene size.
+"""Chirp Scaling on the HLS backend at the full ALOS-1 scene size.
 
 Emits a synthesizable Vitis HLS C++ design for the 16384 x 16384 raster
 the San Francisco example processes on the CPU. Unlike the point-target
@@ -11,6 +11,10 @@ whose lifetimes do not overlap share a plane, and ports of the same
 element type share one bundle, so the design presents a dozen ports on a
 couple of interfaces rather than one per intermediate.
 
+Being interpolation-free costs CSA nothing on chip but buys no traffic
+back: the Doppler-dependent factors are recomputed into each consumer
+rather than stored, so it is the phase-multiply chain that streams.
+
 This runner emits the design only. A C-simulation package needs golden
 data for every top-level port, and the promoted intermediate ports have
 none; use `run_point_target_hls.py` for a csim-able package, and
@@ -20,7 +24,7 @@ No raw data is read: the design is a function of the geometry, not of the
 samples.
 
 Usage:
-    python run_alos_hls.py [--n 16384] [--output hls_project/wka_alos]
+    python run_alos_hls.py [--n 16384] [--output hls_project/csa_alos]
 """
 
 import argparse
@@ -32,7 +36,7 @@ _EXAMPLES = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(_EXAMPLES), str(_EXAMPLES.parent / "python")]
 
 from common.params import ALOS_PARAMS  # noqa: E402
-from wka.algorithm import build_kernel  # noqa: E402
+from csa.algorithm import build_kernel  # noqa: E402
 
 
 def main() -> None:
@@ -42,12 +46,12 @@ def main() -> None:
                         default=16384,
                         help="raster size (power of two)")
     parser.add_argument("--output",
-                        default="hls_project/wka_alos",
+                        default="hls_project/csa_alos",
                         help="directory for the emitted design")
     args = parser.parse_args()
 
     n = args.n
-    print(f"[1/2] Emitting the {n}x{n} WKA kernel through HLS ...")
+    print(f"[1/2] Emitting the {n}x{n} CSA kernel through HLS ...")
     started = time.time()
     design = build_kernel(n,
                           ALOS_PARAMS).compile(backend="hls",
@@ -57,7 +61,7 @@ def main() -> None:
 
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    target = out / "wka_alos.cpp"
+    target = out / "csa_alos.cpp"
     target.write_text(source)
 
     ports = source.count("m_axi")
@@ -67,7 +71,7 @@ def main() -> None:
     })
     print(f"[2/2] Saved {target}")
     print(f"done: {source.count(chr(10))} lines of HLS C++ "
-          f"(flow=affine, top function 'wka'); "
+          f"(flow=affine, top function 'csa'); "
           f"{ports} AXI ports on {bundles} bundle(s)")
 
 

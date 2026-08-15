@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PFA on the ScaleHLS backend: emit a Vitis HLS C++ design and a
+"""PFA on the HLS backend: emit a Vitis HLS C++ design and a
 C-simulation package with golden data from the NumPy reference.
 
 The Python-defined operators inline at trace time, so the emitted design

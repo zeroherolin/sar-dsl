@@ -48,8 +48,9 @@ size (`benchmarks/metrics.py:urban_contrast`, higher is sharper):
 omega-K 0.810, Chirp Scaling 0.809, Range-Doppler 0.808 -- all focus
 the scene in ~3.5 s on a large multi-core CPU.
 
-`wka/run_alos_hls.py` emits a synthesizable design at that same
-16384 x 16384 raster. It compiles with `axi_interface=True`, which puts
+Each of the three also has a `run_alos_hls.py` emitting a synthesizable
+design at that same 16384 x 16384 raster. They compile with
+`axi_interface=True`, which puts
 every full-size buffer -- including the FFT scratch planes -- behind an
 AXI master backed by DRAM and leaves only the constant tables on chip;
 see [docs/backends.md](../docs/backends.md) for how that decision is
