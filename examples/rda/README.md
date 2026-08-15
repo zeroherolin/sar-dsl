@@ -9,9 +9,9 @@ arithmetic.
 |------|---------|
 | `algorithm.py` | The RDA chain in the DSL (`build_kernel`, `make_inputs`) |
 | `reference.py` | NumPy reference implementation (`RDAProcessor`) |
-| `run_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
-| `run_scalehls.py` | Full scalehls-backend flow: emit a Vitis HLS C++ design |
-| `run_alos.py` | Focus the real ALOS-1 San Francisco dataset |
+| `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
+| `run_point_target_scalehls.py` | Full scalehls-backend flow: HLS C++ design + csim package (`hls_project/`) |
+| `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset |
 
 ## Processing chain
 
@@ -29,12 +29,19 @@ range-dependent (`R = c tau / 2` per gate), which matters across wide
 swaths: on the 77 km ALOS swath a fixed `Ka(R0)` loses most of the
 focus away from the reference range.
 
+This is the *basic* RDA (Cumming & Wong ch. 6): parabolic
+range-migration model, no secondary range compression. The residual
+range-azimuth coupling raises the range-axis integrated sidelobes a
+few dB above omega-K and CSA (see `benchmarks/README.md`); at low
+squint and moderate bandwidth that is the textbook trade-off of the
+basic form.
+
 ## Running
 
 ```bash
 # from the repository root, after `make build`
-python examples/rda/run_cpu.py --n 512          # focus + PNG
-python examples/rda/run_scalehls.py --n 256     # Vitis HLS C++ design
+python examples/rda/run_point_target_cpu.py --n 512          # focus + PNG
+python examples/rda/run_point_target_scalehls.py --n 256     # design + csim package
 ```
 
 ![synthetic point targets](assets/rda_synthetic_512.png)

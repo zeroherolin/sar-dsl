@@ -14,7 +14,7 @@ import numpy as np
 
 import sar
 
-from common.params import RadarParams
+from common.params import RadarParams, band_windows
 
 __all__ = ["build_kernel", "make_inputs"]
 
@@ -25,15 +25,15 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
     N = int(n)
     wavelength = p.c / p.fc
     sin_scale = wavelength / (2.0 * p.vr)
-    coupling_scale = p.kr * p.c * p.r0 / (2.0 * p.vr ** 2 * p.fc ** 3)
+    coupling_scale = p.kr * p.c * p.r0 / (2.0 * p.vr**2 * p.fc**3)
     tau_ref_scale = 2.0 * p.r0 / p.c
     rcmc_scale = 4.0 * math.pi * p.r0 / p.c
     az_scale = 4.0 * math.pi * p.fc / p.c
 
-    @sar.jit
-    def csa(raw: sar.c64[N, N], fa: sar.f64[N], fr: sar.f64[N],
-            tau: sar.f64[N], win_r: sar.f64[N],
-            win_a: sar.f64[N]) -> sar.f32[N, N]:
+    @sar.func
+    def csa(raw: sar.c64[N,
+                         N], fa: sar.f64[N], fr: sar.f64[N], tau: sar.f64[N],
+            win_r: sar.f64[N], win_a: sar.f64[N]) -> sar.f32[N, N]:
         ones = sar.constant(1.0, dtype=sar.f64, shape=(N, N))
 
         # Doppler-dependent factors, broadcast along range.
@@ -61,10 +61,9 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
         data = sar.fftshift(sar.fft(data, dim=1), dim=1)
 
         # 4. Range compression + SRC + bulk RCMC (+ range window).
-        phi2 = ((fr2 * fr2) * d / km * math.pi
-                + (inv_d - ones) * fr2 * rcmc_scale)
-        data = data * sar.expj(phi2)
-        data = data * sar.cast(sar.broadcast(win_r, (N, N), dim=1), sar.c128)
+        phi2 = ((fr2 * fr2) * d / km * math.pi +
+                (inv_d - ones) * fr2 * rcmc_scale)
+        data = data * sar.expj(phi2) * win_r
 
         # 5. Range IFFT.
         data = sar.ifft(sar.ifftshift(data, dim=1), dim=1)
@@ -72,7 +71,7 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
         # 6. Azimuth compression (+ azimuth window).
         phi3 = tau2 * (d - ones) * (az_scale * p.c / 2.0)
         data = data * sar.expj(phi3)
-        data = data * sar.cast(sar.broadcast(win_a, (N, N), dim=0), sar.c128)
+        data = data * sar.broadcast(win_a, (N, N), dim=0)
 
         # 7. Azimuth IFFT.
         data = sar.ifft(sar.ifftshift(data, dim=0), dim=0)
@@ -87,5 +86,5 @@ def make_inputs(n: int, p: RadarParams):
     fr = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / p.fs))
     # Absolute fast time: R0 sits at offset t_shift into the window.
     tau = 2.0 * p.r0 / p.c - p.t_shift + np.arange(n) / p.fs
-    win = np.hanning(n)
-    return fa, fr, tau, win.copy(), win.copy()
+    win_r, win_a = band_windows(n, p)
+    return fa, fr, tau, win_r, win_a

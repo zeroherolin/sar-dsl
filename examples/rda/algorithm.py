@@ -1,8 +1,8 @@
 """The Range-Doppler Algorithm (RDA) expressed in SAR-DSL.
 
-Demonstrates that the dialect generalizes beyond omega-K: RCMC is built
-from the orthogonal `sar.interp1d` primitive plus element-wise position
-computation -- no RDA-specific operation exists in the compiler.
+Range cell migration correction is built from the `sar.interp1d`
+primitive fed by an element-wise position computation, so the chain uses
+the same orthogonal operations as the other algorithms.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import numpy as np
 
 import sar
 
-from common.params import RadarParams
+from common.params import RadarParams, band_windows
 
 __all__ = ["build_kernel", "make_inputs"]
 
@@ -32,12 +32,12 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
     N = int(n)
     wavelength = p.c / p.fc
     # Per unit (fa^2 * tau): migration in bins and matched-filter phase.
-    rcmc_scale = wavelength ** 2 * p.fs / (8.0 * p.vr ** 2)
-    az_phase_scale = -math.pi * wavelength * p.c / (4.0 * p.vr ** 2)
+    rcmc_scale = wavelength**2 * p.fs / (8.0 * p.vr**2)
+    az_phase_scale = -math.pi * wavelength * p.c / (4.0 * p.vr**2)
 
     grid = np.arange(N, dtype=np.float64)
 
-    @sar.jit
+    @sar.func
     def rda(raw: sar.c64[N, N], range_ref: sar.c128[N], fa: sar.f64[N],
             tau: sar.f64[N], win_a: sar.f64[N]) -> sar.f32[N, N]:
         data = sar.cast(raw, sar.c128)
@@ -52,17 +52,17 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
         data = sar.fftshift(sar.fft(data, dim=0), dim=0)
 
         # Range-dependent factors: fa^2 (rows) x tau (columns).
-        fa2_tau = (sar.broadcast(fa * fa, (N, N), dim=0)
-                   * sar.broadcast(tau, (N, N), dim=1))
+        fa2_tau = (sar.broadcast(fa * fa, (N, N), dim=0) *
+                   sar.broadcast(tau, (N, N), dim=1))
 
         # RCMC: positions = column index + migration shift(fa, R).
-        positions = (sar.broadcast(sar.constant(grid), (N, N), dim=1)
-                     + fa2_tau * rcmc_scale)
+        positions = (sar.broadcast(sar.constant(grid),
+                                   (N, N), dim=1) + fa2_tau * rcmc_scale)
         data = sar.interp1d(data, positions)
 
         # Azimuth compression + window.
         data = data * sar.expj(fa2_tau * az_phase_scale)
-        data = data * sar.cast(sar.broadcast(win_a, (N, N), dim=0), sar.c128)
+        data = data * sar.broadcast(win_a, (N, N), dim=0)
 
         # Back to the image domain.
         data = sar.ifft(sar.ifftshift(data, dim=0), dim=0)
@@ -76,4 +76,5 @@ def make_inputs(n: int, p: RadarParams):
     from rda.reference import make_range_reference
     fa = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / p.prf))
     tau = 2.0 * p.r0 / p.c - p.t_shift + np.arange(n) / p.fs
-    return make_range_reference(n, p), fa, tau, np.hanning(n)
+    win_a = band_windows(n, p)[1]
+    return make_range_reference(n, p), fa, tau, win_a

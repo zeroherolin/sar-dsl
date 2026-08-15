@@ -53,3 +53,46 @@ func.func @mul_by_other_scalar_kept(%x: tensor<4xf32>) -> tensor<4xf32> {
   %0 = sar.mul_scalar %x, 2.0 : tensor<4xf32>
   return %0 : tensor<4xf32>
 }
+
+// CHECK-LABEL: func.func @double_conj
+func.func @double_conj(%z: tensor<4xcomplex<f32>>) -> tensor<4xcomplex<f32>> {
+  // CHECK-NOT: sar.conj
+  // CHECK: return %arg0
+  %0 = sar.conj %z : tensor<4xcomplex<f32>>
+  %1 = sar.conj %0 : tensor<4xcomplex<f32>>
+  return %1 : tensor<4xcomplex<f32>>
+}
+
+// CHECK-LABEL: func.func @real_imag_of_complex
+func.func @real_imag_of_complex(%re: tensor<4xf64>, %im: tensor<4xf64>)
+    -> (tensor<4xf64>, tensor<4xf64>) {
+  // CHECK-NOT: sar.complex
+  // CHECK: return %arg0, %arg1
+  %0 = sar.complex %re, %im : tensor<4xf64> -> tensor<4xcomplex<f64>>
+  %1 = sar.real %0 : tensor<4xcomplex<f64>> -> tensor<4xf64>
+  %2 = sar.imag %0 : tensor<4xcomplex<f64>> -> tensor<4xf64>
+  return %1, %2 : tensor<4xf64>, tensor<4xf64>
+}
+
+// CHECK-LABEL: func.func @interp_dim0_normalizes
+func.func @interp_dim0_normalizes(%z: tensor<8x4xcomplex<f64>>,
+                                  %p: tensor<8x4xf64>)
+    -> tensor<8x4xcomplex<f64>> {
+  // CHECK: sar.transpose
+  // CHECK: sar.transpose
+  // CHECK: sar.interp1d %{{.*}}, %{{.*}} : (tensor<4x8xcomplex<f64>>, tensor<4x8xf64>)
+  // CHECK: sar.transpose
+  %0 = sar.interp1d %z, %p {dim = 0 : i64}
+      : (tensor<8x4xcomplex<f64>>, tensor<8x4xf64>)
+      -> (tensor<8x4xcomplex<f64>>)
+  return %0 : tensor<8x4xcomplex<f64>>
+}
+
+// CHECK-LABEL: func.func @double_reverse
+func.func @double_reverse(%x: tensor<8xf64>) -> tensor<8xf64> {
+  // CHECK-NOT: sar.reverse
+  // CHECK: return %arg0
+  %0 = sar.reverse %x {dim = 0 : i64} : tensor<8xf64>
+  %1 = sar.reverse %0 {dim = 0 : i64} : tensor<8xf64>
+  return %1 : tensor<8xf64>
+}

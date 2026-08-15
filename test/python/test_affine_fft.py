@@ -6,47 +6,17 @@ without needing an HLS simulator. The decomplexified ABI splits every
 complex tensor into (re, im) float planes, in order, inputs before results.
 """
 
-import ctypes
-import subprocess
-
 import numpy as np
 import pytest
 
-from sar.compiler.toolchain import find_tool
-from sar.runtime import _make_descriptor
-
-from conftest import requires_cpu
+from conftest import requires_cpu, compile_split_kernel, run_split
 
 pytestmark = requires_cpu
 
-
-def _compile_split_kernel(mlir_text: str, name: str, tmp_path,
-                          pipeline: str = "--sar-affine-to-llvm-pipeline"):
-    """Compiles a module through the split-complex affine path into a
-    shared library and returns the `_mlir_ciface_<name>` symbol."""
-    llvm_mlir = subprocess.run(
-        [find_tool("sar-opt"), pipeline, "-"],
-        input=mlir_text, capture_output=True, text=True, check=True).stdout
-    llvm_ir = subprocess.run(
-        [find_tool("mlir-translate"), "--mlir-to-llvmir", "-"],
-        input=llvm_mlir, capture_output=True, text=True, check=True).stdout
-    ll = tmp_path / "kernel.ll"
-    ll.write_text(llvm_ir)
-    so = tmp_path / "kernel.so"
-    subprocess.run(
-        [find_tool("clang"), "-O2", "-shared", "-fPIC", str(ll), "-o",
-         str(so), "-lm", "-Wno-override-module"], check=True)
-    lib = ctypes.CDLL(str(so))
-    fn = getattr(lib, f"_mlir_ciface_{name}")
-    fn.restype = None
-    return lib, fn
-
-
-def _run_split(fn, inputs, out_shapes, dtype):
-    outs = [np.empty(s, dtype=dtype) for s in out_shapes]
-    descriptors = [_make_descriptor(a) for a in list(inputs) + outs]
-    fn(*[ctypes.byref(d) for d in descriptors])
-    return outs
+# Backwards-compatible aliases (the helpers moved to conftest.py so other
+# test modules can share them without private cross-file imports).
+_compile_split_kernel = compile_split_kernel
+_run_split = run_split
 
 
 @pytest.mark.parametrize("n,m,dim", [(4, 8, 1), (8, 16, 0), (16, 16, 1)])
@@ -65,7 +35,9 @@ func.func @k(%x: tensor<{n}x{m}xcomplex<f64>>) -> tensor<{n}x{m}xcomplex<f64>> {
 
     out_re, out_im = _run_split(fn, [re, im], [(n, m), (n, m)], np.float64)
     ref = np.fft.fft(x, axis=dim)
-    np.testing.assert_allclose(out_re + 1j * out_im, ref, rtol=1e-12,
+    np.testing.assert_allclose(out_re + 1j * out_im,
+                               ref,
+                               rtol=1e-12,
                                atol=1e-12)
 
 
@@ -85,8 +57,7 @@ func.func @rt(%x: tensor<{n}x{m}xcomplex<f64>>) -> tensor<{n}x{m}xcomplex<f64>> 
     re, im = np.ascontiguousarray(x.real), np.ascontiguousarray(x.imag)
 
     out_re, out_im = _run_split(fn, [re, im], [(n, m), (n, m)], np.float64)
-    np.testing.assert_allclose(out_re + 1j * out_im, x, rtol=1e-12,
-                               atol=1e-12)
+    np.testing.assert_allclose(out_re + 1j * out_im, x, rtol=1e-12, atol=1e-12)
 
 
 def test_affine_rank1_fft(tmp_path):
@@ -104,10 +75,35 @@ func.func @k1(%x: tensor<{n}xcomplex<f32>>) -> tensor<{n}xcomplex<f32>> {{
     re = np.ascontiguousarray(x.real, dtype=np.float32)
     im = np.ascontiguousarray(x.imag, dtype=np.float32)
 
-    out_re, out_im = _run_split(fn, [re, im], [(n,), (n,)], np.float32)
+    out_re, out_im = _run_split(fn, [re, im], [(n, ), (n, )], np.float32)
     ref = np.fft.fft(x)
-    np.testing.assert_allclose(out_re + 1j * out_im, ref, rtol=1e-4,
-                               atol=1e-3)
+    np.testing.assert_allclose(out_re + 1j * out_im, ref, rtol=1e-4, atol=1e-3)
+
+
+def test_affine_complex_access_ops(tmp_path):
+    """conj/angle through the split-complex path (angle lowers to the
+    sar.atan2 the HLS emitter must also handle)."""
+    n, m = 8, 16
+    mlir = f"""
+func.func @ca(%z: tensor<{n}x{m}xcomplex<f64>>) -> tensor<{n}x{m}xf64> {{
+  %0 = sar.conj %z : tensor<{n}x{m}xcomplex<f64>>
+  %re = sar.real %0 : tensor<{n}x{m}xcomplex<f64>> -> tensor<{n}x{m}xf64>
+  %im = sar.imag %0 : tensor<{n}x{m}xcomplex<f64>> -> tensor<{n}x{m}xf64>
+  %1 = sar.atan2 %im, %re : tensor<{n}x{m}xf64>
+  return %1 : tensor<{n}x{m}xf64>
+}}
+"""
+    lib, fn = _compile_split_kernel(mlir, "ca", tmp_path)
+
+    rng = np.random.default_rng(13)
+    z = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
+    re, im = np.ascontiguousarray(z.real), np.ascontiguousarray(z.imag)
+
+    (out, ) = _run_split(fn, [re, im], [(n, m)], np.float64)
+    np.testing.assert_allclose(out,
+                               np.angle(np.conj(z)),
+                               rtol=1e-12,
+                               atol=1e-12)
 
 
 def test_affine_full_stage_with_elementwise(tmp_path):
@@ -117,7 +113,9 @@ def test_affine_full_stage_with_elementwise(tmp_path):
     mlir = f"""
 func.func @stage(%d: tensor<{n}x{m}xcomplex<f64>>, %p: tensor<{n}x{m}xf64>)
     -> tensor<{n}x{m}xcomplex<f64>> {{
-  %0 = sar.expj %p : tensor<{n}x{m}xf64> -> tensor<{n}x{m}xcomplex<f64>>
+  %pc = sar.cos %p : tensor<{n}x{m}xf64>
+  %ps = sar.sin %p : tensor<{n}x{m}xf64>
+  %0 = sar.complex %pc, %ps : tensor<{n}x{m}xf64> -> tensor<{n}x{m}xcomplex<f64>>
   %1 = sar.mul %d, %0 : tensor<{n}x{m}xcomplex<f64>>
   %2 = sar.fft %1 {{dim = 1 : i64}} : tensor<{n}x{m}xcomplex<f64>>
   return %2 : tensor<{n}x{m}xcomplex<f64>>
@@ -133,5 +131,89 @@ func.func @stage(%d: tensor<{n}x{m}xcomplex<f64>>, %p: tensor<{n}x{m}xf64>)
     out_re, out_im = _run_split(fn, [re, im, np.ascontiguousarray(p)],
                                 [(n, m), (n, m)], np.float64)
     ref = np.fft.fft(d * np.exp(1j * p), axis=1)
-    np.testing.assert_allclose(out_re + 1j * out_im, ref, rtol=1e-12,
+    np.testing.assert_allclose(out_re + 1j * out_im,
+                               ref,
+                               rtol=1e-12,
                                atol=1e-12)
+
+
+@pytest.mark.parametrize("n", [3, 5, 6, 12, 15, 33, 100])
+def test_affine_bluestein_matches_numpy(n, tmp_path):
+    """Non-power-of-two sizes take the Bluestein path in the affine (HLS)
+    lowering, matching numpy to double precision.
+
+    The chirp and the kernel spectrum are folded at compile time, so the
+    emitted code is two padded Stockham transforms plus element-wise
+    passes -- everything affine, nothing size-dependent at runtime.
+    """
+    lines = 4
+    mlir = f"""
+module {{
+  func.func @bz(%re: tensor<{lines}x{n}xf64>, %im: tensor<{lines}x{n}xf64>)
+      -> (tensor<{lines}x{n}xf64>, tensor<{lines}x{n}xf64>) {{
+    %r, %i = sar.fft_split %re, %im {{dim = 1 : i64}} : tensor<{lines}x{n}xf64>
+    return %r, %i : tensor<{lines}x{n}xf64>, tensor<{lines}x{n}xf64>
+  }}
+}}"""
+    lib, fn = _compile_split_kernel(mlir, "bz", tmp_path)
+    rng = np.random.default_rng(n)
+    re = rng.standard_normal((lines, n))
+    im = rng.standard_normal((lines, n))
+    out_re, out_im = _run_split(fn, [re, im], [(lines, n)] * 2, np.float64)
+
+    ref = np.fft.fft(re + 1j * im, axis=1)
+    np.testing.assert_allclose(out_re + 1j * out_im,
+                               ref,
+                               rtol=1e-11,
+                               atol=1e-11)
+
+
+def test_affine_bluestein_scaling_is_exact(tmp_path):
+    """A unit impulse transforms to all-ones.
+
+    This pins the Bluestein scaling specifically: `emitStockham` emits the
+    butterflies only (its `inverse` flag picks the twiddle conjugation, it
+    does not scale), so the 1/M the convolution theorem needs has to be
+    applied by the caller. Getting that wrong leaves the whole spectrum
+    off by a factor of M with the phases still correct -- which an
+    impulse makes obvious and a random-input tolerance check can hide.
+    """
+    n = 6
+    mlir = f"""
+module {{
+  func.func @imp(%re: tensor<1x{n}xf64>, %im: tensor<1x{n}xf64>)
+      -> (tensor<1x{n}xf64>, tensor<1x{n}xf64>) {{
+    %r, %i = sar.fft_split %re, %im {{dim = 1 : i64}} : tensor<1x{n}xf64>
+    return %r, %i : tensor<1x{n}xf64>, tensor<1x{n}xf64>
+  }}
+}}"""
+    lib, fn = _compile_split_kernel(mlir, "imp", tmp_path)
+    re = np.zeros((1, n))
+    re[0, 0] = 1.0
+    out_re, out_im = _run_split(fn, [re, np.zeros((1, n))], [(1, n)] * 2,
+                                np.float64)
+    np.testing.assert_allclose(out_re, np.ones((1, n)), atol=1e-12)
+    np.testing.assert_allclose(out_im, np.zeros((1, n)), atol=1e-12)
+
+
+def test_affine_bluestein_roundtrip(tmp_path):
+    """ifft(fft(x)) == x through the Bluestein path (both directions)."""
+    n, lines = 12, 2
+    mlir = f"""
+module {{
+  func.func @rt(%re: tensor<{lines}x{n}xf64>, %im: tensor<{lines}x{n}xf64>)
+      -> (tensor<{lines}x{n}xf64>, tensor<{lines}x{n}xf64>) {{
+    %fr, %fi = sar.fft_split %re, %im {{dim = 1 : i64}}
+        : tensor<{lines}x{n}xf64>
+    %r, %i = sar.fft_split %fr, %fi {{dim = 1 : i64, inverse}}
+        : tensor<{lines}x{n}xf64>
+    return %r, %i : tensor<{lines}x{n}xf64>, tensor<{lines}x{n}xf64>
+  }}
+}}"""
+    lib, fn = _compile_split_kernel(mlir, "rt", tmp_path)
+    rng = np.random.default_rng(7)
+    re = rng.standard_normal((lines, n))
+    im = rng.standard_normal((lines, n))
+    out_re, out_im = _run_split(fn, [re, im], [(lines, n)] * 2, np.float64)
+    np.testing.assert_allclose(out_re, re, rtol=1e-11, atol=1e-11)
+    np.testing.assert_allclose(out_im, im, rtol=1e-11, atol=1e-11)

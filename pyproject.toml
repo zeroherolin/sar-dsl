@@ -11,6 +11,9 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 dynamic = ["version"]
 
+[project.urls]
+Repository = "https://github.com/zeroherolin/sar-dsl"
+
 [project.optional-dependencies]
 test = ["pytest>=7"]
 examples = ["matplotlib>=3.7"]
@@ -26,3 +29,22 @@ version = { attr = "sar._version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["test/python"]
+
+[tool.yapf]
+based_on_style = "pep8"
+column_limit = 79
+
+[tool.ruff]
+line-length = 79
+extend-exclude = ["externals"]
+
+[tool.ruff.lint]
+select = ["F", "E", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# Embedded MLIR strings keep one op per line regardless of width.
+"test/python/test_affine_fft.py" = ["E501"]
+# The signal vocabulary re-export deliberately sits below the core defs.
+"python/sar/language/__init__.py" = ["E402"]
+# Lit configs use globals injected by the lit runner.
+"test/lit.cfg.py" = ["F821"]

@@ -32,9 +32,9 @@ __all__ = [
 class DType:
     """Element type of a SAR tensor."""
 
-    name: str          # short name used in the DSL, e.g. "c64"
-    mlir: str          # MLIR element type, e.g. "complex<f32>"
-    np_dtype: str      # numpy dtype name, e.g. "complex64"
+    name: str  # short name used in the DSL, e.g. "c64"
+    mlir: str  # MLIR element type, e.g. "complex<f32>"
+    np_dtype: str  # numpy dtype name, e.g. "complex64"
 
     @property
     def is_complex(self) -> bool:
@@ -123,6 +123,11 @@ def _format_attr(value) -> str:
         return f"{int(value)} : i64"
     if isinstance(value, (float, np.floating)):
         return f"{_format_float(value)} : f64"
+    if isinstance(value, str):
+        return f'"{value}"'
+    if isinstance(value, (list, tuple)):
+        elems = ", ".join(str(int(v)) for v in value)
+        return f"array<i64: {elems}>"
     if isinstance(value, DenseAttr):
         return value.text
     raise TypeError(f"unsupported attribute value: {value!r}")
@@ -164,6 +169,7 @@ class DenseAttr:
                 array.astype(type.dtype.to_numpy(), copy=False))
             body = '"0x' + data.tobytes().hex().upper() + '"'
         else:
+
             def nest(arr) -> str:
                 if arr.ndim == 1:
                     return "[" + ", ".join(render(x) for x in arr) + "]"
@@ -177,9 +183,9 @@ class DenseAttr:
 class Operation:
     """A single operation in generic MLIR form."""
 
-    op_name: str                       # e.g. "sar.add"
+    op_name: str  # e.g. "sar.add"
     operands: List[Value]
-    result_types: List[TensorType]
+    result_types: List[object]
     attributes: Dict[str, object] = field(default_factory=dict)
     unit_attributes: Tuple[str, ...] = ()
     results: List[Value] = field(default_factory=list)
@@ -188,8 +194,9 @@ class Operation:
         results = ", ".join(v.name for v in self.results)
         operands = ", ".join(v.name for v in self.operands)
 
-        attr_parts = [f"{k} = {_format_attr(v)}"
-                      for k, v in self.attributes.items()]
+        attr_parts = [
+            f"{k} = {_format_attr(v)}" for k, v in self.attributes.items()
+        ]
         attr_parts += list(self.unit_attributes)
         props = f" <{{{', '.join(attr_parts)}}}>" if attr_parts else ""
 
@@ -198,7 +205,7 @@ class Operation:
         signature = f"({operand_types}) -> ({result_types})"
 
         prefix = f"{results} = " if results else ""
-        return (f'{prefix}"{self.op_name}"({operands}){props} : {signature}')
+        return f'{prefix}"{self.op_name}"({operands}){props} : {signature}'
 
 
 class Function:
@@ -213,18 +220,25 @@ class Function:
         self.returned: Optional[List[Value]] = None
         self._next_id = 0
 
-    def emit(self, op_name: str, operands: Sequence[Value],
-             result_type: TensorType,
-             attributes: Optional[Dict[str, object]] = None,
-             unit_attributes: Sequence[str] = ()) -> Value:
+    def _new_value(self, type: TensorType) -> Value:
+        value = Value(f"%{self._next_id}", type)
+        self._next_id += 1
+        return value
+
+    def emit(
+        self,
+        op_name: str,
+        operands: Sequence[Value],
+        result_type: TensorType,
+        attributes: Optional[Dict[str, object]] = None,
+        unit_attributes: Sequence[str] = ()
+    ) -> Value:
         """Appends an operation with a single result and returns its value."""
         op = Operation(op_name, list(operands), [result_type],
                        dict(attributes or {}), tuple(unit_attributes))
-        result = Value(f"%{self._next_id}", result_type)
-        self._next_id += 1
-        op.results = [result]
+        op.results = [self._new_value(result_type)]
         self.operations.append(op)
-        return result
+        return op.results[0]
 
     def set_return(self, values: Sequence[Value]) -> None:
         self.returned = list(values)

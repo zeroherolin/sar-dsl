@@ -1,4 +1,6 @@
-"""Numerical validation of sar.stolt_interp against a direct numpy port."""
+"""Numerical validation of sar.stolt_interp -- a composition of the
+in-kernel position computation, `sar.interp1d` and the re-referencing
+ramps -- against a direct numpy port of the fused formula."""
 
 import numpy as np
 
@@ -15,7 +17,7 @@ def _stolt_reference(data, fa, fr, c, fc, vr, t_shift):
     out = np.zeros_like(data)
     f_start, df = fr[0], fr[1] - fr[0]
     for i in range(n):
-        term = (fr + fc) ** 2 + (c * fa[i] / (2 * vr)) ** 2
+        term = (fr + fc)**2 + (c * fa[i] / (2 * vr))**2
         frq = np.sqrt(np.maximum(term, 1e-10)) - fc
         idxf = (frq - f_start) / df
         idx0 = np.floor(idxf).astype(int)
@@ -34,17 +36,17 @@ def _stolt_reference(data, fa, fr, c, fc, vr, t_shift):
 def test_stolt_matches_reference():
     n, m = 32, 48
     c, fc, vr, t_shift = 3.0e8, 1.27e9, 7100.0, 1.5e-4
-
-    @sar.jit
-    def k(d: sar.c128[n, m], fa: sar.f64[n], fr: sar.f64[m]) -> sar.c128[n, m]:
-        return sar.stolt_interp(d, fa, fr, c=c, fc=fc, vr=vr,
-                                t_shift=t_shift)
-
-    rng = np.random.default_rng(7)
-    data = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
     fa = np.fft.fftshift(np.fft.fftfreq(n, d=1 / 2000.0))
     fr = np.fft.fftshift(np.fft.fftfreq(m, d=1 / 3.2e7))
 
-    out = k(data, fa, fr)
+    @sar.func
+    def k(d: sar.c128[n, m]) -> sar.c128[n, m]:
+        # The axes bake into the kernel as constants.
+        return sar.stolt_interp(d, fa, fr, c=c, fc=fc, vr=vr, t_shift=t_shift)
+
+    rng = np.random.default_rng(7)
+    data = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
+
+    out = k(data)
     ref = _stolt_reference(data, fa, fr, c, fc, vr, t_shift)
     np.testing.assert_allclose(out, ref, rtol=1e-12, atol=1e-12)

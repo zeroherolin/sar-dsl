@@ -6,20 +6,20 @@ from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["RadarParams", "ALOS_PARAMS", "synthetic_params"]
+__all__ = ["RadarParams", "ALOS_PARAMS", "synthetic_params", "band_windows"]
 
 
 @dataclass(frozen=True)
 class RadarParams:
     """Radar/platform parameters of a stripmap acquisition."""
 
-    c: float    # propagation speed (m/s)
-    fc: float   # carrier frequency (Hz)
-    fs: float   # range sampling rate (Hz)
+    c: float  # propagation speed (m/s)
+    fc: float  # carrier frequency (Hz)
+    fs: float  # range sampling rate (Hz)
     prf: float  # pulse repetition frequency (Hz)
-    vr: float   # effective radar velocity (m/s)
-    r0: float   # reference slant range (m)
-    kr: float   # range chirp rate (Hz/s)
+    vr: float  # effective radar velocity (m/s)
+    r0: float  # reference slant range (m)
+    kr: float  # range chirp rate (Hz/s)
     pulse_len: float  # transmitted chirp duration (s)
     t_shift: float  # fast-time offset of R0 from the window start (s)
 
@@ -40,6 +40,33 @@ ALOS_PARAMS = RadarParams(
     pulse_len=27.0e-6,
     t_shift=4800.0 / 32000000.00,
 )
+
+
+def _hann_band(n: int, frac: float) -> np.ndarray:
+    """Hann taper over the central `frac` of an fftshift-centered
+    frequency axis, zero outside."""
+    m = max(4, min(n, int(round(n * frac))))
+    win = np.zeros(n)
+    start = (n - m) // 2
+    win[start:start + m] = np.hanning(m)
+    return win
+
+
+def band_windows(n: int, p: RadarParams):
+    """(win_r, win_a): Hann tapers matched to the occupied signal bands.
+
+    A taper wider than the signal support degrades sidelobe control --
+    the band edges then see a *truncated* window -- so each window covers
+    exactly the occupied bandwidth: the chirp bandwidth `|kr| T_p` in
+    range, and the full-aperture Doppler span `2 vr^2 T / (lambda r0)`
+    in azimuth, clipped to the PRF for long scenes where the dwell is
+    antenna-limited. Out-of-band bins are zeroed (they carry only
+    spectral leakage and noise).
+    """
+    frac_r = min(1.0, abs(p.kr) * p.pulse_len / p.fs)
+    doppler_span = 2.0 * p.vr**2 * (n / p.prf) / ((p.c / p.fc) * p.r0)
+    frac_a = min(1.0, doppler_span / p.prf)
+    return _hann_band(n, frac_r), _hann_band(n, frac_a)
 
 
 def synthetic_params(n: int) -> RadarParams:
@@ -69,5 +96,12 @@ def synthetic_params(n: int) -> RadarParams:
     vr = prf * np.sqrt(0.7 * wavelength * r0 / (2.0 * n))
     t_shift = n / (2.0 * fs)
 
-    return RadarParams(c=c, fc=fc, fs=fs, prf=prf, vr=vr, r0=r0, kr=kr,
-                       pulse_len=pulse_len, t_shift=t_shift)
+    return RadarParams(c=c,
+                       fc=fc,
+                       fs=fs,
+                       prf=prf,
+                       vr=vr,
+                       r0=r0,
+                       kr=kr,
+                       pulse_len=pulse_len,
+                       t_shift=t_shift)

@@ -32,8 +32,8 @@ def setup():
 def test_rda_matches_numpy_reference(setup):
     params, kernel, inputs = setup
     rng = np.random.default_rng(21)
-    raw = (rng.standard_normal((N, N))
-           + 1j * rng.standard_normal((N, N))).astype(np.complex64)
+    raw = (rng.standard_normal((N, N)) + 1j * rng.standard_normal(
+        (N, N))).astype(np.complex64)
 
     ref = RDAProcessor(N, params).process(raw)
     out = kernel(raw, *inputs)
@@ -52,7 +52,7 @@ def test_rda_focuses_point_target(setup):
     assert abs(i - N // 2) <= 1 and abs(j - N // 2) <= 1
 
     window = image[i - 3:i + 4, j - 3:j + 4]
-    energy_fraction = (window ** 2).sum() / (image ** 2).sum()
+    energy_fraction = (window**2).sum() / (image**2).sum()
     assert energy_fraction > 0.8
 
 
@@ -68,8 +68,8 @@ def test_rda_and_wka_agree_on_point_target(setup):
     rda_img = rda_kernel(raw, *inputs).astype(np.float64)
 
     wka_kernel = build_wka_kernel(N, params)
-    fa_w, fr_w, wr, wa = wka_inputs(N, params)
-    wka_img = wka_kernel(raw, fa_w, fr_w, wr, wa).astype(np.float64)
+    wr, wa = wka_inputs(N, params)
+    wka_img = wka_kernel(raw, wr, wa).astype(np.float64)
 
     rda_peak = np.unravel_index(np.argmax(rda_img), rda_img.shape)
     wka_peak = np.unravel_index(np.argmax(wka_img), wka_img.shape)

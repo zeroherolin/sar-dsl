@@ -4,7 +4,7 @@ Backends are Python packages exposing a ``Backend`` class (subclass of
 `sar.backends.base.BaseBackend`). They are discovered from, in order:
 
 1. subpackages of ``sar.backends`` (populated by ``setup.py`` /
-   ``scripts/setup-dev.sh``, mirroring FlagTree's third_party layout);
+   ``scripts/setup-dev.sh`` from the ``third_party`` layout);
 2. ``$SAR_DSL_BACKEND_PATH`` (os.pathsep-separated directories, each being a
    backend package directory);
 3. ``third_party/*/backend`` relative to a source checkout (development
@@ -49,8 +49,15 @@ def _load_backend_module(name: str, directory: Path) -> None:
         if spec is None or spec.loader is None:
             return
         module = importlib.util.module_from_spec(spec)
+        # The module has to be visible before exec_module for its own
+        # relative imports to resolve; drop it again if it fails to load,
+        # so a broken backend cannot masquerade as an imported one.
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            del sys.modules[module_name]
+            raise
     backend_cls = getattr(module, "Backend", None)
     if backend_cls is not None:
         register_backend(backend_cls)
@@ -72,9 +79,9 @@ def _discover() -> None:
     for entry in os.environ.get("SAR_DSL_BACKEND_PATH", "").split(os.pathsep):
         if entry:
             path = Path(entry)
-            _load_backend_module(path.parent.name
-                                 if path.name == "backend" else path.name,
-                                 path)
+            _load_backend_module(
+                path.parent.name if path.name == "backend" else path.name,
+                path)
 
     # 3. Source-tree third_party/<name>/backend.
     repo_root = package_dir.parent.parent.parent
@@ -87,16 +94,17 @@ def _discover() -> None:
 
 
 def list_backends() -> Dict[str, Type[BaseBackend]]:
+    """All discovered backend classes by name (available or not)."""
     _discover()
     return dict(_registry)
 
 
 def get_backend(name: str) -> Type[BaseBackend]:
+    """The backend class for `name`; raises if unknown or unavailable."""
     _discover()
     if name not in _registry:
-        raise ToolchainError(
-            f"unknown backend '{name}'; discovered backends: "
-            f"{sorted(_registry)}")
+        raise ToolchainError(f"unknown backend '{name}'; discovered backends: "
+                             f"{sorted(_registry)}")
     cls = _registry[name]
     if not cls.is_available():
         raise ToolchainError(

@@ -34,7 +34,7 @@ def compile(kernel, backend: str = "cpu", options: Optional[dict] = None):
 
     cache = KernelCache(module_text, backend, options)
     artifact = module_text
-    for stage_name, stage_fn in stages.items():
+    for stage_fn in stages.values():
         artifact = stage_fn(artifact, metadata, cache)
 
     return backend_obj.make_launcher(artifact, metadata)

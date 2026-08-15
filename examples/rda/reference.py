@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from common.params import RadarParams
+from common.params import RadarParams, band_windows
 
 __all__ = ["RDAProcessor", "make_range_reference"]
 
@@ -24,14 +24,15 @@ def make_range_reference(n: int, p: RadarParams) -> np.ndarray:
     The chirp replica matches the synthetic echo model: duration half the
     sampled window, centered in fast time; it is rolled to start at sample
     zero so that compressed peaks appear at the echo delay position. A
-    Hanning window (centered on DC, hence ifftshift) tapers the range
-    spectrum for sidelobe control.
+    band-matched Hann taper (centered on DC, hence ifftshift) covers the
+    chirp bandwidth for sidelobe control.
     """
     t = (np.arange(n) - n / 2) / p.fs
-    replica = np.where(np.abs(t) <= p.pulse_len / 2.0,
-                       np.exp(1j * np.pi * p.kr * t ** 2), 0.0)
+    replica = np.where(
+        np.abs(t) <= p.pulse_len / 2.0, np.exp(1j * np.pi * p.kr * t**2), 0.0)
     replica = np.roll(replica, -(n // 2))
-    return np.conj(np.fft.fft(replica)) * np.fft.ifftshift(np.hanning(n))
+    win_r = band_windows(n, p)[0]
+    return np.conj(np.fft.fft(replica)) * np.fft.ifftshift(win_r)
 
 
 class RDAProcessor:
@@ -44,10 +45,10 @@ class RDAProcessor:
         self.wavelength = params.c / params.fc
         self.fa = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / params.prf))
         # Absolute fast time / slant range per range gate.
-        self.tau = (2.0 * params.r0 / params.c - params.t_shift
-                    + np.arange(n) / params.fs)
+        self.tau = (2.0 * params.r0 / params.c - params.t_shift +
+                    np.arange(n) / params.fs)
         self.range_ref = make_range_reference(n, params)
-        self.win_azimuth = np.hanning(n)
+        self.win_azimuth = band_windows(n, params)[1]
 
     # ------------------------------------------------------------------ #
     # Stages
@@ -61,9 +62,8 @@ class RDAProcessor:
         """Fractional range positions per (Doppler bin, range gate); the
         migration is range-dependent through R = c tau / 2."""
         p = self.p
-        delta_bins = (self.wavelength ** 2 * p.fs / (8.0 * p.vr ** 2)
-                      * self.fa[:, np.newaxis] ** 2
-                      * self.tau[np.newaxis, :])
+        delta_bins = (self.wavelength**2 * p.fs / (8.0 * p.vr**2) *
+                      self.fa[:, np.newaxis]**2 * self.tau[np.newaxis, :])
         cols = np.arange(self.n, dtype=np.float64)
         return cols[np.newaxis, :] + delta_bins
 
@@ -94,8 +94,8 @@ class RDAProcessor:
         gate R = c tau / 2."""
         p = self.p
         r_gate = p.c * self.tau[np.newaxis, :] / 2.0
-        inv_ka = -self.wavelength * r_gate / (2.0 * p.vr ** 2)
-        return np.exp(1j * np.pi * self.fa[:, np.newaxis] ** 2 * inv_ka)
+        inv_ka = -self.wavelength * r_gate / (2.0 * p.vr**2)
+        return np.exp(1j * np.pi * self.fa[:, np.newaxis]**2 * inv_ka)
 
     # ------------------------------------------------------------------ #
     # Full pipeline

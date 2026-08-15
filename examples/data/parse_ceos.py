@@ -57,7 +57,7 @@ def parse_ceos_leader(led_filepath):
 
     dssr = _read_dssr(led_filepath)
     if dssr:
-        wavelength = _ascii_float(dssr, 501, 16)       # meters
+        wavelength = _ascii_float(dssr, 501, 16)  # meters
         sample_rate_mhz = _ascii_float(dssr, 711, 16)
         prf_milli_hz = _ascii_float(dssr, 935, 16)
         if wavelength:
@@ -89,8 +89,15 @@ def parse_ceos_leader(led_filepath):
         bandwidth = 28.0e6 if abs(fs - 32e6) < 1e5 else 14.0e6
         kr = -(bandwidth / pulse_width)
 
-    params = {"c": c, "fc": fc, "Fs": fs, "PRF": prf, "R0": r0, "Kr": kr,
-              "Rank": rank}
+    params = {
+        "c": c,
+        "fc": fc,
+        "Fs": fs,
+        "PRF": prf,
+        "R0": r0,
+        "Kr": kr,
+        "Rank": rank
+    }
 
     print("====== Extracted Radar Parameters ======")
     print(f"c    = {c} m/s")

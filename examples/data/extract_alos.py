@@ -3,7 +3,7 @@
 
 Reads a block of azimuth lines, removes the DC bias of the 8-bit I/Q
 samples, zero-pads the range dimension to a power of two and writes a
-complex64 binary consumable by `run_alos.py`.
+complex64 binary consumable by `run_alos_cpu.py`.
 """
 
 import os
@@ -12,8 +12,11 @@ import struct
 import numpy as np
 
 
-def extract_alos_raw(input_file, output_file, target_na=16384,
-                     target_nr=16384, start_line=2000):
+def extract_alos_raw(input_file,
+                     output_file,
+                     target_na=16384,
+                     target_nr=16384,
+                     start_line=2000):
     print(f"Processing ALOS-1 PALSAR file: {input_file}")
 
     # Line length from the first CEOS record header (big-endian, bytes 8-11
@@ -42,8 +45,7 @@ def extract_alos_raw(input_file, output_file, target_na=16384,
     print(f"Extracting {target_na} lines starting at line {start_line} ...")
     with open(input_file, "rb") as f:
         f.seek(720 + start_line * record_len)
-        raw = np.frombuffer(f.read(target_na * record_len),
-                            dtype=line_dtype)
+        raw = np.frombuffer(f.read(target_na * record_len), dtype=line_dtype)
 
     # Unsigned 0-255 samples carry a DC bias; subtract the channel means to
     # obtain a zero-mean baseband signal.
@@ -58,19 +60,23 @@ def extract_alos_raw(input_file, output_file, target_na=16384,
 
     print(f"Writing {output_file}")
     padded.tofile(output_file)
-    size_gb = os.path.getsize(output_file) / 1024 ** 3
+    size_gb = os.path.getsize(output_file) / 1024**3
     print(f"Done. Output size: {size_gb:.2f} GiB")
 
 
 if __name__ == "__main__":
     # Input and output both live next to this script, where the per-algorithm
-    # run_alos.py runners expect them.
+    # run_alos_cpu.py runners expect them.
     here = os.path.dirname(os.path.abspath(__file__))
     extract_alos_raw(
-        input_file=os.path.join(
-            here, "ALPSRP275140740-L1.0", "IMG-HH-ALPSRP275140740-H1.0__A"),
+        input_file=os.path.join(here, "ALPSRP275140740-L1.0",
+                                "IMG-HH-ALPSRP275140740-H1.0__A"),
         output_file=os.path.join(here, "alos_raw_16384x16384.bin"),
         target_na=16384,
         target_nr=16384,
+        # start_line=14000 places the 16384-line block over San Francisco
+        # Bay and the city grid (the hero image in the README); the function
+        # default of 2000 is a generic offset that skips the ramp-up lines
+        # at the start of the acquisition.
         start_line=14000,
     )

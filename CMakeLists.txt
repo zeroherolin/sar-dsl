@@ -82,3 +82,12 @@ configure_file(
   ${PROJECT_SOURCE_DIR}/cmake/_build_config.py.in
   ${PROJECT_SOURCE_DIR}/python/sar/_build_config.py
   @ONLY)
+
+# Editor LSP servers referenced by .vscode/settings.json.
+file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
+foreach(tool tblgen-lsp-server mlir-pdll-lsp-server)
+  if(EXISTS "${SAR_DSL_LLVM_TOOL_DIR}/${tool}")
+    file(CREATE_LINK "${SAR_DSL_LLVM_TOOL_DIR}/${tool}"
+         "${PROJECT_BINARY_DIR}/bin/${tool}" SYMBOLIC)
+  endif()
+endforeach()

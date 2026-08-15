@@ -3,4 +3,5 @@
 	url = https://github.com/llvm/llvm-project.git
 [submodule "externals/ScaleHLS-HIDA"]
 	path = externals/ScaleHLS-HIDA
-	url = https://github.com/UIUC-ChenLab/ScaleHLS-HIDA.git
+	url = https://github.com/zeroherolin/ScaleHLS-HIDA.git
+	branch = dev

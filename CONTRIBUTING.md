@@ -16,19 +16,35 @@ for the `scalehls` backend and its tests; they self-skip otherwise).
 ## Editor setup
 
 `make llvm` builds clangd, `make build` generates the compilation
-database; the committed `.clangd` and `.vscode/` wire them up (plus the
-TableGen/MLIR LSP servers), so navigation and diagnostics work out of
+database and the `sar-lsp-server` (the MLIR language server with the
+`sar` dialect registered -- the upstream one would flag every `sar` op
+as unknown); the committed `.clangd` and `.vscode/` wire them up (plus
+the TableGen LSP server), so navigation and diagnostics work out of
 the box in VS Code. Other editors: use the in-tree
-`externals/llvm-project/build/bin/clangd`.
+`externals/llvm-project/build/bin/clangd` and `build/bin/sar-lsp-server`.
+
+## Formatting
+
+Formatting is enforced by [pre-commit](https://pre-commit.com):
+clang-format (LLVM style) for C++, yapf + ruff (pep8, 79 columns) for
+Python, plus whitespace/file hygiene hooks.
+
+```bash
+pip install pre-commit
+pre-commit install         # run on every commit
+pre-commit run --all-files # run manually
+```
+
+CI runs the same hooks on every push.
 
 ## Repository conventions
 
 - **C++** follows the LLVM style (2-space indent, 80 columns,
-  `lowerCamelCase` functions). New passes are declared in tablegen
-  (`include/sar/Conversion/Passes.td`) and registered in `sar-opt`.
-- **Python** is PEP 8 with 79-column lines; keep the frontend dependency-free
-  beyond numpy. `python -m pyflakes python/sar third_party test/python
-  examples/*/*.py benchmarks/*.py` must be clean.
+  `lowerCamelCase` functions; enforced by clang-format). New passes are
+  declared in tablegen (`include/sar/Conversion/Passes.td`) and
+  registered in `sar-opt`.
+- **Python** is PEP 8 with 79-column lines (enforced by yapf + ruff);
+  keep the frontend dependency-free beyond numpy.
 - **Tests are mandatory.** Dialect/lowering changes need lit coverage under
   `test/Dialect` / `test/Conversion`; user-visible behavior needs pytest
   coverage under `test/python`. Numerical kernels are validated against
@@ -45,8 +61,9 @@ the box in VS Code. Other editors: use the in-tree
 - *Runtime kernels*: `runtime/SARRuntime.cpp` is dependency-free C++17 with
   a C ABI; keep it that way.
 
-## Submodule patches
+## ScaleHLS-HIDA development
 
-Local fixes to `externals/` must be captured as patch files under
-`scripts/patches/` and applied idempotently from the build scripts, so a
-fresh clone reproduces the toolchain exactly.
+The submodule tracks the `dev` branch of
+[our fork](https://github.com/zeroherolin/ScaleHLS-HIDA), ported to the
+project's LLVM tree. Fix HIDA bugs there as regular commits, push the
+branch, then bump the submodule pointer here -- no patch files.

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from common.params import RadarParams
+from common.params import RadarParams, band_windows
 
 __all__ = ["CSAProcessor"]
 
@@ -39,10 +39,9 @@ class CSAProcessor:
         self.fa = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / params.prf))
         self.fr = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / params.fs))
         # Absolute fast time: R0 sits at offset t_shift into the window.
-        self.tau = (2.0 * params.r0 / params.c - params.t_shift
-                    + np.arange(n) / params.fs)
-        self.win_range = np.hanning(n)
-        self.win_azimuth = np.hanning(n)
+        self.tau = (2.0 * params.r0 / params.c - params.t_shift +
+                    np.arange(n) / params.fs)
+        self.win_range, self.win_azimuth = band_windows(n, params)
 
     # ------------------------------------------------------------------ #
     # Doppler-dependent factors
@@ -51,13 +50,13 @@ class CSAProcessor:
     def migration_factor(self) -> np.ndarray:
         """D(fa) = sqrt(1 - (lambda fa / 2 Vr)^2)."""
         sin_theta = self.wavelength * self.fa / (2.0 * self.p.vr)
-        return np.sqrt(np.maximum(1.0 - sin_theta ** 2, 1e-10))
+        return np.sqrt(np.maximum(1.0 - sin_theta**2, 1e-10))
 
     def modified_chirp_rate(self, d: np.ndarray) -> np.ndarray:
         """Km(fa): range FM rate modified by range-azimuth coupling."""
         p = self.p
-        coupling = (p.kr * p.c * p.r0 * self.fa ** 2
-                    / (2.0 * p.vr ** 2 * p.fc ** 3 * d ** 3))
+        coupling = (p.kr * p.c * p.r0 * self.fa**2 /
+                    (2.0 * p.vr**2 * p.fc**3 * d**3))
         return p.kr / (1.0 - coupling)
 
     # ------------------------------------------------------------------ #
@@ -68,8 +67,8 @@ class CSAProcessor:
     def chirp_scaling_phase(self, d, km) -> np.ndarray:
         """Equalizes all migration trajectories to the reference one."""
         tau_ref = 2.0 * self.p.r0 / (self.p.c * d[:, None])
-        return (np.pi * km[:, None] * (1.0 / d[:, None] - 1.0)
-                * (self.tau[None, :] - tau_ref) ** 2)
+        return (np.pi * km[:, None] * (1.0 / d[:, None] - 1.0) *
+                (self.tau[None, :] - tau_ref)**2)
 
     def rc_src_rcmc_phase(self, d, km) -> np.ndarray:
         """Range compression + secondary range compression + bulk RCMC.
@@ -81,7 +80,7 @@ class CSAProcessor:
         """
         d2 = d[:, None]
         fr2 = self.fr[None, :]
-        quadratic = np.pi * fr2 ** 2 * d2 / km[:, None]
+        quadratic = np.pi * fr2**2 * d2 / km[:, None]
         linear = (4.0 * np.pi * self.p.r0 / self.p.c) * (1.0 / d2 - 1.0) * fr2
         return quadratic + linear
 
@@ -89,8 +88,8 @@ class CSAProcessor:
         """Conjugates the hyperbolic azimuth phase per range gate
         (the fa-independent carrier is dropped: magnitude imaging)."""
         r_gate = self.p.c * self.tau[None, :] / 2.0
-        return (4.0 * np.pi * self.p.fc / self.p.c) * r_gate * (d[:, None]
-                                                                - 1.0)
+        return (4.0 * np.pi * self.p.fc / self.p.c) * r_gate * (d[:, None] -
+                                                                1.0)
 
     # ------------------------------------------------------------------ #
     # Full pipeline
@@ -101,8 +100,8 @@ class CSAProcessor:
         d = self.migration_factor()
         km = self.modified_chirp_rate(d)
 
-        data = np.fft.fftshift(np.fft.fft(raw.astype(np.complex128),
-                                          axis=0), axes=0)
+        data = np.fft.fftshift(np.fft.fft(raw.astype(np.complex128), axis=0),
+                               axes=0)
         data = data * np.exp(1j * self.chirp_scaling_phase(d, km))
         data = np.fft.fftshift(np.fft.fft(data, axis=1), axes=1)
         data = data * np.exp(1j * self.rc_src_rcmc_phase(d, km))

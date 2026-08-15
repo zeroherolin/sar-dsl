@@ -2,7 +2,7 @@
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
-// Lowers sar.fft / sar.ifft / sar.stolt_interp into calls to libsar_runtime.
+// Lowers sar.fft / sar.ifft / sar.interp1d into calls to libsar_runtime.
 // The rewrite happens at tensor level, before one-shot bufferization, using
 // the sanctioned bufferization escape hatch:
 //
@@ -23,10 +23,12 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #include "sar/Conversion/Passes.h"
 #include "sar/Dialect/SAR/IR/SARDialect.h"
 #include "sar/Dialect/SAR/IR/SAROps.h"
+#include "sar/Runtime/RuntimeEnums.h"
 
 namespace mlir {
 namespace sar {
@@ -68,14 +70,15 @@ static MemRefType getDynamicMemRefType(RankedTensorType tensorType) {
 
 /// Ensures a private declaration of the runtime function exists and returns
 /// it. The declaration carries `llvm.emit_c_interface`.
-static func::FuncOp ensureRuntimeDecl(PatternRewriter &rewriter, ModuleOp module,
-                                      StringRef name, TypeRange argTypes) {
+static func::FuncOp ensureRuntimeDecl(PatternRewriter &rewriter,
+                                      ModuleOp module, StringRef name,
+                                      TypeRange argTypes) {
   if (auto existing = module.lookupSymbol<func::FuncOp>(name))
     return existing;
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(module.getBody());
   auto funcType = rewriter.getFunctionType(argTypes, {});
-  auto decl = rewriter.create<func::FuncOp>(module.getLoc(), name, funcType);
+  auto decl = func::FuncOp::create(rewriter, module.getLoc(), name, funcType);
   decl.setPrivate();
   decl->setAttr("llvm.emit_c_interface", rewriter.getUnitAttr());
   return decl;
@@ -86,10 +89,10 @@ static func::FuncOp ensureRuntimeDecl(PatternRewriter &rewriter, ModuleOp module
 static Value tensorToRuntimeArg(PatternRewriter &rewriter, Location loc,
                                 Value tensor) {
   auto tensorType = cast<RankedTensorType>(tensor.getType());
-  Value buffer = rewriter.create<bufferization::ToBufferOp>(
-      loc, getStaticMemRefType(tensorType), tensor);
-  return rewriter.create<memref::CastOp>(loc, getDynamicMemRefType(tensorType),
-                                         buffer);
+  Value buffer = bufferization::ToBufferOp::create(
+      rewriter, loc, getStaticMemRefType(tensorType), tensor);
+  return memref::CastOp::create(rewriter, loc, getDynamicMemRefType(tensorType),
+                                buffer);
 }
 
 /// Allocates the result buffer, returning both the alloc (static type) and
@@ -98,17 +101,17 @@ static std::pair<Value, Value> allocResultBuffer(PatternRewriter &rewriter,
                                                  Location loc,
                                                  RankedTensorType tensorType) {
   Value alloc =
-      rewriter.create<memref::AllocOp>(loc, getStaticMemRefType(tensorType));
-  Value casted = rewriter.create<memref::CastOp>(
-      loc, getDynamicMemRefType(tensorType), alloc);
+      memref::AllocOp::create(rewriter, loc, getStaticMemRefType(tensorType));
+  Value casted = memref::CastOp::create(
+      rewriter, loc, getDynamicMemRefType(tensorType), alloc);
   return {alloc, casted};
 }
 
 /// Wraps the filled result buffer back into tensor land.
 static Value bufferToResultTensor(PatternRewriter &rewriter, Location loc,
                                   RankedTensorType tensorType, Value alloc) {
-  return rewriter.create<bufferization::ToTensorOp>(
-      loc, tensorType, alloc, /*restrict=*/true, /*writable=*/true);
+  return bufferization::ToTensorOp::create(
+      rewriter, loc, tensorType, alloc, /*restrict=*/true, /*writable=*/true);
 }
 
 template <typename FFTOpTy, bool inverse>
@@ -122,26 +125,25 @@ struct FFTLikeLowering : OpRewritePattern<FFTOpTy> {
     auto tensorType = cast<RankedTensorType>(op.getType());
     int64_t rank = tensorType.getRank();
 
-    std::string symbol =
-        ("sar_rt_fft_" + Twine(rank) + "d_" +
-         getElementSuffix(tensorType.getElementType()))
-            .str();
+    std::string symbol = ("sar_rt_fft_" + Twine(rank) + "d_" +
+                          getElementSuffix(tensorType.getElementType()))
+                             .str();
 
     Value input = tensorToRuntimeArg(rewriter, loc, op.getInput());
     auto [alloc, output] = allocResultBuffer(rewriter, loc, tensorType);
-    Value dim = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(op.getDim()));
-    Value inv = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getBoolAttr(inverse));
+    Value dim = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(op.getDim()));
+    Value inv =
+        arith::ConstantOp::create(rewriter, loc, rewriter.getBoolAttr(inverse));
 
     auto decl = ensureRuntimeDecl(
         rewriter, module, symbol,
         {input.getType(), output.getType(), dim.getType(), inv.getType()});
-    rewriter.create<func::CallOp>(loc, decl,
-                                  ValueRange{input, output, dim, inv});
+    func::CallOp::create(rewriter, loc, decl,
+                         ValueRange{input, output, dim, inv});
 
-    rewriter.replaceOp(
-        op, bufferToResultTensor(rewriter, loc, tensorType, alloc));
+    rewriter.replaceOp(op,
+                       bufferToResultTensor(rewriter, loc, tensorType, alloc));
     return success();
   }
 };
@@ -151,66 +153,53 @@ struct Interp1DLowering : OpRewritePattern<Interp1DOp> {
 
   LogicalResult matchAndRewrite(Interp1DOp op,
                                 PatternRewriter &rewriter) const override {
+    // dim = 0 is normalized into transposes by canonicalization, which
+    // runs before this pass in every pipeline.
+    if (op.getDim() != 1)
+      return op.emitOpError(
+          "interpolation with dim = 0 must be canonicalized to dim = 1 with "
+          "transposes; run --canonicalize before this pass");
     Location loc = op.getLoc();
     auto module = op->getParentOfType<ModuleOp>();
     auto dataType = cast<RankedTensorType>(op.getData().getType());
 
-    std::string symbol =
-        ("sar_rt_interp1d_2d_" +
-         Twine(getElementSuffix(dataType.getElementType())))
-            .str();
+    std::string symbol = ("sar_rt_interp1d_2d_" +
+                          Twine(getElementSuffix(dataType.getElementType())))
+                             .str();
 
     Value data = tensorToRuntimeArg(rewriter, loc, op.getData());
     Value positions = tensorToRuntimeArg(rewriter, loc, op.getPositions());
     auto [alloc, output] = allocResultBuffer(rewriter, loc, dataType);
 
+    // Kernel/window encodings are shared with the runtime through
+    // sar/Runtime/RuntimeEnums.h.
+    int64_t kernelId = llvm::StringSwitch<int64_t>(op.getKernel())
+                           .Case("nearest", sar_rt::kNearest)
+                           .Case("linear", sar_rt::kLinear)
+                           .Case("cubic", sar_rt::kCubic)
+                           .Default(sar_rt::kSinc);
+    int64_t windowId = llvm::StringSwitch<int64_t>(op.getWindow())
+                           .Case("rect", sar_rt::kRect)
+                           .Case("hann", sar_rt::kHann)
+                           .Case("hamming", sar_rt::kHamming)
+                           .Default(sar_rt::kKaiser);
+    Value kernel = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(kernelId));
+    Value taps = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(op.getTaps()));
+    Value window = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(windowId));
+    Value beta = arith::ConstantOp::create(
+        rewriter, loc,
+        rewriter.getF64FloatAttr(op.getBeta().convertToDouble()));
+
     auto decl = ensureRuntimeDecl(
         rewriter, module, symbol,
-        {data.getType(), positions.getType(), output.getType()});
-    rewriter.create<func::CallOp>(loc, decl,
-                                  ValueRange{data, positions, output});
-
-    rewriter.replaceOp(
-        op, bufferToResultTensor(rewriter, loc, dataType, alloc));
-    return success();
-  }
-};
-
-struct StoltInterpLowering : OpRewritePattern<StoltInterpOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(StoltInterpOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    auto module = op->getParentOfType<ModuleOp>();
-    auto dataType = cast<RankedTensorType>(op.getData().getType());
-
-    std::string symbol =
-        ("sar_rt_stolt_2d_" + Twine(getElementSuffix(dataType.getElementType())))
-            .str();
-
-    Value data = tensorToRuntimeArg(rewriter, loc, op.getData());
-    Value fa = tensorToRuntimeArg(rewriter, loc, op.getFa());
-    Value fr = tensorToRuntimeArg(rewriter, loc, op.getFr());
-    auto [alloc, output] = allocResultBuffer(rewriter, loc, dataType);
-
-    auto f64 = rewriter.getF64Type();
-    auto scalarOf = [&](::llvm::APFloat value) -> Value {
-      return rewriter.create<arith::ConstantOp>(
-          loc, rewriter.getFloatAttr(f64, value.convertToDouble()));
-    };
-    Value c = scalarOf(op.getC());
-    Value fc = scalarOf(op.getFc());
-    Value vr = scalarOf(op.getVr());
-    Value tShift = scalarOf(op.getTShift());
-
-    SmallVector<Value> args{data, fa, fr, output, c, fc, vr, tShift};
-    SmallVector<Type> argTypes;
-    for (Value v : args)
-      argTypes.push_back(v.getType());
-
-    auto decl = ensureRuntimeDecl(rewriter, module, symbol, argTypes);
-    rewriter.create<func::CallOp>(loc, decl, args);
+        {data.getType(), positions.getType(), output.getType(),
+         kernel.getType(), taps.getType(), window.getType(), beta.getType()});
+    func::CallOp::create(
+        rewriter, loc, decl,
+        ValueRange{data, positions, output, kernel, taps, window, beta});
 
     rewriter.replaceOp(op,
                        bufferToResultTensor(rewriter, loc, dataType, alloc));
@@ -224,13 +213,13 @@ struct ConvertSARSignalToRuntimePass
     MLIRContext *context = &getContext();
 
     ConversionTarget target(*context);
-    target.addIllegalOp<FFTOp, IFFTOp, StoltInterpOp, Interp1DOp>();
+    target.addIllegalOp<FFTOp, IFFTOp, Interp1DOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
     RewritePatternSet patterns(context);
     patterns.add<FFTLikeLowering<FFTOp, /*inverse=*/false>,
-                 FFTLikeLowering<IFFTOp, /*inverse=*/true>,
-                 StoltInterpLowering, Interp1DLowering>(context);
+                 FFTLikeLowering<IFFTOp, /*inverse=*/true>, Interp1DLowering>(
+        context);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))

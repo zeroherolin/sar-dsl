@@ -22,3 +22,54 @@ requires_cpu = pytest.mark.skipif(
 requires_scalehls = pytest.mark.skipif(
     not _backend_available("scalehls"),
     reason="ScaleHLS toolchain not available")
+
+
+# Shared utilities for split-complex affine/HLS testing
+def compile_split_kernel(mlir_text: str,
+                         name: str,
+                         tmp_path,
+                         pipeline: str = "--sar-affine-to-llvm-pipeline"):
+    """Compiles a module through the split-complex affine path into a
+    shared library and returns the `_mlir_ciface_<name>` symbol."""
+    import ctypes
+    import subprocess
+
+    from sar.compiler.toolchain import find_tool
+
+    llvm_mlir = subprocess.run([find_tool("sar-opt"), pipeline, "-"],
+                               input=mlir_text,
+                               capture_output=True,
+                               text=True,
+                               check=True).stdout
+    llvm_ir = subprocess.run(
+        [find_tool("mlir-translate"), "--mlir-to-llvmir", "-"],
+        input=llvm_mlir,
+        capture_output=True,
+        text=True,
+        check=True).stdout
+    ll = tmp_path / "kernel.ll"
+    ll.write_text(llvm_ir)
+    so = tmp_path / "kernel.so"
+    subprocess.run([
+        find_tool("clang"), "-O2", "-shared", "-fPIC",
+        str(ll), "-o",
+        str(so), "-lm", "-Wno-override-module"
+    ],
+                   check=True)
+    lib = ctypes.CDLL(str(so))
+    fn = getattr(lib, f"_mlir_ciface_{name}")
+    fn.restype = None
+    return lib, fn
+
+
+def run_split(fn, inputs, out_shapes, dtype):
+    """Invokes a split-complex C interface function."""
+    import numpy as np
+
+    from sar.runtime import _make_descriptor
+    import ctypes
+
+    outs = [np.empty(s, dtype=dtype) for s in out_shapes]
+    descriptors = [_make_descriptor(a) for a in list(inputs) + outs]
+    fn(*[ctypes.byref(d) for d in descriptors])
+    return outs

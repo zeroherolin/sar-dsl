@@ -13,11 +13,14 @@ func.func @complex_mul(%a: tensor<4xcomplex<f64>>, %b: tensor<4xcomplex<f64>>)
   return %0 : tensor<4xcomplex<f64>>
 }
 
-// CHECK-LABEL: func.func @expj_becomes_cos_sin
-func.func @expj_becomes_cos_sin(%p: tensor<8xf32>) -> tensor<8xcomplex<f32>> {
+// CHECK-LABEL: func.func @complex_from_planes
+func.func @complex_from_planes(%p: tensor<8xf32>) -> tensor<8xcomplex<f32>> {
   // CHECK-DAG: sar.cos %arg0
   // CHECK-DAG: sar.sin %arg0
-  %0 = sar.expj %p : tensor<8xf32> -> tensor<8xcomplex<f32>>
+  // CHECK: return
+  %c = sar.cos %p : tensor<8xf32>
+  %s = sar.sin %p : tensor<8xf32>
+  %0 = sar.complex %c, %s : tensor<8xf32> -> tensor<8xcomplex<f32>>
   return %0 : tensor<8xcomplex<f32>>
 }
 
@@ -52,18 +55,6 @@ func.func @interp_becomes_split(%d: tensor<8x16xcomplex<f32>>,
   return %0 : tensor<8x16xcomplex<f32>>
 }
 
-// CHECK-LABEL: func.func @stolt_becomes_split
-func.func @stolt_becomes_split(%d: tensor<8x16xcomplex<f32>>,
-                               %fa: tensor<8xf64>, %fr: tensor<16xf64>)
-    -> tensor<8x16xcomplex<f32>> {
-  // CHECK: sar.stolt_interp_split %arg0, %arg1, %arg2, %arg3
-  // CHECK-SAME: t_shift
-  %0 = sar.stolt_interp %d, %fa, %fr {c = 3.0e8, fc = 1.0e9, vr = 7000.0,
-        t_shift = 1.0e-4}
-      : (tensor<8x16xcomplex<f32>>, tensor<8xf64>, tensor<16xf64>)
-      -> (tensor<8x16xcomplex<f32>>)
-  return %0 : tensor<8x16xcomplex<f32>>
-}
 
 // CHECK-LABEL: func.func @complex_constant_splits
 func.func @complex_constant_splits() -> tensor<2xcomplex<f64>> {
@@ -78,4 +69,57 @@ func.func @float_only_untouched(%x: tensor<4xf32>) -> tensor<4xf32> {
   // CHECK: sar.mul_scalar %arg0
   %0 = sar.mul_scalar %x, 2.0 : tensor<4xf32>
   return %0 : tensor<4xf32>
+}
+
+// CHECK-LABEL: func.func @conj_negates_imag
+// CHECK-SAME: (%[[RE:.*]]: tensor<4xf32>, %[[IM:.*]]: tensor<4xf32>)
+func.func @conj_negates_imag(%z: tensor<4xcomplex<f32>>)
+    -> tensor<4xcomplex<f32>> {
+  // CHECK: %[[NEG:.*]] = sar.mul_scalar %[[IM]], -1
+  // CHECK: return %[[RE]], %[[NEG]]
+  %0 = sar.conj %z : tensor<4xcomplex<f32>>
+  return %0 : tensor<4xcomplex<f32>>
+}
+
+
+// CHECK-LABEL: func.func @plane_roundtrip
+// CHECK-SAME: (%[[RE:.*]]: tensor<4xf64>, %[[IM:.*]]: tensor<4xf64>)
+func.func @plane_roundtrip(%z: tensor<4xcomplex<f64>>)
+    -> tensor<4xcomplex<f64>> {
+  // CHECK: return %[[IM]], %[[RE]]
+  %re = sar.imag %z : tensor<4xcomplex<f64>> -> tensor<4xf64>
+  %im = sar.real %z : tensor<4xcomplex<f64>> -> tensor<4xf64>
+  %0 = sar.complex %re, %im : tensor<4xf64> -> tensor<4xcomplex<f64>>
+  return %0 : tensor<4xcomplex<f64>>
+}
+
+// CHECK-LABEL: func.func @complex_sum_splits
+// CHECK-SAME: (%[[RE:.*]]: tensor<4x8xf64>, %[[IM:.*]]: tensor<4x8xf64>)
+func.func @complex_sum_splits(%z: tensor<4x8xcomplex<f64>>)
+    -> tensor<4xcomplex<f64>> {
+  // CHECK-DAG: sar.reduce %[[RE]] {dim = 1 : i64, kind = "sum"}
+  // CHECK-DAG: sar.reduce %[[IM]] {dim = 1 : i64, kind = "sum"}
+  %0 = sar.reduce %z {kind = "sum", dim = 1 : i64}
+      : tensor<4x8xcomplex<f64>> -> tensor<4xcomplex<f64>>
+  return %0 : tensor<4xcomplex<f64>>
+}
+
+// CHECK-LABEL: func.func @pad_planes
+// CHECK-SAME: (%[[RE:.*]]: tensor<4xf32>, %[[IM:.*]]: tensor<4xf32>)
+func.func @pad_planes(%z: tensor<4xcomplex<f32>>) -> tensor<6xcomplex<f32>> {
+  // CHECK-DAG: sar.pad %[[RE]] {high = array<i64: 1>, low = array<i64: 1>, value = 2.500000e-01
+  // CHECK-DAG: sar.pad %[[IM]] {high = array<i64: 1>, low = array<i64: 1>, value = 0.000000e+00
+  %0 = sar.pad %z {low = array<i64: 1>, high = array<i64: 1>, value = 0.25} : tensor<4xcomplex<f32>> -> tensor<6xcomplex<f32>>
+  return %0 : tensor<6xcomplex<f32>>
+}
+
+// CHECK-LABEL: func.func @where_selects_planes
+// CHECK-SAME: (%[[M:.*]]: tensor<4xf32>, %[[ARE:.*]]: tensor<4xf32>, %[[AIM:.*]]: tensor<4xf32>, %[[BRE:.*]]: tensor<4xf32>, %[[BIM:.*]]: tensor<4xf32>)
+func.func @where_selects_planes(%m: tensor<4xf32>, %a: tensor<4xcomplex<f32>>,
+                                %b: tensor<4xcomplex<f32>>)
+    -> tensor<4xcomplex<f32>> {
+  // CHECK-DAG: sar.where %[[M]], %[[ARE]], %[[BRE]]
+  // CHECK-DAG: sar.where %[[M]], %[[AIM]], %[[BIM]]
+  %0 = sar.where %m, %a, %b : (tensor<4xf32>, tensor<4xcomplex<f32>>, tensor<4xcomplex<f32>>) -> (tensor<4xcomplex<f32>>)
+  return %0 : tensor<4xcomplex<f32>>
 }

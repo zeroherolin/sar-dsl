@@ -6,7 +6,9 @@ func.func @kernel(%x: tensor<8x16xcomplex<f32>>, %s: tensor<8x16xf32>)
     -> tensor<8x16xcomplex<f32>> {
   %0 = sar.fft %x {dim = 1 : i64} : tensor<8x16xcomplex<f32>>
   %1 = sar.fftshift %0 {dim = 1 : i64} : tensor<8x16xcomplex<f32>>
-  %2 = sar.expj %s : tensor<8x16xf32> -> tensor<8x16xcomplex<f32>>
+  %sc = sar.cos %s : tensor<8x16xf32>
+  %ss = sar.sin %s : tensor<8x16xf32>
+  %2 = sar.complex %sc, %ss : tensor<8x16xf32> -> tensor<8x16xcomplex<f32>>
   %3 = sar.mul %1, %2 : tensor<8x16xcomplex<f32>>
   return %3 : tensor<8x16xcomplex<f32>>
 }

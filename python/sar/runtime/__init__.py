@@ -5,7 +5,8 @@ tensor: first the inputs, then one output pointer per result
 (destination-passing style produced by `buffer-results-to-out-params`).
 Each pointer refers to a StridedMemRef descriptor::
 
-    { T *allocated; T *aligned; int64 offset; int64 sizes[R]; int64 strides[R]; }
+    { T *allocated; T *aligned;
+      int64 offset; int64 sizes[R]; int64 strides[R]; }
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ _descriptor_cache = {}
 
 def _descriptor_type(rank: int):
     if rank not in _descriptor_cache:
+
         class Descriptor(ctypes.Structure):
             _fields_ = [
                 ("allocated", ctypes.c_void_p),
@@ -89,8 +91,10 @@ class CompiledKernel:
                 f"kernel '{self.name}' takes {len(self.arg_types)} "
                 f"argument(s), got {len(arrays)}")
 
-        inputs = [_check_argument(i, a, t)
-                  for i, (a, t) in enumerate(zip(arrays, self.arg_types))]
+        inputs = [
+            _check_argument(i, a, t)
+            for i, (a, t) in enumerate(zip(arrays, self.arg_types))
+        ]
         outputs: List[np.ndarray] = [
             np.empty(t.shape, dtype=t.dtype.to_numpy())
             for t in self.result_types

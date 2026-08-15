@@ -9,9 +9,9 @@ exercises the pure phase-multiply path of the compiler on both backends.
 |------|---------|
 | `algorithm.py` | The CSA chain in the DSL (`build_kernel`, `make_inputs`) |
 | `reference.py` | NumPy reference implementation (`CSAProcessor`) |
-| `run_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
-| `run_scalehls.py` | Full scalehls-backend flow: emit a Vitis HLS C++ design |
-| `run_alos.py` | Focus the real ALOS-1 San Francisco dataset |
+| `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
+| `run_point_target_scalehls.py` | Full scalehls-backend flow: HLS C++ design + csim package (`hls_project/`) |
+| `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset |
 
 ## Processing chain (zero Doppler centroid)
 
@@ -29,12 +29,17 @@ The Doppler-dependent factors -- migration factor `D(fa)` and modified
 chirp rate `Km(fa)` -- are computed inside the kernel from the `fa` axis
 with element-wise ops; the host only provides the `fa`/`fr`/`tau` axes.
 
+The residual phase introduced by the scaling multiply (Cumming & Wong
+eq. 7.36) is not corrected: the chain outputs a magnitude image, where
+that term has no effect. Interferometric use would need the extra
+multiply after azimuth compression.
+
 ## Running
 
 ```bash
 # from the repository root, after `make build`
-python examples/csa/run_cpu.py --n 512          # focus + PNG
-python examples/csa/run_scalehls.py --n 256     # Vitis HLS C++ design
+python examples/csa/run_point_target_cpu.py --n 512          # focus + PNG
+python examples/csa/run_point_target_scalehls.py --n 256     # design + csim package
 ```
 
 ![synthetic point targets](assets/csa_synthetic_512.png)

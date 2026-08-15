@@ -7,14 +7,22 @@
     ],
     "C_Cpp.intelliSenseEngine": "disabled",
 
-    "mlir.server_path": "externals/llvm-project/build/bin/mlir-lsp-server",
-    "mlir.tablegen_server_path": "externals/llvm-project/build/bin/tblgen-lsp-server",
-    "mlir.pdll_server_path": "externals/llvm-project/build/bin/mlir-pdll-lsp-server",
+    "mlir.server_path": "build/bin/sar-lsp-server",
+    "mlir.tablegen_server_path": "build/bin/tblgen-lsp-server",
+    "mlir.pdll_server_path": "build/bin/mlir-pdll-lsp-server",
     "mlir.tablegen_compilation_databases": [
-        "${workspaceFolder}/build/tablegen_compile_commands.yml"
+        "build/tablegen_compile_commands.yml"
     ],
 
     "python.analysis.extraPaths": [
-        "python"
-    ]
+        "python",
+        "examples",
+        "benchmarks"
+    ],
+
+    "search.exclude": {
+        "externals/**": true,
+        "build/**": true
+    },
+    "search.followSymlinks": false
 }

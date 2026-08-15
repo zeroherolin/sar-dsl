@@ -41,8 +41,7 @@ static bool isComplexTensor(Type type) {
 static RankedTensorType getPlaneType(Type type) {
   auto tensorTy = cast<RankedTensorType>(type);
   auto complexTy = cast<ComplexType>(tensorTy.getElementType());
-  return RankedTensorType::get(tensorTy.getShape(),
-                               complexTy.getElementType());
+  return RankedTensorType::get(tensorTy.getShape(), complexTy.getElementType());
 }
 
 /// Splits a dense complex attribute into (re, im) float attributes.
@@ -116,9 +115,9 @@ FailureOr<func::FuncOp> FunctionDecomplexifier::run() {
     }
   }
 
-  auto replacement = builder.create<func::FuncOp>(
-      original.getLoc(), original.getName(),
-      builder.getFunctionType(inputTypes, resultTypes));
+  auto replacement =
+      func::FuncOp::create(builder, original.getLoc(), original.getName(),
+                           builder.getFunctionType(inputTypes, resultTypes));
   replacement.setVisibility(original.getVisibility());
 
   Block *entry = replacement.addEntryBlock();
@@ -147,9 +146,8 @@ FailureOr<func::FuncOp> FunctionDecomplexifier::run() {
 LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
   Location loc = op->getLoc();
 
-  bool touchesComplex =
-      llvm::any_of(op->getOperandTypes(), isComplexTensor) ||
-      llvm::any_of(op->getResultTypes(), isComplexTensor);
+  bool touchesComplex = llvm::any_of(op->getOperandTypes(), isComplexTensor) ||
+                        llvm::any_of(op->getResultTypes(), isComplexTensor);
 
   // Ops without complex involvement are cloned with remapped operands.
   if (!touchesComplex && !isa<func::ReturnOp>(op)) {
@@ -157,16 +155,14 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
     return success();
   }
 
-  auto planeOf = [&](Value v) { return getPlaneType(v.getType()); };
-
   auto mul = [&](Value a, Value b) -> Value {
-    return builder.create<MulOp>(loc, a, b);
+    return MulOp::create(builder, loc, a, b);
   };
   auto add = [&](Value a, Value b) -> Value {
-    return builder.create<AddOp>(loc, a, b);
+    return AddOp::create(builder, loc, a, b);
   };
   auto sub = [&](Value a, Value b) -> Value {
-    return builder.create<SubOp>(loc, a, b);
+    return SubOp::create(builder, loc, a, b);
   };
 
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
@@ -181,7 +177,7 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
             operands.push_back(getReal(v));
           }
         }
-        builder.create<func::ReturnOp>(loc, operands);
+        func::ReturnOp::create(builder, loc, operands);
         return success();
       })
       .Case<ConstantOp>([&](ConstantOp cst) -> LogicalResult {
@@ -192,8 +188,8 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
         }
         auto planeType = getPlaneType(cst.getType());
         auto [reAttr, imAttr] = splitComplexAttr(dense, planeType);
-        Value re = builder.create<ConstantOp>(loc, planeType, reAttr);
-        Value im = builder.create<ConstantOp>(loc, planeType, imAttr);
+        Value re = ConstantOp::create(builder, loc, planeType, reAttr);
+        Value im = ConstantOp::create(builder, loc, planeType, imAttr);
         splitValues[cst.getResult()] = {re, im};
         return success();
       })
@@ -217,45 +213,62 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
         auto [a, b] = getSplit(divOp.getLhs());
         auto [c, d] = getSplit(divOp.getRhs());
         Value denom = add(mul(c, c), mul(d, d));
-        Value re = builder.create<DivOp>(loc, add(mul(a, c), mul(b, d)),
-                                         denom);
-        Value im = builder.create<DivOp>(loc, sub(mul(b, c), mul(a, d)),
-                                         denom);
+        Value re =
+            DivOp::create(builder, loc, add(mul(a, c), mul(b, d)), denom);
+        Value im =
+            DivOp::create(builder, loc, sub(mul(b, c), mul(a, d)), denom);
         splitValues[divOp.getResult()] = {re, im};
         return success();
       })
       .Case<AddScalarOp>([&](AddScalarOp addScalar) {
         auto [re, im] = getSplit(addScalar.getInput());
-        Value newRe = builder.create<AddScalarOp>(
-            loc, re, addScalar.getScalar());
+        Value newRe =
+            AddScalarOp::create(builder, loc, re, addScalar.getScalar());
         splitValues[addScalar.getResult()] = {newRe, im};
         return success();
       })
       .Case<MulScalarOp>([&](MulScalarOp mulScalar) {
         auto [re, im] = getSplit(mulScalar.getInput());
         splitValues[mulScalar.getResult()] = {
-            builder.create<MulScalarOp>(loc, re, mulScalar.getScalar()),
-            builder.create<MulScalarOp>(loc, im, mulScalar.getScalar())};
-        return success();
-      })
-      .Case<NegOp>([&](NegOp neg) {
-        auto [re, im] = getSplit(neg.getInput());
-        splitValues[neg.getResult()] = {builder.create<NegOp>(loc, re),
-                                        builder.create<NegOp>(loc, im)};
+            MulScalarOp::create(builder, loc, re, mulScalar.getScalar()),
+            MulScalarOp::create(builder, loc, im, mulScalar.getScalar())};
         return success();
       })
       .Case<AbsOp>([&](AbsOp abs) {
         auto [re, im] = getSplit(abs.getInput());
-        Value magnitude = builder.create<SqrtOp>(
-            loc, add(mul(re, re), mul(im, im)));
+        Value magnitude =
+            SqrtOp::create(builder, loc, add(mul(re, re), mul(im, im)));
         realValues.map(abs.getResult(), magnitude);
         return success();
       })
-      .Case<ExpJOp>([&](ExpJOp expj) {
-        Value phase = getReal(expj.getInput());
-        splitValues[expj.getResult()] = {
-            builder.create<CosOp>(loc, phase),
-            builder.create<SinOp>(loc, phase)};
+      .Case<ConjOp>([&](ConjOp conj) {
+        auto [re, im] = getSplit(conj.getInput());
+        splitValues[conj.getResult()] = {
+            re, MulScalarOp::create(builder, loc, im,
+                                    builder.getF64FloatAttr(-1.0))};
+        return success();
+      })
+      .Case<RealOp>([&](RealOp real) {
+        realValues.map(real.getResult(), getSplit(real.getInput()).first);
+        return success();
+      })
+      .Case<ImagOp>([&](ImagOp imag) {
+        realValues.map(imag.getResult(), getSplit(imag.getInput()).second);
+        return success();
+      })
+      .Case<WhereOp>([&](WhereOp where) {
+        // The mask is real; complex branches select plane-wise.
+        Value mask = getReal(where.getMask());
+        auto [lre, lim] = getSplit(where.getLhs());
+        auto [rre, rim] = getSplit(where.getRhs());
+        splitValues[where.getResult()] = {
+            WhereOp::create(builder, loc, lre.getType(), mask, lre, rre),
+            WhereOp::create(builder, loc, lim.getType(), mask, lim, rim)};
+        return success();
+      })
+      .Case<ComplexOp>([&](ComplexOp create) {
+        splitValues[create.getResult()] = {getReal(create.getRe()),
+                                           getReal(create.getIm())};
         return success();
       })
       .Case<CastOp>([&](CastOp castOp) {
@@ -265,35 +278,88 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
           auto castPlane = [&](Value v) -> Value {
             if (v.getType() == Type(resultPlane))
               return v;
-            return builder.create<CastOp>(loc, resultPlane, v);
+            return CastOp::create(builder, loc, resultPlane, v);
           };
           splitValues[castOp.getResult()] = {castPlane(re), castPlane(im)};
         } else {
           Value in = getReal(castOp.getInput());
           Value re = in;
           if (in.getType() != Type(resultPlane))
-            re = builder.create<CastOp>(loc, resultPlane, in);
+            re = CastOp::create(builder, loc, resultPlane, in);
           auto zeroAttr = DenseElementsAttr::get(
               resultPlane,
               builder.getFloatAttr(resultPlane.getElementType(), 0.0));
-          Value im = builder.create<ConstantOp>(loc, resultPlane, zeroAttr);
+          Value im = ConstantOp::create(builder, loc, resultPlane, zeroAttr);
           splitValues[castOp.getResult()] = {re, im};
         }
+        return success();
+      })
+      .Case<ReduceOp>([&](ReduceOp reduce) {
+        // Complex reductions are sums (verified); sum splits plane-wise.
+        auto [re, im] = getSplit(reduce.getInput());
+        auto plane = getPlaneType(reduce.getType());
+        splitValues[reduce.getResult()] = {
+            ReduceOp::create(builder, loc, plane, re, reduce.getKindAttr(),
+                             reduce.getDimAttr()),
+            ReduceOp::create(builder, loc, plane, im, reduce.getKindAttr(),
+                             reduce.getDimAttr())};
         return success();
       })
       .Case<TransposeOp>([&](TransposeOp transpose) {
         auto [re, im] = getSplit(transpose.getInput());
         auto plane = getPlaneType(transpose.getType());
         splitValues[transpose.getResult()] = {
-            builder.create<TransposeOp>(loc, plane, re),
-            builder.create<TransposeOp>(loc, plane, im)};
+            TransposeOp::create(builder, loc, plane, re),
+            TransposeOp::create(builder, loc, plane, im)};
+        return success();
+      })
+      .Case<SliceOp>([&](SliceOp slice) {
+        auto [re, im] = getSplit(slice.getInput());
+        auto plane = getPlaneType(slice.getType());
+        splitValues[slice.getResult()] = {
+            SliceOp::create(builder, loc, plane, re, slice.getOffsetsAttr(),
+                            slice.getSizesAttr(), slice.getStridesAttr()),
+            SliceOp::create(builder, loc, plane, im, slice.getOffsetsAttr(),
+                            slice.getSizesAttr(), slice.getStridesAttr())};
+        return success();
+      })
+      .Case<ConcatOp>([&](ConcatOp concat) {
+        auto [lre, lim] = getSplit(concat.getLhs());
+        auto [rre, rim] = getSplit(concat.getRhs());
+        auto plane = getPlaneType(concat.getType());
+        splitValues[concat.getResult()] = {
+            ConcatOp::create(builder, loc, plane, lre, rre,
+                             concat.getDimAttr()),
+            ConcatOp::create(builder, loc, plane, lim, rim,
+                             concat.getDimAttr())};
+        return success();
+      })
+      .Case<PadOp>([&](PadOp pad) {
+        // The pad value lands in the real plane; the imaginary plane pads
+        // with zero.
+        auto [re, im] = getSplit(pad.getInput());
+        auto plane = getPlaneType(pad.getType());
+        splitValues[pad.getResult()] = {
+            PadOp::create(builder, loc, plane, re, pad.getLowAttr(),
+                          pad.getHighAttr(), pad.getValueAttr()),
+            PadOp::create(builder, loc, plane, im, pad.getLowAttr(),
+                          pad.getHighAttr(), builder.getF64FloatAttr(0.0))};
+        return success();
+      })
+      .Case<ReverseOp>([&](ReverseOp reverse) {
+        auto [re, im] = getSplit(reverse.getInput());
+        splitValues[reverse.getResult()] = {
+            ReverseOp::create(builder, loc, re.getType(), re,
+                              reverse.getDimAttr()),
+            ReverseOp::create(builder, loc, im.getType(), im,
+                              reverse.getDimAttr())};
         return success();
       })
       .Case<FFTShiftOp>([&](FFTShiftOp shift) {
         auto [re, im] = getSplit(shift.getInput());
         auto make = [&](Value v) -> Value {
-          return builder.create<FFTShiftOp>(loc, v, shift.getDim(),
-                                            shift.getInverse());
+          return FFTShiftOp::create(builder, loc, v, shift.getDim(),
+                                    shift.getInverse());
         };
         splitValues[shift.getResult()] = {make(re), make(im)};
         return success();
@@ -302,32 +368,24 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
         auto [re, im] = getSplit(bcast.getInput());
         auto plane = getPlaneType(bcast.getType());
         splitValues[bcast.getResult()] = {
-            builder.create<BroadcastOp>(loc, plane, re, bcast.getDim()),
-            builder.create<BroadcastOp>(loc, plane, im, bcast.getDim())};
+            BroadcastOp::create(builder, loc, plane, re, bcast.getDim()),
+            BroadcastOp::create(builder, loc, plane, im, bcast.getDim())};
         return success();
       })
       .Case<FFTOp, IFFTOp>([&](auto fft) {
         auto [re, im] = getSplit(fft.getInput());
-        auto split = builder.create<FFTSplitOp>(
-            loc, re, im, fft.getDim(), /*inverse=*/isa<IFFTOp>(op));
+        auto split = FFTSplitOp::create(builder, loc, re, im, fft.getDim(),
+                                        /*inverse=*/isa<IFFTOp>(op));
         splitValues[fft.getResult()] = {split.getOutRe(), split.getOutIm()};
         return success();
       })
       .Case<Interp1DOp>([&](Interp1DOp interp) {
         auto [re, im] = getSplit(interp.getData());
-        auto split = builder.create<Interp1DSplitOp>(
-            loc, re, im, getReal(interp.getPositions()));
-        splitValues[interp.getResult()] = {split.getOutRe(),
-                                           split.getOutIm()};
-        return success();
-      })
-      .Case<StoltInterpOp>([&](StoltInterpOp stolt) {
-        auto [re, im] = getSplit(stolt.getData());
-        auto split = builder.create<StoltInterpSplitOp>(
-            loc, re, im, getReal(stolt.getFa()), getReal(stolt.getFr()),
-            stolt.getC(), stolt.getFc(), stolt.getVr(), stolt.getTShift());
-        splitValues[stolt.getResult()] = {split.getOutRe(),
-                                          split.getOutIm()};
+        auto split = Interp1DSplitOp::create(
+            builder, loc, re, im, getReal(interp.getPositions()),
+            interp.getDim(), interp.getKernel(), interp.getTaps(),
+            interp.getWindow(), interp.getBeta());
+        splitValues[interp.getResult()] = {split.getOutRe(), split.getOutIm()};
         return success();
       })
       .Default([&](Operation *other) {

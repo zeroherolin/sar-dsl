@@ -1,16 +1,17 @@
-//===- SARRuntime.cpp - SAR runtime library --------------------------------===//
+//===- SARRuntime.cpp - SAR runtime library -------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
-// C-ABI kernels backing the sar.fft / sar.ifft / sar.stolt_interp operations
+// C-ABI kernels backing the sar.fft / sar.ifft / sar.interp1d operations
 // on CPU targets. Symbols follow the MLIR C interface convention
 // (_mlir_ciface_<name>): memrefs are passed as pointers to strided
 // descriptors, scalars by value.
 //
 // Numerical conventions match numpy: the forward DFT is unscaled, the
-// inverse DFT is scaled by 1/N. FFT sizes must be powers of two (enforced by
-// the sar dialect verifier). All transforms are computed in double precision
-// regardless of the storage precision.
+// inverse DFT is scaled by 1/N. Power-of-two sizes run the radix-2 kernel
+// directly; other sizes go through Bluestein's chirp-z reduction. All
+// transforms are computed in double precision regardless of the storage
+// precision.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,9 +20,13 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
+#include <memory>
 #include <thread>
 #include <vector>
+
+#include "sar/Runtime/RuntimeEnums.h"
 
 namespace {
 
@@ -29,8 +34,7 @@ namespace {
 // MLIR memref descriptors
 //===----------------------------------------------------------------------===//
 
-template <typename T, int Rank>
-struct MemRefDescriptor {
+template <typename T, int Rank> struct MemRefDescriptor {
   T *allocated;
   T *aligned;
   int64_t offset;
@@ -47,9 +51,29 @@ struct MemRefDescriptor {
 // Parallel helpers
 //===----------------------------------------------------------------------===//
 
-/// Runs fn(begin, end) over [0, total) partitioned across hardware threads.
-void parallelFor(int64_t total, const std::function<void(int64_t, int64_t)> &fn) {
-  unsigned workers = std::thread::hardware_concurrency();
+/// Worker count for runtime parallelism. Respects SAR_RT_NUM_THREADS, then
+/// OMP_NUM_THREADS (so the runtime does not oversubscribe when the kernel
+/// is already running inside an OpenMP parallel region with a configured
+/// thread budget), then falls back to the hardware concurrency.
+unsigned runtimeWorkerCount() {
+  static const unsigned cached = [] {
+    for (const char *var : {"SAR_RT_NUM_THREADS", "OMP_NUM_THREADS"}) {
+      if (const char *env = std::getenv(var)) {
+        char *end = nullptr;
+        long value = std::strtol(env, &end, 10);
+        if (end != env && value > 0)
+          return static_cast<unsigned>(value);
+      }
+    }
+    return std::max(1u, std::thread::hardware_concurrency());
+  }();
+  return cached;
+}
+
+/// Runs fn(begin, end) over [0, total) partitioned across worker threads.
+void parallelFor(int64_t total,
+                 const std::function<void(int64_t, int64_t)> &fn) {
+  unsigned workers = runtimeWorkerCount();
   if (workers <= 1 || total < 2) {
     fn(0, total);
     return;
@@ -99,8 +123,8 @@ struct FFTPlan {
     twiddles.reserve(n - 1);
     for (int64_t len = 2; len <= n; len <<= 1) {
       for (int64_t k = 0; k < len / 2; ++k) {
-        double angle = -2.0 * M_PI * static_cast<double>(k) /
-                       static_cast<double>(len);
+        double angle =
+            -2.0 * M_PI * static_cast<double>(k) / static_cast<double>(len);
         twiddles.emplace_back(std::cos(angle), std::sin(angle));
       }
     }
@@ -137,11 +161,87 @@ struct FFTPlan {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Arbitrary-length lines: Bluestein's chirp-z reduction
+//===----------------------------------------------------------------------===//
+
+/// DFT plan for any line length >= 2. Powers of two run the radix-2 kernel
+/// directly; other sizes convolve with a chirp at the next power of two
+/// >= 2n - 1 (Bluestein), reusing the radix-2 kernel for the convolution.
+class LinePlan {
+public:
+  explicit LinePlan(int64_t size) : n(size) {
+    if ((n & (n - 1)) == 0) {
+      pow2 = std::make_unique<FFTPlan>(n);
+      return;
+    }
+    m = 2;
+    while (m < 2 * n - 1)
+      m <<= 1;
+    pow2 = std::make_unique<FFTPlan>(m);
+
+    // chirp[k] = exp(-j pi k^2 / n). exp has period 2 pi i, so k^2 can be
+    // reduced modulo 2n first; folding k before squaring keeps the product
+    // from overflowing for large transforms.
+    chirp.resize(n);
+    for (int64_t k = 0; k < n; ++k) {
+      int64_t sq = ((k % (2 * n)) * k) % (2 * n);
+      double angle =
+          -M_PI * static_cast<double>(sq) / static_cast<double>(n);
+      chirp[k] = std::complex<double>(std::cos(angle), std::sin(angle));
+    }
+
+    std::vector<std::complex<double>> b(m, std::complex<double>(0.0, 0.0));
+    b[0] = std::conj(chirp[0]);
+    for (int64_t k = 1; k < n; ++k)
+      b[k] = b[m - k] = std::conj(chirp[k]);
+    pow2->run(b.data(), /*inverse=*/false);
+    bSpec = std::move(b);
+  }
+
+  void run(std::complex<double> *line, bool inverse) const {
+    if (chirp.empty()) {
+      pow2->run(line, inverse);
+      return;
+    }
+    if (inverse) {
+      // ifft(x) = conj(fft(conj(x))) / n
+      for (int64_t k = 0; k < n; ++k)
+        line[k] = std::conj(line[k]);
+      forward(line);
+      double scale = 1.0 / static_cast<double>(n);
+      for (int64_t k = 0; k < n; ++k)
+        line[k] = std::conj(line[k]) * scale;
+    } else {
+      forward(line);
+    }
+  }
+
+private:
+  void forward(std::complex<double> *line) const {
+    std::vector<std::complex<double>> a(m, std::complex<double>(0.0, 0.0));
+    for (int64_t k = 0; k < n; ++k)
+      a[k] = line[k] * chirp[k];
+    pow2->run(a.data(), /*inverse=*/false);
+    for (int64_t i = 0; i < m; ++i)
+      a[i] *= bSpec[i];
+    pow2->run(a.data(), /*inverse=*/true);
+    for (int64_t k = 0; k < n; ++k)
+      line[k] = a[k] * chirp[k];
+  }
+
+  int64_t n;
+  int64_t m = 0;
+  std::unique_ptr<FFTPlan> pow2;
+  std::vector<std::complex<double>> chirp;
+  std::vector<std::complex<double>> bSpec;
+};
+
 template <typename Scalar>
 void fft1d(const MemRefDescriptor<std::complex<Scalar>, 1> *in,
            MemRefDescriptor<std::complex<Scalar>, 1> *out, bool inverse) {
   int64_t n = in->sizes[0];
-  FFTPlan plan(n);
+  LinePlan plan(n);
   std::vector<std::complex<double>> line(n);
   for (int64_t i = 0; i < n; ++i)
     line[i] = std::complex<double>(in->at(i).real(), in->at(i).imag());
@@ -159,7 +259,7 @@ void fft2d(const MemRefDescriptor<std::complex<Scalar>, 2> *in,
   int64_t cols = in->sizes[1];
   int64_t numLines = (dim == 1) ? rows : cols;
   int64_t lineLen = (dim == 1) ? cols : rows;
-  FFTPlan plan(lineLen);
+  LinePlan plan(lineLen);
 
   parallelFor(numLines, [&](int64_t begin, int64_t end) {
     std::vector<std::complex<double>> line(lineLen);
@@ -183,7 +283,7 @@ void fft2d(const MemRefDescriptor<std::complex<Scalar>, 2> *in,
 }
 
 //===----------------------------------------------------------------------===//
-// Stolt interpolation
+// Windowed-sinc interpolation
 //===----------------------------------------------------------------------===//
 
 /// Normalized sinc, numpy convention: sinc(x) = sin(pi x) / (pi x).
@@ -194,30 +294,114 @@ double sinc(double x) {
   return std::sin(px) / px;
 }
 
-/// 8-tap windowed-sinc sample of a (double-precision) row at a fractional
+// Kernel / window encodings shared with the lowering pass.
+using sar_rt::kCubic;
+using sar_rt::kHamming;
+using sar_rt::kHann;
+using sar_rt::kKaiser;
+using sar_rt::kLinear;
+using sar_rt::kNearest;
+using sar_rt::kRect;
+using sar_rt::kSinc;
+
+/// Modified Bessel function of the first kind, order zero (power series;
+/// the term test exits well before the bound for the beta range the
+/// verifier admits). The iteration bound matches the HLS lowering's.
+double besselI0(double x) {
+  double sum = 1.0, term = 1.0;
+  double halfX = x / 2.0;
+  for (int m = 1; m <= 40; ++m) {
+    term *= (halfX / m) * (halfX / m);
+    sum += term;
+    if (term < 1e-16 * sum)
+      break;
+  }
+  return sum;
+}
+
+/// Window taper evaluated at t = d / (taps/2), |t| <= 1 on the support.
+double interpWindow(int64_t window, double t, double beta, double invI0Beta) {
+  switch (window) {
+  case kRect:
+    return 1.0;
+  case kHann:
+    return 0.5 + 0.5 * std::cos(M_PI * t);
+  case kHamming:
+    return 0.54 + 0.46 * std::cos(M_PI * t);
+  case kKaiser: {
+    double s = 1.0 - t * t;
+    return besselI0(beta * std::sqrt(s > 0.0 ? s : 0.0)) * invI0Beta;
+  }
+  }
+  return 1.0;
+}
+
+/// Kernel-based sample of a (double-precision) row at a fractional
 /// position; out-of-range taps contribute zero.
-inline std::complex<double> sampleWindowedSinc(
-    const std::complex<double> *row, int64_t cols, double position) {
+inline std::complex<double> sampleInterp(const std::complex<double> *row,
+                                         int64_t cols, double position,
+                                         int64_t kernel, int64_t taps,
+                                         int64_t window, double beta,
+                                         double invI0Beta) {
+  if (kernel == kNearest) {
+    int64_t idx = static_cast<int64_t>(std::floor(position + 0.5));
+    if (idx < 0 || idx >= cols)
+      return {0.0, 0.0};
+    return row[idx];
+  }
+
   int64_t idxInt = static_cast<int64_t>(std::floor(position));
+  double frac = position - static_cast<double>(idxInt);
   std::complex<double> acc(0.0, 0.0);
-  for (int64_t k = -3; k <= 4; ++k) {
+
+  if (kernel == kLinear) {
+    for (int64_t k = 0; k <= 1; ++k) {
+      int64_t idx = idxInt + k;
+      if (idx < 0 || idx >= cols)
+        continue;
+      acc += row[idx] * (k == 0 ? 1.0 - frac : frac);
+    }
+    return acc;
+  }
+
+  if (kernel == kCubic) {
+    // Keys cubic convolution, a = -0.5.
+    double s = frac, s2 = s * s, s3 = s2 * s;
+    double w[4] = {-0.5 * s3 + s2 - 0.5 * s, 1.5 * s3 - 2.5 * s2 + 1.0,
+                   -1.5 * s3 + 2.0 * s2 + 0.5 * s, 0.5 * s3 - 0.5 * s2};
+    for (int64_t k = -1; k <= 2; ++k) {
+      int64_t idx = idxInt + k;
+      if (idx < 0 || idx >= cols)
+        continue;
+      acc += row[idx] * w[k + 1];
+    }
+    return acc;
+  }
+
+  // Windowed sinc over `taps` taps centred on the position.
+  int64_t half = taps / 2;
+  for (int64_t k = 1 - half; k <= half; ++k) {
     int64_t idx = idxInt + k;
     if (idx < 0 || idx >= cols)
       continue;
     double dist = position - static_cast<double>(idx);
-    double weight = sinc(dist) * (0.5 + 0.5 * std::cos(M_PI * dist / 4.0));
+    double weight =
+        sinc(dist) *
+        interpWindow(window, dist / static_cast<double>(half), beta, invI0Beta);
     acc += row[idx] * weight;
   }
   return acc;
 }
 
-/// Generic per-row windowed-sinc resampling (the sar.interp1d kernel).
+/// Generic per-row resampling (the sar.interp1d kernel).
 template <typename Scalar>
 void interp1d2d(const MemRefDescriptor<std::complex<Scalar>, 2> *data,
                 const MemRefDescriptor<double, 2> *positions,
-                MemRefDescriptor<std::complex<Scalar>, 2> *out) {
+                MemRefDescriptor<std::complex<Scalar>, 2> *out, int64_t kernel,
+                int64_t taps, int64_t window, double beta) {
   int64_t rows = data->sizes[0];
   int64_t cols = data->sizes[1];
+  double invI0Beta = window == kKaiser ? 1.0 / besselI0(beta) : 1.0;
   parallelFor(rows, [&](int64_t begin, int64_t end) {
     std::vector<std::complex<double>> row(cols);
     for (int64_t i = begin; i < end; ++i) {
@@ -227,61 +411,10 @@ void interp1d2d(const MemRefDescriptor<std::complex<Scalar>, 2> *data,
       }
       for (int64_t j = 0; j < cols; ++j) {
         std::complex<double> acc =
-            sampleWindowedSinc(row.data(), cols, positions->at(i, j));
-        out->at(i, j) =
-            std::complex<Scalar>(static_cast<Scalar>(acc.real()),
-                                 static_cast<Scalar>(acc.imag()));
-      }
-    }
-  });
-}
-
-/// Windowed-sinc Stolt remapping. See the sar.stolt_interp op documentation
-/// for the exact formula; this mirrors the omega-K numpy reference
-/// implementation (taps k in [-3, 4], cosine window of half-width 4).
-template <typename Scalar>
-void stolt2d(const MemRefDescriptor<std::complex<Scalar>, 2> *data,
-             const MemRefDescriptor<double, 1> *fa,
-             const MemRefDescriptor<double, 1> *fr,
-             MemRefDescriptor<std::complex<Scalar>, 2> *out, double c,
-             double fc, double vr, double tShift) {
-  int64_t rows = data->sizes[0];
-  int64_t cols = data->sizes[1];
-  double fStart = fr->at(0);
-  double df = fr->at(1) - fr->at(0);
-
-  // Phase ramp applied to the input spectrum before interpolation.
-  std::vector<std::complex<double>> smooth(cols);
-  for (int64_t j = 0; j < cols; ++j) {
-    double phase = 2.0 * M_PI * fr->at(j) * tShift;
-    smooth[j] = std::complex<double>(std::cos(phase), std::sin(phase));
-  }
-
-  parallelFor(rows, [&](int64_t begin, int64_t end) {
-    std::vector<std::complex<double>> row(cols);
-    for (int64_t i = begin; i < end; ++i) {
-      for (int64_t j = 0; j < cols; ++j) {
-        const std::complex<Scalar> &v = data->at(i, j);
-        row[j] = std::complex<double>(v.real(), v.imag()) * smooth[j];
-      }
-      double faTerm = c * fa->at(i) / (2.0 * vr);
-      for (int64_t j = 0; j < cols; ++j) {
-        double frj = fr->at(j);
-        double term = (frj + fc) * (frj + fc) + faTerm * faTerm;
-        double frQuery = std::sqrt(std::max(term, 1e-10)) - fc;
-        double idxFloat = (frQuery - fStart) / df;
-
-        std::complex<double> acc =
-            sampleWindowedSinc(row.data(), cols, idxFloat);
-        // De-smoothing uses the *output-grid* frequency fr[j]: after the
-        // remapping the sample lives at fr[j] on the new axis, so the
-        // window-reference ramp is restored there. Using frQuery instead
-        // would add a phase proportional to fa^2 (an azimuth defocus).
-        double phase = -2.0 * M_PI * frj * tShift;
-        acc *= std::complex<double>(std::cos(phase), std::sin(phase));
-        out->at(i, j) =
-            std::complex<Scalar>(static_cast<Scalar>(acc.real()),
-                                 static_cast<Scalar>(acc.imag()));
+            sampleInterp(row.data(), cols, positions->at(i, j), kernel, taps,
+                         window, beta, invI0Beta);
+        out->at(i, j) = std::complex<Scalar>(static_cast<Scalar>(acc.real()),
+                                             static_cast<Scalar>(acc.imag()));
       }
     }
   });
@@ -295,9 +428,12 @@ void stolt2d(const MemRefDescriptor<std::complex<Scalar>, 2> *data,
 
 extern "C" {
 
-void _mlir_ciface_sar_rt_fft_1d_c64(MemRefDescriptor<std::complex<float>, 1> *in,
-                                    MemRefDescriptor<std::complex<float>, 1> *out,
-                                    int64_t /*dim*/, bool inverse) {
+void _mlir_ciface_sar_rt_fft_1d_c64(
+    MemRefDescriptor<std::complex<float>, 1> *in,
+    MemRefDescriptor<std::complex<float>, 1> *out, int64_t /*dim*/,
+    bool inverse) {
+  assert(in->sizes[0] == out->sizes[0] &&
+         "FFT output shape must match input shape");
   fft1d<float>(in, out, inverse);
 }
 
@@ -305,49 +441,51 @@ void _mlir_ciface_sar_rt_fft_1d_c128(
     MemRefDescriptor<std::complex<double>, 1> *in,
     MemRefDescriptor<std::complex<double>, 1> *out, int64_t /*dim*/,
     bool inverse) {
+  assert(in->sizes[0] == out->sizes[0] &&
+         "FFT output shape must match input shape");
   fft1d<double>(in, out, inverse);
 }
 
-void _mlir_ciface_sar_rt_fft_2d_c64(MemRefDescriptor<std::complex<float>, 2> *in,
-                                    MemRefDescriptor<std::complex<float>, 2> *out,
-                                    int64_t dim, bool inverse) {
+void _mlir_ciface_sar_rt_fft_2d_c64(
+    MemRefDescriptor<std::complex<float>, 2> *in,
+    MemRefDescriptor<std::complex<float>, 2> *out, int64_t dim, bool inverse) {
+  assert(in->sizes[0] == out->sizes[0] && in->sizes[1] == out->sizes[1] &&
+         "FFT output shape must match input shape");
   fft2d<float>(in, out, dim, inverse);
 }
 
 void _mlir_ciface_sar_rt_fft_2d_c128(
     MemRefDescriptor<std::complex<double>, 2> *in,
     MemRefDescriptor<std::complex<double>, 2> *out, int64_t dim, bool inverse) {
+  assert(in->sizes[0] == out->sizes[0] && in->sizes[1] == out->sizes[1] &&
+         "FFT output shape must match input shape");
   fft2d<double>(in, out, dim, inverse);
 }
 
 void _mlir_ciface_sar_rt_interp1d_2d_c64(
     MemRefDescriptor<std::complex<float>, 2> *data,
     MemRefDescriptor<double, 2> *positions,
-    MemRefDescriptor<std::complex<float>, 2> *out) {
-  interp1d2d<float>(data, positions, out);
+    MemRefDescriptor<std::complex<float>, 2> *out, int64_t kernel, int64_t taps,
+    int64_t window, double beta) {
+  assert(data->sizes[0] == positions->sizes[0] &&
+         data->sizes[1] == positions->sizes[1] &&
+         "interp1d positions shape must match data shape");
+  assert(data->sizes[0] == out->sizes[0] && data->sizes[1] == out->sizes[1] &&
+         "interp1d output shape must match data shape");
+  interp1d2d<float>(data, positions, out, kernel, taps, window, beta);
 }
 
 void _mlir_ciface_sar_rt_interp1d_2d_c128(
     MemRefDescriptor<std::complex<double>, 2> *data,
     MemRefDescriptor<double, 2> *positions,
-    MemRefDescriptor<std::complex<double>, 2> *out) {
-  interp1d2d<double>(data, positions, out);
-}
-
-void _mlir_ciface_sar_rt_stolt_2d_c64(
-    MemRefDescriptor<std::complex<float>, 2> *data,
-    MemRefDescriptor<double, 1> *fa, MemRefDescriptor<double, 1> *fr,
-    MemRefDescriptor<std::complex<float>, 2> *out, double c, double fc,
-    double vr, double tShift) {
-  stolt2d<float>(data, fa, fr, out, c, fc, vr, tShift);
-}
-
-void _mlir_ciface_sar_rt_stolt_2d_c128(
-    MemRefDescriptor<std::complex<double>, 2> *data,
-    MemRefDescriptor<double, 1> *fa, MemRefDescriptor<double, 1> *fr,
-    MemRefDescriptor<std::complex<double>, 2> *out, double c, double fc,
-    double vr, double tShift) {
-  stolt2d<double>(data, fa, fr, out, c, fc, vr, tShift);
+    MemRefDescriptor<std::complex<double>, 2> *out, int64_t kernel,
+    int64_t taps, int64_t window, double beta) {
+  assert(data->sizes[0] == positions->sizes[0] &&
+         data->sizes[1] == positions->sizes[1] &&
+         "interp1d positions shape must match data shape");
+  assert(data->sizes[0] == out->sizes[0] && data->sizes[1] == out->sizes[1] &&
+         "interp1d output shape must match data shape");
+  interp1d2d<double>(data, positions, out, kernel, taps, window, beta);
 }
 
 } // extern "C"

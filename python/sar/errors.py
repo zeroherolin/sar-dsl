@@ -19,9 +19,8 @@ class CompilationError(SARError):
         self.command = list(command)
         self.stderr = stderr
         pretty = " ".join(str(c) for c in self.command)
-        super().__init__(
-            f"stage '{stage}' failed\n  command: {pretty}\n"
-            f"---- tool output ----\n{stderr.strip()}")
+        super().__init__(f"stage '{stage}' failed\n  command: {pretty}\n"
+                         f"---- tool output ----\n{stderr.strip()}")
 
 
 class LaunchError(SARError):

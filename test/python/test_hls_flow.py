@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 
 from conftest import requires_cpu, requires_scalehls
-from test_affine_fft import _compile_split_kernel, _run_split
+from conftest import compile_split_kernel as _compile_split_kernel
+from conftest import run_split as _run_split
 
 from common.params import synthetic_params
 from common.simulate import demo_scene
@@ -34,58 +35,30 @@ def scene():
 # Interpolation ops through the affine path
 # --------------------------------------------------------------------- #
 
-@requires_cpu
-def test_affine_stolt_matches_runtime(tmp_path):
-    n, m = 16, 32
-    c, fc, vr, t_shift = 3.0e8, 1.27e9, 7100.0, 1.5e-4
-    mlir = f"""
-func.func @st(%d: tensor<{n}x{m}xcomplex<f64>>, %fa: tensor<{n}xf64>,
-              %fr: tensor<{m}xf64>) -> tensor<{n}x{m}xcomplex<f64>> {{
-  %0 = sar.stolt_interp %d, %fa, %fr {{c = {c}, fc = {fc}, vr = {vr},
-        t_shift = {t_shift}}}
-      : (tensor<{n}x{m}xcomplex<f64>>, tensor<{n}xf64>, tensor<{m}xf64>)
-      -> (tensor<{n}x{m}xcomplex<f64>>)
-  return %0 : tensor<{n}x{m}xcomplex<f64>>
-}}
-"""
-    lib, fn = _compile_split_kernel(mlir, "st", tmp_path,
-                                    pipeline="--sar-affine-to-llvm-pipeline")
-
-    rng = np.random.default_rng(5)
-    data = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
-    fa = np.fft.fftshift(np.fft.fftfreq(n, d=1 / 2000.0))
-    fr = np.fft.fftshift(np.fft.fftfreq(m, d=1 / 3.2e7))
-    re, im = np.ascontiguousarray(data.real), np.ascontiguousarray(data.imag)
-
-    out_re, out_im = _run_split(fn, [re, im, fa, fr], [(n, m), (n, m)],
-                                np.float64)
-
-    import sar
-
-    @sar.jit
-    def runtime_kernel(d: sar.c128[n, m], fa_: sar.f64[n],
-                       fr_: sar.f64[m]) -> sar.c128[n, m]:
-        return sar.stolt_interp(d, fa_, fr_, c=c, fc=fc, vr=vr,
-                                t_shift=t_shift)
-
-    want = runtime_kernel(data, fa, fr)
-    np.testing.assert_allclose(out_re + 1j * out_im, want, rtol=1e-11,
-                               atol=1e-11)
-
 
 @requires_cpu
-def test_affine_interp1d_matches_runtime(tmp_path):
+@pytest.mark.parametrize("attrs,kwargs", [
+    ("", {}),
+    ('{kernel = "nearest"}', dict(kernel="nearest")),
+    ('{kernel = "linear"}', dict(kernel="linear")),
+    ('{kernel = "cubic"}', dict(kernel="cubic")),
+    ('{taps = 16 : i64, window = "kaiser", beta = 4.0 : f64}',
+     dict(taps=16, window="kaiser", beta=4.0)),
+])
+def test_affine_interp1d_matches_runtime(tmp_path, attrs, kwargs):
     n, m = 8, 32
     mlir = f"""
 func.func @ip(%d: tensor<{n}x{m}xcomplex<f64>>, %p: tensor<{n}x{m}xf64>)
     -> tensor<{n}x{m}xcomplex<f64>> {{
-  %0 = sar.interp1d %d, %p
+  %0 = sar.interp1d %d, %p {attrs}
       : (tensor<{n}x{m}xcomplex<f64>>, tensor<{n}x{m}xf64>)
       -> (tensor<{n}x{m}xcomplex<f64>>)
   return %0 : tensor<{n}x{m}xcomplex<f64>>
 }}
 """
-    lib, fn = _compile_split_kernel(mlir, "ip", tmp_path,
+    lib, fn = _compile_split_kernel(mlir,
+                                    "ip",
+                                    tmp_path,
                                     pipeline="--sar-affine-to-llvm-pipeline")
 
     rng = np.random.default_rng(6)
@@ -98,13 +71,14 @@ func.func @ip(%d: tensor<{n}x{m}xcomplex<f64>>, %p: tensor<{n}x{m}xf64>)
 
     import sar
 
-    @sar.jit
-    def runtime_kernel(d: sar.c128[n, m],
-                       p: sar.f64[n, m]) -> sar.c128[n, m]:
-        return sar.interp1d(d, p)
+    @sar.func
+    def runtime_kernel(d: sar.c128[n, m], p: sar.f64[n, m]) -> sar.c128[n, m]:
+        return sar.interp1d(d, p, **kwargs)
 
     want = runtime_kernel(data, positions)
-    np.testing.assert_allclose(out_re + 1j * out_im, want, rtol=1e-11,
+    np.testing.assert_allclose(out_re + 1j * out_im,
+                               want,
+                               rtol=1e-11,
                                atol=1e-11)
 
 
@@ -112,18 +86,21 @@ func.func @ip(%d: tensor<{n}x{m}xcomplex<f64>>, %p: tensor<{n}x{m}xf64>)
 # Complete algorithms
 # --------------------------------------------------------------------- #
 
+
 @requires_cpu
 def test_wka_affine_ir_matches_numpy(scene, tmp_path):
     """The full omega-K chain in HLS-flavored IR, executed on CPU."""
     params, raw = scene
     kernel = build_wka_kernel(N, params)
-    lib, fn = _compile_split_kernel(kernel.to_mlir(), "wka", tmp_path,
+    lib, fn = _compile_split_kernel(kernel.to_mlir(),
+                                    "wka",
+                                    tmp_path,
                                     pipeline="--sar-affine-to-llvm-pipeline")
 
-    fa, fr, wr, wa = wka_inputs(N, params)
+    wr, wa = wka_inputs(N, params)
     re = np.ascontiguousarray(raw.real)
     im = np.ascontiguousarray(raw.imag)
-    (out,) = _run_split(fn, [re, im, fa, fr, wr, wa], [(N, N)], np.float32)
+    (out, ) = _run_split(fn, [re, im, wr, wa], [(N, N)], np.float32)
 
     ref = WKAProcessor(N, params).process(raw)
     peak = float(ref.max())
@@ -135,8 +112,8 @@ def test_wka_emits_hls_design(scene):
     """The headline: the complete omega-K kernel becomes one HLS design."""
     params, _ = scene
     n = 64  # keep the HIDA optimization time in check
-    design = build_wka_kernel(n, synthetic_params(n)).compile(
-        backend="scalehls")
+    design = build_wka_kernel(n,
+                              synthetic_params(n)).compile(backend="scalehls")
     assert design.flow == "affine"
     source = design.source()
     assert "void wka" in source
@@ -148,8 +125,8 @@ def test_rda_emits_hls_design():
     from rda.algorithm import build_kernel as build_rda_kernel
 
     n = 64
-    design = build_rda_kernel(n, synthetic_params(n)).compile(
-        backend="scalehls")
+    design = build_rda_kernel(n,
+                              synthetic_params(n)).compile(backend="scalehls")
     assert design.flow == "affine"
     source = design.source()
     assert "void rda" in source

@@ -30,8 +30,8 @@ def setup():
 def test_csa_matches_numpy_reference(setup):
     params, kernel, inputs = setup
     rng = np.random.default_rng(31)
-    raw = (rng.standard_normal((N, N))
-           + 1j * rng.standard_normal((N, N))).astype(np.complex64)
+    raw = (rng.standard_normal((N, N)) + 1j * rng.standard_normal(
+        (N, N))).astype(np.complex64)
 
     ref = CSAProcessor(N, params).process(raw)
     out = kernel(raw, *inputs)
@@ -49,7 +49,7 @@ def test_csa_focuses_point_target(setup):
     assert abs(i - N // 2) <= 1 and abs(j - N // 2) <= 1
 
     window = image[i - 3:i + 4, j - 3:j + 4]
-    energy_fraction = (window ** 2).sum() / (image ** 2).sum()
+    energy_fraction = (window**2).sum() / (image**2).sum()
     assert energy_fraction > 0.8
 
 
@@ -64,8 +64,8 @@ def test_csa_and_wka_agree_on_point_target(setup):
     csa_img = csa_kernel(raw, *csa_in).astype(np.float64)
 
     wka_kernel = build_wka_kernel(N, params)
-    fa, fr, wr, wa = wka_inputs(N, params)
-    wka_img = wka_kernel(raw, fa, fr, wr, wa).astype(np.float64)
+    wr, wa = wka_inputs(N, params)
+    wka_img = wka_kernel(raw, wr, wa).astype(np.float64)
 
     csa_peak = np.unravel_index(np.argmax(csa_img), csa_img.shape)
     wka_peak = np.unravel_index(np.argmax(wka_img), wka_img.shape)
@@ -76,8 +76,8 @@ def test_csa_and_wka_agree_on_point_target(setup):
 @requires_scalehls
 def test_csa_emits_hls_design():
     n = 64
-    design = build_csa_kernel(n, synthetic_params(n)).compile(
-        backend="scalehls")
+    design = build_csa_kernel(n,
+                              synthetic_params(n)).compile(backend="scalehls")
     assert design.flow == "affine"
     source = design.source()
     assert "void csa" in source

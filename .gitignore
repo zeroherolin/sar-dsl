@@ -9,6 +9,7 @@ __pycache__/
 *.egg-info/
 dist/
 .pytest_cache/
+.ruff_cache/
 python/sar/_build_config.py
 # backend plugins are linked/copied in from third_party/
 python/sar/backends/*
@@ -28,6 +29,7 @@ examples/data/ALPSRP*
 examples/data/*.bin
 *_cpu.png
 *_hls.cpp
+hls_project/
 /san_francisco_*.png
 
 # OS

@@ -11,36 +11,55 @@ ranked tensors with **static shapes**; supported element types are `f32`,
 | `sar.add/sub/mul/div` | `(T, T) -> T` | float, int or complex elements |
 | `sar.add_scalar` | `(T) -> T`, `scalar: f64` | complex: added to real part |
 | `sar.mul_scalar` | `(T) -> T`, `scalar: f64` | |
-| `sar.max_scalar` | `(T) -> T`, `scalar: f64` | float only (`np.maximum(x, s)`) |
-| `sar.neg` | `(T) -> T` | float/complex |
 | `sar.sqrt` | `(T) -> T` | float only |
-| `sar.cos` / `sar.sin` | `(T) -> T` | float only |
+| `sar.cos` / `sar.sin` / `sar.exp` / `sar.log` | `(T) -> T` | float only |
+| `sar.atan2` | `(T, T) -> T` | float only; numpy argument order `(y, x)` |
 | `sar.abs` | `(complex<t>|t) -> t` | complex magnitude / float abs |
-| `sar.expj` | `(t) -> complex<t>` | `cos(x) + j sin(x)` |
-| `sar.cast` | `(T) -> U` | float<->float, complex<->complex, float->complex |
+| `sar.cmp` | `(t, t) -> t`, `predicate` | 0.0/1.0 mask (frontend: `x > y`, `x == 0.0`, ...) |
+| `sar.where` | `(t, T, T) -> T` | exact per-element selection by a mask (numpy `where`) |
+| `sar.conj` | `(complex<t>) -> complex<t>` | complex conjugate |
+| `sar.real` / `sar.imag` | `(complex<t>) -> t` | plane extraction |
+| `sar.complex` | `(t, t) -> complex<t>` | assemble from (re, im) planes |
+| `sar.cast` | `(T) -> U` | float<->float, complex<->complex, float->complex, int<->int, int->float, float->int (truncation) |
 | `sar.constant` | `() -> T` | dense elements attribute |
+
+## Reductions
+
+| Op | Semantics |
+|----|-----------|
+| `sar.reduce {kind, dim}` | rank-2 -> rank-1 along `dim`; `kind` is `sum` (float/complex) or `max`/`min` (float); rank-1 inputs are normalized to `1 x n` by the frontend |
+| `sar.argmax {dim}` | rank-2 float -> rank-1 i64 indices (numpy `argmax`: first occurrence on ties) |
 
 ## Data movement
 
 | Op | Semantics |
 |----|-----------|
 | `sar.transpose` | rank-2 corner turn |
+| `sar.reverse {dim}` | element order reversed along one axis (frontend: `sar.flip`) |
 | `sar.broadcast {dim}` | 1-D -> 2-D; the vector lies along axis `dim` |
+| `sar.slice {offsets, sizes, strides}` | statically strided sub-tensor (numpy basic slicing; frontend: `x[2:6, ::2]`) |
+| `sar.concat {dim}` | concatenation of two tensors along `dim` |
+| `sar.pad {low, high, value}` | constant padding per axis (numpy `pad`) |
 | `sar.fftshift {dim, inverse?}` | numpy `fftshift`/`ifftshift` along one axis |
 
 ## Signal processing
 
 | Op | Semantics |
 |----|-----------|
-| `sar.fft {dim}` | unscaled forward DFT along `dim` (numpy convention); size must be a power of two |
+| `sar.fft {dim}` | unscaled forward DFT along `dim` (numpy convention); any size >= 2 on both backends (radix-2 where the size allows, Bluestein's chirp-z reduction otherwise) |
 | `sar.ifft {dim}` | inverse DFT scaled by `1/N` |
 | `sar.fft_split {dim, inverse?}` | split-complex FFT on (re, im) float planes; produced by `sar-decomplexify`, not by the frontend |
-| `sar.interp1d` | windowed-sinc resampling of each row at fractional `positions` (f64 tensor); the orthogonal primitive behind Stolt remapping and RCMC |
-| `sar.interp1d_split` / `sar.stolt_interp_split` | split-complex forms of the interpolation ops; produced by `sar-decomplexify` |
-| `sar.stolt_interp {c, fc, vr, t_shift}` | omega-K Stolt remapping (a fused special case of position computation + `sar.interp1d`); operands: 2-D complex spectrum, `fa` (azimuth axis, f64), `fr` (range axis, f64) |
+| `sar.interp1d {dim?, kernel?, taps?, window?, beta?}` | resampling along `dim` (default 1) at fractional `positions` (f64 tensor) with a selectable kernel: `nearest`, `linear`, `cubic` (Keys) or `sinc` (default: 8 taps); sinc taper: `rect`/`hann`/`hamming`/`kaiser(beta)`. The orthogonal primitive behind Stolt remapping and RCMC |
+| `sar.interp1d_split` | split-complex form of `sar.interp1d`; produced by `sar-decomplexify` |
 
 Exact formulas are documented on the ops themselves
 (`include/sar/Dialect/SAR/IR/SAROps.td`).
+
+Anything expressible as a composition of these primitives lives in the
+Python DSL layer instead of the IR: `sar.expj`, `sar.angle`, `sar.maximum`,
+negation, `sar.multilook` and `sar.stolt_interp` all trace to primitive
+graphs and rely on element-wise fusion for performance (see
+[architecture.md](architecture.md)).
 
 ## Example
 
@@ -66,15 +85,22 @@ Passes:
   become `fft_split`. Enables targets without complex support.
 - `--convert-sar-to-linalg`: element-wise/structural ops to
   linalg-on-tensors. Signal ops are illegal here.
-- `--convert-sar-signal-to-runtime`: `fft`/`ifft`/`stolt_interp`/`interp1d`
-  to `libsar_runtime` calls (`_mlir_ciface_sar_rt_*`).
+- `--convert-sar-signal-to-runtime`: `fft`/`ifft`/`interp1d` to
+  `libsar_runtime` calls (`_mlir_ciface_sar_rt_*`).
 - `--convert-sar-fft-to-affine`: `fft_split` to radix-2 **Stockham** affine
   loop nests with constant twiddle globals (no bit-reversal, fully affine
-  accesses -- HLS-friendly).
-- `--convert-sar-interp-to-affine`: the split interpolation ops to affine
-  loops with statically unrolled windowed-sinc taps; gathers use clamped
+  accesses -- HLS-friendly); non-power-of-two sizes go through
+  **Bluestein**'s chirp-z reduction, whose chirp and kernel spectrum are
+  folded into constants at compile time.
+- `--convert-sar-interp-to-affine`: `interp1d_split` to affine loops
+  with the interpolation taps statically unrolled (the Kaiser window's
+  Bessel `I0` expands into a straight-line power series); gathers use
+  clamped
   data-dependent loads masked by selects (straight-line bodies, no control
   flow).
+- `--sar-emit-c-interface`: attaches `llvm.emit_c_interface` to public
+  functions (kernel entry points) so the ctypes launcher finds the
+  `_mlir_ciface_*` wrappers; private declarations keep plain C symbols.
 
 Registered pipelines (see `lib/Pipelines/`):
 

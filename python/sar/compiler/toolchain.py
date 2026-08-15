@@ -76,11 +76,14 @@ def find_runtime_library() -> str:
         "SAR_DSL_RUNTIME_LIB")
 
 
-def run_tool(stage: str, command: Sequence[str],
+def run_tool(stage: str,
+             command: Sequence[str],
              input_text: Optional[str] = None) -> str:
     """Runs a tool, returning stdout; raises CompilationError on failure."""
-    proc = subprocess.run(
-        list(command), input=input_text, capture_output=True, text=True)
+    proc = subprocess.run(list(command),
+                          input=input_text,
+                          capture_output=True,
+                          text=True)
     if proc.returncode != 0:
         raise CompilationError(stage, command, proc.stderr or proc.stdout)
     return proc.stdout

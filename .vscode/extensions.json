@@ -2,6 +2,12 @@
     "recommendations": [
         "llvm-vs-code-extensions.vscode-clangd",
         "llvm-vs-code-extensions.vscode-mlir",
-        "ms-python.python"
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "twxs.cmake"
+    ],
+    "unwantedRecommendations": [
+        "ms-vscode.cpptools"
     ]
 }

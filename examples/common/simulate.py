@@ -13,8 +13,10 @@ import numpy as np
 
 from .params import RadarParams
 
-__all__ = ["PointTarget", "simulate_point_targets", "demo_scene",
-           "single_target_scene"]
+__all__ = [
+    "PointTarget", "simulate_point_targets", "demo_scene",
+    "single_target_scene"
+]
 
 
 @dataclass(frozen=True)
@@ -41,24 +43,23 @@ def simulate_point_targets(n: int, p: RadarParams,
         r0_t = p.r0 + target.range_offset
         eta_c = target.azimuth_offset / p.vr
         # Instantaneous slant range (hyperbolic model).
-        r_eta = np.sqrt(r0_t ** 2 + (p.vr * (eta - eta_c)) ** 2)
+        r_eta = np.sqrt(r0_t**2 + (p.vr * (eta - eta_c))**2)
 
         delay = 2.0 * r_eta / p.c
         t = tau[np.newaxis, :] - delay[:, np.newaxis]
         envelope = (np.abs(t) <= pulse_len / 2.0)
 
-        phase = (-4.0 * np.pi * p.fc * r_eta[:, np.newaxis] / p.c
-                 + np.pi * p.kr * t ** 2)
+        phase = (-4.0 * np.pi * p.fc * r_eta[:, np.newaxis] / p.c +
+                 np.pi * p.kr * t**2)
         raw += target.rcs * envelope * np.exp(1j * phase)
 
     return raw.astype(np.complex64)
 
 
-def demo_scene(n: int, p: RadarParams) -> Tuple[np.ndarray,
-                                                List[PointTarget]]:
+def demo_scene(n: int, p: RadarParams) -> Tuple[np.ndarray, List[PointTarget]]:
     """A small constellation of point targets plus the raw echoes."""
-    swath = n / p.fs * p.c / 2.0          # slant-range extent (m)
-    strip = n / p.prf * p.vr              # along-track extent (m)
+    swath = n / p.fs * p.c / 2.0  # slant-range extent (m)
+    strip = n / p.prf * p.vr  # along-track extent (m)
     targets = [
         PointTarget(0.0, 0.0, 1.0),
         PointTarget(-0.15 * swath, -0.2 * strip, 0.8),

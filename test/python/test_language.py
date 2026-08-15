@@ -13,7 +13,7 @@ from sar.language import TraceError
 def test_trace_emits_generic_ops():
     N = 16
 
-    @sar.jit
+    @sar.func
     def k(x: sar.f32[N, N], y: sar.f32[N, N]) -> sar.f32[N, N]:
         return x * 2.0 + y
 
@@ -27,10 +27,11 @@ def test_trace_emits_generic_ops():
 def test_trace_signal_ops():
     N = 32
 
-    @sar.jit
+    @sar.func
     def k(x: sar.c64[N, N]) -> sar.c64[N, N]:
-        return sar.ifftshift(sar.ifft(sar.fftshift(sar.fft(x, dim=0),
-                                                   dim=0), dim=1), dim=1)
+        return sar.ifftshift(sar.ifft(sar.fftshift(sar.fft(x, dim=0), dim=0),
+                                      dim=1),
+                             dim=1)
 
     text = k.to_mlir()
     assert '"sar.fft"' in text and '"sar.ifft"' in text
@@ -38,34 +39,45 @@ def test_trace_signal_ops():
 
 
 def test_shape_mismatch_raises_at_trace_time():
-    @sar.jit
+
+    @sar.func
     def k(x: sar.f32[4, 4], y: sar.f32[8, 8]) -> sar.f32[4, 4]:
         return x + y
 
-    with pytest.raises(TraceError, match="operand types differ"):
+    with pytest.raises(TraceError, match="operand shapes differ"):
         k.to_mlir()
 
 
-def test_dtype_mismatch_suggests_cast():
-    @sar.jit
+def test_mixed_dtypes_promote_numpy_style():
+
+    @sar.func
     def k(x: sar.c64[4], y: sar.c128[4]) -> sar.c128[4]:
         return x * y
 
-    with pytest.raises(TraceError, match="sar.cast"):
-        k.to_mlir()
+    text = k.to_mlir()
+    assert '"sar.cast"' in text  # c64 operand promoted to c128
+    assert text.count("complex<f64>") > text.count("complex<f32>")
 
 
-def test_fft_requires_power_of_two():
-    @sar.jit
+def test_fft_accepts_any_size_geq_two():
+
+    @sar.func
     def k(x: sar.c64[12]) -> sar.c64[12]:
         return sar.fft(x, dim=0)
 
-    with pytest.raises(TraceError, match="power of two"):
-        k.to_mlir()
+    assert '"sar.fft"' in k.to_mlir()
+
+    @sar.func
+    def too_small(x: sar.c64[4, 1]) -> sar.c64[4, 1]:
+        return sar.fft(x, dim=1)
+
+    with pytest.raises(TraceError, match="at least 2"):
+        too_small.to_mlir()
 
 
 def test_fft_requires_complex():
-    @sar.jit
+
+    @sar.func
     def k(x: sar.f32[16]) -> sar.f32[16]:
         return sar.fft(x, dim=0)
 
@@ -74,7 +86,8 @@ def test_fft_requires_complex():
 
 
 def test_result_type_checked_against_annotation():
-    @sar.jit
+
+    @sar.func
     def k(x: sar.f32[4, 4]) -> sar.f64[4, 4]:
         return x + 1.0
 
@@ -82,15 +95,28 @@ def test_result_type_checked_against_annotation():
         k.to_mlir()
 
 
-def test_missing_annotation_rejected():
+def test_unannotated_kernels_specialize_per_call():
+
+    @sar.func
+    def k(x):
+        return x * 2.0
+
+    assert isinstance(k, sar.language.GenericKernel)
+    variant = k.specialize(sar.f64[4])
+    assert "tensor<4xf64>" in variant.to_mlir()
+
+
+def test_partially_annotated_kernel_rejected():
     with pytest.raises(TraceError, match="type annotation"):
-        @sar.jit
-        def k(x) -> sar.f32[4]:
-            return x
+
+        @sar.func
+        def k(x, y: sar.f32[4]) -> sar.f32[4]:
+            return x + y
 
 
 def test_constant_from_numpy_array():
-    @sar.jit
+
+    @sar.func
     def k(x: sar.f64[4]) -> sar.f64[4]:
         return x * sar.constant(np.array([1.0, 2.0, 3.0, 4.0]))
 

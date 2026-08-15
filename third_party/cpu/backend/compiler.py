@@ -38,12 +38,12 @@ def _native_arch_flags() -> tuple:
     """
     clang = find_tool("clang")
     for flag in ("-march=native", "-mcpu=native"):
-        probe = subprocess.run(
-            [clang, flag, "-x", "c", "-", "-fsyntax-only"],
-            input="int main(void){return 0;}", capture_output=True,
-            text=True)
+        probe = subprocess.run([clang, flag, "-x", "c", "-", "-fsyntax-only"],
+                               input="int main(void){return 0;}",
+                               capture_output=True,
+                               text=True)
         if probe.returncode == 0:
-            return (flag,)
+            return (flag, )
     return ()
 
 
@@ -93,10 +93,9 @@ class Backend(BaseBackend):
         if cache.has("kernel.llvm.mlir"):
             return cache.read_text("kernel.llvm.mlir")
         cache.write_text("kernel.sar.mlir", module_text)
-        out = run_tool(
-            "sar-to-llvm",
-            [find_tool("sar-opt"), "--sar-to-llvm-pipeline", "-"],
-            input_text=module_text)
+        out = run_tool("sar-to-llvm",
+                       [find_tool("sar-opt"), "--sar-to-llvm-pipeline", "-"],
+                       input_text=module_text)
         cache.write_text("kernel.llvm.mlir", out)
         return out
 
@@ -105,10 +104,9 @@ class Backend(BaseBackend):
                        cache) -> str:
         if cache.has("kernel.ll"):
             return cache.read_text("kernel.ll")
-        out = run_tool(
-            "mlir-translate",
-            [find_tool("mlir-translate"), "--mlir-to-llvmir", "-"],
-            input_text=llvm_dialect)
+        out = run_tool("mlir-translate",
+                       [find_tool("mlir-translate"), "--mlir-to-llvmir", "-"],
+                       input_text=llvm_dialect)
         cache.write_text("kernel.ll", out)
         return out
 
@@ -122,10 +120,12 @@ class Backend(BaseBackend):
         runtime = find_runtime_library()
         opt_level = str(metadata.options.get("opt_level", 3))
         scratch = cache.scratch_path("kernel.so")
-        command = [find_tool("clang"), f"-O{opt_level}", "-shared", "-fPIC",
-                   str(ll_path), runtime, "-o", str(scratch), "-lm",
-                   f"-Wl,-rpath,{os.path.dirname(runtime)}",
-                   "-Wno-override-module"]
+        command = [
+            find_tool("clang"), f"-O{opt_level}", "-shared", "-fPIC",
+            str(ll_path), runtime, "-o",
+            str(scratch), "-lm", f"-Wl,-rpath,{os.path.dirname(runtime)}",
+            "-Wno-override-module"
+        ]
         if metadata.options.get("native_codegen", True):
             command += _native_arch_flags()
         command += _openmp_link_flags()

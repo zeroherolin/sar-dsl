@@ -44,15 +44,21 @@ def save_scene(image: np.ndarray, p: RadarParams, path: str,
     wy = np.clip(src_y - y0, 0.0, 1.0)[:, np.newaxis]
     resized = norm[y0, :] * (1.0 - wy) + norm[y1, :] * wy
 
-    import matplotlib
-    matplotlib.use("Agg")
+    from common.plot import apply_style
+    apply_style()
     import matplotlib.pyplot as plt
 
-    plt.figure(figsize=(10, 10 * out_h / w))
-    plt.imshow(resized, cmap="gray", vmin=0.0, vmax=1.0)
-    plt.title(title)
-    plt.xlabel("Range (ground projected)")
-    plt.ylabel("Azimuth")
-    plt.tight_layout()
-    plt.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close()
+    fig, ax = plt.subplots(figsize=(10, 10 * out_h / w))
+    ax.grid(False)
+    # Antialiased resampling: the swath is far wider than the output
+    # raster, and nearest-neighbour decimation aliases the speckle.
+    ax.imshow(resized,
+              cmap="gray",
+              vmin=0.0,
+              vmax=1.0,
+              interpolation="antialiased")
+    ax.set_title(title)
+    ax.set_xlabel("Range (ground projected)")
+    ax.set_ylabel("Azimuth")
+    fig.savefig(path, dpi=240)
+    plt.close(fig)

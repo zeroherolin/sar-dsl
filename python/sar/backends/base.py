@@ -1,9 +1,9 @@
 """Backend abstraction.
 
-A backend contributes an ordered set of *stages* (FlagTree/Triton style):
-each stage is a function ``(artifact, metadata, cache) -> artifact`` that
-refines the previous artifact, starting from the serialized `sar` dialect
-module. The final artifact is wrapped into a launcher by `make_launcher`.
+A backend contributes an ordered set of *stages*: each stage is a
+function ``(artifact, metadata, cache) -> artifact`` that refines the
+previous artifact, starting from the serialized `sar` dialect module.
+The final artifact is wrapped into a launcher by `make_launcher`.
 
 New hardware targets drop a package with a ``Backend`` subclass into
 ``third_party/<name>/backend`` (development) or ``sar/backends/<name>``

@@ -1,8 +1,8 @@
 """Packaging entry point.
 
-Mirrors the FlagTree/Triton convention: backend plugin packages living in
-``third_party/<vendor>/backend`` are copied into ``sar/backends/<vendor>``
-at build time so the installed package is self-contained.
+Backend plugin packages living in ``third_party/<vendor>/backend`` are
+copied into ``sar/backends/<vendor>`` at build time so the installed
+package is self-contained.
 """
 
 import shutil
@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent
 
 
 class BuildPyWithBackends(build_py):
+
     def run(self):
         backends_dir = ROOT / "python" / "sar" / "backends"
         for vendor_dir in sorted((ROOT / "third_party").glob("*/backend")):

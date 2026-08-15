@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Nightly full build: the toolchain-dependent suites (lit, e2e imaging
+    # chains, HLS emission) never run on the per-push job.
+    - cron: "0 2 * * *"
 
 jobs:
   # Frontend tests are pure Python: tracing, IR emission, error reporting
@@ -20,29 +24,85 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install numpy pytest pyflakes
-      - name: Lint
-        run: |
-          python -m pyflakes python/sar third_party test/python \
-            examples/wka/*.py examples/rda/*.py benchmarks/*.py
+      - run: pip install numpy pytest pre-commit
+      - name: Lint and format checks
+        run: pre-commit run --all-files --show-diff-on-failure
       - name: Frontend tests
-        run: PYTHONPATH=python python -m pytest test/python -q
+        run: |
+          set -o pipefail
+          PYTHONPATH=python python -m pytest test/python -q | tee pytest.out
+      # Most of the suite self-skips here (no toolchain), so a green run says
+      # little on its own. Pin the floor of tests that must actually execute:
+      # it only ever grows, and it fails loudly if a toolchain-free test is
+      # accidentally marked `requires_cpu` / `requires_scalehls`.
+      - name: Guard against silent coverage loss
+        run: |
+          PASSED=$(grep -oE '[0-9]+ passed' pytest.out | tail -1 | cut -d' ' -f1)
+          PASSED=${PASSED:-0}
+          FLOOR=26
+          echo "$PASSED toolchain-free tests ran (floor: $FLOOR)"
+          if [ "$PASSED" -lt "$FLOOR" ]; then
+            echo "::error::only $PASSED tests ran, expected at least $FLOOR;"\
+                 "a frontend test likely became toolchain-dependent"
+            exit 1
+          fi
 
-  # The full build (LLVM submodule + sar-opt + lit + e2e) takes hours of
-  # compute; run it on demand or on a schedule rather than per-push.
+  # The full build (LLVM + ScaleHLS + sar-opt + lit + e2e) takes hours from
+  # scratch, so it runs nightly and on demand, with the toolchain trees
+  # cached between runs.
   full-build:
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: false
-      - run: git submodule update --init externals/llvm-project
+
+      # The submodule gitlink SHAs key the toolchain caches. They are read
+      # from the superproject tree, so this works before `submodule update`.
+      - name: Resolve submodule revisions
+        id: subrev
+        run: |
+          echo "llvm=$(git rev-parse HEAD:externals/llvm-project)" >> "$GITHUB_OUTPUT"
+          echo "scalehls=$(git rev-parse HEAD:externals/ScaleHLS-HIDA)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install numpy pytest
       - run: sudo apt-get install -y ninja-build
-      - run: make llvm
+
+      - name: Cache LLVM/MLIR/Clang build
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: externals/llvm-project/build
+          key: llvm-${{ runner.os }}-${{ steps.subrev.outputs.llvm }}-${{ hashFiles('scripts/build-llvm.sh') }}
+
+      - name: Cache ScaleHLS-HIDA build
+        id: cache-scalehls
+        uses: actions/cache@v4
+        with:
+          path: externals/ScaleHLS-HIDA/build
+          key: scalehls-${{ runner.os }}-${{ steps.subrev.outputs.llvm }}-${{ steps.subrev.outputs.scalehls }}-${{ hashFiles('scripts/build-scalehls.sh') }}
+
+      # Sources are always needed: the cached build trees carry CMake configs
+      # that point back into the submodule source directories.
+      - name: Check out submodule sources
+        run: |
+          git submodule update --init externals/llvm-project
+          git submodule update --init externals/ScaleHLS-HIDA
+
+      - name: Build LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: make llvm
+
+      - name: Build ScaleHLS
+        if: steps.cache-scalehls.outputs.cache-hit != 'true'
+        run: make scalehls
+
       - run: make build
       - run: make test
