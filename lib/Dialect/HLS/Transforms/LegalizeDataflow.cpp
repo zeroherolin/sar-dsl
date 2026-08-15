@@ -236,11 +236,6 @@ struct LegalizeDataflow : public sar::impl::LegalizeDataflowBase<LegalizeDataflo
           !hasSharedExternalBuffer(schedule))
         schedule.setIsLegalAttr(UnitAttr::get(context));
     });
-
-    // // Reallocate internal buffers.
-    // patterns.clear();
-    // patterns.add<AllocateInternalBuffer>(context);
-    // (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
   }
 };
 } // namespace
