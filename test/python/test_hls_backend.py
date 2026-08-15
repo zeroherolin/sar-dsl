@@ -37,7 +37,7 @@ def test_hls_design_is_not_executable():
 
 def test_fft_kernel_emits_via_affine_flow():
     """Complex kernels with FFTs go through decomplexify + Stockham affine
-    lowering and the HIDA C++ entry point."""
+    lowering and the HLS pipeline."""
 
     @sar.func
     def spectrum(a: sar.c64[N, N], p: sar.f32[N, N]) -> sar.c64[N, N]:
@@ -64,7 +64,7 @@ def test_interp_kernel_emits_via_affine_flow():
 def test_every_construct_emits_hls():
     """Backend-symmetry gate: one kernel per DSL construct group must
     emit HLS C++ (transpose/broadcast/strided slices route to the
-    affine flow; HIDA's PyTorch entry cannot schedule them)."""
+    HLS pipeline)."""
     import numpy as np
 
     n = 16

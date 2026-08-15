@@ -10,7 +10,7 @@ arithmetic.
 | `algorithm.py` | The RDA chain in the DSL (`build_kernel`, `make_inputs`) |
 | `reference.py` | NumPy reference implementation (`RDAProcessor`) |
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
-| `run_point_target_scalehls.py` | Full scalehls-backend flow: HLS C++ design + csim package (`hls_project/`) |
+| `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 | `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset |
 
 ## Processing chain
@@ -41,7 +41,7 @@ basic form.
 ```bash
 # from the repository root, after `make build`
 python examples/rda/run_point_target_cpu.py --n 512          # focus + PNG
-python examples/rda/run_point_target_scalehls.py --n 256     # design + csim package
+python examples/rda/run_point_target_hls.py --n 256     # design + csim package
 ```
 
 ![synthetic point targets](assets/rda_synthetic_512.png)

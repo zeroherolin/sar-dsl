@@ -18,7 +18,7 @@ two pieces that go beyond straight op chaining:
 | `geometry.py` | Polar collection grid, inscribed target grid, phase-history simulation |
 | `reference.py` | NumPy reference implementation (`PFAProcessor`) |
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, measure, save a PNG |
-| `run_point_target_scalehls.py` | Full scalehls-backend flow: HLS C++ design + csim package (`hls_project/`) |
+| `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 
 PFA is a spotlight-mode algorithm, so unlike the stripmap examples
 ([wka](../wka/), [rda](../rda/), [csa](../csa/)) there is no
@@ -46,7 +46,7 @@ polar phase history (one arc per pulse)
 ```bash
 # from the repository root, after `make build`
 python examples/pfa/run_point_target_cpu.py --n 512       # focus + PNG
-python examples/pfa/run_point_target_scalehls.py --n 128  # design + csim package
+python examples/pfa/run_point_target_hls.py --n 128  # design + csim package
 ```
 
 SVA removes the -13 dB sidelobes of the uniform weighting with *zero*

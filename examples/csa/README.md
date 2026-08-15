@@ -10,7 +10,7 @@ exercises the pure phase-multiply path of the compiler on both backends.
 | `algorithm.py` | The CSA chain in the DSL (`build_kernel`, `make_inputs`) |
 | `reference.py` | NumPy reference implementation (`CSAProcessor`) |
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
-| `run_point_target_scalehls.py` | Full scalehls-backend flow: HLS C++ design + csim package (`hls_project/`) |
+| `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 | `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset |
 
 ## Processing chain (zero Doppler centroid)
@@ -39,7 +39,7 @@ multiply after azimuth compression.
 ```bash
 # from the repository root, after `make build`
 python examples/csa/run_point_target_cpu.py --n 512          # focus + PNG
-python examples/csa/run_point_target_scalehls.py --n 256     # design + csim package
+python examples/csa/run_point_target_hls.py --n 256     # design + csim package
 ```
 
 ![synthetic point targets](assets/csa_synthetic_512.png)

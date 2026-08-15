@@ -52,7 +52,6 @@ createFuncPreprocessPass(std::string hlsTopFunc = "forward");
 
 /// Dataflow-related passes.
 std::unique_ptr<Pass> createBalanceDataflowNodePass();
-std::unique_ptr<Pass> createBufferizeDataflowPass();
 std::unique_ptr<Pass>
 createConvertDataflowToFuncPass(bool splitExternalAccess = true);
 std::unique_ptr<Pass> createCreateDataflowFromAffinePass();
@@ -84,14 +83,10 @@ std::unique_ptr<Pass>
 createAffineLoopTilePass(unsigned loopTileSize = 1,
                         unsigned tileBufferBytes = 512 * 1024);
 std::unique_ptr<Pass> createRemoveVariableBoundPass();
-std::unique_ptr<Pass> createLowerAffinePass();
 
 /// Memory-related passes.
 std::unique_ptr<Pass> createAffineStoreForwardPass();
 std::unique_ptr<Pass> createCollapseMemrefUnitDimsPass();
-std::unique_ptr<Pass>
-createAffineLoopUnrollJamPass(unsigned loopUnrollFactor = 1,
-                              bool unrollPointLoopOnly = false);
 std::unique_ptr<Pass> createCreateMemrefSubviewPass(
     CreateSubviewMode createSubviewMode = CreateSubviewMode::Point);
 std::unique_ptr<Pass>
@@ -112,7 +107,6 @@ std::unique_ptr<Pass>
 createCreateAxiInterfacePass(std::string hlsTopFunc = "forward");
 std::unique_ptr<Pass> createCreateHLSPrimitivePass();
 std::unique_ptr<Pass> createLoopPipeliningPass();
-std::unique_ptr<Pass> createLowerAffinePass();
 
 #define GEN_PASS_DECL
 #define GEN_PASS_REGISTRATION

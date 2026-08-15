@@ -12,7 +12,7 @@ Quick start::
         return x * 2.0 + y
 
     out = scale_add(x_np, y_np)                    # run on CPU
-    hls = scale_add.compile(backend="scalehls")    # or emit HLS C++
+    hls = scale_add.compile(backend="hls")    # or emit HLS C++
 """
 
 from ._version import __version__

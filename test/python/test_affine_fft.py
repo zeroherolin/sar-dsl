@@ -1,7 +1,7 @@
 """Numerical validation of the split-complex affine (Stockham) FFT path.
 
 The `sar-affine-to-llvm-pipeline` compiles the same IR the ScaleHLS backend
-hands to HIDA, so passing here validates the HLS lowering's arithmetic
+hands to the HLS pipeline, so passing here validates the HLS lowering's arithmetic
 without needing an HLS simulator. The decomplexified ABI splits every
 complex tensor into (re, im) float planes, in order, inputs before results.
 """

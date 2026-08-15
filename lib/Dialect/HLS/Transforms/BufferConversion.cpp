@@ -1,6 +1,12 @@
+//===- BufferConversion.cpp - memref allocations to dataflow buffers ------===//
+//
+// Part of the SAR-DSL Project. Licensed under the MIT License.
+//
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Rewrites `memref.alloc`/`alloca`/`get_global` into the dialect's own
+// buffer ops, which carry the memory kind and initial value a synthesis
+// backend needs. Used by the passes that build the dataflow hierarchy.
 //
 //===----------------------------------------------------------------------===//
 
@@ -8,13 +14,6 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
-
-namespace mlir {
-namespace sar {
-#define GEN_PASS_DEF_BUFFERIZEDATAFLOW
-#include "sar/Dialect/HLS/Transforms/Passes.h.inc"
-} // namespace sar
-} // namespace mlir
 
 
 using namespace mlir;
@@ -155,26 +154,4 @@ void sar::populateBufferConversionPatterns(RewritePatternSet &patterns) {
   patterns.add<ConvertAllocToBuffer<memref::AllocOp>>(context);
   patterns.add<ConvertAllocToBuffer<memref::AllocaOp>>(context);
   patterns.add<ConvertGetGlobalToConstBuffer>(context);
-}
-
-namespace {
-struct BufferizeDataflow : public sar::impl::BufferizeDataflowBase<BufferizeDataflow> {
-  void runOnOperation() override {
-    auto func = getOperation();
-    auto context = func.getContext();
-
-    mlir::RewritePatternSet patterns(context);
-    populateBufferConversionPatterns(patterns);
-    patterns.add<BufferizeDispatchOrTask<DispatchOp>>(context);
-    patterns.add<BufferizeDispatchOrTask<TaskOp>>(context);
-    patterns.add<HoistBuffer<DispatchOp>>(context);
-    patterns.add<HoistBuffer<TaskOp>>(context);
-    patterns.add<BufferizeTensorEmpty>(context);
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
-  }
-};
-} // namespace
-
-std::unique_ptr<Pass> sar::createBufferizeDataflowPass() {
-  return std::make_unique<BufferizeDataflow>();
 }

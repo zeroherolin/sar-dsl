@@ -14,7 +14,7 @@ operations::
         return x * 2.0
 
     y = scale(np_array)                      # JIT on the CPU backend
-    design = scale.compile(backend="scalehls")   # emit HLS C++ instead
+    design = scale.compile(backend="hls")   # emit HLS C++ instead
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """End-to-end validation of the HLS (affine) flow on complete algorithms.
 
 Two complementary checks per algorithm:
-1. numerical: the exact IR handed to ScaleHLS-HIDA is compiled for the CPU
+1. numerical: the exact IR handed to ScaleHLS-the HLS pipeline is compiled for the CPU
    through `sar-affine-to-llvm-pipeline` and compared against the NumPy
    reference;
 2. emission: the ScaleHLS backend produces Vitis HLS C++ for the full
@@ -111,7 +111,7 @@ def test_wka_affine_ir_matches_numpy(scene, tmp_path):
 def test_wka_emits_hls_design(scene):
     """The headline: the complete omega-K kernel becomes one HLS design."""
     params, _ = scene
-    n = 64  # keep the HIDA optimization time in check
+    n = 64  # keep the the HLS pipeline optimization time in check
     design = build_wka_kernel(n,
                               synthetic_params(n)).compile(backend="hls")
     source = design.source()

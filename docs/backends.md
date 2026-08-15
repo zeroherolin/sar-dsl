@@ -7,13 +7,12 @@ package contributing an ordered set of compilation *stages*.
 
 ```python
 compiled = kernel.compile(backend="cpu")             # default
-design   = kernel.compile(backend="scalehls",
-                          options={"flow": "linalg",
-                                   "loop_tile_size": 16})
+design   = kernel.compile(backend="hls",
+                          options={"on_chip_budget": 8 << 20})
 print(sar.list_backends())                           # discovery
 ```
 
-## CPU backend (`third_party/cpu`)
+## CPU backend (`sar.backends.cpu`)
 
 Compiles kernels for the **host** CPU -- whatever machine the driver runs
 on. The lowering is architecture-neutral (LLVM dialect, portable runtime
@@ -33,50 +32,43 @@ results are allocated by the caller (destination-passing style).
 Options: `opt_level` (default 3), `native_codegen` (default True).
 `OMP_NUM_THREADS` controls loop parallelism at run time.
 
-## ScaleHLS backend (`third_party/scalehls`)
+## HLS backend (`sar.backends.hls`)
 
-Stages: `select-flow` -> `lower` -> `hls` (scalehls-opt HIDA +
-scalehls-translate). Returns an `HLSDesign` handle
-(`.cpp_path`, `.source()`, `.flow`); it is not executable.
+Stages: `lower` (`sar-opt --sar-to-affine-pipeline`) -> `hls`
+(`sar-opt -hls-pipeline` then `sar-translate -hls-emit-hlscpp`). Returns
+an `HLSDesign` handle (`.cpp_path`, `.source()`); it is not executable.
+
+The kernel is decomplexified (complex tensors become re/im float planes),
+FFTs become Stockham loop nests and interpolation becomes windowed-sinc
+gather loops. The resulting affine IR enters the HLS pipeline, which
+builds the dataflow hierarchy, places buffers on or off chip and shapes
+the interfaces. Generated top functions take each complex tensor as two
+adjacent float arrays (re, im).
+
+Every SAR operation has a lowering, so complete imaging chains (omega-K,
+range-Doppler, chirp scaling, polar format) emit as single HLS designs;
+the identical IR is validated numerically on the CPU through
+`--sar-affine-to-llvm-pipeline`. FFTs of any size >= 2 lower here: powers
+of two run Stockham directly, other sizes go through Bluestein's chirp-z
+reduction (two padded Stockham transforms with the chirp and kernel
+spectrum folded at compile time).
 
 `HLSDesign.write_testbench(inputs, expected, output_dir)` emits a
 self-contained C-simulation package: the design, a testbench comparing
-every output plane against golden data (from the NumPy reference or
-the cpu backend), the data files, a `vitis_hls` csim script (written
-against Vitis HLS 2022.2, the recommended version), and Vitis header
-stand-ins so the package also csims with any plain C++ compiler
+every output plane against golden data (from the NumPy reference or the
+cpu backend), the data files, a `vitis_hls` csim script (written against
+Vitis HLS 2022.2), and Vitis header stand-ins so the package also csims
+with any plain C++ compiler
 (`c++ -O2 -I stubs <top>.cpp <top>_tb.cpp -o csim -pthread`). The
-testbench runs the design on a dedicated 1 GiB stack: in C simulation
-the on-chip buffers are stack arrays, which overflow default limits
-for larger scenes. The example runners generate one package per
-algorithm under `hls_project/<name>/`
-(`python examples/wka/run_point_target_scalehls.py`). All four imaging chains csim
-bit-exactly against the NumPy reference.
+testbench runs the design on a dedicated 1 GiB stack: in C simulation the
+on-chip buffers are stack arrays, which overflow default limits for
+larger scenes. The example runners generate one package per algorithm
+under `hls_project/<name>/`
+(`python examples/wka/run_point_target_hls.py`). All four imaging chains
+csim bit-exactly against the NumPy reference.
 
-Two lowering flows:
-
-- **affine** (the default for every kernel):
-  `--sar-to-affine-pipeline` (decomplexify + Stockham FFT loop nests +
-  interpolation gathers) into `-hida-cpp-pipeline`. Generated top
-  functions take each complex tensor as two adjacent float arrays
-  (re, im).
-- **linalg** (opt-in via `options={"flow": "linalg"}`):
-  `--sar-to-linalg-pipeline` into `-hida-pytorch-pipeline` (dataflow
-  decomposition, tiling, unrolling). Suits purely elementwise and
-  reduction kernels; FFT and interpolation only lower on the affine
-  flow.
-
-Every SAR operation has a lowering in the affine flow, so complete
-imaging chains (omega-K, range-Doppler, chirp scaling) emit as single
-HLS designs; the identical IR is validated numerically on the CPU
-through `--sar-affine-to-llvm-pipeline`. FFTs of any size >= 2 lower
-here: powers of two run Stockham directly, other sizes go through
-Bluestein's chirp-z reduction (two padded Stockham transforms with the
-chirp and kernel spectrum folded at compile time).
-
-Options: `flow` ("auto"), `top_func`, `axi_interface` (False),
-`on_chip_budget` (4 MiB), `loop_tile_size` (8), `loop_unroll_factor`
-(4, linalg flow).
+Options: `top_func`, `axi_interface` (False), `on_chip_budget` (4 MiB),
+`axi_bus_bits` (512), `loop_tile_size` (8).
 
 ### Where the data lives
 
@@ -105,8 +97,8 @@ as soon as the next pass has read it and the ones whose lifetimes do not
 overlap share an allocation. That is what keeps the streamed set a
 property of the algorithm rather than of the chain's length: adding
 passes to a kernel does not add ports. At `16384 x 16384` the omega-K
-chain streams twelve planes over two AXI bundles, roughly 21 GiB of
-DRAM, and holds only the tables and the line scratch on chip.
+chain streams eight planes over two AXI bundles, roughly 13 GiB of DRAM,
+and holds only the tables and the line scratch on chip.
 
 Testbench generation rejects `axi_interface=True`: the promoted
 intermediate ports have no golden data to drive them. Emit the csim
@@ -149,7 +141,8 @@ of the two rather than the larger of them.
 
 ## Adding a backend
 
-1. Create `third_party/<name>/backend/compiler.py`:
+1. Create a backend package -- `python/sar/backends/<name>/compiler.py`
+   for a built-in one, any directory for an out-of-tree one:
 
 ```python
 from sar.backends.base import BaseBackend, KernelMetadata
@@ -171,9 +164,9 @@ class Backend(BaseBackend):
 
 2. Add `__init__.py` re-exporting `Backend`.
 
-That's all: source-tree checkouts discover `third_party/*/backend`
-automatically; `setup.py` copies the package into `sar/backends/<name>` for
-installation; `SAR_DSL_BACKEND_PATH` supports out-of-tree development.
+That's all: subpackages of `sar.backends` are discovered automatically,
+and `SAR_DSL_BACKEND_PATH` (os.pathsep-separated directories) picks up
+out-of-tree ones.
 
 Useful building blocks: `sar.compiler.toolchain.find_tool` / `run_tool`
 (tool discovery + subprocess execution with good errors), the per-kernel

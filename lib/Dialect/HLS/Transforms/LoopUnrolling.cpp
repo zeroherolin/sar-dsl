@@ -1,6 +1,11 @@
+//===- LoopUnrolling.cpp - Fully unroll a loop band ----------------------===//
+//
+// Part of the SAR-DSL Project. Licensed under the MIT License.
+//
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Unrolls a band outright when its trip count is small enough to be worth
+// it, which is what lets pipelining schedule the whole body as one region.
 //
 //===----------------------------------------------------------------------===//
 
@@ -8,14 +13,6 @@
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
-
-namespace mlir {
-namespace sar {
-#define GEN_PASS_DEF_AFFINELOOPUNROLLJAM
-#include "sar/Dialect/HLS/Transforms/Passes.h.inc"
-} // namespace sar
-} // namespace mlir
-
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -71,45 +68,4 @@ bool sar::applyLoopUnrollJam(AffineLoopBand &band,
   return result;
 }
 
-namespace {
-struct AffineLoopUnrollJam
-    : public sar::impl::AffineLoopUnrollJamBase<AffineLoopUnrollJam> {
-  AffineLoopUnrollJam() = default;
-  AffineLoopUnrollJam(unsigned loopUnrollFactor, bool unrollPointLoopOnly) {
-    unrollFactor = loopUnrollFactor;
-    pointLoopOnly = unrollPointLoopOnly;
-  }
 
-  void runOnOperation() override {
-    AffineLoopBands targetBands;
-    getLoopBands(getOperation().front(), targetBands);
-    // getTileableBands(getOperation(), &targetBands);
-
-    for (auto &band : targetBands) {
-      // For loop band that has effect on external buffers, we should directly
-      // unroll them without considering whether it's point loop.
-      if (hasEffectOnExternalBuffer(band.front())) {
-        applyLoopUnrollJam(band, unrollFactor.getValue());
-        continue;
-      }
-
-      if (pointLoopOnly) {
-        AffineLoopBand tileBand;
-        AffineLoopBand pointBand;
-        if (!getTileAndPointLoopBand(band, tileBand, pointBand) ||
-            pointBand.empty())
-          continue;
-        band = pointBand;
-      }
-      applyLoopUnrollJam(band, unrollFactor.getValue());
-    }
-  }
-};
-} // namespace
-
-std::unique_ptr<Pass>
-sar::createAffineLoopUnrollJamPass(unsigned loopUnrollFactor,
-                                        bool unrollPointLoopOnly) {
-  return std::make_unique<AffineLoopUnrollJam>(loopUnrollFactor,
-                                               unrollPointLoopOnly);
-}

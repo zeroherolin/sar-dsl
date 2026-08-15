@@ -34,12 +34,11 @@ compiled omega-K kernel in 3.6 seconds.*
   kernel, validated against a NumPy reference and cross-checked on
   point targets ([examples/](examples/)).
 - **Multi-backend by construction.** A `cpu` backend executes kernels
-  natively (linalg fusion, OpenMP, `libsar_runtime` FFT); a `hls`
-  backend emits Vitis HLS C++ through
-  [HLS-HIDA](https://github.com/UIUC-ChenLab/HLS-HIDA). Every SAR
-  operation has an HLS lowering — FFTs as bit-reversal-free Stockham affine
-  loops, interpolation as straight-line masked gathers — so **complete
-  imaging chains emit as single FPGA designs**, each with a generated
+  natively (linalg fusion, OpenMP, `libsar_runtime` FFT); an `hls`
+  backend emits Vitis HLS C++ for FPGA synthesis. Every SAR operation has
+  an HLS lowering — FFTs as bit-reversal-free Stockham affine loops,
+  interpolation as straight-line masked gathers — so **complete imaging
+  chains emit as single FPGA designs**, each with a generated
   C-simulation testbench that all four algorithms pass bit-exactly.
   New targets plug in as [backend packages](docs/backends.md) without
   core changes.
@@ -104,11 +103,10 @@ flowchart TB
 
     subgraph HLS["hls backend · FPGA emission"]
         direction TB
-        H1["HIDA PyTorch flow<br/><sub>dataflow, tiling</sub>"]
-        H2["decomplexify → Stockham FFT affine loops<br/>→ HIDA C++ flow"]
+        H1["decomplexify → Stockham FFT affine loops"]
+        H2["hls-pipeline<br/><sub>dataflow, buffer placement, interfaces</sub>"]
         H3["kernel.hls.cpp<br/><sub>Vitis HLS C++ + csim testbench</sub>"]
-        H1 --> H3
-        H2 --> H3
+        H1 --> H2 --> H3
     end
 ```
 
@@ -237,12 +235,11 @@ with numpy (matplotlib for the examples).
 
 ```bash
 git clone https://github.com/zeroherolin/sar-dsl.git && cd sar-dsl
-git submodule update --init externals/llvm-project externals/HLS-HIDA
+git submodule update --init externals/llvm-project
 pip install numpy matplotlib pytest   # matplotlib/pytest: examples & tests
 
 make llvm        # 1. in-tree LLVM/MLIR/Clang toolchain (one-time, long)
-make build       # 2. sar-opt, libsar_runtime, tests
-make hls    # 3. optional: HLS-HIDA toolchain for the HLS backend
+make build       # 2. sar-opt, sar-translate, libsar_runtime, tests
 
 export PYTHONPATH=$PWD/python:$PYTHONPATH
 make test        # lit + pytest, everything should pass
@@ -251,11 +248,6 @@ make examples    # focus a 512x512 synthetic scene, writes a PNG
 
 The example runners insert `python/` into `sys.path` themselves, so they
 also work without the `PYTHONPATH` export.
-
-Step 3 builds our [HLS-HIDA fork](https://github.com/zeroherolin/HLS-HIDA)
-(`dev` branch: ported to this project's LLVM, bug fixes land as regular
-commits) against the same LLVM tree as step 1 — one toolchain for
-everything.
 
 To reproduce the San Francisco image, place the ALOS-1 CEOS product under
 `examples/data/` and run:
@@ -286,13 +278,12 @@ python examples/wka/run_alos_cpu.py
 ```
 include/sar/, lib/       C++ core: dialect, conversions, pipelines
 runtime/                 libsar_runtime (FFT, interpolation kernels; C ABI)
-tools/                   sar-opt (optimizer driver), sar-lsp-server (editor)
-python/sar/              sar package: language, ir, compiler, backends
-third_party/             backend plugins (cpu, hls)
+tools/                   sar-opt, sar-translate, sar-lsp-server
+python/sar/              sar package: language, ir, compiler, backends (cpu, hls)
 examples/                omega-K, Range-Doppler, Chirp Scaling, PFA
 benchmarks/              timing, image-quality metrics and figures
 test/                    lit suites (MLIR) and pytest suites (Python, e2e, fuzz)
-externals/               submodules: llvm-project, HLS-HIDA
+externals/               llvm-project submodule
 scripts/                 toolchain build scripts
 ```
 
@@ -319,6 +310,7 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 MIT — see [LICENSE](LICENSE). Built on
-[LLVM/MLIR](https://mlir.llvm.org/) and
-[HLS-HIDA](https://github.com/UIUC-ChenLab/HLS-HIDA); sample
-imagery derives from JAXA ALOS-1 PALSAR data.
+[LLVM/MLIR](https://mlir.llvm.org/); the HLS dialect and its passes derive
+from [ScaleHLS-HIDA](https://github.com/UIUC-ChenLab/ScaleHLS-HIDA)
+(Apache-2.0 with LLVM exceptions, see [NOTICE](NOTICE)). Sample imagery
+derives from JAXA ALOS-1 PALSAR data.

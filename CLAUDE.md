@@ -21,6 +21,5 @@
 
 ## 验证
 
-改动后跑：`pytest test/python`、`cmake --build build --target check-sar-lit`、
-以及 `externals/ScaleHLS-HIDA` 的 `check-scalehls`（基线有 11 个上游遗留失败，
-只看是否新增）。数值改动另需 csim 验证。
+改动后跑：`pytest test/python` 与 `cmake --build build --target check-sar-lit`，
+两者应全绿。数值改动另需 csim 验证（见 `docs/backends.md`）。

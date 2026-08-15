@@ -39,14 +39,14 @@ language compiles to every backend.
   warns on double FFTs, inverse transforms of centered spectra and
   mixed-domain arithmetic (`sar.DomainWarning`).
 - **HLS designs csim bit-exact.** All four imaging chains pass their
-  generated C-simulation testbenches. Two upstream HIDA bugs were
+  generated C-simulation testbenches. Two bugs in the derived HLS passes were
   root-caused and fixed in our fork: the HLS C++ emitter printed
   floating-point constants with 6 decimals (quantizing FFT twiddles
   and flushing small phase coefficients to zero), and multi-consumer
   forking redirected reads across buffer redefinitions to stale data.
 - **Scene size bounded by DRAM, not by the device.** The full
   16384 x 16384 ALOS raster emits as a single design
-  (`examples/wka/run_alos_scalehls.py`). The backend budgets on-chip
+  (`examples/wka/run_alos_hls.py`). The backend budgets on-chip
   memory itself: buffers stay resident while the working set fits
   `on_chip_budget`, and past it the full-size planes -- including the
   FFT scratch -- move behind AXI masters, leaving only the constant
@@ -57,12 +57,12 @@ language compiles to every backend.
   ports of one element type now share a bundle instead of each taking
   its own. The Stockham lowering also lost its copy-in and copy-out
   passes, reading the input and writing the result directly.
-- **Both HLS flows work on LLVM 22.** The HIDA-PyTorch (linalg)
-  pipeline was repaired in the fork (one-shot bufferization layouts,
-  out-param convention, region isolation after unrolling, subview
-  legality in array partition). The affine flow remains the default
-  because the FFT and interpolation lowerings are affine-only; linalg
-  is the opt-in path for purely elementwise/reduction kernels.
+- **The HLS dialect moved in-tree.** What the pipeline actually uses --
+  the dialect, 32 passes and the C++ emitter -- now lives under
+  `lib/Dialect/HLS` and `lib/Target/HLS`, built by the same CMake as the
+  rest. The TOSA and PyTorch frontends, design-space exploration and QoR
+  estimation went with the submodule; `sar-opt` and `sar-translate`
+  replaced the two vendor tools.
 
 ## Next
 
@@ -73,8 +73,8 @@ language compiles to every backend.
   and a windowed rank filter) with lowerings on both backends, keeping
   every DSL construct backend-symmetric.
 - Compiled counted loops with tensor carries (sub-aperture and block
-  processing). Requires an HLS lowering story (HIDA handling of loop
-  nests) so the construct stays backend-symmetric.
+  processing). Requires an HLS lowering story for loop nests with
+  tensor carries so the construct stays backend-symmetric.
 - Generalized gather beyond per-line interpolation, towards time-domain
   backprojection.
 - Interpolation boundary policies beyond zero (edge replication for

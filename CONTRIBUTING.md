@@ -61,9 +61,10 @@ CI runs the same hooks on every push.
 - *Runtime kernels*: `runtime/SARRuntime.cpp` is dependency-free C++17 with
   a C ABI; keep it that way.
 
-## ScaleHLS-HIDA development
+## HLS dialect development
 
-The submodule tracks the `dev` branch of
-[our fork](https://github.com/zeroherolin/ScaleHLS-HIDA), ported to the
-project's LLVM tree. Fix HIDA bugs there as regular commits, push the
-branch, then bump the submodule pointer here -- no patch files.
+The `hls` dialect and its passes (`include/sar/Dialect/HLS`,
+`lib/Dialect/HLS`, `lib/Target/HLS`) are ordinary in-tree code: change
+them like any other pass, and `test/Dialect/HLS/*.mlir` covers them.
+They derive from ScaleHLS-HIDA -- see [NOTICE](NOTICE) -- so files
+carrying the original copyright header keep it.

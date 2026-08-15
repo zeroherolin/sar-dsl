@@ -41,7 +41,7 @@ def _default_cache_root() -> Path:
 #: Tools whose output the cache holds. Every one of them has to be in the
 #: fingerprint: a kernel passes through all of them, so rebuilding any one
 #: can change the artifacts while the source and options stay identical.
-_FINGERPRINTED_TOOLS = ("sar-opt", "scalehls-opt", "scalehls-translate")
+_FINGERPRINTED_TOOLS = ("sar-opt", "sar-translate")
 
 
 def _toolchain_fingerprint() -> str:

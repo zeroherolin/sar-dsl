@@ -9,9 +9,9 @@ demonstrated on both synthetic point targets and a real ALOS-1 dataset.
 | `algorithm.py` | The WKA chain in the DSL (`build_kernel`, `make_inputs`) |
 | `reference.py` | NumPy reference implementation (`WKAProcessor`) |
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
-| `run_point_target_scalehls.py` | Full scalehls-backend flow: HLS C++ design + csim package (`hls_project/`) |
+| `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 | `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset (16384x16384) |
-| `run_alos_scalehls.py` | Emit a synthesizable design at the full ALOS raster |
+| `run_alos_hls.py` | Emit a synthesizable design at the full ALOS raster |
 | `assets/` | Reference imagery |
 
 ## Processing chain
@@ -34,7 +34,7 @@ into the IR at trace time.
 ```bash
 # from the repository root, after `make build`
 python examples/wka/run_point_target_cpu.py --n 512          # focus + PNG
-python examples/wka/run_point_target_scalehls.py --n 256     # design + csim package
+python examples/wka/run_point_target_hls.py --n 256     # design + csim package
 ```
 
 Each simulated point target focuses to roughly one resolution cell:
@@ -47,7 +47,7 @@ Each simulated point target focuses to roughly one resolution cell:
 # from the repository root; the dataset is shared by all three algorithms
 python examples/data/extract_alos.py   # CEOS L1.0 -> alos_raw_...bin (2 GiB)
 python examples/wka/run_alos_cpu.py        # tens of GiB of RAM at full size
-python examples/wka/run_alos_scalehls.py   # emit the design at the same size
+python examples/wka/run_alos_hls.py   # emit the design at the same size
 ```
 
 The full 16384x16384 scene focuses in about 3.6 seconds on a large

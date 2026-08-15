@@ -181,8 +181,9 @@ All kernels follow the split-complex affine path (`sar-to-affine-pipeline`):
    masked with selects -- the loop bodies stay straight-line, which
    keeps HLS pipelining applicable. Position and weight arithmetic is
    f64, mirroring the CPU runtime.
-4. The bufferized affine IR enters HIDA's C++ entry point
-   (`-hida-cpp-pipeline`), then `scalehls-translate` emits Vitis HLS C++.
+4. The bufferized affine IR enters the HLS pipeline (`-hls-pipeline`),
+   which builds the dataflow hierarchy, places buffers on or off chip and
+   shapes the interfaces; `sar-translate` then emits Vitis HLS C++.
 
 With that, every SAR operation lowers in the affine flow and complete
 imaging chains (omega-K, range-Doppler, chirp scaling) emit as single
@@ -193,13 +194,18 @@ emitted C++ itself C-simulates against a generated testbench -- all four
 imaging chains match their NumPy references bit-exactly at f32 output
 precision.
 
-## One LLVM tree
+## The HLS dialect
 
-The SAR core and the ScaleHLS-HIDA toolchain build against the same
-`externals/llvm-project`. Upstream ScaleHLS pinned an old LLVM through
-`polygeist`; our [fork](https://github.com/zeroherolin/ScaleHLS-HIDA)
-(`dev` branch) is ported to the project's LLVM so there is exactly one
-toolchain to build, and HIDA fixes land as regular commits instead of
-patch files. The processes still communicate through serialized IR
-piped into `scalehls-opt` -- the versioned, stable surface this
-architecture is built around.
+The `hls` dialect (`include/sar/Dialect/HLS`) models what a synthesis
+backend needs to say about a design that MLIR's own dialects cannot:
+dataflow structure (`schedule`, `node`, `buffer`, `stream`), where a
+buffer lives (`#hls.mem<dram>`, `bram_t2p`, ...), how an array is banked
+(`#hls.partition`), and what an interface looks like (`axi.bundle`,
+`axi.port`). Its passes derive from
+[ScaleHLS-HIDA](https://github.com/UIUC-ChenLab/ScaleHLS-HIDA); see
+[NOTICE](../NOTICE).
+
+Keeping it in-tree means one LLVM build and one set of tools:
+`sar-opt` runs every pass from SAR down to scheduled HLS IR, and
+`sar-translate` writes the C++. A second emission target registers itself
+in `include/sar/Target/InitAllTranslations.h` and needs no new tool.

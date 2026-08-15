@@ -521,18 +521,6 @@ def LoopPipelining : Pass<"hls-loop-pipelining", "func::FuncOp"> {
   ];
 }
 
-def LowerAffine : Pass<"hls-lower-affine", "func::FuncOp"> {
-  let dependentDialects = [
-    "mlir::sar::hls::HLSDialect", "mlir::affine::AffineDialect",
-    "mlir::arith::ArithDialect", "mlir::func::FuncDialect",
-    "mlir::linalg::LinalgDialect", "mlir::memref::MemRefDialect",
-    "mlir::scf::SCFDialect", "mlir::tensor::TensorDialect",
-    "mlir::vector::VectorDialect",
-    "mlir::bufferization::BufferizationDialect"];
-
-  let summary = "Lower AffineSelectOp and affine::AffineForOp";
-  let constructor = "mlir::sar::createLowerAffinePass()";
-}
 
 
 #endif // SCALEHLS_TRANSFORMS_PASSES_TD
@@ -559,33 +547,4 @@ def CreateMemrefSubview :
   ];
 }
 
-def BufferizeDataflow : Pass<"hls-bufferize-dataflow", "func::FuncOp"> {
-  let dependentDialects = [
-    "mlir::sar::hls::HLSDialect", "mlir::affine::AffineDialect",
-    "mlir::arith::ArithDialect", "mlir::func::FuncDialect",
-    "mlir::linalg::LinalgDialect", "mlir::memref::MemRefDialect",
-    "mlir::scf::SCFDialect", "mlir::tensor::TensorDialect",
-    "mlir::vector::VectorDialect",
-    "mlir::bufferization::BufferizationDialect"];
 
-  let summary = "Bufferize dataflow operations";
-  let constructor = "mlir::sar::createBufferizeDataflowPass()";
-}
-
-def AffineLoopUnrollJam :
-      Pass<"hls-affine-loop-unroll-jam", "func::FuncOp"> {
-  let summary = "Unroll and jam affine loop nests";
-  let description = [{
-    Unroll and jam from the outermost loop until the overall unroll factor
-    reaches the specified "unroll-factor". Optionally, optimize the loop order
-    after the unrolling.
-  }];
-  let constructor = "mlir::sar::createAffineLoopUnrollJamPass()";
-
-  let options = [
-    Option<"unrollFactor", "unroll-factor", "unsigned", /*default=*/"1",
-           "Positive number: the factor of unrolling">,
-    Option<"pointLoopOnly", "point-loop-only", "bool", /*default=*/"false",
-           "Only apply unroll and jam to point loop band">
-  ];
-}

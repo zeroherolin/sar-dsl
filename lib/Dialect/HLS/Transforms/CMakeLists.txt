@@ -6,12 +6,11 @@ add_mlir_library(HLSTransforms
   AffineStoreForward.cpp
   ArrayPartition.cpp
   BalanceDataflowNode.cpp
+  BufferConversion.cpp
   CollapseMemrefUnitDims.cpp
   ConvertDataflowToFunc.cpp
   CreateMemrefSubview.cpp
-  LowerAffine.cpp
-  AffineLoopUnrollJam.cpp
-  BufferizeDataflow.cpp
+  LoopUnrolling.cpp
   CreateAxiInterface.cpp
   CreateDataflowFromAffine.cpp
   CreateHLSPrimitive.cpp
