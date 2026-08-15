@@ -122,3 +122,41 @@ def test_port_count_does_not_track_chain_length(n):
                               }).source().count("m_axi")
 
     assert ports(1) == ports(4)
+
+
+@pytest.mark.parametrize("n", [64, 128])
+def test_oversampled_grid_is_streamed(n):
+    """Placement follows the planes the kernel works on, not the ones it
+    is handed.
+
+    A chain may resample onto a grid larger than any argument -- polar
+    format oversamples by two -- and those planes are what decide the
+    working set. Sizing the decision from the signature alone leaves them
+    resident, which is how a design ends up asking for more on-chip
+    memory than a device has.
+    """
+    import re
+
+    budget = 64 * 1024
+
+    @sar.func
+    def upsample(x: sar.c64[n, n]) -> sar.c64[2 * n, 2 * n]:
+        wide = sar.pad(x, ((0, n), (0, n)))
+        return sar.fft(wide * 2.0, axis=1)
+
+    upsample.name = f"oversampled_{n}"
+    source = upsample.compile(backend="hls",
+                              options={
+                                  "axi_interface": True,
+                                  "on_chip_budget": budget
+                              }).source()
+
+    on_chip = 0
+    for decl in re.finditer(r"^\s+(float|double) \w+((?:\[\d+\])+);", source,
+                            re.M):
+        elements = 1
+        for dim in re.findall(r"\[(\d+)\]", decl.group(2)):
+            elements *= int(dim)
+        on_chip += elements * _ELEMENT_BITS[decl.group(1)] // 8
+    assert on_chip <= budget, (
+        f"{on_chip} B on chip against a {budget} B budget")

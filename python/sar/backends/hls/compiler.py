@@ -58,10 +58,42 @@ _KEEP_ON_CHIP = 2**32 - 1
 _ELEMENT_BYTES = {"f32": 4, "f64": 8}
 
 
-def _largest_plane_elements(metadata: KernelMetadata) -> int:
+def _signature_plane_elements(metadata: KernelMetadata) -> int:
     """Element count of the largest plane the kernel's signature names."""
     planes = list(metadata.arg_types) + list(metadata.result_types)
     return max((int(np.prod(t.shape)) for t in planes), default=0)
+
+
+def _buffer_extents(lowered: str):
+    """(elements, bytes) of every buffer the lowered kernel allocates."""
+    for match in re.finditer(r"memref\.alloc\(\)[^:]*: memref<([^>]+)>",
+                             lowered):
+        parts = match.group(1).split("x")
+        width = _ELEMENT_BYTES.get(parts[-1])
+        if width is None:
+            continue
+        elements = int(np.prod([int(d) for d in parts[:-1]]))
+        yield elements, elements * width
+
+
+#: A buffer within this factor of the largest plane counts as one of them.
+#: Slicing an edge off a raster leaves a buffer a hair under full size --
+#: it is still a plane, and streaming its siblings while keeping it
+#: resident would be the worst of both.
+_PLANE_TOLERANCE = 4
+
+
+def _plane_elements(metadata: KernelMetadata, lowered: str) -> int:
+    """Element count above which a buffer counts as a full-scene plane.
+
+    Taken from the IR rather than the signature: a chain may work on a
+    grid larger than anything it is handed -- polar format resamples onto
+    an oversampled raster -- and it is those planes, not the arguments,
+    that decide what has to be streamed.
+    """
+    largest = max([_signature_plane_elements(metadata)] +
+                  [elements for elements, _ in _buffer_extents(lowered)])
+    return largest // _PLANE_TOLERANCE
 
 
 def _resident_bytes(metadata: KernelMetadata, lowered: str,
@@ -78,15 +110,8 @@ def _resident_bytes(metadata: KernelMetadata, lowered: str,
     planes = list(metadata.arg_types) + list(metadata.result_types)
     total = sum(
         int(np.prod(t.shape)) * t.dtype.to_numpy().itemsize for t in planes)
-    for match in re.finditer(r"memref\.alloc\(\)[^:]*: memref<([^>]+)>",
-                             lowered):
-        parts = match.group(1).split("x")
-        width = _ELEMENT_BYTES.get(parts[-1])
-        if width is None:
-            continue
-        elements = int(np.prod([int(d) for d in parts[:-1]]))
-        if elements >= min_elements:
-            total += elements * width
+    total += sum(size for elements, size in _buffer_extents(lowered)
+                 if elements >= min_elements)
     return total
 
 
@@ -101,7 +126,7 @@ def _external_buffer_threshold(metadata: KernelMetadata, lowered: str) -> int:
     scene size grow past the device.
     """
     budget = metadata.options.get("on_chip_budget", _DEFAULT_ON_CHIP_BUDGET)
-    elements = _largest_plane_elements(metadata)
+    elements = _plane_elements(metadata, lowered)
     if budget <= 0 or not elements:
         return _KEEP_ON_CHIP
     if _resident_bytes(metadata, lowered, elements) <= budget:
@@ -410,7 +435,7 @@ class Backend(BaseBackend):
         cache.write_text("kernel.sar.mlir", module_text)
 
         options = metadata.options
-        planes = _largest_plane_elements(metadata)
+        planes = _signature_plane_elements(metadata)
         budget = max(
             1, int(options.get("on_chip_budget", _DEFAULT_ON_CHIP_BUDGET)))
 

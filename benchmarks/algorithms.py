@@ -40,7 +40,8 @@ class Chain:
     """One benchmarkable imaging chain, set up for a given size."""
 
     name: str
-    compile_kernel: Callable  # () -> compiled kernel
+    #: (backend="cpu", **options) -> compiled kernel or emitted design
+    compile_kernel: Callable
     run: Callable  # (kernel) -> image(s)
     run_reference: Callable  # () -> numpy reference image(s)
 
@@ -59,9 +60,12 @@ def _stripmap(name: str, n: int) -> Chain:
     params = synthetic_params(n)
     raw = single_target_scene(n, params)
     inputs = alg.make_inputs(n, params)
-    return Chain(name, lambda: alg.build_kernel(n, params).compile("cpu"),
-                 lambda kernel: kernel(raw, *inputs),
-                 lambda: ref(n, params).process(raw))
+    return Chain(
+        name,
+        lambda backend="cpu", **opts: alg.build_kernel(n, params).compile(
+            backend=backend, options=opts or None),
+        lambda kernel: kernel(raw, *inputs),
+        lambda: ref(n, params).process(raw))
 
 
 def _pfa(name: str, n: int) -> Chain:
@@ -72,9 +76,12 @@ def _pfa(name: str, n: int) -> Chain:
     geometry = Geometry(n)
     raw = geometry.simulate(geometry.demo_targets())
     inputs = make_inputs(n, geometry)
-    return Chain(name, lambda: build_kernel(n, geometry).compile("cpu"),
-                 lambda kernel: kernel(raw, *inputs),
-                 lambda: PFAProcessor(n, geometry).process(raw))
+    return Chain(
+        name,
+        lambda backend="cpu", **opts: build_kernel(n, geometry).compile(
+            backend=backend, options=opts or None),
+        lambda kernel: kernel(raw, *inputs),
+        lambda: PFAProcessor(n, geometry).process(raw))
 
 
 def load(name: str, n: int) -> Chain:
