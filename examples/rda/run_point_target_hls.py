@@ -50,7 +50,7 @@ def main() -> None:
         design.write_testbench([raw, *make_inputs(n, params)], [golden], out)
     print(f"[2/2] Saved {out}")
     print(f"done: {design.source().count(chr(10))} lines of HLS C++ "
-          f"(flow={"affine"}, top function 'rda'); "
+          f"(flow=affine, top function 'rda'); "
           "csim: cd {out} && vitis_hls -f rda_csim.tcl".format(out=out))
 
 

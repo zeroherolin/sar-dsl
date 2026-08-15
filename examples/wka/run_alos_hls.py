@@ -67,7 +67,7 @@ def main() -> None:
     })
     print(f"[2/2] Saved {target}")
     print(f"done: {source.count(chr(10))} lines of HLS C++ "
-          f"(flow={"affine"}, top function 'wka'); "
+          f"(flow=affine, top function 'wka'); "
           f"{ports} AXI ports on {bundles} bundle(s)")
 
 

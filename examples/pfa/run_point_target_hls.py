@@ -52,7 +52,7 @@ def main() -> None:
         golden = PFAProcessor(n, geometry).process(raw)
         design.write_testbench([raw, *make_inputs(n, geometry)], list(golden),
                                out)
-    print(f"[2/2] Saved {out} (flow: {"affine"})")
+    print(f"[2/2] Saved {out} (flow: affine)")
     print(f"done; csim: cd {out} && vitis_hls -f pfa_csim.tcl")
 
 
