@@ -6,14 +6,50 @@
 | `metrics.py` | Point-target metrics: IRW / PSLR / ISLR (also used by `test/python/test_quality.py`) |
 | `run_performance.py` | Timing table: compiled kernels vs the NumPy references |
 | `run_quality.py` | Image-quality table |
+| `run_precision.py` | What single precision costs an image |
+| `run_resources.py` | What each chain costs on an FPGA |
 | `run_figures.py` | Publication figures into `assets/` |
 
 ```bash
 PYTHONPATH=python python3 benchmarks/run_performance.py \
     --sizes 1024 4096 --numpy
 PYTHONPATH=python python3 benchmarks/run_quality.py --n 512
+PYTHONPATH=python python3 benchmarks/run_precision.py --n 512
+PYTHONPATH=python python3 benchmarks/run_resources.py --sizes 512 4096
 PYTHONPATH=python python3 benchmarks/run_figures.py
 ```
+
+## Precision
+
+Narrowing the data path to single precision leaves the impulse response
+unchanged on all three stripmap chains (`run_precision.py`, 256x256):
+
+| Algorithm | IRW f64 / f32 | PSLR f64 / f32 | relative error |
+|-----------|--------------:|---------------:|---------------:|
+| omega-K | 2.12 / 2.12 | -38.23 / -38.23 dB | 1.5e-08 |
+| Range-Doppler | 2.09 / 2.09 | -35.00 / -35.00 dB | 1.4e-07 |
+| Chirp Scaling | 2.12 / 2.12 | -38.19 / -38.19 dB | 2.1e-07 |
+
+Geometry stays double. The frequency axes feed the interpolation
+positions, where an error is a fraction of a resampling bin rather than
+of a sample value: narrowing them too costs omega-K about 4 dB of PSLR
+while the other two are unaffected.
+
+## FPGA resources
+
+What a design asks of the device, measured from the emitted C++
+(`run_resources.py`, 512x512, 4 MiB on-chip budget). Ports are AXI master
+pointers, which share bundles by element type:
+
+| Algorithm | ports | bundles | DRAM | on-chip | dataflow regions |
+|-----------|------:|--------:|-----:|--------:|-----------------:|
+| omega-K | 10 | 2 | 14.0 MiB | 512 KiB | 7 |
+| Range-Doppler | 8 | 2 | 13.0 MiB | 272 KiB | 4 |
+| Chirp Scaling | 7 | 2 | 11.0 MiB | 256 KiB | 4 |
+| PFA | 23 | 1 | 117.9 MiB | 2992 KiB | 7 |
+
+PFA resamples onto a 2x oversampled polar grid, so its planes are four
+times the size of its arguments and more of them have to stream.
 
 ## Image quality
 
