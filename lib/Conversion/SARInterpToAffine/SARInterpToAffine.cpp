@@ -92,7 +92,7 @@ struct ScalarBuilder {
 };
 
 /// Emits floor(posF64) as i64 via truncation plus a negative-fraction
-/// fixup: fptosi rounds toward zero, and the ScaleHLS HLS emitter has no
+/// fixup: fptosi rounds toward zero, and the HLS emitter has no
 /// math.floor.
 static Value emitFloorI64(ScalarBuilder &s, Value posF64) {
   OpBuilder &b = s.b;

@@ -26,19 +26,6 @@ namespace {
 #include "sar/Dialect/HLS/Transforms/Passes.h.inc"
 } // namespace
 
-namespace {
-struct ScaleHLSDSEPipelineOptions
-    : public PassPipelineOptions<ScaleHLSDSEPipelineOptions> {
-  Option<std::string> hlsTopFunc{
-      *this, "top-func", llvm::cl::init("main"),
-      llvm::cl::desc("Specify the top function of the design")};
-
-  Option<std::string> dseTargetSpec{
-      *this, "target-spec", llvm::cl::init("./config.json"),
-      llvm::cl::desc(
-          "File path: target backend specifications and configurations")};
-};
-} // namespace
 
 
 void sar::addCreateSubviewPasses(OpPassManager &pm, CreateSubviewMode mode) {

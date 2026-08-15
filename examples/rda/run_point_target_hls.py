@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Range-Doppler on the ScaleHLS backend: emit a Vitis HLS C++ design
 and a C-simulation package with golden data from the NumPy reference
-(requires `make scalehls`).
+
 
 Usage:
-    python run_point_target_scalehls.py [--n 256] [--output hls_project/rda]
+    python run_point_target_hls.py [--n 256] [--output hls_project/rda]
                            [--no-testbench]
 """
 

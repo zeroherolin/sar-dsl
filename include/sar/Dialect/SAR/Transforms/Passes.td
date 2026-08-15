@@ -19,7 +19,7 @@ def SARDecomplexify : Pass<"sar-decomplexify", "ModuleOp"> {
     tensors, in order).
 
     This enables targets without complex-number support -- notably HLS
-    C++ emission through ScaleHLS-HIDA. Signal and interpolation ops map
+    C++ emission. Signal and interpolation ops map
     to their split-complex forms: `sar.fft`/`sar.ifft` become
     `sar.fft_split` and `sar.interp1d` becomes `sar.interp1d_split`.
   }];

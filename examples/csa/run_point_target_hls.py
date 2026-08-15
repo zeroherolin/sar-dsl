@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Chirp Scaling on the ScaleHLS backend: emit a Vitis HLS C++ design
 and a C-simulation package with golden data from the NumPy reference
-(requires `make scalehls`).
+
 
 Usage:
-    python run_point_target_scalehls.py [--n 256] [--output hls_project/csa]
+    python run_point_target_hls.py [--n 256] [--output hls_project/csa]
                            [--no-testbench]
 """
 

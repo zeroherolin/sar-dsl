@@ -13,14 +13,14 @@ couple of interfaces rather than one per intermediate.
 
 This runner emits the design only. A C-simulation package needs golden
 data for every top-level port, and the promoted intermediate ports have
-none; use `run_point_target_scalehls.py` for a csim-able package, and
+none; use `run_point_target_hls.py` for a csim-able package, and
 validate the arithmetic there.
 
 No raw data is read: the design is a function of the geometry, not of the
 samples.
 
 Usage:
-    python run_alos_scalehls.py [--n 16384] [--output hls_project/wka_alos]
+    python run_alos_hls.py [--n 16384] [--output hls_project/wka_alos]
 """
 
 import argparse

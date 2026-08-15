@@ -8,7 +8,7 @@ in-kernel geometry math lowers through decomplexify/affine like any
 other op chain).
 
 Usage:
-    python run_point_target_scalehls.py [--n 256] [--output hls_project/pfa]
+    python run_point_target_hls.py [--n 256] [--output hls_project/pfa]
                            [--no-testbench]
 """
 

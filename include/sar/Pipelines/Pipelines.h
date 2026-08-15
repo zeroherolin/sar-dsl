@@ -44,7 +44,7 @@ struct SARBufferPipelineOptions
 };
 
 /// Lowers SAR kernels to linalg-on-tensors. This is the hand-off level for
-/// HLS-oriented backends (e.g. ScaleHLS-HIDA), which run their own
+/// HLS-oriented backends, which run their own
 /// bufferization and loop transformations.
 void buildSARToLinalgPipeline(OpPassManager &pm);
 
@@ -58,7 +58,7 @@ void buildSARToLLVMPipeline(OpPassManager &pm,
 /// Lowers SAR kernels to split-complex affine/memref form: decomplexify,
 /// Stockham FFT loop nests, windowed-sinc interpolation loops, linalg ->
 /// affine loops, destination-passing style. This is the hand-off level for
-/// HLS flows consuming affine IR (ScaleHLS `hida-cpp-pipeline`).
+/// HLS flows consuming affine IR (`-hls-pipeline`).
 void buildSARToAffinePipeline(OpPassManager &pm,
                               const SARBufferPipelineOptions &options = {});
 

@@ -6,7 +6,7 @@
 // into affine loop nests implementing the radix-2 Stockham autosort FFT.
 // Stockham is chosen over Cooley-Tukey deliberately: it needs no
 // bit-reversal permutation, so every memory access is an affine function of
-// the loop indices -- exactly what HLS flows (ScaleHLS-HIDA) require for
+// the loop indices -- exactly what an HLS flow requires for
 // loop analysis, pipelining and array partitioning.
 //
 // Per stage t (statically unrolled; n_cur = L >> t, m = n_cur / 2,

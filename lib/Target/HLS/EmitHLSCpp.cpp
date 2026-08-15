@@ -186,9 +186,9 @@ static std::string getVivadoStorageTypeAndImpl(MemoryKind kind) {
 namespace {
 /// This class maintains the mutable state that cross-cuts and is shared by the
 /// various emitters.
-class ScaleHLSEmitterState {
+class HLSEmitterState {
 public:
-  explicit ScaleHLSEmitterState(raw_ostream &os) : os(os) {}
+  explicit HLSEmitterState(raw_ostream &os) : os(os) {}
 
   // The stream to emit to.
   raw_ostream &os;
@@ -200,16 +200,16 @@ public:
   DenseMap<Value, SmallString<8>> nameTable;
 
 private:
-  ScaleHLSEmitterState(const ScaleHLSEmitterState &) = delete;
-  void operator=(const ScaleHLSEmitterState &) = delete;
+  HLSEmitterState(const HLSEmitterState &) = delete;
+  void operator=(const HLSEmitterState &) = delete;
 };
 } // namespace
 
 namespace {
 /// This is the base class for all of the HLSCpp Emitter components.
-class ScaleHLSEmitterBase {
+class HLSEmitterBase {
 public:
-  explicit ScaleHLSEmitterBase(ScaleHLSEmitterState &state)
+  explicit HLSEmitterBase(HLSEmitterState &state)
       : state(state), os(state.os) {}
 
   InFlightDiagnostic emitError(Operation *op, const Twine &message) {
@@ -223,7 +223,7 @@ public:
   void reduceIndent() { state.currentIndent -= 2; }
 
   // All of the mutable state we are maintaining.
-  ScaleHLSEmitterState &state;
+  HLSEmitterState &state;
 
   // The stream to emit to.
   raw_ostream &os;
@@ -243,13 +243,13 @@ public:
   }
 
 private:
-  ScaleHLSEmitterBase(const ScaleHLSEmitterBase &) = delete;
-  void operator=(const ScaleHLSEmitterBase &) = delete;
+  HLSEmitterBase(const HLSEmitterBase &) = delete;
+  void operator=(const HLSEmitterBase &) = delete;
 };
 } // namespace
 
 // TODO: update naming rule.
-SmallString<8> ScaleHLSEmitterBase::addName(Value val, bool isPtr) {
+SmallString<8> HLSEmitterBase::addName(Value val, bool isPtr) {
   assert(!isDeclared(val) && "has been declared before.");
 
   SmallString<8> valName;
@@ -262,7 +262,7 @@ SmallString<8> ScaleHLSEmitterBase::addName(Value val, bool isPtr) {
   return valName;
 }
 
-SmallString<8> ScaleHLSEmitterBase::addAlias(Value val, Value alias) {
+SmallString<8> HLSEmitterBase::addAlias(Value val, Value alias) {
   assert(!isDeclared(alias) && "has been declared before.");
   assert(isDeclared(val) && "hasn't been declared before.");
 
@@ -328,7 +328,7 @@ static SmallString<8> getConstantString(Type type, Attribute attr) {
   return string;
 }
 
-SmallString<8> ScaleHLSEmitterBase::getName(Value val) {
+SmallString<8> HLSEmitterBase::getName(Value val) {
   // For constant scalar operations, the constant number will be returned rather
   // than the value name.
   if (auto constOp = val.getDefiningOp<arith::ConstantOp>())
@@ -346,11 +346,11 @@ SmallString<8> ScaleHLSEmitterBase::getName(Value val) {
 //===----------------------------------------------------------------------===//
 
 namespace {
-class ModuleEmitter : public ScaleHLSEmitterBase {
+class ModuleEmitter : public HLSEmitterBase {
 public:
   using operand_range = Operation::operand_range;
-  explicit ModuleEmitter(ScaleHLSEmitterState &state)
-      : ScaleHLSEmitterBase(state) {}
+  explicit ModuleEmitter(HLSEmitterState &state)
+      : HLSEmitterBase(state) {}
 
   /// HLS dialect operation emitters.
   void emitConstBuffer(ConstBufferOp op);
@@ -438,13 +438,13 @@ private:
 //===----------------------------------------------------------------------===//
 
 namespace {
-class AffineExprEmitter : public ScaleHLSEmitterBase,
+class AffineExprEmitter : public HLSEmitterBase,
                           public AffineExprVisitor<AffineExprEmitter> {
 public:
   using operand_range = Operation::operand_range;
-  explicit AffineExprEmitter(ScaleHLSEmitterState &state, unsigned numDim,
+  explicit AffineExprEmitter(HLSEmitterState &state, unsigned numDim,
                              operand_range operands)
-      : ScaleHLSEmitterBase(state), numDim(numDim), operands(operands) {}
+      : HLSEmitterBase(state), numDim(numDim), operands(operands) {}
 
   void visitAddExpr(AffineBinaryOpExpr expr) { emitAffineBinary(expr, "+"); }
   void visitMulExpr(AffineBinaryOpExpr expr) { emitAffineBinary(expr, "*"); }
@@ -2132,7 +2132,7 @@ void pack_mul(int8_t A[2], int8_t B, int16_t C[2]) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult sar::emitHLSCpp(ModuleOp module, llvm::raw_ostream &os) {
-  ScaleHLSEmitterState state(os);
+  HLSEmitterState state(os);
   ModuleEmitter(state).emitModule(module);
   return failure(state.encounteredError);
 }

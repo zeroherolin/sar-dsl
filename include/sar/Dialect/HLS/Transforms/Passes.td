@@ -20,7 +20,7 @@ def FuncPreprocess : Pass<"hls-func-preprocess", "func::FuncOp"> {
     "mlir::vector::VectorDialect",
     "mlir::bufferization::BufferizationDialect"];
 
-  let summary = "Preprocess the functions subsequent ScaleHLS optimizations";
+  let summary = "Preprocess functions for the HLS pipeline";
   let constructor = "mlir::sar::createFuncPreprocessPass()";
 
   let options = [

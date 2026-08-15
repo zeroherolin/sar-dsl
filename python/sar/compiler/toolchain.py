@@ -1,4 +1,5 @@
-"""Locates external tools (sar-opt, mlir-translate, clang, ScaleHLS, ...).
+"""Locates the tools a backend shells out to (sar-opt, sar-translate,
+mlir-translate, clang).
 
 Search order for a tool named `foo-bar`:
 1. environment variable ``SAR_DSL_TOOL_FOO_BAR`` (full path);

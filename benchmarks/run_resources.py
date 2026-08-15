@@ -93,7 +93,8 @@ def main() -> None:
                 stats = measure(design.source(), design.name)
                 print(f"{LABELS[name]:<14} {size:>6} {budget >> 20:>7} MiB "
                       f"{stats['ports']:>6} {stats['bundles']:>8} "
-                      f"{stats['dram_mib']:>10.1f} {stats['on_chip_kib']:>10.1f} "
+                      f"{stats['dram_mib']:>10.1f} "
+                      f"{stats['on_chip_kib']:>10.1f} "
                       f"{stats['dataflow']:>9}")
 
 

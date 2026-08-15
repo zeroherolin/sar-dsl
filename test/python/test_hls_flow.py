@@ -1,7 +1,8 @@
 """End-to-end validation of the HLS (affine) flow on complete algorithms.
 
 Two complementary checks per algorithm:
-1. numerical: the exact IR handed to ScaleHLS-the HLS pipeline is compiled for the CPU
+1. numerical: the exact IR handed to the HLS pipeline is compiled for
+   the CPU
    through `sar-affine-to-llvm-pipeline` and compared against the NumPy
    reference;
 2. emission: the ScaleHLS backend produces Vitis HLS C++ for the full
