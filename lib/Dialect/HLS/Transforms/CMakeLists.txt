@@ -1,0 +1,65 @@
+add_mlir_library(HLSTransforms
+  AffineLoopFusion.cpp
+  AffineLoopOrderOpt.cpp
+  AffineLoopPerfection.cpp
+  AffineLoopTile.cpp
+  AffineStoreForward.cpp
+  ArrayPartition.cpp
+  BalanceDataflowNode.cpp
+  CollapseMemrefUnitDims.cpp
+  ConvertDataflowToFunc.cpp
+  CreateMemrefSubview.cpp
+  LowerAffine.cpp
+  AffineLoopUnrollJam.cpp
+  BufferizeDataflow.cpp
+  CreateAxiInterface.cpp
+  CreateDataflowFromAffine.cpp
+  CreateHLSPrimitive.cpp
+  CreateLocalBuffer.cpp
+  CreateTokenStream.cpp
+  EliminateMultiConsumer.cpp
+  EliminateMultiProducer.cpp
+  FuncPreprocess.cpp
+  LegalizeDataflow.cpp
+  LoopPipelining.cpp
+  LowerCopyToAffine.cpp
+  LowerDataflow.cpp
+  ParallelizeDataflowNode.cpp
+  Passes.cpp
+  PlaceDataflowBuffer.cpp
+  RaiseAffineToCopy.cpp
+  ReduceInitialInterval.cpp
+  RemoveVariableBound.cpp
+  ScheduleDataflowNode.cpp
+  SimplifyAffineIf.cpp
+  SimplifyCopy.cpp
+  StreamDataflowTask.cpp
+  Utils.cpp
+
+  ADDITIONAL_HEADER_DIRS
+  ${PROJECT_SOURCE_DIR}/include/sar/Dialect/HLS/Transforms
+
+  DEPENDS
+  HLSTransformsIncGen
+
+  LINK_LIBS PUBLIC
+  HLSDialect
+  MLIRAffineDialect
+  MLIRAffineAnalysis
+  MLIRAffineTransforms
+  MLIRAffineUtils
+  MLIRArithDialect
+  MLIRBufferizationDialect
+  MLIRBufferizationTransforms
+  MLIRFuncDialect
+  MLIRIR
+  MLIRLinalgDialect
+  MLIRLinalgTransforms
+  MLIRMemRefDialect
+  MLIRMemRefTransforms
+  MLIRPass
+  MLIRSCFDialect
+  MLIRTensorDialect
+  MLIRTransforms
+  MLIRVectorDialect
+)

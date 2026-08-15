@@ -11,7 +11,7 @@ Two complementary checks per algorithm:
 import numpy as np
 import pytest
 
-from conftest import requires_cpu, requires_scalehls
+from conftest import requires_cpu, requires_hls
 from conftest import compile_split_kernel as _compile_split_kernel
 from conftest import run_split as _run_split
 
@@ -107,27 +107,25 @@ def test_wka_affine_ir_matches_numpy(scene, tmp_path):
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-6 * peak)
 
 
-@requires_scalehls
+@requires_hls
 def test_wka_emits_hls_design(scene):
     """The headline: the complete omega-K kernel becomes one HLS design."""
     params, _ = scene
     n = 64  # keep the HIDA optimization time in check
     design = build_wka_kernel(n,
-                              synthetic_params(n)).compile(backend="scalehls")
-    assert design.flow == "affine"
+                              synthetic_params(n)).compile(backend="hls")
     source = design.source()
     assert "void wka" in source
     assert "#pragma HLS" in source
 
 
-@requires_scalehls
+@requires_hls
 def test_rda_emits_hls_design():
     from rda.algorithm import build_kernel as build_rda_kernel
 
     n = 64
     design = build_rda_kernel(n,
-                              synthetic_params(n)).compile(backend="scalehls")
-    assert design.flow == "affine"
+                              synthetic_params(n)).compile(backend="hls")
     source = design.source()
     assert "void rda" in source
     assert "#pragma HLS" in source

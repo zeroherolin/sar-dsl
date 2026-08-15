@@ -10,8 +10,8 @@ export PYTHONPATH=$PWD/python:$PYTHONPATH
 make test        # lit + pytest, everything must pass
 ```
 
-`make scalehls` additionally builds the ScaleHLS-HIDA toolchain (needed only
-for the `scalehls` backend and its tests; they self-skip otherwise).
+The `hls` backend uses `sar-opt` and `sar-translate`, which are built by
+`make build`. No separate step is needed.
 
 ## Editor setup
 

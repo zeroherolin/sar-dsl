@@ -28,7 +28,6 @@ def _config_dirs() -> List[str]:
     if _config is not None:
         dirs.append(getattr(_config, "SAR_DSL_TOOL_DIR", ""))
         dirs.append(getattr(_config, "LLVM_TOOL_DIR", ""))
-        dirs.append(getattr(_config, "SCALEHLS_TOOL_DIR", ""))
     extra = os.environ.get("SAR_DSL_TOOL_PATH", "")
     dirs.extend(p for p in extra.split(os.pathsep) if p)
     return [d for d in dirs if d]

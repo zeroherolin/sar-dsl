@@ -19,8 +19,8 @@ requires_cpu = pytest.mark.skipif(
     not _backend_available("cpu"),
     reason="CPU backend toolchain not available (build the project first)")
 
-requires_scalehls = pytest.mark.skipif(
-    not _backend_available("scalehls"),
+requires_hls = pytest.mark.skipif(
+    not _backend_available("hls"),
     reason="ScaleHLS toolchain not available")
 
 

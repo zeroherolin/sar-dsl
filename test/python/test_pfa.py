@@ -13,7 +13,7 @@ import sys
 import numpy as np
 import pytest
 
-from conftest import REPO_ROOT, requires_cpu, requires_scalehls
+from conftest import REPO_ROOT, requires_cpu, requires_hls
 
 sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
 
@@ -68,11 +68,10 @@ def test_pfa_focuses_and_sva_suppresses_sidelobes(setup):
     assert sva["irw"] < plain["irw"] * 1.05
 
 
-@requires_scalehls
+@requires_hls
 def test_pfa_emits_hls_design():
     n = 32
-    design = build_kernel(n, Geometry(n)).compile(backend="scalehls")
-    assert design.flow == "affine"
+    design = build_kernel(n, Geometry(n)).compile(backend="hls")
     source = design.source()
     assert "void pfa" in source
     assert "#pragma HLS" in source

@@ -74,10 +74,6 @@ endif()
 set(SAR_DSL_TOOL_DIR "${PROJECT_BINARY_DIR}/bin")
 set(SAR_DSL_RUNTIME_LIB "${PROJECT_BINARY_DIR}/lib/libsar_runtime.so")
 set(SAR_DSL_LLVM_TOOL_DIR "${SAR_DSL_LLVM_BUILD_DIR}/bin")
-set(SAR_DSL_SCALEHLS_TOOL_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/externals/ScaleHLS-HIDA/build/bin"
-    CACHE PATH "Directory containing scalehls-opt / scalehls-translate")
-
 configure_file(
   ${PROJECT_SOURCE_DIR}/cmake/_build_config.py.in
   ${PROJECT_SOURCE_DIR}/python/sar/_build_config.py

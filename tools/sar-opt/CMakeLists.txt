@@ -8,12 +8,16 @@ add_llvm_executable(sar-opt
   DEPENDS
   SARDialectIncGen
   SARConversionIncGen
+  HLSDialectIncGen
+  HLSTransformsIncGen
 )
 target_link_libraries(sar-opt PRIVATE
   SARDialect
   SARTransforms
   SARConversion
   SARPipelines
+  HLSDialect
+  HLSTransforms
   ${dialect_libs}
   ${conversion_libs}
   ${extension_libs}

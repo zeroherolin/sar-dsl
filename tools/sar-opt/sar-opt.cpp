@@ -11,6 +11,8 @@
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
 #include "sar/Conversion/Passes.h"
+#include "sar/Dialect/HLS/IR/HLS.h"
+#include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/SAR/IR/SARDialect.h"
 #include "sar/Dialect/SAR/Transforms/Passes.h"
 #include "sar/Pipelines/Pipelines.h"
@@ -20,11 +22,12 @@ int main(int argc, char **argv) {
   mlir::sar::registerConversionPasses();
   mlir::sar::registerSARTransformsPasses();
   mlir::sar::registerSARPipelines();
+  mlir::sar::registerTransformsPasses();
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
-  registry.insert<mlir::sar::SARDialect>();
+  registry.insert<mlir::sar::SARDialect, mlir::sar::hls::HLSDialect>();
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "SAR-DSL optimizer driver\n", registry));

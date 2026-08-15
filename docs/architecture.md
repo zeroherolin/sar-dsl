@@ -25,12 +25,12 @@ kernel language.
  │                          SARFFTToAffine, SARInterpToAffine │
  │  Pipelines/              sar-to-{linalg,affine,llvm}       │
  └───────┬───────────────────────────────┬────────────────────┘
-         │ cpu                           │ scalehls
+         │ cpu                           │ hls
  ┌───────▼───────────────┐   ┌───────────▼────────────────────┐
- │ fusion + OpenMP loops │   │ float:   linalg -> HIDA-pytorch│
- │ mlir-translate        │   │ complex: affine -> HIDA-cpp    │
- │ clang -O3 -shared     │   │ scalehls-translate             │
- │ + libsar_runtime      │   │ -> Vitis HLS C++               │
+ │ fusion + OpenMP loops │   │ affine + HLS pipeline          │
+ │ mlir-translate        │   │ sar-translate --hls-emit-hlscpp│
+ │ clang -O3 -shared     │   │ -> Vitis HLS C++               │
+ │ + libsar_runtime      │   │                                │
  │ -> kernel.so (ctypes) │   │                                │
  └───────────────────────┘   └────────────────────────────────┘
 ```
@@ -123,7 +123,7 @@ form within a few percent of a hand-fused kernel on the 16384^2 scene.
 ### 5. Backend plugin model
 
 `sar.backends` discovers `Backend` classes from `sar/backends/<name>`
-(installed) or `third_party/<name>/backend` (source tree). A backend
+(built-in) or `$SAR_DSL_BACKEND_PATH` (out-of-tree extensions). A backend
 implements:
 
 ```python
@@ -138,16 +138,11 @@ class Backend(BaseBackend):
 Stages communicate through a shared `KernelMetadata` and a content-addressed
 on-disk cache (`~/.cache/sar-dsl/<sha256>/`), so recompilation is skipped
 for unchanged kernels. Execution backends return callables; emission
-backends (ScaleHLS) return artifact handles.
+backends (`hls`) return `HLSDesign` artifact handles.
 
-### 6. ScaleHLS-HIDA backend: two flows
+### 6. HLS backend
 
-Float-only elementwise/reduction kernels can opt into the original path:
-linalg-on-tensors into HIDA's PyTorch entry point (dataflow
-decomposition, tiling, unrolling).
-
-Kernels using complex arithmetic or FFTs take the split-complex affine
-path (`sar-to-affine-pipeline`):
+All kernels follow the split-complex affine path (`sar-to-affine-pipeline`):
 
 1. `sar-decomplexify` (Dialect/SAR/Transforms) rewrites functions so no
    complex types remain: complex tensors become (re, im) float plane

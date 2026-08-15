@@ -7,7 +7,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](CMakeLists.txt)
 [![LLVM/MLIR 22](https://img.shields.io/badge/LLVM%2FMLIR-22-orange.svg)](https://mlir.llvm.org/)
-[![Backends](https://img.shields.io/badge/backends-cpu%20%7C%20scalehls-8a2be2.svg)](docs/backends.md)
+[![Backends](https://img.shields.io/badge/backends-cpu%20%7C%20hls-8a2be2.svg)](docs/backends.md)
 [![Vitis HLS 2022.2](https://img.shields.io/badge/Vitis%20HLS-2022.2-brightgreen.svg)](docs/backends.md)
 [![Platform](https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey.svg)](README.md#status-and-roadmap)
 
@@ -34,9 +34,9 @@ compiled omega-K kernel in 3.6 seconds.*
   kernel, validated against a NumPy reference and cross-checked on
   point targets ([examples/](examples/)).
 - **Multi-backend by construction.** A `cpu` backend executes kernels
-  natively (linalg fusion, OpenMP, `libsar_runtime` FFT); a `scalehls`
+  natively (linalg fusion, OpenMP, `libsar_runtime` FFT); a `hls`
   backend emits Vitis HLS C++ through
-  [ScaleHLS-HIDA](https://github.com/UIUC-ChenLab/ScaleHLS-HIDA). Every SAR
+  [HLS-HIDA](https://github.com/UIUC-ChenLab/HLS-HIDA). Every SAR
   operation has an HLS lowering — FFTs as bit-reversal-free Stockham affine
   loops, interpolation as straight-line masked gathers — so **complete
   imaging chains emit as single FPGA designs**, each with a generated
@@ -75,7 +75,7 @@ def range_compress(raw, replica):     # specializes per call, numpy-style
 image = range_compress(raw_np, replica_np)            # JIT on CPU
 
 hls = range_compress.specialize(sar.c64[512, 512], sar.c64[512, 512])
-print(hls.compile(backend="scalehls").cpp_path)       # or emit HLS C++
+print(hls.compile(backend="hls").cpp_path)       # or emit HLS C++
 ```
 
 ## How it works
@@ -102,7 +102,7 @@ flowchart TB
         CPU1 --> CPU2 --> CPU3
     end
 
-    subgraph HLS["scalehls backend · FPGA emission"]
+    subgraph HLS["hls backend · FPGA emission"]
         direction TB
         H1["HIDA PyTorch flow<br/><sub>dataflow, tiling</sub>"]
         H2["decomplexify → Stockham FFT affine loops<br/>→ HIDA C++ flow"]
@@ -237,12 +237,12 @@ with numpy (matplotlib for the examples).
 
 ```bash
 git clone https://github.com/zeroherolin/sar-dsl.git && cd sar-dsl
-git submodule update --init externals/llvm-project externals/ScaleHLS-HIDA
+git submodule update --init externals/llvm-project externals/HLS-HIDA
 pip install numpy matplotlib pytest   # matplotlib/pytest: examples & tests
 
 make llvm        # 1. in-tree LLVM/MLIR/Clang toolchain (one-time, long)
 make build       # 2. sar-opt, libsar_runtime, tests
-make scalehls    # 3. optional: ScaleHLS-HIDA toolchain for the HLS backend
+make hls    # 3. optional: HLS-HIDA toolchain for the HLS backend
 
 export PYTHONPATH=$PWD/python:$PYTHONPATH
 make test        # lit + pytest, everything should pass
@@ -252,7 +252,7 @@ make examples    # focus a 512x512 synthetic scene, writes a PNG
 The example runners insert `python/` into `sys.path` themselves, so they
 also work without the `PYTHONPATH` export.
 
-Step 3 builds our [ScaleHLS-HIDA fork](https://github.com/zeroherolin/ScaleHLS-HIDA)
+Step 3 builds our [HLS-HIDA fork](https://github.com/zeroherolin/HLS-HIDA)
 (`dev` branch: ported to this project's LLVM, bug fixes land as regular
 commits) against the same LLVM tree as step 1 — one toolchain for
 everything.
@@ -273,7 +273,7 @@ python examples/wka/run_alos_cpu.py
 | [docs/architecture.md](docs/architecture.md) | Layering, design decisions and their rationale |
 | [docs/dialect.md](docs/dialect.md) | The `sar` dialect reference: ops, passes, pipelines |
 | [docs/defining-ops.md](docs/defining-ops.md) | Defining operators with `@sar.op` |
-| [docs/backends.md](docs/backends.md) | Backend guide: cpu, scalehls, adding your own |
+| [docs/backends.md](docs/backends.md) | Backend guide: cpu, hls, adding your own |
 | [docs/roadmap.md](docs/roadmap.md) | What is done, what is next, what is out of scope |
 | [examples/wka/README.md](examples/wka/README.md) | omega-K walkthrough (synthetic + real data) |
 | [examples/rda/README.md](examples/rda/README.md) | Range-Doppler walkthrough |
@@ -288,11 +288,11 @@ include/sar/, lib/       C++ core: dialect, conversions, pipelines
 runtime/                 libsar_runtime (FFT, interpolation kernels; C ABI)
 tools/                   sar-opt (optimizer driver), sar-lsp-server (editor)
 python/sar/              sar package: language, ir, compiler, backends
-third_party/             backend plugins (cpu, scalehls)
+third_party/             backend plugins (cpu, hls)
 examples/                omega-K, Range-Doppler, Chirp Scaling, PFA
 benchmarks/              timing, image-quality metrics and figures
 test/                    lit suites (MLIR) and pytest suites (Python, e2e, fuzz)
-externals/               submodules: llvm-project, ScaleHLS-HIDA
+externals/               submodules: llvm-project, HLS-HIDA
 scripts/                 toolchain build scripts
 ```
 
@@ -320,5 +320,5 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 MIT — see [LICENSE](LICENSE). Built on
 [LLVM/MLIR](https://mlir.llvm.org/) and
-[ScaleHLS-HIDA](https://github.com/UIUC-ChenLab/ScaleHLS-HIDA); sample
+[HLS-HIDA](https://github.com/UIUC-ChenLab/HLS-HIDA); sample
 imagery derives from JAXA ALOS-1 PALSAR data.

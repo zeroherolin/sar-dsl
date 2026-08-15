@@ -103,7 +103,7 @@ def test_recompilation_hits_cache(tmp_path, monkeypatch):
 
 def test_backend_registry_contents():
     backends = sar.list_backends()
-    assert "cpu" in backends and "scalehls" in backends
+    assert "cpu" in backends and "hls" in backends
 
 
 def test_unknown_backend_message():

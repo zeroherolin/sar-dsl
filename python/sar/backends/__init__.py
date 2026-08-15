@@ -1,15 +1,10 @@
 """Backend discovery and registry.
 
 Backends are Python packages exposing a ``Backend`` class (subclass of
-`sar.backends.base.BaseBackend`). They are discovered from, in order:
-
-1. subpackages of ``sar.backends`` (populated by ``setup.py`` /
-   ``scripts/setup-dev.sh`` from the ``third_party`` layout);
-2. ``$SAR_DSL_BACKEND_PATH`` (os.pathsep-separated directories, each being a
-   backend package directory);
-3. ``third_party/*/backend`` relative to a source checkout (development
-   convenience).
-"""
+`sar.backends.base.BaseBackend`). The built-in ones -- ``cpu`` and ``hls``
+-- are subpackages here; out-of-tree backends are discovered from
+``$SAR_DSL_BACKEND_PATH`` (os.pathsep-separated directories, each being a
+backend package directory)."""
 
 from __future__ import annotations
 
@@ -69,7 +64,7 @@ def _discover() -> None:
         return
     _discovered = True
 
-    # 1. Installed subpackages of sar.backends.
+    # 1. Built-in subpackages of sar.backends.
     package_dir = Path(__file__).parent
     for child in sorted(package_dir.iterdir()):
         if child.is_dir() and (child / "compiler.py").exists():
@@ -82,15 +77,6 @@ def _discover() -> None:
             _load_backend_module(
                 path.parent.name if path.name == "backend" else path.name,
                 path)
-
-    # 3. Source-tree third_party/<name>/backend.
-    repo_root = package_dir.parent.parent.parent
-    third_party = repo_root / "third_party"
-    if third_party.is_dir():
-        for vendor in sorted(third_party.iterdir()):
-            backend_dir = vendor / "backend"
-            if backend_dir.is_dir():
-                _load_backend_module(vendor.name, backend_dir)
 
 
 def list_backends() -> Dict[str, Type[BaseBackend]]:

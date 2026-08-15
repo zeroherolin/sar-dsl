@@ -8,7 +8,7 @@ the full chain also exercises the pure phase-multiply + FFT path.
 import numpy as np
 import pytest
 
-from conftest import requires_cpu, requires_scalehls
+from conftest import requires_cpu, requires_hls
 
 from common.params import synthetic_params
 from common.simulate import demo_scene, single_target_scene
@@ -73,12 +73,11 @@ def test_csa_and_wka_agree_on_point_target(setup):
     assert abs(csa_peak[1] - wka_peak[1]) <= 1
 
 
-@requires_scalehls
+@requires_hls
 def test_csa_emits_hls_design():
     n = 64
     design = build_csa_kernel(n,
-                              synthetic_params(n)).compile(backend="scalehls")
-    assert design.flow == "affine"
+                              synthetic_params(n)).compile(backend="hls")
     source = design.source()
     assert "void csa" in source
     assert "#pragma HLS" in source

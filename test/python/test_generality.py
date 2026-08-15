@@ -13,9 +13,9 @@ import pytest
 
 import sar
 
-from conftest import requires_scalehls
+from conftest import requires_hls
 
-pytestmark = requires_scalehls
+pytestmark = requires_hls
 
 #: A bank smaller than this many bits belongs in distributed RAM; anything
 #: larger asks for more LUTs than a device can spare.
@@ -50,7 +50,7 @@ def _emit(name, spec, body):
         return body(x)
 
     kernel.name = name
-    return kernel.specialize(spec).compile(backend="scalehls",
+    return kernel.specialize(spec).compile(backend="hls",
                                            options={
                                                "axi_interface": True,
                                                "on_chip_budget": 8192
@@ -115,7 +115,7 @@ def test_port_count_does_not_track_chain_length(n):
             return z
 
         kernel.name = f"len_{n}_{passes}"
-        return kernel.compile(backend="scalehls",
+        return kernel.compile(backend="hls",
                               options={
                                   "axi_interface": True,
                                   "on_chip_budget": 1
