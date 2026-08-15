@@ -11,8 +11,6 @@ from common.simulate import demo_scene, single_target_scene
 from wka.algorithm import build_kernel, make_inputs
 from wka.reference import WKAProcessor
 
-pytestmark = requires_cpu
-
 N = 128
 
 
@@ -23,6 +21,7 @@ def compiled_kernel():
     return kernel, params
 
 
+@requires_cpu
 def test_wka_matches_numpy_reference(compiled_kernel):
     kernel, params = compiled_kernel
     raw, _ = demo_scene(N, params)
@@ -35,6 +34,7 @@ def test_wka_matches_numpy_reference(compiled_kernel):
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-6 * peak)
 
 
+@requires_cpu
 def test_wka_focuses_point_target(compiled_kernel):
     kernel, params = compiled_kernel
     raw = single_target_scene(N, params)
@@ -59,6 +59,7 @@ def test_wka_focuses_point_target(compiled_kernel):
     assert raw_fraction < 0.05
 
 
+@requires_cpu
 def test_wka_with_alos_parameters():
     """The ALOS parameter set must run through the pipeline as well (spaceborne
     geometry does not focus at N=128, so only algebraic equivalence with the

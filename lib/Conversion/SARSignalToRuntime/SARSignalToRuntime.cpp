@@ -42,13 +42,13 @@ using namespace mlir::sar;
 
 namespace {
 
-/// Returns the runtime symbol suffix for a complex element type: "c64" for
-/// complex<f32>, "c128" for complex<f64>, "f64" for f64.
+/// Returns the runtime symbol suffix for an element type: "c64" for
+/// complex<f32>, "c128" for complex<f64>, "f64" for f64. Empty when the
+/// runtime has no entry point for the type, which the caller reports.
 static StringRef getElementSuffix(Type elementType) {
   if (auto complexTy = dyn_cast<ComplexType>(elementType))
     return complexTy.getElementType().isF32() ? "c64" : "c128";
-  assert(elementType.isF64() && "unexpected runtime element type");
-  return "f64";
+  return elementType.isF64() ? "f64" : "";
 }
 
 /// Returns a memref type with the same shape/element type as `tensorType`
@@ -125,9 +125,12 @@ struct FFTLikeLowering : OpRewritePattern<FFTOpTy> {
     auto tensorType = cast<RankedTensorType>(op.getType());
     int64_t rank = tensorType.getRank();
 
-    std::string symbol = ("sar_rt_fft_" + Twine(rank) + "d_" +
-                          getElementSuffix(tensorType.getElementType()))
-                             .str();
+    StringRef suffix = getElementSuffix(tensorType.getElementType());
+    if (suffix.empty())
+      return op.emitOpError("no runtime entry point for element type ")
+             << tensorType.getElementType();
+    std::string symbol =
+        ("sar_rt_fft_" + Twine(rank) + "d_" + suffix).str();
 
     Value input = tensorToRuntimeArg(rewriter, loc, op.getInput());
     auto [alloc, output] = allocResultBuffer(rewriter, loc, tensorType);
@@ -163,9 +166,11 @@ struct Interp1DLowering : OpRewritePattern<Interp1DOp> {
     auto module = op->getParentOfType<ModuleOp>();
     auto dataType = cast<RankedTensorType>(op.getData().getType());
 
-    std::string symbol = ("sar_rt_interp1d_2d_" +
-                          Twine(getElementSuffix(dataType.getElementType())))
-                             .str();
+    StringRef suffix = getElementSuffix(dataType.getElementType());
+    if (suffix.empty())
+      return op.emitOpError("no runtime entry point for element type ")
+             << dataType.getElementType();
+    std::string symbol = ("sar_rt_interp1d_2d_" + Twine(suffix)).str();
 
     Value data = tensorToRuntimeArg(rewriter, loc, op.getData());
     Value positions = tensorToRuntimeArg(rewriter, loc, op.getPositions());

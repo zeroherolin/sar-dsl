@@ -111,3 +111,72 @@ func.func @batched(%in: memref<4x8x8xf64>, %out: memref<4x8x8xf64>) {
   }
   return
 }
+
+// -----
+
+// Decomplexification splits a complex plane into real and imaginary halves,
+// so a corner turn on the HLS path writes two buffers from one body. The
+// writes agree on which level sweeps them, so each read gets a block and
+// both halves stay contiguous.
+
+// CHECK-LABEL: func.func @split_complex
+// With block-bytes=128 and two f64 planes (16 bytes each), the edge is 2.
+// CHECK-COUNT-2: memref.alloc() : memref<2x2xf64>
+// CHECK-NOT: memref.alloc()
+// CHECK: affine.load %arg0[%{{.*}} * 2 + %{{.*}}, %{{.*}} * 2 + %[[R:.*]]]
+// CHECK: affine.store %{{.*}}, %alloc[%[[R]], %{{.*}}]
+// CHECK: affine.store %{{.*}}, %arg2[
+// CHECK: affine.store %{{.*}}, %arg3[
+func.func @split_complex(%re: memref<8x8xf64>, %im: memref<8x8xf64>,
+                         %ore: memref<8x8xf64>, %oim: memref<8x8xf64>) {
+  affine.for %i = 0 to 8 {
+    affine.for %j = 0 to 8 {
+      %a = affine.load %re[%j, %i] : memref<8x8xf64>
+      %b = affine.load %im[%j, %i] : memref<8x8xf64>
+      affine.store %a, %ore[%i, %j] : memref<8x8xf64>
+      affine.store %b, %oim[%i, %j] : memref<8x8xf64>
+    }
+  }
+  return
+}
+
+// -----
+
+// A write that does not name every level of the band revisits the same
+// address across the levels it drops, so staging would let a different
+// iteration win. Such a nest is left alone.
+
+// CHECK-LABEL: func.func @write_drops_a_level
+// CHECK-NOT: memref.alloc
+func.func @write_drops_a_level(%in: memref<8x8x8xf64>, %out: memref<8x8xf64>) {
+  affine.for %i = 0 to 8 {
+    affine.for %j = 0 to 8 {
+      affine.for %k = 0 to 8 {
+        %v = affine.load %in[%i, %k, %j] : memref<8x8x8xf64>
+        affine.store %v, %out[%i, %j] : memref<8x8xf64>
+      }
+    }
+  }
+  return
+}
+
+// -----
+
+// When an outer level reaches no access, the band below it matches on its
+// own as well. Only the outermost match is staged: rewriting it erases the
+// inner band, so staging both would work on freed loops.
+
+// CHECK-LABEL: func.func @nested_match
+// CHECK: memref.alloc() : memref<4x4xf64>
+// CHECK-NOT: memref.alloc()
+func.func @nested_match(%a: memref<8x8xf64>, %b: memref<8x8xf64>) {
+  affine.for %i = 0 to 8 {
+    affine.for %j = 0 to 8 {
+      affine.for %k = 0 to 8 {
+        %v = affine.load %a[%k, %j] : memref<8x8xf64>
+        affine.store %v, %b[%j, %k] : memref<8x8xf64>
+      }
+    }
+  }
+  return
+}

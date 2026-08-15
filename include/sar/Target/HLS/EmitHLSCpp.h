@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_TRANSLATION_EMITHLSCPP_H
-#define SCALEHLS_TRANSLATION_EMITHLSCPP_H
+#ifndef SAR_TARGET_HLS_EMITHLSCPP_H
+#define SAR_TARGET_HLS_EMITHLSCPP_H
 
 #include "mlir/IR/BuiltinOps.h"
 
@@ -18,4 +18,4 @@ void registerEmitHLSCppTranslation();
 } // namespace sar
 } // namespace mlir
 
-#endif // SCALEHLS_TRANSLATION_EMITHLSCPP_H
+#endif // SAR_TARGET_HLS_EMITHLSCPP_H

@@ -70,8 +70,12 @@ def test_pfa_focuses_and_sva_suppresses_sidelobes(setup):
 
 @requires_hls
 def test_pfa_emits_hls_design():
+    """The full PFA + SVA chain must emit as a single design."""
+    import re
+
     n = 32
     design = build_kernel(n, Geometry(n)).compile(backend="hls")
     source = design.source()
     assert "void pfa" in source
     assert "#pragma HLS" in source
+    assert not re.findall(r"\b(malloc|free|printf|std::cout)\b", source)

@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
@@ -10,7 +10,6 @@
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IntegerSet.h"
@@ -31,34 +30,10 @@ MemoryKind sar::getMemoryKind(MemRefType type) {
   return MemoryKind::UNKNOWN;
 }
 
-bool sar::isRam1P(MemRefType type) {
-  auto kind = getMemoryKind(type);
-  return kind == MemoryKind::LUTRAM_1P || kind == MemoryKind::BRAM_1P ||
-         kind == MemoryKind::URAM_1P;
-}
-bool sar::isRam2P(MemRefType type) {
-  auto kind = getMemoryKind(type);
-  return kind == MemoryKind::LUTRAM_2P || kind == MemoryKind::BRAM_2P ||
-         kind == MemoryKind::URAM_2P;
-}
-bool sar::isRamS2P(MemRefType type) {
-  auto kind = getMemoryKind(type);
-  return kind == MemoryKind::LUTRAM_S2P || kind == MemoryKind::BRAM_S2P ||
-         kind == MemoryKind::URAM_S2P;
-}
-bool sar::isRamT2P(MemRefType type) {
-  auto kind = getMemoryKind(type);
-  return kind == MemoryKind::BRAM_T2P || kind == MemoryKind::URAM_T2P;
-}
 bool sar::isDram(MemRefType type) {
   auto kind = getMemoryKind(type);
   return kind == MemoryKind::DRAM;
 }
-bool sar::isUnknown(MemRefType type) {
-  auto kind = getMemoryKind(type);
-  return kind == MemoryKind::UNKNOWN;
-}
-
 //===----------------------------------------------------------------------===//
 // Dataflow utils
 //===----------------------------------------------------------------------===//
@@ -230,9 +205,6 @@ SmallVector<NodeOp> sar::getConsumersExcept(Value buffer, NodeOp except) {
 SmallVector<NodeOp> sar::getProducersExcept(Value buffer, NodeOp except) {
   return getUsersExcept(buffer, OperandKind::OUTPUT, except);
 }
-SmallVector<NodeOp> sar::getConsumers(Value buffer) {
-  return getConsumersExcept(buffer, NodeOp());
-}
 SmallVector<NodeOp> sar::getProducers(Value buffer) {
   return getProducersExcept(buffer, NodeOp());
 }
@@ -305,10 +277,6 @@ sar::getNestedConsumersExcept(Value buffer, NodeOp except) {
 SmallVector<std::pair<NodeOp, Value>>
 sar::getNestedProducersExcept(Value buffer, NodeOp except) {
   return getNestedUsersExcept(buffer, OperandKind::OUTPUT, except);
-}
-SmallVector<std::pair<NodeOp, Value>>
-sar::getNestedConsumers(Value buffer) {
-  return getNestedConsumersExcept(buffer, NodeOp());
 }
 SmallVector<std::pair<NodeOp, Value>>
 sar::getNestedProducers(Value buffer) {
@@ -1126,19 +1094,6 @@ func::FuncOp sar::getTopFunc(ModuleOp module, std::string topFuncName) {
         return func::FuncOp();
     }
   return topFunc;
-}
-
-func::FuncOp sar::getRuntimeFunc(ModuleOp module,
-                                      std::string runtimeFuncName) {
-  func::FuncOp runtimeFunc;
-  for (auto func : module.getOps<func::FuncOp>())
-    if (hasRuntimeAttr(func) || func.getName() == runtimeFuncName) {
-      if (!runtimeFunc)
-        runtimeFunc = func;
-      else
-        return func::FuncOp();
-    }
-  return runtimeFunc;
 }
 
 //===----------------------------------------------------------------------===//

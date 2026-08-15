@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_TRANSFORMS_PASSES_TD
-#define SCALEHLS_TRANSFORMS_PASSES_TD
+#ifndef SAR_DIALECT_HLS_TRANSFORMS_PASSES_TD
+#define SAR_DIALECT_HLS_TRANSFORMS_PASSES_TD
 
 include "mlir/Pass/PassBase.td"
 
@@ -523,7 +523,7 @@ def LoopPipelining : Pass<"hls-loop-pipelining", "func::FuncOp"> {
 
 
 
-#endif // SCALEHLS_TRANSFORMS_PASSES_TD
+#endif // SAR_DIALECT_HLS_TRANSFORMS_PASSES_TD
 
 def CreateMemrefSubview :
       Pass<"hls-create-memref-subview", "func::FuncOp"> {

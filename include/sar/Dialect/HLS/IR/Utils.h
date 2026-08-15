@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_SUPPORT_UTILS_H
-#define SCALEHLS_SUPPORT_UTILS_H
+#ifndef SAR_DIALECT_HLS_IR_UTILS_H
+#define SAR_DIALECT_HLS_IR_UTILS_H
 
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
@@ -27,12 +27,7 @@ using FactorList = SmallVector<unsigned, 8>;
 //===----------------------------------------------------------------------===//
 
 MemoryKind getMemoryKind(MemRefType type);
-bool isRam1P(MemRefType type);
-bool isRam2P(MemRefType type);
-bool isRamS2P(MemRefType type);
-bool isRamT2P(MemRefType type);
 bool isDram(MemRefType type);
-bool isUnknown(MemRefType type);
 
 //===----------------------------------------------------------------------===//
 // Dataflow utils
@@ -60,7 +55,6 @@ NodeOp fuseNodeOps(ArrayRef<NodeOp> nodes, PatternRewriter &rewriter);
 /// Get the consumer/producer nodes of the given buffer expect the given op.
 SmallVector<NodeOp> getConsumersExcept(Value buffer, NodeOp except);
 SmallVector<NodeOp> getProducersExcept(Value buffer, NodeOp except);
-SmallVector<NodeOp> getConsumers(Value buffer);
 SmallVector<NodeOp> getProducers(Value buffer);
 SmallVector<NodeOp> getDependentConsumers(Value buffer, NodeOp node);
 
@@ -70,7 +64,6 @@ SmallVector<std::pair<NodeOp, Value>> getNestedConsumersExcept(Value buffer,
                                                                NodeOp except);
 SmallVector<std::pair<NodeOp, Value>> getNestedProducersExcept(Value buffer,
                                                                NodeOp except);
-SmallVector<std::pair<NodeOp, Value>> getNestedConsumers(Value buffer);
 SmallVector<std::pair<NodeOp, Value>> getNestedProducers(Value buffer);
 
 /// Get the depth of a buffer or stream channel. Note that only if the defining
@@ -200,7 +193,6 @@ bool checkDependence(Operation *A, Operation *B);
 
 func::FuncOp getTopFunc(ModuleOp module, std::string topFuncName = "");
 
-func::FuncOp getRuntimeFunc(ModuleOp module, std::string runtimeFuncName = "");
 
 /// Ensure that all operations that could be executed after `start`
 /// (noninclusive) and prior to `memOp` (e.g. on a control flow/op path between
@@ -453,4 +445,4 @@ template <> struct DenseMapInfo<mlir::sar::PtrLikeMemRefAccess> {
 
 } // namespace llvm
 
-#endif // SCALEHLS_SUPPORT_UTILS_H
+#endif // SAR_DIALECT_HLS_IR_UTILS_H

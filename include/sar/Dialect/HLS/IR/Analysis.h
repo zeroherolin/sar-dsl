@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_DIALECT_HLS_ANALYSIS_H
-#define SCALEHLS_DIALECT_HLS_ANALYSIS_H
+#ifndef SAR_DIALECT_HLS_IR_ANALYSIS_H
+#define SAR_DIALECT_HLS_IR_ANALYSIS_H
 
 #include "sar/Dialect/HLS/IR/HLS.h"
 #include "sar/Dialect/HLS/IR/Utils.h"
@@ -185,4 +185,4 @@ private:
 } // namespace sar
 } // namespace mlir
 
-#endif // SCALEHLS_DIALECT_HLS_ANALYSIS_H
+#endif // SAR_DIALECT_HLS_IR_ANALYSIS_H

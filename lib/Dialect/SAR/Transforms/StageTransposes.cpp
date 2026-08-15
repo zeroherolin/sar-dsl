@@ -95,25 +95,25 @@ static std::optional<TransposeNest> matchTranspose(affine::AffineForOp outer) {
   for (auto loop : band)
     ivs.push_back(loop.getInductionVar());
 
-  // Exactly one write, and every access has to be expressible over the tile
-  // and point loops the rewrite introduces.
-  affine::AffineStoreOp store;
+  // Every access has to be expressible over the tile and point loops the
+  // rewrite introduces. A body may write more than one plane -- splitting
+  // complex data into real and imaginary halves is the common case -- so
+  // long as the writes agree on which level sweeps them.
+  SmallVector<affine::AffineStoreOp> stores;
   SmallVector<affine::AffineLoadOp> loads;
   bool retargetable = true;
   band.back().getBody()->walk([&](Operation *op) {
     if (auto load = dyn_cast<affine::AffineLoadOp>(op)) {
       loads.push_back(load);
     } else if (auto write = dyn_cast<affine::AffineStoreOp>(op)) {
-      if (store)
-        retargetable = false;
-      store = write;
+      stores.push_back(write);
     } else if (isa<affine::AffineForOp, affine::AffineIfOp>(op)) {
       // A nested region would carry induction variables the rewrite does
       // not know how to re-express.
       retargetable = false;
     }
   });
-  if (!retargetable || !store)
+  if (!retargetable || stores.empty())
     return std::nullopt;
 
   auto accessesOnlyIVs = [&](ValueRange operands) {
@@ -126,13 +126,25 @@ static std::optional<TransposeNest> matchTranspose(affine::AffineForOp outer) {
     return type.getRank() >= 2 && type.hasStaticShape();
   };
 
-  if (!accessesOnlyIVs(store.getMapOperands()) ||
-      !staged(store.getMemRefType()))
-    return std::nullopt;
-  auto destLevel =
-      fastestLevel(store.getAffineMap(), store.getMapOperands(), ivs);
-  if (!destLevel)
-    return std::nullopt;
+  std::optional<unsigned> destLevel;
+  for (auto store : stores) {
+    if (!accessesOnlyIVs(store.getMapOperands()) ||
+        !staged(store.getMemRefType()))
+      return std::nullopt;
+    // Reordering iterations is only sound when each writes its own element,
+    // so a write has to name every level of the band. A write that drops a
+    // level revisits the same address, and the block would decide the
+    // winner by a different order than the original nest.
+    if (llvm::any_of(ivs, [&](Value iv) {
+          return !llvm::is_contained(store.getMapOperands(), iv);
+        }))
+      return std::nullopt;
+    auto level =
+        fastestLevel(store.getAffineMap(), store.getMapOperands(), ivs);
+    if (!level || (destLevel && *destLevel != *level))
+      return std::nullopt;
+    destLevel = level;
+  }
 
   SmallVector<affine::AffineLoadOp> transposing;
   std::optional<unsigned> sourceLevel;
@@ -301,12 +313,35 @@ struct SARStageTransposes
   using SARStageTransposesBase::SARStageTransposesBase;
 
   void runOnOperation() override {
+    // Collect in pre-order so that an outer match always precedes any inner
+    // match it contains. (The default walk is post-order, which would visit
+    // inner loops first and break the containment check below.)
     SmallVector<TransposeNest> nests;
-    getOperation().walk([&](affine::AffineForOp loop) {
+    getOperation().walk<WalkOrder::PreOrder>([&](affine::AffineForOp loop) {
       if (auto nest = matchTranspose(loop))
         nests.push_back(*nest);
     });
-    for (auto &nest : nests)
+
+    // When an outer loop's induction variable does not appear in any access
+    // map, the inner band also matches on its own. Staging rewrites a nest
+    // by erasing its entire band, so attempting to stage the inner nest
+    // afterward would be a use-after-free. Pre-order guarantees a container
+    // precedes what it holds, so we just track which outer loops were kept
+    // and skip any nest whose outer loop is a descendant of one of them.
+    DenseSet<Operation *> outermost;
+    SmallVector<TransposeNest> toStage;
+    for (auto &nest : nests) {
+      bool contained = false;
+      for (Operation *p = nest.band.front()->getParentOp();
+           p && !contained; p = p->getParentOp())
+        contained = outermost.contains(p);
+      if (contained)
+        continue;
+      outermost.insert(nest.band.front().getOperation());
+      toStage.push_back(nest);
+    }
+
+    for (auto &nest : toStage)
       (void)stageTranspose(nest, blockBytes);
   }
 };

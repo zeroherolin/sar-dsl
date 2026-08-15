@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
@@ -1387,6 +1387,12 @@ void ModuleEmitter::emitAffineYield(AffineYieldOp op) {
       case (arith::AtomicRMWKind::andi):
         os << " &= ";
         emitValue(op.getOperand(resultIdx++), rank);
+        break;
+      default:
+        // Emitting the assignment without a right-hand side would produce
+        // C++ that silently computes something else, so refuse instead.
+        op.emitOpError("unsupported reduction kind in affine.yield");
+        os << " = /*unsupported*/";
         break;
       }
       os << ";";

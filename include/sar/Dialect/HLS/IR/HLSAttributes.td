@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_DIALECT_HLS_HLSATTRIBUTES_TD
-#define SCALEHLS_DIALECT_HLS_HLSATTRIBUTES_TD
+#ifndef SAR_DIALECT_HLS_IR_HLSATTRIBUTES_TD
+#define SAR_DIALECT_HLS_IR_HLSATTRIBUTES_TD
 
 include "sar/Dialect/HLS/IR/HLSBase.td"
 include "mlir/IR/AttrTypeBase.td"
@@ -194,4 +194,4 @@ def FuncDirectiveAttr : HLSAttr<"FuncDirective"> {
   }];
 }
 
-#endif // SCALEHLS_DIALECT_HLS_HLSATTRIBUTES_TD
+#endif // SAR_DIALECT_HLS_IR_HLSATTRIBUTES_TD

@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_DIALECT_HLS_HLSTYPES_TD
-#define SCALEHLS_DIALECT_HLS_HLSTYPES_TD
+#ifndef SAR_DIALECT_HLS_IR_HLSTYPES_TD
+#define SAR_DIALECT_HLS_IR_HLSTYPES_TD
 
 include "sar/Dialect/HLS/IR/HLSAttributes.td"
 
@@ -45,4 +45,4 @@ def BundleType : HLSType<"Bundle"> {
   let assemblyFormat = "`<` qualified($dataType) `,` $kind `>`";
 }
 
-#endif // SCALEHLS_DIALECT_HLS_HLSTYPES_TD
+#endif // SAR_DIALECT_HLS_IR_HLSTYPES_TD

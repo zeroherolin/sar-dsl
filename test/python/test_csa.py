@@ -75,9 +75,13 @@ def test_csa_and_wka_agree_on_point_target(setup):
 
 @requires_hls
 def test_csa_emits_hls_design():
+    """The full chirp-scaling chain must emit as a single design."""
+    import re
+
     n = 64
     design = build_csa_kernel(n,
                               synthetic_params(n)).compile(backend="hls")
     source = design.source()
     assert "void csa" in source
     assert "#pragma HLS" in source
+    assert not re.findall(r"\b(malloc|free|printf|std::cout)\b", source)

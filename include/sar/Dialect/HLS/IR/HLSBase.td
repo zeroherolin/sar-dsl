@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_DIALECT_HLS_HLSBASE_TD
-#define SCALEHLS_DIALECT_HLS_HLSBASE_TD
+#ifndef SAR_DIALECT_HLS_IR_HLSBASE_TD
+#define SAR_DIALECT_HLS_IR_HLSBASE_TD
 
 include "mlir/IR/OpBase.td"
 
@@ -22,4 +22,4 @@ def HLSDialect : Dialect {
   let cppNamespace = "::mlir::sar::hls";
 }
 
-#endif // SCALEHLS_DIALECT_HLS_HLSBASE_TD
+#endif // SAR_DIALECT_HLS_IR_HLSBASE_TD

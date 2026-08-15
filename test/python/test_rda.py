@@ -16,8 +16,6 @@ from rda.algorithm import build_kernel as build_rda_kernel
 from rda.algorithm import make_inputs as rda_inputs
 from rda.reference import RDAProcessor
 
-pytestmark = requires_cpu
-
 N = 128
 
 
@@ -29,6 +27,7 @@ def setup():
     return params, kernel, inputs
 
 
+@requires_cpu
 def test_rda_matches_numpy_reference(setup):
     params, kernel, inputs = setup
     rng = np.random.default_rng(21)
@@ -42,6 +41,7 @@ def test_rda_matches_numpy_reference(setup):
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-6 * peak)
 
 
+@requires_cpu
 def test_rda_focuses_point_target(setup):
     params, kernel, inputs = setup
     raw = single_target_scene(N, params)
@@ -56,6 +56,7 @@ def test_rda_focuses_point_target(setup):
     assert energy_fraction > 0.8
 
 
+@requires_cpu
 def test_rda_and_wka_agree_on_point_target(setup):
     """Both imaging algorithms must place the same scatterer at the same
     pixel with comparable focusing quality."""

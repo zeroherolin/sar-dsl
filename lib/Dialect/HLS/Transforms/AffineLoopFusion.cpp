@@ -147,15 +147,6 @@ public:
       return storeOpCount;
     }
 
-    // Returns all store ops in 'storeOps' which access 'memref'.
-    void getStoreOpsForMemref(Value memref,
-                              SmallVectorImpl<Operation *> *storeOps) {
-      for (auto *storeOpInst : stores) {
-        if (memref == cast<AffineWriteOpInterface>(storeOpInst).getMemRef())
-          storeOps->push_back(storeOpInst);
-      }
-    }
-
     // Returns all load ops in 'loadOps' which access 'memref'.
     void getLoadOpsForMemref(Value memref,
                              SmallVectorImpl<Operation *> *loadOps) {
@@ -258,24 +249,6 @@ public:
     inEdges.erase(id);
     outEdges.erase(id);
     nodes.erase(id);
-  }
-
-  // Returns true if node 'id' writes to any memref which escapes (or is an
-  // argument to) the function/block. Returns false otherwise.
-  bool writesToLiveInOrEscapingMemrefs(unsigned id) {
-    Node *node = getNode(id);
-    for (auto *storeOpInst : node->stores) {
-      auto memref = cast<AffineWriteOpInterface>(storeOpInst).getMemRef();
-      auto *op = memref.getDefiningOp();
-      // Return true if 'memref' is a block argument.
-      if (!op)
-        return true;
-      // Return true if any use of 'memref' escapes the function.
-      for (auto *user : memref.getUsers())
-        if (!isa<AffineMapAccessInterface>(*user))
-          return true;
-    }
-    return false;
   }
 
   // Returns true iff there is an edge from node 'srcId' to node 'dstId' which
@@ -581,25 +554,6 @@ public:
       callback(edge);
     }
   }
-
-  void print(raw_ostream &os) const {
-    os << "\nMemRefDependenceGraph\n";
-    os << "\nNodes:\n";
-    for (const auto &idAndNode : nodes) {
-      os << "Node: " << idAndNode.first << "\n";
-      auto it = inEdges.find(idAndNode.first);
-      if (it != inEdges.end()) {
-        for (const auto &e : it->second)
-          os << "  InEdge: " << e.id << " " << e.value << "\n";
-      }
-      it = outEdges.find(idAndNode.first);
-      if (it != outEdges.end()) {
-        for (const auto &e : it->second)
-          os << "  OutEdge: " << e.id << " " << e.value << "\n";
-      }
-    }
-  }
-  void dump() const { print(llvm::errs()); }
 
   hls::StageLikeInterface getStage() { return stage; }
 
@@ -996,6 +950,10 @@ static Value createPrivateMemRef(AffineForOp forOp, Operation *srcStoreOpInst,
 
   // Replace all users of 'oldMemRef' with 'newMemRef', restricted to
   // users dominated by the loop body start (the former domOpFilter).
+  // `dominates`, not `properlyDominates`: the filter op is itself the first
+  // op of the fused body and usually accesses the memref, so excluding it
+  // would leave that one access reading the shared buffer while every
+  // later access reads the private one.
   Operation *domFilter = &*forOp.getBody()->begin();
   DominanceInfo domInfo(domFilter->getParentOfType<FunctionOpInterface>());
   LogicalResult res = replaceAllMemRefUsesWith(
@@ -1003,7 +961,7 @@ static Value createPrivateMemRef(AffineForOp forOp, Operation *srcStoreOpInst,
       /*extraOperands=*/outerIVs,
       /*symbolOperands=*/{},
       /*userFilterFn=*/[&](Operation *user) {
-        return domInfo.properlyDominates(domFilter, user);
+        return domInfo.dominates(domFilter, user);
       });
   assert(succeeded(res) &&
          "replaceAllMemrefUsesWith should always succeed here");

@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_DIALECT_HLS_HLSINTERFACES_TD
-#define SCALEHLS_DIALECT_HLS_HLSINTERFACES_TD
+#ifndef SAR_DIALECT_HLS_IR_HLSINTERFACES_TD
+#define SAR_DIALECT_HLS_IR_HLSINTERFACES_TD
 
 include "mlir/IR/OpBase.td"
 
@@ -56,4 +56,4 @@ def StageLikeInterface : OpInterface<"StageLikeInterface"> {
   ];
 }
 
-#endif // SCALEHLS_DIALECT_HLS_HLSINTERFACES_TD
+#endif // SAR_DIALECT_HLS_IR_HLSINTERFACES_TD

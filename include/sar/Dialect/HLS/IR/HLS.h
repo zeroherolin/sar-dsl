@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_DIALECT_HLS_HLS_H
-#define SCALEHLS_DIALECT_HLS_HLS_H
+#ifndef SAR_DIALECT_HLS_IR_HLS_H
+#define SAR_DIALECT_HLS_IR_HLS_H
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -132,4 +132,4 @@ public:
 #define GET_OP_CLASSES
 #include "sar/Dialect/HLS/IR/HLSOps.h.inc"
 
-#endif // SCALEHLS_DIALECT_HLS_HLS_H
+#endif // SAR_DIALECT_HLS_IR_HLS_H

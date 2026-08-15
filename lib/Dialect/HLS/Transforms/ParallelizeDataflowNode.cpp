@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,29 +28,6 @@ using namespace mlir::affine;
 using namespace sar;
 
 /// Apply loop vectorization to the loop band.
-static bool applyLoopVectorization(AffineLoopBand &band,
-                                   FactorList vectorFactors) {
-  assert(!band.empty() && "no loops provided");
-  if (llvm::all_of(vectorFactors, [](unsigned factor) { return factor == 1; }))
-    return true;
-
-  // We require all loops to be parallel loop.
-  for (auto [loop, size] : llvm::zip(band, vectorFactors))
-    if (size != 1 && !(hasParallelAttr(loop) || isLoopParallel(loop)))
-      return false;
-
-  LLVM_DEBUG(llvm::dbgs() << "Loop vectorization ";);
-  LLVM_DEBUG(llvm::dbgs() << "vector factors: ";);
-  LLVM_DEBUG(for (auto factor : vectorFactors) llvm::dbgs() << factor << " ";);
-
-  // Apply loop vectorization.
-  auto loopSet = llvm::DenseSet<Operation *>(band.begin(), band.end());
-  auto sizes =
-      SmallVector<int64_t>(vectorFactors.rbegin(), vectorFactors.rend());
-  vectorizeAffineLoops(band.front()->getParentOp(), loopSet, sizes, {});
-  return true;
-}
-
 namespace {
 struct GenerateBufferLayout
     : public OpInterfaceRewritePattern<VectorTransferOpInterface> {
@@ -315,7 +292,6 @@ struct ParallelizeDataflowNode
     for (auto p : nodeUnrollFactorsMap) {
       auto band = getNodeLoopBand(p.first);
       // if (hasEffectOnExternalBuffer(band.front()))
-      //   applyLoopVectorization(band, p.second);
       // else
       applyLoopUnrollJam(band, p.second);
     }

@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_TRANSFORMS_PASSES_H
-#define SCALEHLS_TRANSFORMS_PASSES_H
+#ifndef SAR_DIALECT_HLS_TRANSFORMS_PASSES_H
+#define SAR_DIALECT_HLS_TRANSFORMS_PASSES_H
 
 #include "mlir/Pass/Pass.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -41,7 +41,6 @@ enum CreateSubviewMode { Point, Reduction };
 void registerHLSPipeline();
 void registerTransformsPasses();
 
-void addSimplifyCopyPasses(OpPassManager &pm);
 void addSimplifyAffineLoopPasses(OpPassManager &pm);
 void addCreateSubviewPasses(
     OpPassManager &pm,
@@ -115,4 +114,4 @@ std::unique_ptr<Pass> createLoopPipeliningPass();
 } // namespace sar
 } // namespace mlir
 
-#endif // SCALEHLS_TRANSFORMS_PASSES_H
+#endif // SAR_DIALECT_HLS_TRANSFORMS_PASSES_H

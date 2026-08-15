@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
@@ -54,8 +54,6 @@ bool sar::applyAffineLoopOrderOpt(AffineLoopBand &band,
   // and calculate the number of common surrouding loops for later uses.
   MemAccessesMap loadStoresMap;
   getMemAccessesMap(loopBlock, loadStoresMap);
-  // auto commonLoopDepth = getNumCommonSurroundingLoops(
-  //     *loopBlock.begin(), *std::next(loopBlock.begin()));
 
   // A map of dependency distances indexed by the loop in the band.
   SmallVector<AffineForOp, 8> targetLoops;
@@ -63,66 +61,7 @@ bool sar::applyAffineLoopOrderOpt(AffineLoopBand &band,
     if (!isLoopParallel(loop))
       targetLoops.push_back(loop);
 
-  // llvm::SmallDenseMap<Operation *, unsigned, 8> distanceMap;
-
-  // //  Only the loops in the loop band will be checked.
-  // unsigned startDepth = commonLoopDepth - bandDepth + 1;
-  // for (unsigned depth = startDepth; depth < commonLoopDepth + 1; ++depth) {
-  //   auto loop = band[depth - startDepth];
-  //   unsigned minDistance = UINT_MAX;
-
-  //   // Traverse all memories in the loop block and find all dependencies
-  //   // associated to each memory.
-  //   for (auto pair : loadStoresMap) {
-  //     auto loadStores = pair.second;
-
-  //     int64_t dstIndex = 1;
-  //     for (auto dstOp : loadStores) {
-  //       for (auto srcOp : llvm::drop_begin(loadStores, dstIndex)) {
-  //         MemRefAccess dstAccess(dstOp);
-  //         MemRefAccess srcAccess(srcOp);
-
-  //         FlatAffineValueConstraints depConstrs;
-  //         SmallVector<DependenceComponent, 2> depComps;
-
-  //         DependenceResult result = checkMemrefAccessDependence(
-  //             srcAccess, dstAccess, depth, &depConstrs, &depComps);
-
-  //         if (hasDependence(result)) {
-  //           auto depComp = depComps[depth - 1];
-  //           assert(loop == depComp.op && "unexpected dependency");
-
-  //           // Only positive distance will be recorded.
-  //           if (depComp.ub.value() > 0) {
-  //             unsigned distance = std::max(depComp.lb.value(), (int64_t)1);
-  //             minDistance = std::min(minDistance, distance);
-  //           }
-  //         }
-  //       }
-  //       ++dstIndex;
-  //     }
-  //   }
-
-  //   // Collect all candidate loops into an ordered vector. Loop with the
-  //   // smallest distance will appear in the front.
-  //   if (minDistance < UINT_MAX) {
-  //     distanceMap[loop] = minDistance;
-
-  //     for (auto it = targetLoops.begin(); it <= targetLoops.end(); ++it)
-  //       if (it == targetLoops.end()) {
-  //         targetLoops.push_back(loop);
-  //         break;
-  //       } else if (minDistance < distanceMap[*it]) {
-  //         targetLoops.insert(it, loop);
-  //         break;
-  //       }
-  //   }
-  // }
-
-  // distanceMap.clear();
-
   // Permute the target loops one by one.
-  // TODO: a more comprehensive permution strategy search.
   for (auto loop : targetLoops) {
     unsigned targetLoopLoc =
         std::find(band.begin(), band.end(), loop) - band.begin();

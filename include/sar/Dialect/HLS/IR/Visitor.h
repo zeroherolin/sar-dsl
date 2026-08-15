@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_DIALECT_HLS_VISITOR_H
-#define SCALEHLS_DIALECT_HLS_VISITOR_H
+#ifndef SAR_DIALECT_HLS_IR_VISITOR_H
+#define SAR_DIALECT_HLS_IR_VISITOR_H
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -225,4 +225,4 @@ public:
 } // namespace sar
 } // namespace mlir
 
-#endif // SCALEHLS_DIALECT_HLS_VISITOR_H
+#endif // SAR_DIALECT_HLS_IR_VISITOR_H

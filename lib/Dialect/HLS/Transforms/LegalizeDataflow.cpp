@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
@@ -75,7 +75,6 @@ struct FuseMultiConsumer : public OpRewritePattern<ScheduleOp> {
     DominanceInfo domInfo;
     bool hasChanged = false;
     for (const auto &p : levelToNodesMap) {
-      // llvm::outs() << p.first << "\n";
       llvm::SmallDenseSet<NodeOp> visitedNodes;
       SmallVector<SmallVector<NodeOp>> worklist;
 
@@ -137,10 +136,12 @@ static void collectBypassNodes(
   if (maxDiff == 1)
     return;
 
-  for (auto level = targetLevel - 1; level >= targetLevel - maxDiff; --level) {
+  // Levels are unsigned, so counting down to `targetLevel - maxDiff` wraps
+  // past zero and never terminates. Clamp the stop bound instead.
+  unsigned stop = targetLevel > maxDiff ? targetLevel - maxDiff : 0;
+  for (unsigned level = targetLevel; level-- > stop;) {
     if (!mergedLevels.insert(level).second)
       continue;
-    // llvm::outs() << "---------- " << level << "\n";
     for (auto node : map.lookup(level))
       nodesToMerge.push_back(node);
     collectBypassNodes(map, mergedLevels, nodesToMerge, level);
@@ -171,7 +172,6 @@ struct FuseBypassPath : public OpRewritePattern<ScheduleOp> {
     for (auto level = maxLevel; level > 0; --level) {
       if (mergedLevels.count(level))
         continue;
-      // llvm::outs() << "\n========== " << level << "\n";
       SmallVector<NodeOp> nodesToMerge;
       collectBypassNodes(levelToNodesMap, mergedLevels, nodesToMerge, level);
       if (nodesToMerge.size() > 1)
@@ -193,26 +193,6 @@ struct FuseBypassPath : public OpRewritePattern<ScheduleOp> {
 };
 } // namespace
 
-// namespace {
-// struct AllocateInternalBuffer : public OpRewritePattern<BufferOp> {
-//   using OpRewritePattern<BufferOp>::OpRewritePattern;
-
-//   LogicalResult matchAndRewrite(BufferOp buffer,
-//                                 PatternRewriter &rewriter) const override {
-//     if (isExtBuffer(buffer) && llvm::hasSingleElement(buffer->getUsers()))
-//       if (auto node = dyn_cast<NodeOp>(*buffer->user_begin())) {
-//         auto bufferType = buffer.getType();
-//         auto newType = MemRefType::get(
-//             bufferType.getShape(), bufferType.getElementType(), AffineMap(),
-//             MemoryKindAttr::get(buffer.getContext(), MemoryKind::BRAM_T2P));
-//         buffer.getMemref().setType(newType);
-//         node.updateSignatureRecursively();
-//         return success();
-//       }
-//     return failure();
-//   }
-// };
-// } // namespace
 
 /// Whether any external buffer in `schedule` is written by more than one node.
 ///

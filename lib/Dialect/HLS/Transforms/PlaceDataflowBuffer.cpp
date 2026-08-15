@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
@@ -36,13 +36,6 @@ struct PlaceBuffer : public OpRewritePattern<func::FuncOp> {
     auto newType = MemRefType::get(
         type.getShape(), type.getElementType(), type.getLayout().getAffineMap(),
         MemoryKindAttr::get(type.getContext(), kind));
-    return newType;
-  }
-
-  MemRefType getPlacedOnDramType(MemRefType type) const {
-    auto newType = MemRefType::get(
-        type.getShape(), type.getElementType(), type.getLayout().getAffineMap(),
-        MemoryKindAttr::get(type.getContext(), MemoryKind::DRAM));
     return newType;
   }
 

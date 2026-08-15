@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_DIALECT_HLS_HLSOPS_TD
-#define SCALEHLS_DIALECT_HLS_HLSOPS_TD
+#ifndef SAR_DIALECT_HLS_IR_HLSOPS_TD
+#define SAR_DIALECT_HLS_IR_HLSOPS_TD
 
 include "sar/Dialect/HLS/IR/HLSInterfaces.td"
 include "sar/Dialect/HLS/IR/HLSTypes.td"
@@ -516,4 +516,4 @@ def VectorInitOp : HLSOp<"vector.init", [NoMemoryEffect]> {
   let assemblyFormat = "attr-dict `:` type($output)";
 }
 
-#endif // SCALEHLS_DIALECT_HLS_HLSOPS_TD
+#endif // SAR_DIALECT_HLS_IR_HLSOPS_TD

@@ -1,11 +1,11 @@
 //===----------------------------------------------------------------------===//
 //
-// Copyright 2020-2021 The ScaleHLS Authors.
+// Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SCALEHLS_TRANSFORMS_UTILS_H
-#define SCALEHLS_TRANSFORMS_UTILS_H
+#ifndef SAR_DIALECT_HLS_TRANSFORMS_UTILS_H
+#define SAR_DIALECT_HLS_TRANSFORMS_UTILS_H
 
 #include "sar/Dialect/HLS/IR/Utils.h"
 
@@ -79,4 +79,4 @@ bool applyOptStrategy(func::FuncOp func, ArrayRef<FactorList> tileLists,
 } // namespace sar
 } // namespace mlir
 
-#endif // SCALEHLS_TRANSFORMS_UTILS_H
+#endif // SAR_DIALECT_HLS_TRANSFORMS_UTILS_H

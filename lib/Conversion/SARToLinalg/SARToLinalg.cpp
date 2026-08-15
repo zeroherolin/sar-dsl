@@ -413,6 +413,8 @@ struct ReduceOpLowering : OpRewritePattern<ReduceOp> {
     auto resultType = cast<RankedTensorType>(op.getType());
     Type elementType = resultType.getElementType();
     StringRef kind = op.getKind();
+    if (kind != "sum" && kind != "max" && kind != "min")
+      return op.emitOpError("unknown reduction kind '") << kind << "'";
 
     // The identity has to be the one the combinator leaves untouched, or
     // the first element folded in would be lost.
