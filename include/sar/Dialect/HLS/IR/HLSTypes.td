@@ -15,8 +15,8 @@ class HLSType<string name, list<Trait> traits = []> :
 def StreamType : HLSType<"Stream"> {
   let summary = "An HLS stream type";
   let description = [{
-    Represents a stream of any type that can be transfered between HLS modules.
-    This type is equal to the hls::stream<> type in Xilinx Vivado HLS.
+    Represents a stream of any type that can be transferred between HLS
+    modules. Emits as the Vitis HLS hls::stream<> type.
   }];
   let mnemonic = "stream";
 

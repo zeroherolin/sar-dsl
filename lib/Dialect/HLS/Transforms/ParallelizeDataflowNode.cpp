@@ -20,7 +20,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 #define DEBUG_TYPE "parallelize-dataflow-node"
 
 using namespace mlir;
@@ -91,14 +90,6 @@ struct ParallelizeDataflowNode
           return WalkResult::interrupt();
         }
         scheduleUnrollFactor = nodeParallelFactorMap.lookup(parentNode);
-        // FIXME: A hacky method to hand tune the factors and resolve
-        // outstanding dataflow nodes.
-        if (auto attr = schedule->getAttr("increase"))
-          if (auto annoFactor = dyn_cast<IntegerAttr>(attr))
-            scheduleUnrollFactor *= annoFactor.getInt();
-        if (auto attr = schedule->getAttr("decrease"))
-          if (auto annoFactor = dyn_cast<IntegerAttr>(attr))
-            scheduleUnrollFactor /= annoFactor.getInt();
       }
 
       auto scheduleComplexity = compAnal.getScheduleComplexity(schedule);
@@ -184,10 +175,11 @@ struct ParallelizeDataflowNode
     SmallVector<std::pair<NodeOp, unsigned>> worklist;
     for (auto &nodeAndList : corrAnal)
       worklist.push_back({nodeAndList.first, nodeAndList.second.size()});
-    llvm::sort(worklist, [](auto a, auto b) { return a.second < b.second; });
+    llvm::stable_sort(worklist,
+                      [](auto a, auto b) { return a.second < b.second; });
 
     // Optimize the unroll factors from the most critical node.
-    llvm::SmallDenseMap<NodeOp, FactorList> nodeUnrollFactorsMap;
+    llvm::MapVector<NodeOp, FactorList> nodeUnrollFactorsMap;
     while (!worklist.empty()) {
       auto current = worklist.pop_back_val();
       auto node = current.first;
@@ -222,12 +214,6 @@ struct ParallelizeDataflowNode
         auto [corrFactors, roundedFlag] = corr.permuteAndScaleFactors(
             corrNode, nodeUnrollFactorsMap.lookup(corrNode));
         corrFactorsList.push_back(corrFactors);
-
-        // Rounded parallel factors means that when the correlated node is
-        // parallelized, the strided memory access pattern of the current node
-        // was not awared. Therefore, we need to revisit the correlated node.
-        // if (roundedFlag)
-        //   worklist.push_back({corrNode, 0});
 
         // Make sure each factor is larger than the corresponding factor of
         // the external buffer correlatations.
@@ -291,8 +277,6 @@ struct ParallelizeDataflowNode
     // correlation-aware unroll factors.
     for (auto p : nodeUnrollFactorsMap) {
       auto band = getNodeLoopBand(p.first);
-      // if (hasEffectOnExternalBuffer(band.front()))
-      // else
       applyLoopUnrollJam(band, p.second);
     }
 
@@ -332,11 +316,11 @@ struct ParallelizeDataflowNode
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<GenerateBufferLayout>(context);
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+    (void)applyPatternsGreedily(func, std::move(patterns));
   }
 
 private:
-  llvm::SmallDenseMap<NodeOp, unsigned long> nodeParallelFactorMap;
+  llvm::MapVector<NodeOp, unsigned long> nodeParallelFactorMap;
 };
 } // namespace
 

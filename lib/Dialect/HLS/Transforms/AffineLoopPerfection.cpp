@@ -15,7 +15,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -47,17 +46,17 @@ bool sar::applyAffineLoopPerfection(AffineLoopBand &band) {
           auto map = builder.getConstantAffineMap(0);
 
           builder.setInsertionPoint(band.front());
-          auto alloc = builder.create<BufferOp>(loop.getLoc(), type);
+          auto alloc = BufferOp::create(builder, loop.getLoc(), type);
           builder.setInsertionPointAfter(&op);
-          builder.create<AffineStoreOp>(loop.getLoc(), result, alloc, map,
-                                        ValueRange({}));
+          AffineStoreOp::create(builder, loop.getLoc(), result, alloc, map,
+                                ValueRange({}));
 
           for (auto &use : llvm::make_early_inc_range(result.getUses())) {
             if (!childLoop->isProperAncestor(use.getOwner()))
               continue;
             builder.setInsertionPoint(use.getOwner());
-            auto load = builder.create<AffineLoadOp>(loop.getLoc(), alloc, map,
-                                                     ValueRange({}));
+            auto load = AffineLoadOp::create(builder, loop.getLoc(), alloc, map,
+                                             ValueRange({}));
             use.set(load);
           }
         }
@@ -121,8 +120,8 @@ bool sar::applyAffineLoopPerfection(AffineLoopBand &band) {
       for (auto op : prefixOps) {
         if (hasEffect<MemoryEffects::Write>(op)) {
           builder.setInsertionPoint(destOp);
-          auto ifOp = builder.create<AffineIfOp>(
-              loop.getLoc(), ifCondition, ifOperands, /*withElseRegion=*/false);
+          auto ifOp = AffineIfOp::create(builder, loop.getLoc(), ifCondition,
+                                         ifOperands, /*withElseRegion=*/false);
           op->moveBefore(ifOp.getThenBlock()->getTerminator());
         } else
           op->moveBefore(destOp);
@@ -166,8 +165,8 @@ bool sar::applyAffineLoopPerfection(AffineLoopBand &band) {
       for (auto op : suffixOps) {
         if (hasEffect<MemoryEffects::Write>(op)) {
           builder.setInsertionPoint(destOp);
-          auto ifOp = builder.create<AffineIfOp>(
-              loop.getLoc(), ifCondition, ifOperands, /*withElseRegion=*/false);
+          auto ifOp = AffineIfOp::create(builder, loop.getLoc(), ifCondition,
+                                         ifOperands, /*withElseRegion=*/false);
           op->moveBefore(ifOp.getThenBlock()->getTerminator());
         } else
           op->moveBefore(destOp);

@@ -61,11 +61,11 @@ DispatchOp sar::dispatchBlock(Block *block) {
   OpBuilder builder(block, block->begin());
   ValueRange returnValues(block->getTerminator()->getOperands());
   auto loc = builder.getUnknownLoc();
-  auto dispatch = builder.create<DispatchOp>(loc, returnValues);
+  auto dispatch = DispatchOp::create(builder, loc, returnValues);
 
   auto &dispatchBlock = dispatch.getBody().emplaceBlock();
   builder.setInsertionPointToEnd(&dispatchBlock);
-  builder.create<YieldOp>(loc, returnValues);
+  YieldOp::create(builder, loc, returnValues);
 
   auto &dispatchOps = dispatchBlock.getOperations();
   auto &parentOps = block->getOperations();
@@ -80,8 +80,7 @@ DispatchOp sar::dispatchBlock(Block *block) {
 /// inserted in order. This method always succeeds even if the resulting IR is
 /// invalid.
 TaskOp sar::fuseOpsIntoTask(ArrayRef<Operation *> ops,
-                                 PatternRewriter &rewriter,
-                                 bool insertToLastOp) {
+                            PatternRewriter &rewriter, bool insertToLastOp) {
   assert(!ops.empty() && "must fuse at least one op");
   llvm::SmallDenseSet<Operation *, 4> opsSet(ops.begin(), ops.end());
 
@@ -101,12 +100,12 @@ TaskOp sar::fuseOpsIntoTask(ArrayRef<Operation *> ops,
   else
     rewriter.setInsertionPoint(ops.back());
   auto task =
-      rewriter.create<TaskOp>(loc, ValueRange(outputValues.getArrayRef()));
+      TaskOp::create(rewriter, loc, ValueRange(outputValues.getArrayRef()));
   auto taskBlock = rewriter.createBlock(&task.getBody());
 
   // Move each targeted op into the new graph task.
   rewriter.setInsertionPointToEnd(taskBlock);
-  auto yield = rewriter.create<YieldOp>(loc, outputValues.getArrayRef());
+  auto yield = YieldOp::create(rewriter, loc, outputValues.getArrayRef());
   for (auto op : ops)
     op->moveBefore(yield);
 
@@ -129,8 +128,7 @@ TaskOp sar::fuseOpsIntoTask(ArrayRef<Operation *> ops,
 }
 
 /// Fuse multiple nodes into a new node.
-NodeOp sar::fuseNodeOps(ArrayRef<NodeOp> nodes,
-                             PatternRewriter &rewriter) {
+NodeOp sar::fuseNodeOps(ArrayRef<NodeOp> nodes, PatternRewriter &rewriter) {
   assert((nodes.size() > 1) && "must fuse at least two nodes");
 
   // Collect inputs, outputs, and params of the new node.
@@ -162,9 +160,9 @@ NodeOp sar::fuseNodeOps(ArrayRef<NodeOp> nodes,
 
   // Construct the new node after the last node.
   rewriter.setInsertionPointAfter(nodes.back());
-  auto newNode = rewriter.create<NodeOp>(
-      rewriter.getUnknownLoc(), inputs.getArrayRef(), outputs.getArrayRef(),
-      params.getArrayRef(), inputTaps);
+  auto newNode =
+      NodeOp::create(rewriter, rewriter.getUnknownLoc(), inputs.getArrayRef(),
+                     outputs.getArrayRef(), params.getArrayRef(), inputTaps);
   auto block = rewriter.createBlock(&newNode.getBody());
   block->addArguments(ValueRange(inputs.getArrayRef()), inputLocs);
   block->addArguments(ValueRange(outputs.getArrayRef()), outputLocs);
@@ -278,8 +276,7 @@ SmallVector<std::pair<NodeOp, Value>>
 sar::getNestedProducersExcept(Value buffer, NodeOp except) {
   return getNestedUsersExcept(buffer, OperandKind::OUTPUT, except);
 }
-SmallVector<std::pair<NodeOp, Value>>
-sar::getNestedProducers(Value buffer) {
+SmallVector<std::pair<NodeOp, Value>> sar::getNestedProducers(Value buffer) {
   return getNestedProducersExcept(buffer, NodeOp());
 }
 
@@ -444,25 +441,6 @@ LogicalResult sar::getEvenlyDistributedFactors(
     const SmallVectorImpl<mlir::affine::AffineForOp> &band,
     const SmallVectorImpl<FactorList> &constrFactorsList, bool powerOf2Constr) {
 
-  // auto emitFactors = [&](const FactorList &factors) {
-  //   llvm::errs() << "factors: ";
-  //   for (auto factor : factors)
-  //     llvm::errs() << factor << " ";
-  //   llvm::errs() << "\n";
-  // };
-
-  // llvm::errs() << "\n==========\n";
-
-  // llvm::errs() << "Init ";
-  // emitFactors(factors);
-
-  // for (auto &constrFactors : constrFactorsList) {
-  //   llvm::errs() << "Constr ";
-  //   emitFactors(constrFactors);
-  // }
-
-  // llvm::errs() << band.front() << "\n";
-
   // Traverse each loop in the given loop band.
   SmallVector<FactorList> constrs;
   SmallVector<bool> reductionFlags;
@@ -597,8 +575,6 @@ LogicalResult sar::getEvenlyDistributedFactors(
     increaseFactor(factors[depth], depth);
   }
 
-  // llvm::errs() << "Final ";
-  // emitFactors(factors);
   return success();
 }
 
@@ -693,7 +669,7 @@ bool sar::checkSameIfStatement(AffineIfOp lhsOp, AffineIfOp rhsOp) {
 
 /// Parse array attributes.
 SmallVector<int64_t, 8> sar::getIntArrayAttrValue(Operation *op,
-                                                       StringRef name) {
+                                                  StringRef name) {
   SmallVector<int64_t, 8> array;
   if (auto arrayAttr = op->getAttrOfType<ArrayAttr>(name)) {
     for (auto attr : arrayAttr)
@@ -708,7 +684,7 @@ SmallVector<int64_t, 8> sar::getIntArrayAttrValue(Operation *op,
 
 /// Collect all load and store operations in the block and return them in "map".
 void sar::getMemAccessesMap(Block &block, MemAccessesMap &map,
-                                 bool includeVectorTransfer) {
+                            bool includeVectorTransfer) {
   for (auto &op : block) {
     if (auto load = dyn_cast<AffineReadOpInterface>(op))
       map[load.getMemRef()].push_back(&op);
@@ -784,26 +760,6 @@ sar::checkSameLevel(Operation *lhsOp, Operation *rhsOp) {
   return std::optional<std::pair<Operation *, Operation *>>();
 }
 
-/// Returns the number of surrounding loops common to 'loopsA' and 'loopsB',
-/// where each lists loops from outer-most to inner-most in loop nest.
-unsigned sar::getCommonSurroundingLoops(Operation *A, Operation *B,
-                                             AffineLoopBand *band) {
-  SmallVector<AffineForOp, 4> loopsA, loopsB;
-  getAffineForIVs(*A, &loopsA);
-  getAffineForIVs(*B, &loopsB);
-
-  unsigned minNumLoops = std::min(loopsA.size(), loopsB.size());
-  unsigned numCommonLoops = 0;
-  for (unsigned i = 0; i < minNumLoops; ++i) {
-    if (loopsA[i] != loopsB[i])
-      break;
-    ++numCommonLoops;
-    if (band != nullptr)
-      band->push_back(loopsB[i]);
-  }
-  return numCommonLoops;
-}
-
 /// Calculate the lower and upper bound of the affine map if possible.
 std::optional<std::pair<int64_t, int64_t>>
 sar::getBoundOfAffineMap(AffineMap map, ValueRange operands) {
@@ -845,7 +801,9 @@ sar::getBoundOfAffineMap(AffineMap map, ValueRange operands) {
   for (unsigned i = 0, e = pow(2, operandNum); i < e; ++i) {
     SmallVector<AffineExpr, 4> replacements;
     for (unsigned pos = 0; pos < operandNum; ++pos) {
-      if (i >> pos % 2 == 0)
+      // Bit `pos` of `i` selects the lower or upper bound for this operand,
+      // enumerating every corner of the iteration box.
+      if (((i >> pos) & 1) == 0)
         replacements.push_back(getAffineConstantExpr(lbs[pos], context));
       else
         replacements.push_back(getAffineConstantExpr(ubs[pos], context));
@@ -881,7 +839,7 @@ bool sar::isFullyPartitioned(MemRefType memrefType) {
 // them in "factors". Meanwhile, the overall partition number is calculated and
 // returned as well.
 int64_t sar::getPartitionFactors(MemRefType memrefType,
-                                      SmallVectorImpl<int64_t> *factors) {
+                                 SmallVectorImpl<int64_t> *factors) {
   int64_t accumFactor = 1;
   if (auto attr = dyn_cast<PartitionLayoutAttr>(memrefType.getLayout()))
     for (auto factor : attr.getActualFactors(memrefType.getShape())) {
@@ -910,8 +868,8 @@ unsigned sar::getChildLoopNum(Operation *op) {
 /// Given a tiled loop band, return true and get the tile (tile-space) loop band
 /// and the point (intra-tile) loop band. If failed, return false.
 bool sar::getTileAndPointLoopBand(const AffineLoopBand &band,
-                                       AffineLoopBand &tileBand,
-                                       AffineLoopBand &pointBand) {
+                                  AffineLoopBand &tileBand,
+                                  AffineLoopBand &pointBand) {
   tileBand.clear();
   pointBand.clear();
   bool isPointLoop = false;
@@ -939,8 +897,8 @@ bool sar::getTileAndPointLoopBand(const AffineLoopBand &band,
 /// Given a loop band, return true and get the parallel loop band outsides and
 /// the reduction loop band inside. If failed, return false.
 bool sar::getParallelAndReductionLoopBand(const AffineLoopBand &band,
-                                               AffineLoopBand &parallelBand,
-                                               AffineLoopBand &reductionBand) {
+                                          AffineLoopBand &parallelBand,
+                                          AffineLoopBand &reductionBand) {
   parallelBand.clear();
   reductionBand.clear();
   bool isReductionLoop = false;
@@ -970,7 +928,7 @@ bool sar::getParallelAndReductionLoopBand(const AffineLoopBand &band,
 /// Get the whole loop band given the outermost loop and return it in "band".
 /// Meanwhile, the return value is the innermost loop of this loop band.
 AffineForOp sar::getLoopBandFromOutermost(AffineForOp forOp,
-                                               AffineLoopBand &band) {
+                                          AffineLoopBand &band) {
   band.clear();
   auto currentLoop = forOp;
   while (true) {
@@ -984,7 +942,7 @@ AffineForOp sar::getLoopBandFromOutermost(AffineForOp forOp,
   return band.back();
 }
 AffineForOp sar::getLoopBandFromInnermost(AffineForOp forOp,
-                                               AffineLoopBand &band) {
+                                          AffineLoopBand &band) {
   band.clear();
   AffineLoopBand reverseBand;
 
@@ -1011,7 +969,7 @@ AffineForOp sar::getLoopBandFromInnermost(AffineForOp forOp,
 /// bands are also collected. Otherwise, only loop bands that contains no child
 /// loops are collected.
 void sar::getLoopBands(Block &block, AffineLoopBands &bands,
-                            bool allowHavingChilds) {
+                       bool allowHavingChilds) {
   bands.clear();
   block.walk([&](AffineForOp loop) {
     auto childNum = getChildLoopNum(loop);
@@ -1022,22 +980,6 @@ void sar::getLoopBands(Block &block, AffineLoopBands &bands,
       bands.push_back(band);
     }
   });
-}
-
-void sar::getArrays(Block &block, SmallVectorImpl<Value> &arrays,
-                         bool allowArguments) {
-  // Collect argument arrays.
-  if (allowArguments)
-    for (auto arg : block.getArguments()) {
-      if (isa<MemRefType>(arg.getType()))
-        arrays.push_back(arg);
-    }
-
-  // Collect local arrays.
-  for (auto &op : block.getOperations()) {
-    if (isa<memref::AllocaOp, memref::AllocOp>(op))
-      arrays.push_back(op.getResult(0));
-  }
 }
 
 std::optional<unsigned> sar::getAverageTripCount(AffineForOp forOp) {
@@ -1063,27 +1005,6 @@ std::optional<unsigned> sar::getAverageTripCount(AffineForOp forOp) {
   }
 }
 
-bool sar::checkDependence(Operation *A, Operation *B) {
-  AffineLoopBand commonLoops;
-  unsigned numCommonLoops = getCommonSurroundingLoops(A, B, &commonLoops);
-
-  // Traverse each loop level to find dependencies.
-  for (unsigned depth = numCommonLoops; depth > 0; depth--) {
-    // Skip all parallel loop level.
-    if (hasParallelAttr(commonLoops[depth - 1]))
-      continue;
-
-    FlatAffineValueConstraints depConstrs;
-    DependenceResult result = checkMemrefAccessDependence(
-        MemRefAccess(A), MemRefAccess(B), depth, &depConstrs,
-        /*dependenceComponents=*/nullptr);
-    if (hasDependence(result))
-      return true;
-  }
-
-  return false;
-}
-
 func::FuncOp sar::getTopFunc(ModuleOp module, std::string topFuncName) {
   func::FuncOp topFunc;
   for (auto func : module.getOps<func::FuncOp>())
@@ -1094,63 +1015,4 @@ func::FuncOp sar::getTopFunc(ModuleOp module, std::string topFuncName) {
         return func::FuncOp();
     }
   return topFunc;
-}
-
-//===----------------------------------------------------------------------===//
-// PtrLikeMemRefAccess Struct Definition
-//===----------------------------------------------------------------------===//
-
-PtrLikeMemRefAccess::PtrLikeMemRefAccess(Operation *loadOrStoreOpInst) {
-  Operation *opInst = nullptr;
-  SmallVector<Value, 4> indices;
-
-  if (auto loadOp = dyn_cast<AffineReadOpInterface>(loadOrStoreOpInst)) {
-    memref = loadOp.getMemRef();
-    opInst = loadOrStoreOpInst;
-    auto loadMemrefType = loadOp.getMemRefType();
-
-    indices.reserve(loadMemrefType.getRank());
-    for (auto index : loadOp.getMapOperands()) {
-      indices.push_back(index);
-    }
-  } else {
-    assert(isa<AffineWriteOpInterface>(loadOrStoreOpInst) &&
-           "Affine read/write op expected");
-    auto storeOp = cast<AffineWriteOpInterface>(loadOrStoreOpInst);
-    opInst = loadOrStoreOpInst;
-    memref = storeOp.getMemRef();
-    auto storeMemrefType = storeOp.getMemRefType();
-
-    indices.reserve(storeMemrefType.getRank());
-    for (auto index : storeOp.getMapOperands()) {
-      indices.push_back(index);
-    }
-  }
-
-  // Get affine map from AffineLoad/Store.
-  AffineMap map;
-  if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst))
-    map = loadOp.getAffineMap();
-  else
-    map = cast<AffineWriteOpInterface>(opInst).getAffineMap();
-
-  SmallVector<Value, 8> operands(indices.begin(), indices.end());
-  fullyComposeAffineMapAndOperands(&map, &operands);
-  map = simplifyAffineMap(map);
-  canonicalizeMapAndOperands(&map, &operands);
-
-  accessMap.reset(map, operands);
-}
-
-bool PtrLikeMemRefAccess::operator==(const PtrLikeMemRefAccess &rhs) const {
-  if (memref != rhs.memref || impl != rhs.impl)
-    return false;
-
-  if (impl == rhs.impl && impl && rhs.impl)
-    return true;
-
-  AffineValueMap diff;
-  AffineValueMap::difference(accessMap, rhs.accessMap, &diff);
-  return llvm::all_of(diff.getAffineMap().getResults(),
-                      [](AffineExpr e) { return e == 0; });
 }

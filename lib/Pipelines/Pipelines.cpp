@@ -58,7 +58,15 @@ void mlir::sar::buildSARToLLVMPipeline(
   // Fuse element-wise chains: long phase-computation sequences collapse
   // into single generics, eliminating whole intermediate tensors (the
   // dominant memory-bandwidth cost for large scenes).
-  pm.addPass(createLinalgElementwiseOpFusionPass());
+  //
+  // The SAR pass rather than the upstream one: upstream only fuses a
+  // producer with a single consumer, which leaves every value the phase
+  // expression reuses -- the broadcast frequency axes and the terms built
+  // from them -- standing as its own full-raster plane. Recomputing those
+  // costs arithmetic the machine has to spare and saves the traffic it
+  // does not.
+  pm.addNestedPass<func::FuncOp>(
+      sar::createSARFuseElementwise({options.recomputeMinElements}));
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 
@@ -67,6 +75,9 @@ void mlir::sar::buildSARToLLVMPipeline(
   bufferizeOptions.bufferizeFunctionBoundaries = true;
   bufferizeOptions.functionBoundaryTypeConversion =
       bufferization::LayoutMapOption::IdentityLayoutMap;
+  // A compiled loop's body yields freshly computed planes; without this
+  // the strict yield-equivalence check rejects every tensor carry.
+  bufferizeOptions.allowReturnAllocsFromLoops = true;
   pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
 
   bufferization::BufferResultsToOutParamsPassOptions outParamsOptions;
@@ -84,8 +95,12 @@ void mlir::sar::buildSARToLLVMPipeline(
   // kernel does not link against.
   pm.addNestedPass<func::FuncOp>(sar::createSARLowerCopy());
 
-  pm.addNestedPass<func::FuncOp>(
-      sar::createSARReuseBuffers({options.reuseBufferMinElements}));
+  // allow-retype is safe on the CPU path: memref.view lowers through
+  // expand-strided-metadata and finalize-memref-to-llvm without issue.
+  // It is left off on the HLS path below: the C++ emitter only understands
+  // typed arrays and has no memref.view emission.
+  pm.addNestedPass<func::FuncOp>(sar::createSARReuseBuffers(
+      {options.reuseBufferMinElements, /*allowRetype=*/true}));
 
   bufferization::BufferDeallocationPipelineOptions deallocationOptions;
   bufferization::buildBufferDeallocationPipeline(pm, deallocationOptions);
@@ -111,7 +126,15 @@ void mlir::sar::buildSARToLLVMPipeline(
   pm.addPass(createConvertComplexToLLVMPass());
   pm.addPass(createConvertMathToLLVMPass());
   pm.addPass(createArithToLLVMConversionPass());
-  pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+  // Allocate through the runtime's plane pool rather than libc. A kernel's
+  // intermediate planes are gigabytes each and are freed at the end of the
+  // call; left to libc they are unmapped, and the next call faults and
+  // zeroes every page again before it can store anything. Pooling them
+  // makes that first touch a once-per-process cost instead of a
+  // once-per-call one.
+  FinalizeMemRefToLLVMConversionPassOptions memrefOptions;
+  memrefOptions.useGenericFunctions = true;
+  pm.addPass(createFinalizeMemRefToLLVMConversionPass(memrefOptions));
   pm.addPass(createConvertOpenMPToLLVMPass());
   pm.addPass(createConvertFuncToLLVMPass());
   pm.addPass(createConvertControlFlowToLLVMPass());
@@ -122,8 +145,10 @@ void mlir::sar::buildSARToAffinePipeline(
     OpPassManager &pm, const SARBufferPipelineOptions &options) {
   pm.addPass(createCanonicalizerPass());
   pm.addPass(sar::createSARDecomplexify());
-  pm.addPass(sar::createConvertSARFFTToAffine());
-  pm.addPass(sar::createConvertSARInterpToAffine());
+  pm.addPass(sar::createConvertSARFFTToAffine({options.fftStageGroup}));
+  ConvertSARInterpToAffineOptions interpOptions;
+  interpOptions.enableBandedGather = options.interpEnableBandedGather;
+  pm.addPass(sar::createConvertSARInterpToAffine(interpOptions));
   pm.addPass(sar::createConvertSARToLinalg());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
@@ -149,6 +174,9 @@ void mlir::sar::buildSARToAffinePipeline(
   bufferizeOptions.bufferizeFunctionBoundaries = true;
   bufferizeOptions.functionBoundaryTypeConversion =
       bufferization::LayoutMapOption::IdentityLayoutMap;
+  // A compiled loop's body yields freshly computed planes; without this
+  // the strict yield-equivalence check rejects every tensor carry.
+  bufferizeOptions.allowReturnAllocsFromLoops = true;
   pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
 
   bufferization::BufferResultsToOutParamsPassOptions outParamsOptions;
@@ -157,13 +185,22 @@ void mlir::sar::buildSARToAffinePipeline(
   pm.addPass(
       bufferization::createBufferResultsToOutParamsPass(outParamsOptions));
 
+  // The HLS dataflow model forbids tasks with results, so compiled loops
+  // stop carrying values here: the body iterates in the init buffer and a
+  // per-iteration copy replaces the yield.
+  pm.addNestedPass<func::FuncOp>(sar::createSARDemoteLoopCarries());
+
   // Expand the copies bufferization leaves behind before anything else
   // reasons about the body: they are calls into a runtime the emitted
   // kernel does not link against.
   pm.addNestedPass<func::FuncOp>(sar::createSARLowerCopy());
 
-  pm.addNestedPass<func::FuncOp>(
-      sar::createSARReuseBuffers({options.reuseBufferMinElements}));
+  // Same-type sharing only. Retyping a buffer through memref.view needs a
+  // target that addresses bytes; here a buffer becomes a typed on-chip
+  // array whose element width drives banking and partitioning, and the
+  // HLS C++ emitter rejects memref.view outright.
+  pm.addNestedPass<func::FuncOp>(sar::createSARReuseBuffers(
+      {options.reuseBufferMinElements, /*allowRetype=*/false}));
 
   pm.addPass(createConvertLinalgToAffineLoopsPass());
 
@@ -208,7 +245,7 @@ void mlir::sar::buildSARAffineToLLVMPipeline(
 void mlir::sar::registerSARPipelines() {
   PassPipelineRegistration<>(
       "sar-to-linalg-pipeline",
-      "Lower SAR kernels to linalg-on-tensors (HLS hand-off level)",
+      "Lower SAR kernels to linalg-on-tensors (external backend hand-off)",
       [](OpPassManager &pm) { buildSARToLinalgPipeline(pm); });
   PassPipelineRegistration<SARBufferPipelineOptions>(
       "sar-to-llvm-pipeline",

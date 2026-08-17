@@ -8,7 +8,7 @@ in-kernel geometry math lowers through decomplexify/affine like any
 other op chain).
 
 Usage:
-    python run_point_target_hls.py [--n 256] [--output hls_project/pfa]
+    python run_point_target_hls.py [--n 256] [--output PATH]
                            [--no-testbench]
 """
 
@@ -31,7 +31,7 @@ def main() -> None:
                         default=256,
                         help="raster size (power of two)")
     parser.add_argument("--output",
-                        default="hls_project/pfa",
+                        default=str(_EXAMPLES / "hls_project" / "pfa"),
                         help="C-simulation package directory")
     parser.add_argument("--no-testbench",
                         action="store_true",
@@ -52,8 +52,10 @@ def main() -> None:
         golden = PFAProcessor(n, geometry).process(raw)
         design.write_testbench([raw, *make_inputs(n, geometry)], list(golden),
                                out)
-    print(f"[2/2] Saved {out} (flow: affine)")
-    print(f"done; csim: cd {out} && vitis_hls -f pfa_csim.tcl")
+    print(f"[2/2] Saved {out}")
+    print(f"done: {design.source().count(chr(10))} lines of HLS C++, "
+          f"top function 'pfa'")
+    print(f"      csim: cd {out} && vitis_hls -f pfa_csim.tcl")
 
 
 if __name__ == "__main__":

@@ -129,3 +129,148 @@ def test_ops_outside_kernel_rejected():
         sar.Tensor.__add__  # attribute exists
         # Building a constant requires an active tracing context.
         sar.constant(np.zeros((2, 2)))
+
+
+def test_cumsum_emits_ir():
+    N = 8
+
+    @sar.func
+    def k(x: sar.f64[N, N]) -> sar.f64[N, N]:
+        return sar.cumsum(x, dim=1)
+
+    text = k.to_mlir()
+    assert '"sar.cumsum"' in text
+    assert 'dim = 1' in text
+
+
+def test_cumsum_complex_emits_ir():
+    N = 8
+
+    @sar.func
+    def k(x: sar.c64[N, N]) -> sar.c64[N, N]:
+        return sar.cumsum(x, dim=0)
+
+    text = k.to_mlir()
+    assert '"sar.cumsum"' in text
+
+
+def test_cumsum_int_rejected():
+    N = 8
+    from sar.language import TraceError
+
+    @sar.func
+    def k(x: sar.i64[N, N]) -> sar.i64[N, N]:
+        return sar.cumsum(x, dim=1)
+
+    with pytest.raises(TraceError, match="integer"):
+        k.to_mlir()
+
+
+def test_rank_filter_emits_ir():
+    N = 16
+
+    @sar.func
+    def k(x: sar.f32[N, N]) -> sar.f32[N, N]:
+        return sar.rank_filter(x, window=5, rank=2, dim=1)
+
+    text = k.to_mlir()
+    assert '"sar.rank_filter"' in text
+    assert 'window = 5' in text
+
+
+def test_median_filter_emits_ir():
+    N = 16
+
+    @sar.func
+    def k(x: sar.f32[N, N]) -> sar.f32[N, N]:
+        return sar.median_filter(x, window=7, dim=0)
+
+    text = k.to_mlir()
+    assert '"sar.rank_filter"' in text
+    assert 'rank = 3' in text  # window//2 = 7//2 = 3
+
+
+def test_rank_filter_even_window_rejected():
+    N = 16
+
+    @sar.func
+    def k(x: sar.f32[N, N]) -> sar.f32[N, N]:
+        return sar.rank_filter(x, window=4, rank=1, dim=1)
+
+    with pytest.raises(TraceError, match="odd"):
+        k.to_mlir()
+
+
+def test_rank_filter_complex_rejected():
+    N = 8
+
+    @sar.func
+    def k(x: sar.c64[N, N]) -> sar.c64[N, N]:
+        return sar.rank_filter(x, window=3, rank=1, dim=1)
+
+    with pytest.raises(TraceError, match="float"):
+        k.to_mlir()
+
+
+def test_where_rejects_integer_branches():
+    """Integer branches used to escape as a bare KeyError from the
+    precision table; the report has to be a TraceError naming the op."""
+    N = 8
+
+    @sar.func
+    def k(x: sar.f32[N], a: sar.i32[N], b: sar.i32[N]) -> sar.i32[N]:
+        return sar.where(x > 0.0, a, b)
+
+    with pytest.raises(TraceError, match="integer branch"):
+        k.to_mlir()
+
+
+def test_unresolvable_annotation_reports_kernel_and_text():
+    """A string annotation that fails to evaluate must name the kernel
+    and the annotation, not surface as a bare NameError."""
+    with pytest.raises(TraceError, match=r"kernel 'bad'.*undefined_dim"):
+
+        @sar.func
+        def bad(x: "sar.f32[undefined_dim]") -> "sar.f32[4]":  # noqa: F821
+            return x
+
+
+def test_generic_kernel_dtype_errors_are_specific():
+
+    @sar.func
+    def k(x):
+        return x * 2.0
+
+    # Not an array at all: say what specialization needs.
+    with pytest.raises(TraceError, match="numpy array"):
+        k([1.0, 2.0])
+    # An array of an unsupported dtype: name it and list the supported.
+    with pytest.raises(TraceError, match=r"float16.*float32"):
+        k(np.zeros(4, dtype=np.float16))
+
+
+def test_to_mlir_reuses_the_trace():
+    """Tracing is deterministic per kernel, so repeated to_mlir calls
+    reuse the first trace instead of re-running the kernel body."""
+    body_runs = []
+    N = 4
+
+    @sar.func
+    def k(x: sar.f32[N]) -> sar.f32[N]:
+        body_runs.append(1)
+        return x + 1.0
+
+    first = k.to_mlir()
+    second = k.to_mlir()
+    assert first == second
+    assert len(body_runs) == 1
+
+
+def test_trace_error_is_a_first_class_export():
+    from sar.errors import TraceError as from_errors
+
+    assert sar.TraceError is from_errors
+    assert sar.language.TraceError is from_errors
+    assert "TraceError" in sar.__all__
+    assert issubclass(sar.TraceError, sar.SARError)
+    assert issubclass(sar.TraceError, TypeError)  # legacy catches still work

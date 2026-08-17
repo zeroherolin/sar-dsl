@@ -15,7 +15,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -28,9 +27,8 @@ struct TaskPartition : public OpRewritePattern<DispatchOp> {
   LogicalResult matchAndRewrite(DispatchOp dispatch,
                                 PatternRewriter &rewriter) const override {
     if (llvm::any_of(dispatch.getOps(), [](Operation &op) {
-          return isa<bufferization::BufferizationDialect,
-                     tensor::TensorDialect, linalg::LinalgDialect>(
-                     op.getDialect()) ||
+          return isa<bufferization::BufferizationDialect, tensor::TensorDialect,
+                     linalg::LinalgDialect>(op.getDialect()) ||
                  isa<func::CallOp, DispatchOp, TaskOp, ScheduleOp, NodeOp>(op);
         }))
       return failure();
@@ -87,7 +85,7 @@ struct CreateDataflowFromAffine
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<TaskPartition>(context);
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+    (void)applyPatternsGreedily(func, std::move(patterns));
   }
 };
 } // namespace

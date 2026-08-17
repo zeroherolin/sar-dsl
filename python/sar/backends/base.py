@@ -14,13 +14,25 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 from ..ir import TensorType
 
-__all__ = ["BaseBackend", "KernelMetadata", "Stage"]
+__all__ = ["BaseBackend", "KernelMetadata", "Stage", "cached_stage"]
 
 Stage = Callable  # (artifact, metadata: KernelMetadata, cache) -> artifact
+
+
+def cached_stage(cache, filename: str, build: Callable[[], str]) -> str:
+    """Runs one stage through the artifact cache: returns the cached text
+    when present, otherwise calls `build`, stores its result under
+    `filename` and returns it."""
+    cached = cache.read_if_cached(filename)
+    if cached is not None:
+        return cached
+    out = build()
+    cache.write_text(filename, out)
+    return out
 
 
 @dataclass
@@ -32,6 +44,9 @@ class KernelMetadata:
     result_types: List[TensorType]
     options: Dict[str, object] = field(default_factory=dict)
     extra: Dict[str, object] = field(default_factory=dict)
+    #: The kernel's Python parameter names (None when the signature does
+    #: not expose them); the traced IR carries them as `sar.arg_names`.
+    param_names: Optional[List[str]] = None
 
 
 class BaseBackend(ABC):

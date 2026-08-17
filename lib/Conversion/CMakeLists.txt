@@ -11,6 +11,7 @@ add_mlir_library(SARConversion
   SARConversionIncGen
 
   LINK_LIBS PUBLIC
+  SARAnalysis
   SARDialect
   MLIRAffineDialect
   MLIRArithDialect

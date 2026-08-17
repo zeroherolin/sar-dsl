@@ -120,6 +120,26 @@ FailureOr<func::FuncOp> FunctionDecomplexifier::run() {
                            builder.getFunctionType(inputTypes, resultTypes));
   replacement.setVisibility(original.getVisibility());
 
+  // The frontend names arguments after the kernel's Python parameters
+  // (`sar.arg_names`); a split complex argument keeps the name on both of
+  // its planes so the emitted design's ports still read as the user's
+  // signature.
+  if (auto names = original->getAttrOfType<ArrayAttr>("sar.arg_names");
+      names && names.size() == original.getNumArguments()) {
+    SmallVector<Attribute> planeNames;
+    for (auto [name, type] :
+         llvm::zip(names.getValue(), original.getArgumentTypes())) {
+      auto base = cast<StringAttr>(name).getValue();
+      if (isComplexTensor(type)) {
+        planeNames.push_back(builder.getStringAttr(base + "_re"));
+        planeNames.push_back(builder.getStringAttr(base + "_im"));
+      } else {
+        planeNames.push_back(name);
+      }
+    }
+    replacement->setAttr("sar.arg_names", builder.getArrayAttr(planeNames));
+  }
+
   Block *entry = replacement.addEntryBlock();
   unsigned newArgIndex = 0;
   for (BlockArgument arg : original.getArguments()) {
@@ -150,7 +170,9 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
                         llvm::any_of(op->getResultTypes(), isComplexTensor);
 
   // Ops without complex involvement are cloned with remapped operands.
-  if (!touchesComplex && !isa<func::ReturnOp>(op)) {
+  // A loop is rebuilt either way: its body may compute complex values
+  // even when every carry is real.
+  if (!touchesComplex && !isa<func::ReturnOp, IterateOp>(op)) {
     builder.clone(*op, realValues);
     return success();
   }
@@ -305,6 +327,16 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
                              reduce.getDimAttr())};
         return success();
       })
+      .Case<CumsumOp>([&](CumsumOp cumsum) {
+        // A prefix sum is linear, so it runs independently on each plane.
+        auto [re, im] = getSplit(cumsum.getInput());
+        splitValues[cumsum.getResult()] = {
+            CumsumOp::create(builder, loc, re.getType(), re,
+                             cumsum.getDimAttr()),
+            CumsumOp::create(builder, loc, im.getType(), im,
+                             cumsum.getDimAttr())};
+        return success();
+      })
       .Case<TransposeOp>([&](TransposeOp transpose) {
         auto [re, im] = getSplit(transpose.getInput());
         auto plane = getPlaneType(transpose.getType());
@@ -379,12 +411,91 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
         splitValues[fft.getResult()] = {split.getOutRe(), split.getOutIm()};
         return success();
       })
+      .Case<IterateOp>([&](IterateOp loop) -> LogicalResult {
+        // Complex carries expand into adjacent (re, im) pairs, exactly as
+        // function signatures do; the body is rewritten recursively into
+        // the new loop's block.
+        SmallVector<Value> inits;
+        SmallVector<Type> carryTypes;
+        SmallVector<Location> argLocs;
+        for (Value init : loop.getInits()) {
+          if (isComplexTensor(init.getType())) {
+            auto [re, im] = getSplit(init);
+            inits.append({re, im});
+            carryTypes.append({re.getType(), im.getType()});
+            argLocs.append(2, init.getLoc());
+          } else {
+            Value mapped = getReal(init);
+            inits.push_back(mapped);
+            carryTypes.push_back(mapped.getType());
+            argLocs.push_back(init.getLoc());
+          }
+        }
+
+        auto newLoop = IterateOp::create(builder, loc, carryTypes, inits,
+                                         loop.getTripsAttr());
+        {
+          // createBlock moves the insertion point into the new block; the
+          // guard restores it so the ops after the loop land after it.
+          OpBuilder::InsertionGuard guard(builder);
+          Block *block =
+              builder.createBlock(&newLoop.getBody(), {}, carryTypes, argLocs);
+          unsigned argIndex = 0;
+          for (BlockArgument arg : loop.getBody().front().getArguments()) {
+            if (isComplexTensor(arg.getType())) {
+              splitValues[arg] = {block->getArgument(argIndex),
+                                  block->getArgument(argIndex + 1)};
+              argIndex += 2;
+            } else {
+              realValues.map(arg, block->getArgument(argIndex++));
+            }
+          }
+          for (Operation &inner : loop.getBody().front())
+            if (failed(rewriteOp(&inner)))
+              return failure();
+        }
+
+        unsigned resultIndex = 0;
+        for (Value result : loop.getResults()) {
+          if (isComplexTensor(result.getType())) {
+            splitValues[result] = {newLoop.getResult(resultIndex),
+                                   newLoop.getResult(resultIndex + 1)};
+            resultIndex += 2;
+          } else {
+            realValues.map(result, newLoop.getResult(resultIndex++));
+          }
+        }
+        return success();
+      })
+      .Case<YieldOp>([&](YieldOp yield) {
+        SmallVector<Value> operands;
+        for (Value v : yield.getOperands()) {
+          if (isComplexTensor(v.getType())) {
+            auto [re, im] = getSplit(v);
+            operands.append({re, im});
+          } else {
+            operands.push_back(getReal(v));
+          }
+        }
+        YieldOp::create(builder, loc, operands);
+        return success();
+      })
+      .Case<Gather2DOp>([&](Gather2DOp gather) {
+        auto [re, im] = getSplit(gather.getData());
+        auto plane = getPlaneType(gather.getType());
+        auto split = Gather2DSplitOp::create(
+            builder, loc, plane, plane, re, im, getReal(gather.getRows()),
+            getReal(gather.getCols()), gather.getKernelAttr(),
+            gather.getBoundaryAttr());
+        splitValues[gather.getResult()] = {split.getOutRe(), split.getOutIm()};
+        return success();
+      })
       .Case<Interp1DOp>([&](Interp1DOp interp) {
         auto [re, im] = getSplit(interp.getData());
         auto split = Interp1DSplitOp::create(
             builder, loc, re, im, getReal(interp.getPositions()),
             interp.getDim(), interp.getKernel(), interp.getTaps(),
-            interp.getWindow(), interp.getBeta());
+            interp.getWindow(), interp.getBeta(), interp.getBoundary());
         splitValues[interp.getResult()] = {split.getOutRe(), split.getOutIm()};
         return success();
       })
@@ -420,6 +531,17 @@ struct SARDecomplexifyPass
     }
 
     for (func::FuncOp func : worklist) {
+      // The rewrite walks one straight-line body: a declaration has no body
+      // to walk, and branch successors would need their block arguments
+      // remapped. Traced kernels are always single-block; anything else is
+      // rejected rather than miscompiled.
+      if (!func.getBody().hasOneBlock()) {
+        func.emitOpError("carries complex tensors but does not have a "
+                         "single-block body, which sar-decomplexify cannot "
+                         "rewrite");
+        signalPassFailure();
+        return;
+      }
       builder.setInsertionPoint(func);
       FunctionDecomplexifier rewriter(func, builder);
       std::string name = func.getName().str();

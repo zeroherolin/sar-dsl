@@ -16,8 +16,8 @@ import numpy as np
 import sar
 
 from . import (Tensor, TraceError, _require_tensor, _resolve_axis, _tracing,
-               broadcast, concatenate, conj, constant, exp, expj, fft, ifft,
-               interp1d, log, maximum, sin, sqrt, where)
+               broadcast, cast, concatenate, conj, constant, exp, expj, fft,
+               ifft, interp1d, log, maximum, sin, sqrt, where)
 from . import sum as _sum
 
 __all__ = [
@@ -81,10 +81,19 @@ def circshift(x: Tensor,
     if k == 0:
         return x
     if x.rank == 1:
-        return concatenate((x[n - k:], x[:n - k]), dim=0)
-    if dim == 0:
-        return concatenate((x[n - k:, :], x[:n - k, :]), dim=0)
-    return concatenate((x[:, n - k:], x[:, :n - k]), dim=1)
+        rolled = concatenate((x[n - k:], x[:n - k]), dim=0)
+    elif dim == 0:
+        rolled = concatenate((x[n - k:, :], x[:n - k, :]), dim=0)
+    else:
+        rolled = concatenate((x[:, n - k:], x[:, :n - k]), dim=1)
+    # Slice/concat are structural, so they drop the spectral state. A roll
+    # keeps every axis in the domain it was in -- only the position of the
+    # zero-frequency bin on the shifted axis becomes unknown -- so restore
+    # it here and keep the domain diagnostics live across a circshift.
+    axes = list(x._axes)
+    axes[dim] = (axes[dim][0], None)
+    rolled._axes = tuple(axes)
+    return rolled
 
 
 @sar.op
@@ -250,8 +259,12 @@ def stolt_interp(data: Tensor,
     # Smoothing ramp re-references fast time to the scene center before
     # the nonlinear remapping; the inverse ramp restores it on the
     # output grid (see the omega-K reference for the derivation).
-    ramp = expj(fr2 * (2.0 * np.pi * t_shift))
-    deramp = expj(fr2 * (-2.0 * np.pi * t_shift))
+    # Positions stay f64 above (interp1d's contract). The ramps multiply the
+    # data, so building them at f64 would promote a c64 pipeline to c128 and
+    # double the arithmetic downstream; keep them at the data's precision.
+    ramp_axis = fr2 if data.dtype.name == "c128" else cast(fr2, sar.f32)
+    ramp = expj(ramp_axis * (2.0 * np.pi * t_shift))
+    deramp = expj(ramp_axis * (-2.0 * np.pi * t_shift))
     return deramp * interp1d(data * ramp,
                              positions,
                              axis=1,

@@ -38,7 +38,10 @@ def measure_cut(cut: np.ndarray, factor: int = UPSAMPLE) -> dict:
     peak = fine[peak_idx]
     power = fine**2
 
-    # -3 dB width around the peak.
+    # -3 dB width around the peak. The crossing falls between samples, so
+    # stepping out to the first sample below the half-power level would
+    # bias the width high by up to one fine sample; interpolate linearly
+    # between the bracketing pair instead.
     half = peak / np.sqrt(2.0)
     left = peak_idx
     while left > 0 and fine[left] > half:
@@ -46,7 +49,20 @@ def measure_cut(cut: np.ndarray, factor: int = UPSAMPLE) -> dict:
     right = peak_idx
     while right < len(fine) - 1 and fine[right] > half:
         right += 1
-    irw = (right - left) / factor
+
+    def crossing(inner: int, outer: int) -> float:
+        """Sub-sample position where the cut crosses `half`, between the
+        last sample above it and the first below."""
+        hi, lo = fine[inner], fine[outer]
+        if hi == lo:
+            return float(outer)
+        return outer + (half - lo) / (hi - lo) * (inner - outer)
+
+    lo_edge = crossing(min(left + 1, peak_idx), left) if fine[left] <= half \
+        else float(left)
+    hi_edge = crossing(max(right - 1, peak_idx), right) \
+        if fine[right] <= half else float(right)
+    irw = (hi_edge - lo_edge) / factor
 
     # Mainlobe extent: first minima on both sides.
     lo = peak_idx

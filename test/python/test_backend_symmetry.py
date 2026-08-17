@@ -49,6 +49,8 @@ CONSTRUCTS = {
     lambda x: sar.broadcast(sar.sum(sar.absolute(x), axis=1), (N, N), dim=1),
     "reduce_max":
     lambda x: sar.broadcast(sar.max(sar.absolute(x), axis=1), (N, N), dim=1),
+    "reduce_min":
+    lambda x: sar.broadcast(sar.min(sar.absolute(x), axis=1), (N, N), dim=1),
     "argmax":
     lambda x: sar.broadcast(
         sar.cast(sar.argmax(sar.absolute(x), axis=1), sar.f64), (N, N), dim=1),
@@ -57,11 +59,13 @@ CONSTRUCTS = {
     "slice_concat":
     lambda x: sar.concatenate((x[:N // 2, :], x[N // 2:, :]), dim=0),
     "pad":
-    lambda x: sar.pad(x, ((0, 0), (0, 0))),
+    lambda x: sar.pad(x, ((1, 2), (0, 3)), value=0.5),
     "reverse":
     lambda x: sar.flip(x, axis=1),
     "fftshift":
     lambda x: sar.fftshift(x, axis=1),
+    "ifftshift":
+    lambda x: sar.ifftshift(x, axis=1),
     "fft":
     lambda x: sar.fft(x, axis=1),
     "ifft":
@@ -69,6 +73,20 @@ CONSTRUCTS = {
     "interp1d":
     lambda x: sar.interp1d(
         x, sar.broadcast(np.linspace(0, N - 1, N), (N, N), dim=1)),
+    "cumsum":
+    lambda x: sar.cumsum(x, axis=1),
+    "rank_filter":
+    lambda x: sar.rank_filter(sar.absolute(x), window=5, rank=1, axis=1),
+    "median_filter":
+    lambda x: sar.median_filter(sar.absolute(x), window=3, axis=0),
+    "sort":
+    lambda x: sar.sort(sar.absolute(x), axis=1),
+    "gather2d":
+    lambda x: sar.gather2d(
+        x, sar.broadcast(np.linspace(0, N - 1, N), (N, N), dim=0),
+        sar.broadcast(np.linspace(0, N - 1, N), (N, N), dim=1)),
+    "iterate":
+    lambda x: sar.iterate(4, lambda acc: acc * x, x),
 }
 
 
@@ -97,12 +115,23 @@ def test_construct_lowers_on_hls(construct):
     _compile(construct, CONSTRUCTS[construct], "hls")
 
 
-@pytest.mark.parametrize("backend", ["cpu", "hls"])
-def test_non_power_of_two_fft_lowers_everywhere(backend):
-    """Bluestein is the one place where the two backends take visibly
-    different routes -- a runtime call against a compile-time-folded
-    chirp-z reduction -- so it is worth naming separately."""
+# Bluestein is the one place where the two backends take visibly
+# different routes -- a runtime call against a compile-time-folded
+# chirp-z reduction -- so it is worth naming separately. One test per
+# backend so each carries its own availability gate.
+
+
+@requires_cpu
+def test_non_power_of_two_fft_lowers_on_cpu():
     _compile("nonpow2",
              lambda x: sar.fft(x, axis=1),
-             backend,
+             "cpu",
+             spec=sar.c128[12, 12])
+
+
+@requires_hls
+def test_non_power_of_two_fft_lowers_on_hls():
+    _compile("nonpow2",
+             lambda x: sar.fft(x, axis=1),
+             "hls",
              spec=sar.c128[12, 12])

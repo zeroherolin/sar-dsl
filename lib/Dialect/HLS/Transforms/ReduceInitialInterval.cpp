@@ -18,7 +18,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 #define DEBUG_TYPE "hls-reduce-initial-interval"
 
 using namespace mlir;
@@ -188,7 +187,8 @@ struct ReduceInitialInterval
     patterns.add<ReduceInitialIntervalPattern>(func.getContext());
     (void)applyPatternsGreedily(
         func, std::move(patterns),
-        GreedyRewriteConfig().setUseTopDownTraversal(false).setMaxIterations(1));
+        GreedyRewriteConfig().setUseTopDownTraversal(false).setMaxIterations(
+            1));
   }
 };
 } // namespace

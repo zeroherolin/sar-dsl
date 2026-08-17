@@ -70,7 +70,7 @@ struct SimplifyDispatchOrTaskOutputs : public OpRewritePattern<OpType> {
 
       rewriter.setInsertionPoint(op);
       auto newTask =
-          rewriter.create<OpType>(op.getLoc(), ValueRange(usedOutputs));
+          OpType::create(rewriter, op.getLoc(), ValueRange(usedOutputs));
       rewriter.inlineRegionBefore(op.getBody(), newTask.getBody(),
                                   newTask.getBody().end());
       for (auto t : llvm::zip(usedResults, newTask.getResults()))
@@ -135,11 +135,8 @@ YieldOp DispatchOp::getYieldOp() {
 void TaskOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                          MLIRContext *context) {
   results.add<SimplifyDispatchOrTaskOutputs<TaskOp>>(context);
-  results.add<InlineDispatchOrTask<TaskOp>>(context, [](TaskOp op) {
-    return llvm::hasSingleElement(op.getOps());
-    // return llvm::hasSingleElement(op.getDispatchOp().getOps<TaskOp>()) ||
-    //        llvm::hasSingleElement(op.getOps());
-  });
+  results.add<InlineDispatchOrTask<TaskOp>>(
+      context, [](TaskOp op) { return llvm::hasSingleElement(op.getOps()); });
 }
 
 LogicalResult TaskOp::verify() {
@@ -165,7 +162,19 @@ bool TaskOp::isLivein(Value value) {
 
 SmallVector<Value> TaskOp::getLiveins() {
   auto liveins = Liveness(*this).getLiveIn(&(*this).getBody().front());
-  return {liveins.begin(), liveins.end()};
+  // The liveness set iterates by pointer, which varies from run to run;
+  // order by first use inside the body so callers see a stable sequence.
+  SmallVector<Value> ordered;
+  llvm::SmallPtrSet<Value, 16> seen;
+  (*this).getBody().front().walk([&](Operation *op) {
+    for (Value operand : op->getOperands())
+      if (liveins.contains(operand) && seen.insert(operand).second)
+        ordered.push_back(operand);
+  });
+  for (Value livein : liveins)
+    if (!seen.contains(livein))
+      ordered.push_back(livein);
+  return ordered;
 }
 
 SmallVector<Operation *> TaskOp::getLiveinUsers(Value livein) {
@@ -237,7 +246,7 @@ struct SimplifyScheduleOperands : public OpRewritePattern<ScheduleOp> {
     if (hasUnusedPort) {
       rewriter.setInsertionPoint(schedule);
       auto newSchedule =
-          rewriter.create<ScheduleOp>(schedule.getLoc(), usedOperands);
+          ScheduleOp::create(rewriter, schedule.getLoc(), usedOperands);
       rewriter.inlineRegionBefore(schedule.getBody(), newSchedule.getBody(),
                                   newSchedule.getBody().end());
       rewriter.eraseOp(schedule);
@@ -288,8 +297,7 @@ LogicalResult ScheduleOp::verify() {
 
   if (getIsLegal())
     for (auto &op : getOps())
-      if (!isa<NodeOp, BufferOp, ConstBufferOp, StreamOp, BufferVectorizeOp,
-               BufferDevectorizeOp>(op)) {
+      if (!isa<NodeOp, BufferOp, ConstBufferOp, StreamOp>(op)) {
         auto diag = emitOpError("legal schedule has illegal ops:\n");
         diag.attachNote(op.getLoc())
             .append("see current op: ")
@@ -364,8 +372,8 @@ struct SimplifyNodeIOs : public OpRewritePattern<NodeOp> {
     // Construct new dataflow node.
     if (hasUnusedPort) {
       rewriter.setInsertionPoint(node);
-      auto newNode = rewriter.create<NodeOp>(
-          node.getLoc(), usedInputs, usedOutputs, usedParams,
+      auto newNode = NodeOp::create(
+          rewriter, node.getLoc(), usedInputs, usedOutputs, usedParams,
           rewriter.getI32ArrayAttr(usedInputTaps), node.getLevelAttr());
       rewriter.inlineRegionBefore(node.getBody(), newNode.getBody(),
                                   newNode.getBody().end());
@@ -380,10 +388,8 @@ struct SimplifyNodeIOs : public OpRewritePattern<NodeOp> {
 void NodeOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                          MLIRContext *context) {
   results.add<SimplifyNodeIOs>(context);
-  results.add<InlineScheduleOrNode<NodeOp>>(context, [](NodeOp op) {
-    return false;
-    // return llvm::hasSingleElement(op.getScheduleOp().getOps<NodeOp>());
-  });
+  results.add<InlineScheduleOrNode<NodeOp>>(context,
+                                            [](NodeOp op) { return false; });
 }
 
 LogicalResult NodeOp::verify() {
@@ -403,6 +409,7 @@ LogicalResult NodeOp::verify() {
     if (depth <= inputTap) {
       auto diag = emitOpError("node input tap is larger than buffer depth, ");
       diag << "input tap: " << inputTap << ", depth: " << depth;
+      return diag;
     }
   }
 
@@ -571,7 +578,7 @@ struct FlattenReadOnlyBuffer : public OpRewritePattern<BufferOp> {
         })) {
       auto initValue = buffer.getInitValue().value();
       auto constant =
-          rewriter.create<arith::ConstantOp>(buffer.getLoc(), initValue);
+          arith::ConstantOp::create(rewriter, buffer.getLoc(), initValue);
       for (auto user : buffer->getUsers())
         rewriter.replaceOp(user, constant.getResult());
       rewriter.eraseOp(buffer);
@@ -622,8 +629,8 @@ static NodeOp sinkBufferIntoNode(NodeOp node, BufferOp buffer,
 
   rewriter.setInsertionPointAfter(node);
   auto newNode =
-      rewriter.create<NodeOp>(node.getLoc(), inputs, outputs, node.getParams(),
-                              inputTaps, node.getLevelAttr());
+      NodeOp::create(rewriter, node.getLoc(), inputs, outputs, node.getParams(),
+                     inputTaps, node.getLevelAttr());
   rewriter.inlineRegionBefore(node.getBody(), newNode.getBody(),
                               newNode.getBody().begin());
   rewriter.eraseOp(node);
@@ -650,8 +657,8 @@ static ScheduleOp sinkBufferIntoSchedule(ScheduleOp schedule, BufferOp buffer,
   scheduleBlock.eraseArguments(eraseIndices);
 
   rewriter.setInsertionPointAfter(schedule);
-  auto newSchedule = rewriter.create<ScheduleOp>(schedule.getLoc(), operands,
-                                                 schedule.getIsLegalAttr());
+  auto newSchedule = ScheduleOp::create(rewriter, schedule.getLoc(), operands,
+                                        schedule.getIsLegalAttr());
   rewriter.inlineRegionBefore(schedule.getBody(), newSchedule.getBody(),
                               newSchedule.getBody().begin());
   rewriter.eraseOp(schedule);
@@ -704,7 +711,9 @@ LogicalResult BufferOp::verify() {
 }
 
 int32_t BufferOp::getBufferDepth() { return getDepth(); }
-std::optional<TypedAttr> BufferOp::getBufferInitValue() { return getInitValue(); }
+std::optional<TypedAttr> BufferOp::getBufferInitValue() {
+  return getInitValue();
+}
 
 void BufferOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
@@ -766,79 +775,11 @@ LogicalResult StreamReadOp::verify() {
   return success();
 }
 
-// void StreamReadOp::getEffects(
-//     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
-//         &effects) {
-//   effects.emplace_back(MemoryEffects::Read::get(), getChannel(),
-//                        SideEffects::DefaultResource::get());
-// }
-
 LogicalResult StreamWriteOp::verify() {
   if (cast<StreamType>(getChannel().getType()).getElementType() !=
       getValue().getType())
     return emitOpError("value type doesn't align with channel type");
   return success();
-}
-
-// void StreamWriteOp::getEffects(
-//     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
-//         &effects) {
-//   effects.emplace_back(MemoryEffects::Write::get(), getChannel(),
-//                        SideEffects::DefaultResource::get());
-// }
-
-//===----------------------------------------------------------------------===//
-// BufferVectorizeOp and BufferDevectorizeOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult
-verifyVectorizationTypes(function_ref<InFlightDiagnostic()> emitError,
-                         MemRefType type, MemRefType vectorizedType) {
-  auto vectorType = dyn_cast<VectorType>(vectorizedType.getElementType());
-  if (!vectorType || vectorType.getElementType() != type.getElementType())
-    return emitError() << "vectorized type must have vector elements with the "
-                          "same data type";
-
-  auto layout = dyn_cast<TileLayoutAttr>(type.getLayout());
-  auto vectorizedLayout = dyn_cast<TileLayoutAttr>(vectorizedType.getLayout());
-  if (!layout || !vectorizedLayout)
-    return emitError() << "input and output types must have tile layout";
-
-  for (auto [tileSize, vectorSize, vectorizedTileSize] :
-       llvm::zip(layout.getTileShape(), layout.getVectorShape(),
-                 vectorizedLayout.getTileShape()))
-    if (tileSize != vectorSize * vectorizedTileSize)
-      return emitError() << "tile layout mismatch";
-
-  for (auto [size, vectorizedSize, vectorSize] : llvm::zip(
-           type.getShape(), vectorizedType.getShape(), layout.getVectorShape()))
-    if (size != vectorizedSize * vectorSize)
-      return emitError() << "vector shape mismatch";
-
-  unsigned vectorNumElements = 1;
-  for (auto dim : layout.getVectorShape())
-    vectorNumElements *= dim;
-  if (vectorNumElements != vectorType.getNumElements())
-    return emitError() << "number of elements mismatch";
-
-  return success();
-}
-
-LogicalResult BufferVectorizeOp::verify() {
-  return verifyVectorizationTypes([&]() { return emitOpError(); },
-                                  getInputType(), getType());
-}
-
-LogicalResult BufferDevectorizeOp::verify() {
-  return verifyVectorizationTypes([&]() { return emitOpError(); }, getType(),
-                                  getInputType());
-}
-
-OpFoldResult BufferVectorizeOp::fold(FoldAdaptor) {
-  if (auto devectorize = getInput().getDefiningOp<BufferDevectorizeOp>())
-    if (devectorize.getInputType() == getType())
-      return devectorize.getInput();
-  return {};
 }
 
 //===----------------------------------------------------------------------===//
@@ -889,62 +830,7 @@ LogicalResult AxiPortOp::verify() {
       });
 }
 
-LogicalResult AxiPackOp::verify() {
-  // if (getAxiType().getElementType() != getElement().getType())
-  //   return emitOpError("axi type doesn't align with element type");
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
-// Primitive operations
-//===----------------------------------------------------------------------===//
-
-LogicalResult PrimMulOp::verify() {
-  auto AIsVector = isa<VectorType>(getA().getType());
-  auto BIsVector = isa<VectorType>(getB().getType());
-  auto CIsVector = isa<VectorType>(getC().getType());
-
-  if ((AIsVector || BIsVector) && CIsVector)
-    return success();
-  if (!AIsVector && !BIsVector && !CIsVector)
-    return success();
-  return failure();
-}
-
-bool PrimMulOp::isPackMul() {
-  auto AIsVector = isa<VectorType>(getA().getType());
-  auto BIsVector = isa<VectorType>(getB().getType());
-  return (AIsVector && !BIsVector) || (!AIsVector && BIsVector);
-}
-
-namespace {
-struct SimplifyPrimCastOp : public OpRewritePattern<PrimCastOp> {
-  using OpRewritePattern<PrimCastOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(PrimCastOp cast,
-                                PatternRewriter &rewriter) const override {
-    if (cast.getInput().getType() == cast.getOutput().getType()) {
-      rewriter.replaceOp(cast, cast.getInput());
-      return success();
-    }
-
-    // If the input of the cast is defined by another cast, then the two casts
-    // can be merged into one.
-    if (cast.getInput().hasOneUse())
-      if (auto defCast = cast.getInput().getDefiningOp<PrimCastOp>()) {
-        rewriter.replaceOpWithNewOp<PrimCastOp>(cast, cast.getType(),
-                                                defCast.getInput());
-        return success();
-      }
-    return failure();
-  }
-};
-} // namespace
-
-void PrimCastOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                             MLIRContext *context) {
-  results.add<SimplifyPrimCastOp>(context);
-}
+LogicalResult AxiPackOp::verify() { return success(); }
 
 //===----------------------------------------------------------------------===//
 // Affine SelectOp
@@ -1249,7 +1135,7 @@ PartitionLayoutAttr PartitionLayoutAttr::getWithActualFactors(
     else
       factors.push_back(factor);
   }
-  return get(context, kinds, actualFactors);
+  return get(context, kinds, factors);
 }
 
 //===----------------------------------------------------------------------===//

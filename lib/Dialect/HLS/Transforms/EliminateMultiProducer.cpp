@@ -9,6 +9,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
+#include "llvm/ADT/SetVector.h"
 
 namespace mlir {
 namespace sar {
@@ -16,7 +17,6 @@ namespace sar {
 #include "sar/Dialect/HLS/Transforms/Passes.h.inc"
 } // namespace sar
 } // namespace mlir
-
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -68,7 +68,7 @@ struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
         // The original buffer will be passed into the new node as inputs.
         newInputs.push_back(buffer);
         newInputTaps.push_back(0);
-        auto newBuffer = rewriter.create<BufferOp>(loc, buffer.getType());
+        auto newBuffer = BufferOp::create(rewriter, loc, buffer.getType());
         auto bufferIdx = llvm::find(node.getOutputs(), buffer) -
                          node.getOutputs().begin() + node.getNumInputs();
         node.setOperand(bufferIdx, newBuffer);
@@ -80,9 +80,9 @@ struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
         });
 
         // Create a new node and erase the original one.
-        auto newNode = rewriter.create<NodeOp>(
-            node.getLoc(), newInputs, node.getOutputs(), node.getParams(),
-            newInputTaps, node.getLevelAttr());
+        auto newNode = NodeOp::create(rewriter, node.getLoc(), newInputs,
+                                      node.getOutputs(), node.getParams(),
+                                      newInputTaps, node.getLevelAttr());
         rewriter.inlineRegionBefore(node.getBody(), newNode.getBody(),
                                     newNode.getBody().end());
         rewriter.eraseOp(node);
@@ -107,13 +107,15 @@ struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
             AffineLoopBand band;
             getAffineForIVs(*read, &band);
 
-            llvm::SmallDenseSet<Value> depInductionVars;
+            // A SetVector: the leftovers below become if-condition operands,
+            // and their order has to follow the band, not pointer values.
+            llvm::SmallSetVector<Value, 4> depInductionVars;
             for (auto loop : band)
               depInductionVars.insert(loop.getInductionVar());
 
             auto noEscapeIndex = true;
             for (auto operand : read.getMapOperands())
-              if (!depInductionVars.erase(operand))
+              if (!depInductionVars.remove(operand))
                 noEscapeIndex = false;
 
             if (noEscapeIndex && read.getAffineMap().isIdentity()) {
@@ -148,18 +150,19 @@ struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
               }
 
               rewriter.setInsertionPoint(read);
-              auto value = rewriter.create<mlir::affine::AffineLoadOp>(
-                  read.getLoc(), bufferArg, read.getMapOperands());
+              auto value = mlir::affine::AffineLoadOp::create(
+                  rewriter, read.getLoc(), bufferArg, read.getMapOperands());
 
               if (!ifExprs.empty()) {
                 auto ifCondition = IntegerSet::get(dim, 0, ifExprs, ifEqFlags);
-                auto ifOp = rewriter.create<AffineIfOp>(
-                    read.getLoc(), ifCondition, ifOperands, false);
+                auto ifOp = AffineIfOp::create(rewriter, read.getLoc(),
+                                               ifCondition, ifOperands, false);
                 rewriter.setInsertionPointToStart(ifOp.getThenBlock());
               }
 
-              rewriter.create<mlir::affine::AffineStoreOp>(
-                  read.getLoc(), value, newBufferArg, read.getMapOperands());
+              mlir::affine::AffineStoreOp::create(rewriter, read.getLoc(),
+                                                  value, newBufferArg,
+                                                  read.getMapOperands());
               continue;
             }
           }
@@ -167,7 +170,7 @@ struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
         // Otherwise, we need to create explicit data copy from the original
         // buffer to new buffer if the new buffer is ever read.
         if (!readUses.empty())
-          rewriter.create<memref::CopyOp>(loc, bufferArg, newBufferArg);
+          memref::CopyOp::create(rewriter, loc, bufferArg, newBufferArg);
       }
     }
     return success(hasChanged);
@@ -223,7 +226,7 @@ struct EliminateMultiProducer
     mlir::RewritePatternSet patterns(context);
     patterns.add<BufferMultiProducer>(context);
     patterns.add<MergeMultiProducer>(context);
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+    (void)applyPatternsGreedily(func, std::move(patterns));
   }
 };
 } // namespace

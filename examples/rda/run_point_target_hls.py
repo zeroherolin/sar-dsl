@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Range-Doppler on the HLS backend: emit a Vitis HLS C++ design
-and a C-simulation package with golden data from the NumPy reference
-
+and a C-simulation package with golden data from the NumPy reference.
 
 Usage:
-    python run_point_target_hls.py [--n 256] [--output hls_project/rda]
+    python run_point_target_hls.py [--n 256] [--output PATH]
                            [--no-testbench]
 """
 
@@ -28,7 +27,7 @@ def main() -> None:
                         default=256,
                         help="raster size (power of two)")
     parser.add_argument("--output",
-                        default="hls_project/rda",
+                        default=str(_EXAMPLES / "hls_project" / "rda"),
                         help="C-simulation package directory")
     parser.add_argument("--no-testbench",
                         action="store_true",
@@ -49,9 +48,9 @@ def main() -> None:
         golden = RDAProcessor(n, params).process(raw)
         design.write_testbench([raw, *make_inputs(n, params)], [golden], out)
     print(f"[2/2] Saved {out}")
-    print(f"done: {design.source().count(chr(10))} lines of HLS C++ "
-          f"(flow=affine, top function 'rda'); "
-          "csim: cd {out} && vitis_hls -f rda_csim.tcl".format(out=out))
+    print(f"done: {design.source().count(chr(10))} lines of HLS C++, "
+          f"top function 'rda'")
+    print(f"      csim: cd {out} && vitis_hls -f rda_csim.tcl")
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ def PartitionKind: I32EnumAttr<"PartitionKind", "Kind of array partition", [
 def PartitionKindParam: EnumParameter<PartitionKind>;
 
 def MemoryKind: I32EnumAttr<"MemoryKind", "Kind of memory", [
-    I32EnumAttrCase<"UNKNOWN", 0, "unknown">,  
+    I32EnumAttrCase<"UNKNOWN", 0, "unknown">,
     I32EnumAttrCase<"LUTRAM_1P", 1, "lutram_1p">,
     I32EnumAttrCase<"LUTRAM_2P", 2, "lutram_2p">,
     I32EnumAttrCase<"LUTRAM_S2P", 3, "lutram_s2p">,
@@ -174,7 +174,7 @@ def LoopDirectiveAttr : HLSAttr<"LoopDirective"> {
   let summary = "Aggregation of loop directives";
   let parameters = (ins "bool":$pipeline, "int64_t":$targetII, "bool":$dataflow,
                     "bool":$flatten);
-  
+
   let mnemonic = "loop";
   let assemblyFormat = [{
     `<` `pipeline` `=` $pipeline `,` `target_ii` `=` $targetII `,` `dataflow`

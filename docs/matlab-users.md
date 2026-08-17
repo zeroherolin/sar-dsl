@@ -11,14 +11,19 @@ than an error.
 
 | Matlab | SAR-DSL | Note |
 |--------|---------|------|
-| `x(1)` | `x[0]` | first element |
-| `x(end)` | `x[-1]` | last element |
+| `x(1)` | `x[0:1]` | first element |
+| `x(end)` | `x[-1:]` | last element |
 | `x(1:8)` | `x[0:8]` | 8 elements; the end index is *excluded* |
 | `x(2:2:end)` | `x[1::2]` | every other element from the second |
-| `x(:, 3)` | `x[:, 2]` | third column |
+| `x(:, 3)` | `x[:, 2:3]` | third column |
 | `size(x, 1)` | `x.shape[0]` | rows |
-| `x.'` | `sar.transpose(x)` | transpose (no conjugation) |
-| `x'` | `sar.conj(sar.transpose(x))` | conjugate transpose |
+| `x.'` | `sar.transpose(x)` or `x.T` | transpose (no conjugation) |
+| `x'` | `sar.conj(x.T)` | conjugate transpose |
+
+Indexing is always by *slice*: `x[0]` is rejected rather than silently
+dropping a dimension, so a single element or line is a length-1 slice
+(`x[0:1]`) and every result keeps the tensor's rank. Negative bounds
+count from the end as in numpy.
 
 Axis numbers follow the same rule: Matlab's `fft(x, [], 2)` (along
 columns) is `sar.fft(x, axis=1)`.
@@ -38,7 +43,7 @@ Where they differ:
 |--------|---------|------|
 | `[~, i] = max(x)` | `sar.argmax(x, axis=...)` | index only |
 | `[~, i] = min(x)` | `sar.argmin(x, axis=...)` | index only; composition over `argmax` |
-| `interp1` | `sar.interp1d` | kernel selectable (`sinc`, `cubic`, ...) |
+| `interp1` | `sar.interp1d` | kernel selectable (`sinc`, `cubic`, ...); out of range, `boundary=` (`zero`/`edge`/`reflect`) applies, not Matlab's NaN/`extrapval` |
 | `cat(2, a, b)` | `sar.concat([a, b], axis=1)` | also spelled `concatenate` |
 | `padarray` | `sar.pad` | |
 | `fliplr` / `flipud` | `sar.flip(x, axis=1)` / `axis=0` | |

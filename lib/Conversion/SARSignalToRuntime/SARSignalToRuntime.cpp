@@ -43,12 +43,12 @@ using namespace mlir::sar;
 namespace {
 
 /// Returns the runtime symbol suffix for an element type: "c64" for
-/// complex<f32>, "c128" for complex<f64>, "f64" for f64. Empty when the
-/// runtime has no entry point for the type, which the caller reports.
+/// complex<f32>, "c128" for complex<f64>. Empty when the runtime has no
+/// entry point for the type, which the caller reports.
 static StringRef getElementSuffix(Type elementType) {
   if (auto complexTy = dyn_cast<ComplexType>(elementType))
     return complexTy.getElementType().isF32() ? "c64" : "c128";
-  return elementType.isF64() ? "f64" : "";
+  return "";
 }
 
 /// Returns a memref type with the same shape/element type as `tensorType`
@@ -129,8 +129,7 @@ struct FFTLikeLowering : OpRewritePattern<FFTOpTy> {
     if (suffix.empty())
       return op.emitOpError("no runtime entry point for element type ")
              << tensorType.getElementType();
-    std::string symbol =
-        ("sar_rt_fft_" + Twine(rank) + "d_" + suffix).str();
+    std::string symbol = ("sar_rt_fft_" + Twine(rank) + "d_" + suffix).str();
 
     Value input = tensorToRuntimeArg(rewriter, loc, op.getInput());
     auto [alloc, output] = allocResultBuffer(rewriter, loc, tensorType);
@@ -188,6 +187,10 @@ struct Interp1DLowering : OpRewritePattern<Interp1DOp> {
                            .Case("hann", sar_rt::kHann)
                            .Case("hamming", sar_rt::kHamming)
                            .Default(sar_rt::kKaiser);
+    int64_t boundaryId = llvm::StringSwitch<int64_t>(op.getBoundary())
+                             .Case("zero", sar_rt::kZero)
+                             .Case("edge", sar_rt::kEdge)
+                             .Default(sar_rt::kReflect);
     Value kernel = arith::ConstantOp::create(
         rewriter, loc, rewriter.getI64IntegerAttr(kernelId));
     Value taps = arith::ConstantOp::create(
@@ -197,14 +200,17 @@ struct Interp1DLowering : OpRewritePattern<Interp1DOp> {
     Value beta = arith::ConstantOp::create(
         rewriter, loc,
         rewriter.getF64FloatAttr(op.getBeta().convertToDouble()));
+    Value boundary = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(boundaryId));
 
-    auto decl = ensureRuntimeDecl(
-        rewriter, module, symbol,
-        {data.getType(), positions.getType(), output.getType(),
-         kernel.getType(), taps.getType(), window.getType(), beta.getType()});
-    func::CallOp::create(
-        rewriter, loc, decl,
-        ValueRange{data, positions, output, kernel, taps, window, beta});
+    auto decl = ensureRuntimeDecl(rewriter, module, symbol,
+                                  {data.getType(), positions.getType(),
+                                   output.getType(), kernel.getType(),
+                                   taps.getType(), window.getType(),
+                                   beta.getType(), boundary.getType()});
+    func::CallOp::create(rewriter, loc, decl,
+                         ValueRange{data, positions, output, kernel, taps,
+                                    window, beta, boundary});
 
     rewriter.replaceOp(op,
                        bufferToResultTensor(rewriter, loc, dataType, alloc));

@@ -22,7 +22,7 @@ import functools
 import os
 import subprocess
 
-from sar.backends.base import BaseBackend, KernelMetadata
+from sar.backends.base import BaseBackend, KernelMetadata, cached_stage
 from sar.compiler.toolchain import find_runtime_library, find_tool, run_tool
 from sar.errors import ToolchainError
 from sar.runtime import CompiledKernel
@@ -59,7 +59,12 @@ def _openmp_link_flags() -> list:
     for candidate in candidates:
         if candidate and os.path.isfile(candidate):
             directory = os.path.dirname(candidate)
-            return [f"-L{directory}", "-lomp", f"-Wl,-rpath,{directory}"]
+            # -Xlinker rather than -Wl: the -Wl spelling splits its
+            # argument on commas, so a build path containing one would
+            # reach the linker in pieces.
+            return [
+                f"-L{directory}", "-lomp", "-Xlinker", f"-rpath={directory}"
+            ]
     # Fall back to the driver's default -fopenmp resolution.
     return ["-fopenmp"]
 
@@ -90,25 +95,27 @@ class Backend(BaseBackend):
     @staticmethod
     def _stage_llvm_dialect(module_text: str, metadata: KernelMetadata,
                             cache) -> str:
-        if cache.has("kernel.llvm.mlir"):
-            return cache.read_text("kernel.llvm.mlir")
-        cache.write_text("kernel.sar.mlir", module_text)
-        out = run_tool("sar-to-llvm",
-                       [find_tool("sar-opt"), "--sar-to-llvm-pipeline", "-"],
-                       input_text=module_text)
-        cache.write_text("kernel.llvm.mlir", out)
-        return out
+
+        def build() -> str:
+            cache.write_text("kernel.sar.mlir", module_text)
+            return run_tool(
+                "sar-to-llvm",
+                [find_tool("sar-opt"), "--sar-to-llvm-pipeline", "-"],
+                input_text=module_text)
+
+        return cached_stage(cache, "kernel.llvm.mlir", build)
 
     @staticmethod
     def _stage_llvm_ir(llvm_dialect: str, metadata: KernelMetadata,
                        cache) -> str:
-        if cache.has("kernel.ll"):
-            return cache.read_text("kernel.ll")
-        out = run_tool("mlir-translate",
-                       [find_tool("mlir-translate"), "--mlir-to-llvmir", "-"],
-                       input_text=llvm_dialect)
-        cache.write_text("kernel.ll", out)
-        return out
+
+        def build() -> str:
+            return run_tool(
+                "mlir-translate",
+                [find_tool("mlir-translate"), "--mlir-to-llvmir", "-"],
+                input_text=llvm_dialect)
+
+        return cached_stage(cache, "kernel.ll", build)
 
     @staticmethod
     def _stage_shared_library(llvm_ir: str, metadata: KernelMetadata,
@@ -123,8 +130,8 @@ class Backend(BaseBackend):
         command = [
             find_tool("clang"), f"-O{opt_level}", "-shared", "-fPIC",
             str(ll_path), runtime, "-o",
-            str(scratch), "-lm", f"-Wl,-rpath,{os.path.dirname(runtime)}",
-            "-Wno-override-module"
+            str(scratch), "-lm", "-Xlinker",
+            f"-rpath={os.path.dirname(runtime)}", "-Wno-override-module"
         ]
         if metadata.options.get("native_codegen", True):
             command += _native_arch_flags()

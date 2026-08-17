@@ -1,18 +1,20 @@
-//===----------------------------------------------------------------------===//
+//===- EmitHLSCpp.cpp - Translate scheduled HLS IR to Vitis HLS C++ -------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/InitAllDialects.h"
 #include "sar/Target/HLS/EmitHLSCpp.h"
 #include "mlir/Analysis/CallGraph.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/IntegerSet.h"
+#include "mlir/InitAllDialects.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "sar/Dialect/HLS/IR/Utils.h"
 #include "sar/Dialect/HLS/IR/Visitor.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -23,8 +25,6 @@ static llvm::cl::opt<bool> emitVitisDirectives("emit-vitis-directives",
                                                llvm::cl::init(false));
 static llvm::cl::opt<bool> enforceFalseDependency("enforce-false-dependency",
                                                   llvm::cl::init(false));
-static llvm::cl::opt<int64_t> limitDspNumber("limit-dsp-number",
-                                             llvm::cl::init(240));
 static llvm::cl::opt<unsigned>
     axiBusBits("axi-bus-bits",
                llvm::cl::desc("Data width, in bits, of the AXI master ports"),
@@ -57,6 +57,12 @@ struct AxiShape {
 static AxiShape getAxiShape(MemRefType type) {
   unsigned elementBits = type.getElementTypeBitWidth();
   if (elementBits == 0 || !type.hasStaticShape())
+    return {0, 0, 0};
+
+  // A single-element buffer -- the DRAM scratch placeholder when nothing
+  // spilled -- moves no bulk data, so shaping it is noise; the Vitis
+  // defaults serve. Real buffers always have a contiguous run to shape.
+  if (type.getNumElements() == 1)
     return {0, 0, 0};
 
   // Widen while the beat still divides the contiguous run: a partial beat
@@ -180,6 +186,102 @@ static std::string getVivadoStorageTypeAndImpl(MemoryKind kind) {
 }
 
 //===----------------------------------------------------------------------===//
+// Port role analysis
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// Which way data crosses a port. A buffer that a callee only fills is an
+/// output at the caller's boundary too, so the walk follows calls.
+enum class PortRole { Unused, In, Out, InOut };
+} // namespace
+
+static const char *getPortRolePrefix(PortRole role) {
+  switch (role) {
+  case PortRole::Unused:
+    return "unused";
+  case PortRole::In:
+    return "in";
+  case PortRole::Out:
+    return "out";
+  case PortRole::InOut:
+    return "inout";
+  }
+  return "arg";
+}
+
+/// Accumulates whether `value` is read and/or written. Recursion through
+/// calls is bounded by `visited`, which keys the callee block arguments
+/// already on the stack.
+static void
+collectAccess(Value value, bool &isRead, bool &isWritten,
+              llvm::DenseSet<std::pair<Operation *, unsigned>> &visited) {
+  for (auto &use : value.getUses()) {
+    auto *owner = use.getOwner();
+    unsigned idx = use.getOperandNumber();
+
+    if (auto load = dyn_cast<AffineLoadOp>(owner)) {
+      if (load.getMemRef() == value)
+        isRead = true;
+    } else if (auto store = dyn_cast<AffineStoreOp>(owner)) {
+      isWritten |= store.getMemRef() == value;
+      isRead |= store.getValueToStore() == value;
+    } else if (auto load = dyn_cast<memref::LoadOp>(owner)) {
+      if (load.getMemRef() == value)
+        isRead = true;
+    } else if (auto store = dyn_cast<memref::StoreOp>(owner)) {
+      isWritten |= store.getMemRef() == value;
+      isRead |= store.getValueToStore() == value;
+    } else if (auto copy = dyn_cast<memref::CopyOp>(owner)) {
+      isRead |= copy.getSource() == value;
+      isWritten |= copy.getTarget() == value;
+    } else if (auto read = dyn_cast<vector::TransferReadOp>(owner)) {
+      isRead |= read.getBase() == value;
+    } else if (auto write = dyn_cast<vector::TransferWriteOp>(owner)) {
+      isWritten |= write.getBase() == value;
+      isRead |= write.getVector() == value;
+    } else if (isa<StreamReadOp>(owner)) {
+      isRead = true;
+    } else if (auto write = dyn_cast<StreamWriteOp>(owner)) {
+      isWritten |= write.getChannel() == value;
+      isRead |= write.getValue() == value;
+    } else if (auto call = dyn_cast<func::CallOp>(owner)) {
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (!callee || callee.isExternal() || idx >= callee.getNumArguments()) {
+        // Cannot see the callee: assume the worst rather than mislabel.
+        isRead = isWritten = true;
+        continue;
+      }
+      if (!visited.insert({callee.getOperation(), idx}).second)
+        continue;
+      collectAccess(callee.getArgument(idx), isRead, isWritten, visited);
+    } else if (isa<func::ReturnOp>(owner)) {
+      isRead = true;
+    } else {
+      // An operation the emitter does not model precisely; both directions
+      // are possible, and over-reporting only costs a vaguer name.
+      isRead = isWritten = true;
+    }
+
+    if (isRead && isWritten)
+      return;
+  }
+}
+
+static PortRole getPortRole(Value value) {
+  bool isRead = false, isWritten = false;
+  llvm::DenseSet<std::pair<Operation *, unsigned>> visited;
+  collectAccess(value, isRead, isWritten, visited);
+  if (isRead && isWritten)
+    return PortRole::InOut;
+  if (isWritten)
+    return PortRole::Out;
+  if (isRead)
+    return PortRole::In;
+  return PortRole::Unused;
+}
+
+//===----------------------------------------------------------------------===//
 // Some Base Classes
 //===----------------------------------------------------------------------===//
 
@@ -198,6 +300,16 @@ public:
 
   // This table contains all declared values.
   DenseMap<Value, SmallString<8>> nameTable;
+
+  // Temporaries are numbered per function, so a reader sees `v3` in a
+  // twenty-line node instead of `v1546` counted across the whole design.
+  unsigned localNameIdx = 0;
+
+  // Constant tables lifted to file scope, and the names they were given.
+  DenseMap<Value, std::string> globalTables;
+
+  // Sub-functions renamed for readability: original symbol -> emitted name.
+  llvm::StringMap<std::string> funcNames;
 
 private:
   HLSEmitterState(const HLSEmitterState &) = delete;
@@ -231,6 +343,11 @@ public:
   /// Value name management methods.
   SmallString<8> addName(Value val, bool isPtr = false);
 
+  /// Binds `val` to an explicit name, uniqued against names already handed
+  /// out. Used for ports and buffers, whose names carry meaning.
+  SmallString<8> addNamedValue(Value val, const Twine &base,
+                               bool isPtr = false);
+
   SmallString<8> addAlias(Value val, Value alias);
 
   SmallString<8> getName(Value val);
@@ -248,7 +365,6 @@ private:
 };
 } // namespace
 
-// TODO: update naming rule.
 SmallString<8> HLSEmitterBase::addName(Value val, bool isPtr) {
   assert(!isDeclared(val) && "has been declared before.");
 
@@ -256,7 +372,20 @@ SmallString<8> HLSEmitterBase::addName(Value val, bool isPtr) {
   if (isPtr)
     valName += "*";
 
-  valName += StringRef("v" + std::to_string(state.nameTable.size()));
+  valName += StringRef("v" + std::to_string(state.localNameIdx++));
+  state.nameTable[val] = valName;
+
+  return valName;
+}
+
+SmallString<8> HLSEmitterBase::addNamedValue(Value val, const Twine &base,
+                                             bool isPtr) {
+  assert(!isDeclared(val) && "has been declared before.");
+
+  SmallString<8> valName;
+  if (isPtr)
+    valName += "*";
+  base.toVector(valName);
   state.nameTable[val] = valName;
 
   return valName;
@@ -349,8 +478,7 @@ namespace {
 class ModuleEmitter : public HLSEmitterBase {
 public:
   using operand_range = Operation::operand_range;
-  explicit ModuleEmitter(HLSEmitterState &state)
-      : HLSEmitterBase(state) {}
+  explicit ModuleEmitter(HLSEmitterState &state) : HLSEmitterBase(state) {}
 
   /// HLS dialect operation emitters.
   void emitConstBuffer(ConstBufferOp op);
@@ -358,12 +486,20 @@ public:
   void emitStreamRead(StreamReadOp op);
   void emitStreamWrite(StreamWriteOp op);
   void emitAxiPort(AxiPortOp op);
-  void emitPrimMul(PrimMulOp op);
   template <typename AssignOpType> void emitAssign(AssignOpType op);
+  void emitExtUI(arith::ExtUIOp op);
   void emitAffineSelect(hls::AffineSelectOp op);
 
   /// Control flow operation emitters.
   void emitCall(func::CallOp op);
+
+  /// Loop-carried values (`iter_args`): one variable per carry, declared
+  /// before the loop, aliased by the region argument and reassigned by the
+  /// yield.
+  LogicalResult emitLoopCarries(ValueRange results, ValueRange inits,
+                                ValueRange iterArgs, Operation *op);
+  void emitLoopCarryAssign(ValueRange results, ValueRange yields,
+                           Operation *op);
 
   /// SCF statement emitters.
   void emitScfFor(scf::ForOp op);
@@ -382,7 +518,6 @@ public:
   void emitAffineYield(AffineYieldOp op);
 
   /// Vector-related statement emitters.
-  void emitVectorInit(hls::VectorInitOp op);
   void emitInsert(vector::InsertOp op);
   void emitExtract(vector::ExtractOp op);
   void emitTransferRead(vector::TransferReadOp op);
@@ -394,7 +529,6 @@ public:
   void emitLoad(memref::LoadOp op);
   void emitStore(memref::StoreOp op);
   void emitMemCpy(memref::CopyOp op);
-  template <typename OpType> void emitReshape(OpType op);
 
   /// Standard expression emitters.
   void emitUnary(Operation *op, const char *syntax);
@@ -416,6 +550,7 @@ private:
   /// C++ component emitters.
   void emitValue(Value val, unsigned rank = 0, bool isPtr = false,
                  bool isRef = false);
+  void emitValueDecl(Value val, bool isPtr = false);
   void emitArrayDecl(Value array);
   unsigned emitNestedLoopHeader(Value val);
   void emitNestedLoopFooter(unsigned rank);
@@ -429,7 +564,35 @@ private:
   void emitFunctionDirectives(func::FuncOp func, ArrayRef<Value> portList);
   void emitFunction(func::FuncOp func);
 
-  unsigned numDSPs = 0;
+  /// Naming and layout helpers.
+  StringRef getEmittedFuncName(StringRef symbol);
+  void assignFuncNames(ArrayRef<func::FuncOp> funcs, func::FuncOp topFunc);
+  SmallVector<Value, 8> assignPortNames(func::FuncOp func);
+  void emitPortDecl(Value port, bool isConst);
+  void emitFunctionSignature(func::FuncOp func, ArrayRef<Value> portList,
+                             bool asPrototype);
+  void nameLoopIV(Value iv);
+
+  /// Constant table hoisting.
+  void collectGlobalTables(ModuleOp module, ArrayRef<func::FuncOp> funcs);
+  void emitGlobalTables();
+  bool isConstParam(func::FuncOp func, unsigned idx) const;
+
+  /// Loop induction variables are numbered per function.
+  unsigned loopIVIdx = 0;
+
+  /// Intermediate buffers are numbered per function.
+  unsigned bufferIdx = 0;
+
+  /// Ops whose results became file-scope tables; their bodies emit nothing.
+  llvm::SetVector<Operation *> hoistedTables;
+
+  /// Lifted tables that must stay writable because some callee parameter
+  /// they reach could not be made const.
+  DenseSet<Value> mutableTables;
+
+  /// Callee parameters that only ever receive a file-scope const table.
+  DenseMap<Operation *, llvm::BitVector> constParams;
 };
 } // namespace
 
@@ -539,8 +702,6 @@ public:
   bool visitOp(AxiBundleOp op) { return true; }
   bool visitOp(AxiPortOp op) { return emitter.emitAxiPort(op), true; }
   bool visitOp(AxiPackOp op) { return false; }
-  bool visitOp(PrimMulOp op) { return emitter.emitPrimMul(op), true; }
-  bool visitOp(PrimCastOp op) { return emitter.emitAssign(op), true; }
   bool visitOp(hls::AffineSelectOp op) {
     return emitter.emitAffineSelect(op), true;
   }
@@ -577,9 +738,6 @@ public:
   bool visitOp(AffineYieldOp op) { return emitter.emitAffineYield(op), true; }
 
   /// Vector statements.
-  bool visitOp(hls::VectorInitOp op) {
-    return emitter.emitVectorInit(op), true;
-  }
   bool visitOp(vector::InsertOp op) { return emitter.emitInsert(op), true; };
   bool visitOp(vector::ExtractOp op) { return emitter.emitExtract(op), true; };
   bool visitOp(vector::TransferReadOp op) {
@@ -599,16 +757,6 @@ public:
   bool visitOp(memref::StoreOp op) { return emitter.emitStore(op), true; }
   bool visitOp(memref::DeallocOp op) { return true; }
   bool visitOp(memref::CopyOp op) { return emitter.emitMemCpy(op), true; }
-  // bool visitOp(memref::ReshapeOp op) { return emitter.emitReshape(op), true;
-  // } bool visitOp(memref::CollapseShapeOp op) {
-  //   return emitter.emitReshape(op), true;
-  // }
-  // bool visitOp(memref::ExpandShapeOp op) {
-  //   return emitter.emitReshape(op), true;
-  // }
-  // bool visitOp(memref::ReinterpretCastOp op) {
-  //   return emitter.emitReshape(op), true;
-  // }
 
 private:
   ModuleEmitter &emitter;
@@ -622,22 +770,44 @@ public:
   using HLSVisitorBase::visitOp;
 
   /// Unary expressions.
-  bool visitOp(math::AbsIOp op) { return emitter.emitUnary(op, "abs"), true; }
-  bool visitOp(math::AbsFOp op) { return emitter.emitUnary(op, "abs"), true; }
-  bool visitOp(math::CeilOp op) { return emitter.emitUnary(op, "ceil"), true; }
-  bool visitOp(math::CosOp op) { return emitter.emitUnary(op, "cos"), true; }
-  bool visitOp(math::SinOp op) { return emitter.emitUnary(op, "sin"), true; }
-  bool visitOp(math::TanhOp op) { return emitter.emitUnary(op, "tanh"), true; }
-  bool visitOp(math::SqrtOp op) { return emitter.emitUnary(op, "sqrt"), true; }
-  bool visitOp(math::RsqrtOp op) {
-    return emitter.emitUnary(op, "1.0 / sqrt"), true;
+  bool visitOp(math::AbsIOp op) {
+    return emitter.emitUnary(op, "std::abs"), true;
   }
-  bool visitOp(math::ExpOp op) { return emitter.emitUnary(op, "exp"), true; }
-  bool visitOp(math::Exp2Op op) { return emitter.emitUnary(op, "exp2"), true; }
-  bool visitOp(math::LogOp op) { return emitter.emitUnary(op, "log"), true; }
-  bool visitOp(math::Log2Op op) { return emitter.emitUnary(op, "log2"), true; }
+  bool visitOp(math::AbsFOp op) {
+    return emitter.emitUnary(op, "std::abs"), true;
+  }
+  bool visitOp(math::CeilOp op) {
+    return emitter.emitUnary(op, "std::ceil"), true;
+  }
+  bool visitOp(math::CosOp op) {
+    return emitter.emitUnary(op, "std::cos"), true;
+  }
+  bool visitOp(math::SinOp op) {
+    return emitter.emitUnary(op, "std::sin"), true;
+  }
+  bool visitOp(math::TanhOp op) {
+    return emitter.emitUnary(op, "std::tanh"), true;
+  }
+  bool visitOp(math::SqrtOp op) {
+    return emitter.emitUnary(op, "std::sqrt"), true;
+  }
+  bool visitOp(math::RsqrtOp op) {
+    return emitter.emitUnary(op, "1.0 / std::sqrt"), true;
+  }
+  bool visitOp(math::ExpOp op) {
+    return emitter.emitUnary(op, "std::exp"), true;
+  }
+  bool visitOp(math::Exp2Op op) {
+    return emitter.emitUnary(op, "std::exp2"), true;
+  }
+  bool visitOp(math::LogOp op) {
+    return emitter.emitUnary(op, "std::log"), true;
+  }
+  bool visitOp(math::Log2Op op) {
+    return emitter.emitUnary(op, "std::log2"), true;
+  }
   bool visitOp(math::Log10Op op) {
-    return emitter.emitUnary(op, "log10"), true;
+    return emitter.emitUnary(op, "std::log10"), true;
   }
   bool visitOp(arith::NegFOp op) { return emitter.emitUnary(op, "-"), true; }
 
@@ -648,11 +818,17 @@ public:
   bool visitOp(arith::MulFOp op) { return emitter.emitBinary(op, "*"), true; }
   bool visitOp(arith::DivFOp op) { return emitter.emitBinary(op, "/"), true; }
   bool visitOp(arith::RemFOp op) { return emitter.emitBinary(op, "%"), true; }
-  bool visitOp(arith::MaximumFOp op) { return emitter.emitMaxMin(op, "max"), true; }
-  bool visitOp(arith::MinimumFOp op) { return emitter.emitMaxMin(op, "min"), true; }
-  bool visitOp(math::PowFOp op) { return emitter.emitMaxMin(op, "pow"), true; }
+  bool visitOp(arith::MaximumFOp op) {
+    return emitter.emitMaxMin(op, "std::max"), true;
+  }
+  bool visitOp(arith::MinimumFOp op) {
+    return emitter.emitMaxMin(op, "std::min"), true;
+  }
+  bool visitOp(math::PowFOp op) {
+    return emitter.emitMaxMin(op, "std::pow"), true;
+  }
   bool visitOp(math::Atan2Op op) {
-    return emitter.emitMaxMin(op, "atan2"), true;
+    return emitter.emitMaxMin(op, "std::atan2"), true;
   }
 
   /// Integer binary expressions.
@@ -671,16 +847,16 @@ public:
   bool visitOp(arith::ShRSIOp op) { return emitter.emitBinary(op, ">>"), true; }
   bool visitOp(arith::ShRUIOp op) { return emitter.emitBinary(op, ">>"), true; }
   bool visitOp(arith::MaxSIOp op) {
-    return emitter.emitMaxMin(op, "max"), true;
+    return emitter.emitMaxMin(op, "std::max"), true;
   }
   bool visitOp(arith::MinSIOp op) {
-    return emitter.emitMaxMin(op, "min"), true;
+    return emitter.emitMaxMin(op, "std::min"), true;
   }
   bool visitOp(arith::MaxUIOp op) {
-    return emitter.emitMaxMin(op, "max"), true;
+    return emitter.emitMaxMin(op, "std::max"), true;
   }
   bool visitOp(arith::MinUIOp op) {
-    return emitter.emitMaxMin(op, "min"), true;
+    return emitter.emitMaxMin(op, "std::min"), true;
   }
 
   /// Special expressions.
@@ -692,10 +868,13 @@ public:
   bool visitOp(arith::FPToUIOp op) { return emitter.emitAssign(op), true; }
   bool visitOp(arith::FPToSIOp op) { return emitter.emitAssign(op), true; }
 
-  /// TODO: Figure out whether these ops need to be separately handled.
+  /// Width conversions emit as plain assignments: the emitted types
+  /// (`ap_int<W>`, float/double) carry truncation and extension in their
+  /// conversion operators. The one exception is zero-extension, where the
+  /// signed source type would sign-extend, so it casts through unsigned.
   bool visitOp(arith::TruncIOp op) { return emitter.emitAssign(op), true; }
   bool visitOp(arith::TruncFOp op) { return emitter.emitAssign(op), true; }
-  bool visitOp(arith::ExtUIOp op) { return emitter.emitAssign(op), true; }
+  bool visitOp(arith::ExtUIOp op) { return emitter.emitExtUI(op), true; }
   bool visitOp(arith::ExtSIOp op) { return emitter.emitAssign(op), true; }
   bool visitOp(arith::ExtFOp op) { return emitter.emitAssign(op), true; }
 
@@ -749,6 +928,7 @@ bool ExprVisitor::visitOp(arith::CmpIOp op) {
   case arith::CmpIPredicate::uge:
     return emitter.emitBinary(op, ">="), true;
   }
+  llvm_unreachable("covered switch");
 }
 
 //===----------------------------------------------------------------------===//
@@ -757,6 +937,11 @@ bool ExprVisitor::visitOp(arith::CmpIOp op) {
 
 /// HLS dialect operation emitters.
 void ModuleEmitter::emitConstBuffer(ConstBufferOp op) {
+  // Tables lifted to file scope are already defined and named; a local
+  // copy would only duplicate the ROM.
+  if (hoistedTables.count(op.getOperation()))
+    return;
+
   emitConstant(op);
   emitArrayDirectives(op.getResult());
 }
@@ -804,21 +989,38 @@ void ModuleEmitter::emitAxiShape(MemRefType type) {
 void ModuleEmitter::emitAxiPort(AxiPortOp op) {
   addAlias(op.getAxi(), op.getElement());
 
-  // if (isa<MemRefType, StreamType>(op.getType())) {
+  // A design compiled for AXI4-Stream carries this on its top function. The
+  // port types are unchanged -- a memref must be mapped to an MM bundle for
+  // the IR to verify -- so the protocol is decided here, at the pragma.
+  auto func = op->getParentOfType<func::FuncOp>();
+  bool streamInterface = func && func->hasAttr("stream_interface");
+
+  // A port the design both reads and writes is a scratch buffer that spilled
+  // to DRAM, not a data stream: an AXI4-Stream is unidirectional and consumed
+  // once, so `axis` on such a port cannot synthesize. Neither can a port the
+  // design never touches (the placeholder scratch when nothing spilled) -- a
+  // stream nobody drains would stall the host. Only pure inputs and pure
+  // outputs stream; everything else stays memory-mapped.
+  auto role = getPortRole(op.getElement());
+  bool streaming =
+      op.getBundleType().getKind() == AxiKind::STREAM ||
+      (streamInterface && (role == PortRole::In || role == PortRole::Out));
+
   indent() << "#pragma HLS interface";
 
-  if (op.getBundleType().getKind() == AxiKind::MM) {
-    if (isExtBuffer(op.getElement())) {
-      os << " m_axi offset=slave";
-      emitAxiShape(cast<MemRefType>(op.getElement().getType()));
-    } else {
-      os << " bram ";
-      auto kind = getMemoryKind(cast<MemRefType>(op.getElement().getType()));
-      os << getStorageTypeAndImpl(kind, "storage_type", "storage_impl");
-    }
-  } else if (op.getBundleType().getKind() == AxiKind::STREAM)
+  if (streaming) {
+    // `axis` takes a bundle but no burst/latency shaping: those describe
+    // addressed access to DRAM, which a stream port does not perform.
     os << " axis";
-  else
+  } else if (op.getBundleType().getKind() == AxiKind::MM) {
+    // A memory-mapped bundle is the contract with the host, so the port is
+    // an AXI master whatever the compiler decided about keeping a copy on
+    // chip. Downgrading it to `bram` because the buffer happened to fit
+    // would emit `bundle=` on a mode that does not take one -- a pragma
+    // Vitis rejects -- and would make the signature depend on placement.
+    os << " m_axi offset=slave";
+    emitAxiShape(cast<MemRefType>(op.getElement().getType()));
+  } else
     llvm_unreachable("AXI element type must be a memref or stream");
 
   os << " port=";
@@ -826,70 +1028,27 @@ void ModuleEmitter::emitAxiPort(AxiPortOp op) {
   os << " bundle=" << op.getBundleName();
   os << "\n";
 
-  if (isa<MemRefType>(op.getElement().getType()))
+  // Array directives describe an on-chip memory's banking and storage type;
+  // a streaming port has neither, so they are emitted only for memory-mapped
+  // ports.
+  if (!streaming && isa<MemRefType>(op.getElement().getType()))
     emitArrayDirectives(op.getElement(), true);
-  // } else {
-  //   indent() << "#pragma HLS interface s_axilite";
-  //   os << " port=";
-
-  //   // TODO: This is a temporary solution.
-  //   auto name = getName(op.getElement());
-  //   if (name.front() == "*"[0])
-  //     name.erase(name.begin());
-  //   os << name;
-  //   os << " bundle=" << op.getBundleName() << "\n";
-  // }
   // An empty line.
   os << "\n";
 }
 
-void ModuleEmitter::emitPrimMul(PrimMulOp op) {
-  if (op.isPackMul()) {
-    // Declare the result C array.
-    if (!isDeclared(op.getC())) {
-      indent();
-      emitArrayDecl(op.getC());
-      os << ";\n";
-
-      indent() << "#pragma HLS array_partition variable=";
-      emitValue(op.getC());
-      os << " complete dim=0\n";
-    }
-
-    auto AIsVector = isa<VectorType>(op.getA().getType());
-    indent() << "pack_mul(";
-    emitValue(AIsVector ? op.getA() : op.getB());
-    os << ", ";
-    emitValue(AIsVector ? op.getB() : op.getA());
-    os << ", ";
-    emitValue(op.getC());
-    os << ");";
-    emitInfoAndNewLine(op);
-
-  } else {
-    // To ensure DSP is utilized, the two operands are casted to 16-bits integer
-    // before the multiplication.
-    auto rank = emitNestedLoopHeader(op.getC());
-    indent();
-    emitValue(op.getC(), rank);
-    os << " = (ap_int<8>)";
-    emitValue(op.getA(), rank);
-    os << " * (ap_int<8>)";
-    emitValue(op.getB(), rank);
-    os << ";";
-    emitInfoAndNewLine(op);
-    emitNestedLoopFooter(rank);
-
-    indent();
-    os << "#pragma HLS bind_op op=mul variable=";
-    emitValue(op.getC(), rank);
-    if (numDSPs < limitDspNumber) {
-      numDSPs++;
-      os << " impl=dsp";
-    } else
-      os << " impl=fabric";
-    os << "\n";
-  }
+/// Zero-extension. Integers are declared as signed `ap_int`, whose widening
+/// conversion sign-extends; reinterpreting the source as unsigned at its own
+/// width makes the assignment fill with zeros instead.
+void ModuleEmitter::emitExtUI(arith::ExtUIOp op) {
+  unsigned rank = emitNestedLoopHeader(op.getResult());
+  indent();
+  emitValue(op.getResult(), rank);
+  os << " = (ap_uint<" << op.getIn().getType().getIntOrFloatBitWidth() << ">)";
+  emitValue(op.getIn(), rank);
+  os << ";";
+  emitInfoAndNewLine(op);
+  emitNestedLoopFooter(rank);
 }
 
 template <typename AssignOpType>
@@ -947,7 +1106,7 @@ void ModuleEmitter::emitCall(func::CallOp op) {
   }
 
   // Emit the function call.
-  indent() << op.getCallee() << "(";
+  indent() << getEmittedFuncName(op.getCallee()) << "(";
 
   // Handle input arguments.
   unsigned argIdx = 0;
@@ -973,13 +1132,107 @@ void ModuleEmitter::emitCall(func::CallOp op) {
   emitInfoAndNewLine(op);
 }
 
+/// Loop-carried values compile to ordinary variables: declared and
+/// initialized ahead of the loop, read through the region's iter arg (an
+/// alias of the same variable) inside it, and reassigned by the yield. The
+/// loop's results are those variables after the last iteration.
+///
+/// A carried *array* cannot be reassigned in C, so it lives in its init
+/// buffer instead: the iter arg and the result both alias it, and the
+/// yield copies back into it unless the body already wrote it in place.
+LogicalResult ModuleEmitter::emitLoopCarries(ValueRange results,
+                                             ValueRange inits,
+                                             ValueRange iterArgs,
+                                             Operation *op) {
+  for (auto [result, init, iterArg] : llvm::zip(results, inits, iterArgs)) {
+    if (isa<MemRefType>(result.getType())) {
+      addAlias(init, iterArg);
+      addAlias(init, result);
+      continue;
+    }
+    if (isa<ShapedType>(result.getType())) {
+      emitError(op, "only scalar and memref loop carries are supported");
+      return failure();
+    }
+    indent();
+    emitValueDecl(result);
+    os << " = ";
+    emitValue(init);
+    os << ";\n";
+    addAlias(result, iterArg);
+  }
+  return success();
+}
+
+/// Assigns what a loop yields into its carried variables. With more than
+/// one scalar carry the values stage through temporaries first: a permuted
+/// yield (`yield %b, %a`) must read this iteration's values, not the ones
+/// the first assignment just overwrote. Array carries cannot stage, so a
+/// permuted array yield is rejected rather than miscompiled.
+void ModuleEmitter::emitLoopCarryAssign(ValueRange results, ValueRange yields,
+                                        Operation *op) {
+  for (auto [result, yielded] : llvm::zip(results, yields)) {
+    if (!isa<MemRefType>(result.getType()))
+      continue;
+    if (getName(yielded) == getName(result))
+      continue; // the body wrote the carry buffer in place
+    for (Value other : results)
+      if (other != result && isa<MemRefType>(other.getType()) &&
+          getName(other) == getName(yielded)) {
+        emitError(op, "swapped array carries are not supported; copy "
+                      "through a scratch buffer inside the loop instead");
+        return;
+      }
+    unsigned rank = emitNestedLoopHeader(result);
+    indent();
+    emitValue(result, rank);
+    os << " = ";
+    emitValue(yielded, rank);
+    os << ";";
+    emitInfoAndNewLine(op);
+    emitNestedLoopFooter(rank);
+  }
+
+  SmallVector<unsigned> scalars;
+  for (auto [idx, result] : llvm::enumerate(results))
+    if (!isa<MemRefType>(result.getType()))
+      scalars.push_back(idx);
+  llvm::DenseMap<unsigned, std::string> temps;
+  if (scalars.size() > 1) {
+    for (unsigned idx : scalars) {
+      auto temp = "carry" + std::to_string(state.localNameIdx++);
+      indent() << getDataTypeName(yields[idx].getType()) << " " << temp
+               << " = ";
+      emitValue(yields[idx]);
+      os << ";";
+      emitInfoAndNewLine(op);
+      temps[idx] = temp;
+    }
+  }
+  for (unsigned idx : scalars) {
+    indent();
+    emitValue(results[idx]);
+    os << " = ";
+    if (auto it = temps.find(idx); it != temps.end())
+      os << it->second;
+    else
+      emitValue(yields[idx]);
+    os << ";";
+    emitInfoAndNewLine(op);
+  }
+}
+
 /// SCF statement emitters.
 void ModuleEmitter::emitScfFor(scf::ForOp op) {
+  if (failed(emitLoopCarries(op.getResults(), op.getInitArgs(),
+                             op.getRegionIterArgs(), op)))
+    return;
+
   indent() << "for (";
   auto iterVar = op.getInductionVar();
 
   // Emit lower bound.
-  emitValue(iterVar);
+  nameLoopIV(iterVar);
   os << " = ";
   emitValue(op.getLowerBound());
   os << "; ";
@@ -1043,8 +1296,11 @@ void ModuleEmitter::emitScfYield(scf::YieldOp op) {
   if (op.getNumOperands() == 0)
     return;
 
-  // For now, only and scf::If operations will use scf::Yield to return
-  // generated values.
+  if (auto forOp = dyn_cast<scf::ForOp>(op->getParentOp())) {
+    emitLoopCarryAssign(forOp.getResults(), op.getOperands(), op);
+    return;
+  }
+
   if (auto parentOp = dyn_cast<scf::IfOp>(op->getParentOp())) {
     unsigned resultIdx = 0;
     for (auto result : parentOp.getResults()) {
@@ -1062,11 +1318,15 @@ void ModuleEmitter::emitScfYield(scf::YieldOp op) {
 
 /// Affine statement emitters.
 void ModuleEmitter::emitAffineFor(AffineForOp op) {
+  if (failed(emitLoopCarries(op.getResults(), op.getInits(),
+                             op.getRegionIterArgs(), op)))
+    return;
+
   indent() << "for (";
   auto iterVar = op.getInductionVar();
 
   // Emit lower bound.
-  emitValue(iterVar);
+  nameLoopIV(iterVar);
   os << " = ";
   auto lowerMap = op.getLowerBoundMap();
   AffineExprEmitter lowerEmitter(state, lowerMap.getNumDims(),
@@ -1075,7 +1335,7 @@ void ModuleEmitter::emitAffineFor(AffineForOp op) {
     lowerEmitter.emitAffineExpr(lowerMap.getResult(0));
   else {
     for (unsigned i = 0, e = lowerMap.getNumResults() - 1; i < e; ++i)
-      os << "max(";
+      os << "std::max(";
     lowerEmitter.emitAffineExpr(lowerMap.getResult(0));
     for (auto &expr : llvm::drop_begin(lowerMap.getResults(), 1)) {
       os << ", ";
@@ -1095,7 +1355,7 @@ void ModuleEmitter::emitAffineFor(AffineForOp op) {
     upperEmitter.emitAffineExpr(upperMap.getResult(0));
   else {
     for (unsigned i = 0, e = upperMap.getNumResults() - 1; i < e; ++i)
-      os << "min(";
+      os << "std::min(";
     upperEmitter.emitAffineExpr(upperMap.getResult(0));
     for (auto &expr : llvm::drop_begin(upperMap.getResults(), 1)) {
       os << ", ";
@@ -1187,7 +1447,7 @@ void ModuleEmitter::emitAffineParallel(AffineParallelOp op) {
     auto iterVar = op.getBody()->getArgument(i);
 
     // Emit lower bound.
-    emitValue(iterVar);
+    nameLoopIV(iterVar);
     os << " = ";
     auto lowerMap = op.getLowerBoundsValueMap().getAffineMap();
     AffineExprEmitter lowerEmitter(state, lowerMap.getNumDims(),
@@ -1286,16 +1546,18 @@ void ModuleEmitter::emitAffineStore(AffineStoreOp op) {
   emitInfoAndNewLine(op);
 }
 
-// TODO: For now, all values created in the AffineIf region will be declared
-// in the generated C++. However, values which will be returned by affine
-// yield operation should not be declared again. How to "bind" the pair of
-// values inside/outside of AffineIf region needs to be considered.
+// The parent op declares the values a yield produces ahead of its regions
+// (`emitAffineIf`, and the carried variables of `emitAffineFor`), so the
+// yield only assigns into names that already exist at the outer scope.
 void ModuleEmitter::emitAffineYield(AffineYieldOp op) {
   if (op.getNumOperands() == 0)
     return;
 
-  // For now, only AffineParallel and AffineIf operations will use
-  // AffineYield to return generated values.
+  if (auto forOp = dyn_cast<AffineForOp>(op->getParentOp())) {
+    emitLoopCarryAssign(forOp.getResults(), op.getOperands(), op);
+    return;
+  }
+
   if (auto parentOp = dyn_cast<AffineIfOp>(op->getParentOp())) {
     unsigned resultIdx = 0;
     for (auto result : parentOp.getResults()) {
@@ -1360,7 +1622,7 @@ void ModuleEmitter::emitAffineYield(AffineYieldOp op) {
       case (arith::AtomicRMWKind::maximumf):
       case (arith::AtomicRMWKind::maxs):
       case (arith::AtomicRMWKind::maxu):
-        os << " = max(";
+        os << " = std::max(";
         emitValue(result, rank);
         os << ", ";
         emitValue(op.getOperand(resultIdx++), rank);
@@ -1369,7 +1631,7 @@ void ModuleEmitter::emitAffineYield(AffineYieldOp op) {
       case (arith::AtomicRMWKind::minimumf):
       case (arith::AtomicRMWKind::mins):
       case (arith::AtomicRMWKind::minu):
-        os << " = min(";
+        os << " = std::min(";
         emitValue(result, rank);
         os << ", ";
         emitValue(op.getOperand(resultIdx++), rank);
@@ -1451,13 +1713,6 @@ getTransferCondition(TransferOpType op,
 }
 
 /// Vector-related statement emitters.
-void ModuleEmitter::emitVectorInit(hls::VectorInitOp op) {
-  indent();
-  emitValue(op.getResult());
-  os << ";";
-  emitInfoAndNewLine(op);
-}
-
 void ModuleEmitter::emitInsert(vector::InsertOp op) {
   addAlias(op.getDest(), op.getResult());
   indent();
@@ -1577,9 +1832,13 @@ template <typename OpType> void ModuleEmitter::emitAlloc(OpType op) {
   if (isDeclared(op.getResult()))
     return;
 
-  // Vivado HLS only supports static shape on-chip memory.
+  // On-chip memory must have a static shape.
   if (!op.getType().hasStaticShape())
     emitError(op, "is unranked or has dynamic shape.");
+
+  // Intermediate storage reads as storage, not as another temporary.
+  if (!isDeclared(op.getResult()))
+    addNamedValue(op.getResult(), "buf" + std::to_string(bufferIdx++));
 
   indent();
   emitArrayDecl(op.getResult());
@@ -1630,30 +1889,6 @@ void ModuleEmitter::emitMemCpy(memref::CopyOp op) {
   os << "\n";
 }
 
-template <typename OpType> void ModuleEmitter::emitReshape(OpType op) {
-  auto array = op->getResult(0);
-  assert(!isDeclared(array) && "has been declared before.");
-
-  auto arrayType = cast<ShapedType>(array.getType());
-  indent() << getTypeName(arrayType) << " (*";
-
-  // Add the new value to nameTable and emit its name.
-  os << addName(array, false);
-  os << ")";
-
-  for (auto &shape : llvm::drop_begin(arrayType.getShape(), 1))
-    os << "[" << shape << "]";
-
-  os << " = (" << getTypeName(arrayType) << "(*)";
-  for (auto &shape : llvm::drop_begin(arrayType.getShape(), 1))
-    os << "[" << shape << "]";
-  os << ") ";
-
-  emitValue(op->getOperand(0));
-  os << ";";
-  emitInfoAndNewLine(op);
-}
-
 /// Standard expression emitters.
 void ModuleEmitter::emitUnary(Operation *op, const char *syntax) {
   auto rank = emitNestedLoopHeader(op->getResult(0));
@@ -1683,7 +1918,7 @@ template <typename OpType>
 void ModuleEmitter::emitMaxMin(OpType op, const char *syntax) {
   auto rank = emitNestedLoopHeader(op.getResult());
   indent();
-  emitValue(op.getResult());
+  emitValue(op.getResult(), rank);
   os << " = " << syntax << "(";
   emitValue(op.getLhs(), rank);
   os << ", ";
@@ -1705,10 +1940,8 @@ void ModuleEmitter::emitSelect(arith::SelectOp op) {
   os << " = ";
   emitValue(op.getCondition(), conditionRank);
   os << " ? ";
-  // os << "(" << getTypeName(op.getTrueValue()) << ")";
   emitValue(op.getTrueValue(), rank);
   os << " : ";
-  // os << "(" << getTypeName(op.getFalseValue()) << ")";
   emitValue(op.getFalseValue(), rank);
   os << ";";
   emitInfoAndNewLine(op);
@@ -1724,8 +1957,7 @@ template <typename OpType> void ModuleEmitter::emitConstant(OpType op) {
     indent();
     emitArrayDecl(op.getResult());
     os << " = {";
-    auto type =
-        cast<MemRefType>(op.getResult().getType()).getElementType();
+    auto type = cast<MemRefType>(op.getResult().getType()).getElementType();
 
     unsigned elementIdx = 0;
     for (auto element : denseAttr.template getValues<Attribute>()) {
@@ -1766,16 +1998,26 @@ void ModuleEmitter::emitValue(Value val, unsigned rank, bool isPtr,
     os << "[iv" << i << "]";
 }
 
+/// Prints `<type> <name>` for a value being introduced. Unlike emitValue,
+/// the type is always printed: a value may have been named ahead of its
+/// declaration so that a signature and its body agree on the spelling.
+void ModuleEmitter::emitValueDecl(Value val, bool isPtr) {
+  os << getDataTypeName(val.getType()) << " ";
+  if (isDeclared(val))
+    os << getName(val);
+  else
+    os << addName(val, isPtr);
+}
+
 void ModuleEmitter::emitArrayDecl(Value array) {
-  assert(!isDeclared(array) && "has been declared before.");
   auto arrayType = dyn_cast<MemRefType>(peelAxiType(array.getType()));
 
   if (arrayType.hasStaticShape()) {
-    emitValue(array);
+    emitValueDecl(array);
     for (auto &shape : arrayType.getShape())
       os << "[" << shape << "]";
   } else
-    emitValue(array, /*rank=*/0, /*isPtr=*/true);
+    emitValueDecl(array, /*isPtr=*/true);
 }
 
 unsigned ModuleEmitter::emitNestedLoopHeader(Value val) {
@@ -1792,8 +2034,8 @@ unsigned ModuleEmitter::emitNestedLoopHeader(Value val) {
       indent();
       emitArrayDecl(val);
       os << ";\n";
-      // TODO: More precise control here. Now we assume vectors are always
-      // completely partitioned at all dimensions.
+      // A vector value's lanes are one hardware word, all live at once, so
+      // a complete partition is exact rather than a guess.
       if (isa<VectorType>(type)) {
         indent() << "#pragma HLS array_partition variable=";
         emitValue(val);
@@ -1809,8 +2051,8 @@ unsigned ModuleEmitter::emitNestedLoopHeader(Value val) {
       os << "++iv" << dimIdx++ << ") {\n";
 
       addIndent();
-      // TODO: More precise control here. Now we assume vectorization loops are
-      // always fully unrolled.
+      // The lanes of a vector value are one hardware word, so the sweep
+      // over them unrolls fully by construction.
       if (isa<VectorType>(type))
         indent() << "#pragma HLS unroll\n";
     }
@@ -1829,20 +2071,21 @@ void ModuleEmitter::emitNestedLoopFooter(unsigned rank) {
 }
 
 void ModuleEmitter::emitInfoAndNewLine(Operation *op) {
-  os << "\t//";
-  // Print line number.
-  if (auto loc = dyn_cast<FileLineColLoc>(op->getLoc()))
-    os << " L" << loc.getLine();
+  // The source location is a line number in the temporary MLIR file that fed
+  // this translation, which the reader of the C++ does not have. Only
+  // schedule and loop facts are worth carrying over.
+  std::string info;
+  llvm::raw_string_ostream infoOs(info);
 
-  // Print schedule information.
   if (auto timing = getTiming(op))
-    os << ", [" << timing.getBegin() << "," << timing.getEnd() << ")";
+    infoOs << " [" << timing.getBegin() << "," << timing.getEnd() << ")";
 
-  // Print loop information.
   if (auto loopInfo = getLoopInfo(op))
-    os << ", iterCycle=" << loopInfo.getIterLatency()
-       << ", II=" << loopInfo.getMinII();
+    infoOs << " iterCycle=" << loopInfo.getIterLatency()
+           << ", II=" << loopInfo.getMinII();
 
+  if (!info.empty())
+    os << "\t//" << info;
   os << "\n";
 }
 
@@ -1870,8 +2113,6 @@ void ModuleEmitter::emitLoopDirectives(Operation *loop) {
 
   if (loopDirect.getPipeline()) {
     indent() << "#pragma HLS pipeline II=" << loopDirect.getTargetII() << "\n";
-    // if (enforceFalseDependency.getValue())
-    //   indent() << "#pragma HLS dependence false\n";
   } else if (loopDirect.getDataflow())
     indent() << "#pragma HLS dataflow\n";
 }
@@ -1888,7 +2129,9 @@ void ModuleEmitter::emitArrayDirectives(Value memref, bool isInterface) {
       if (factor != 1) {
         emitPragmaFlag = true;
 
-        // FIXME: How to handle external memories?
+        // Partition attributes never land on external (DRAM) buffers:
+        // `hls-array-partition` skips them (`isExtBuffer`), so this pragma
+        // only ever names an on-chip array.
         indent() << "#pragma HLS array_partition";
         os << " variable=";
         emitValue(memref);
@@ -1897,8 +2140,8 @@ void ModuleEmitter::emitArrayDirectives(Value memref, bool isInterface) {
         os << " " << stringifyPartitionKind(kind);
         os << " factor=" << factor;
 
-        // Vitis HLS has a wierd feature/bug that will automatically collapse
-        // the first dimension if its size is equal to one.
+        // Vitis HLS automatically collapses the first dimension when its
+        // size is one, so the directive dimension shifts to match.
         auto directiveDim = dim + 1;
         if (emitVitisDirectives.getValue())
           if (type.getShape().front() == 1)
@@ -1995,12 +2238,503 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Naming, ordering, and constant hoisting
+//===----------------------------------------------------------------------===//
+
+/// Describes a sub-function by the arithmetic it actually contains.
+///
+/// This is all the lowered IR still knows: by the time a design reaches the
+/// emitter the pipeline has erased which algorithm stage a node came from,
+/// so a name like `stolt` cannot be recovered here without guessing. Only
+/// classifications that follow directly from the operations present are
+/// used; everything else falls back to the bare stage index.
+static StringRef classifyStage(func::FuncOp func) {
+  bool hasArith = false, hasExt = false, hasTrunc = false;
+  bool hasSin = false, hasCos = false;
+
+  func.walk([&](Operation *op) {
+    if (isa<math::SinOp>(op))
+      hasSin = true;
+    if (isa<math::CosOp>(op))
+      hasCos = true;
+
+    if (isa<arith::ExtFOp>(op)) {
+      hasExt = true;
+      return;
+    }
+    if (isa<arith::TruncFOp>(op)) {
+      hasTrunc = true;
+      return;
+    }
+    if (isa<arith::ConstantOp, arith::IndexCastOp>(op))
+      return;
+    if (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()))
+      hasArith = true;
+  });
+
+  // A node that computes a sine and a cosine is applying a phase factor.
+  if (hasSin && hasCos)
+    return "phase";
+  if (hasArith)
+    return "";
+  if (hasExt && !hasTrunc)
+    return "widen";
+  if (hasTrunc && !hasExt)
+    return "narrow";
+  if (!hasExt && !hasTrunc)
+    return "copy";
+  return "";
+}
+
+StringRef ModuleEmitter::getEmittedFuncName(StringRef symbol) {
+  auto it = state.funcNames.find(symbol);
+  return it == state.funcNames.end() ? symbol : StringRef(it->second);
+}
+
+/// Sub-functions arrive numbered in the order the dataflow pass happened to
+/// create them, which runs roughly backwards against execution. Renumbering
+/// them in call order lets the reader follow the pipeline top to bottom.
+void ModuleEmitter::assignFuncNames(ArrayRef<func::FuncOp> funcs,
+                                    func::FuncOp topFunc) {
+  if (!topFunc)
+    return;
+
+  // Order sub-functions by first call from the top function, then by any
+  // remaining calls, so nested helpers follow their caller.
+  SmallVector<func::FuncOp, 16> ordered;
+  llvm::SmallDenseSet<Operation *> seen;
+  std::function<void(func::FuncOp)> visit = [&](func::FuncOp caller) {
+    caller.walk([&](func::CallOp call) {
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (!callee || callee == topFunc || !seen.insert(callee).second)
+        return;
+      ordered.push_back(callee);
+      visit(callee);
+    });
+  };
+  visit(topFunc);
+
+  // Anything never reached from the top keeps a slot at the end.
+  for (auto func : funcs)
+    if (func != topFunc && seen.insert(func).second)
+      ordered.push_back(func);
+
+  unsigned stageIdx = 0;
+  for (auto func : ordered) {
+    SmallString<32> name;
+    llvm::raw_svector_ostream nameOs(name);
+    nameOs << topFunc.getName() << "_s";
+    if (stageIdx < 10)
+      nameOs << "0";
+    nameOs << stageIdx++;
+    if (auto role = classifyStage(func); !role.empty())
+      nameOs << "_" << role;
+    state.funcNames[func.getName()] = std::string(name);
+  }
+}
+
+/// Whether a user-supplied port name can be emitted verbatim: a C identifier
+/// that is neither a C++ keyword nor shaped like the names the emitter hands
+/// out itself (`v3`, `i0`, `buf1`, `in0`, `out0`, ...), which are not uniqued
+/// against it.
+static bool isUsablePortName(StringRef name) {
+  if (name.empty() || (!llvm::isAlpha(name.front()) && name.front() != '_'))
+    return false;
+  if (!llvm::all_of(name, [](char c) { return llvm::isAlnum(c) || c == '_'; }))
+    return false;
+
+  static const llvm::StringSet<> keywords = {
+      "alignas",   "alignof",  "asm",     "auto",     "bool",     "break",
+      "case",      "catch",    "char",    "class",    "const",    "constexpr",
+      "continue",  "default",  "delete",  "do",       "double",   "else",
+      "enum",      "explicit", "extern",  "false",    "float",    "for",
+      "friend",    "goto",     "if",      "inline",   "int",      "long",
+      "namespace", "new",      "nullptr", "operator", "private",  "protected",
+      "public",    "register", "return",  "short",    "signed",   "sizeof",
+      "static",    "struct",   "switch",  "template", "this",     "throw",
+      "true",      "try",      "typedef", "typeid",   "typename", "union",
+      "unsigned",  "using",    "virtual", "void",     "volatile", "while"};
+  if (keywords.contains(name))
+    return false;
+
+  // Reserved generated-name shapes: a known stem followed by digits only.
+  StringRef digits = name;
+  for (StringRef stem :
+       {"v", "i", "buf", "in", "out", "arg", "out_scalar", "iv", "val"})
+    if (name.starts_with(stem) && name.size() > stem.size()) {
+      digits = name.drop_front(stem.size());
+      if (llvm::all_of(digits, [](char c) { return llvm::isDigit(c); }))
+        return false;
+    }
+  return true;
+}
+
+/// Names the ports of `func` and returns them in signature order. Naming
+/// happens before any emission so a prototype and its definition agree.
+///
+/// Arguments covered by the `sar.arg_names` attribute -- the kernel's Python
+/// parameter names, split per plane by `sar-decomplexify` -- keep those
+/// names; everything else (out-params, the DRAM scratch, sub-function ports)
+/// falls back to the role-based scheme.
+SmallVector<Value, 8> ModuleEmitter::assignPortNames(func::FuncOp func) {
+  SmallVector<Value, 8> portList;
+  unsigned roleIdx[4] = {0, 0, 0, 0};
+  unsigned scalarIdx = 0;
+
+  auto argNames = func->getAttrOfType<ArrayAttr>("sar.arg_names");
+
+  // The names are emitted verbatim, so a duplicate -- a complex `raw`
+  // splitting into `raw_re` beside a parameter already called `raw_re` --
+  // would redeclare a port. Fall back to the generated scheme entirely
+  // rather than emit C++ that does not compile.
+  if (argNames) {
+    llvm::StringSet<> seen;
+    for (auto attr : argNames)
+      if (auto str = dyn_cast<StringAttr>(attr))
+        if (!seen.insert(str.getValue()).second) {
+          argNames = nullptr;
+          break;
+        }
+  }
+
+  // Each port must be a distinct value: a function returning one of its
+  // arguments, or the same value twice, would emit two ports with one name
+  // -- C++ that does not compile. Seen within this invocation only, since
+  // the prototype and the definition both walk the same list.
+  DenseSet<Value> seenPorts;
+
+  auto nameOne = [&](Value port, bool isResult, StringRef given) {
+    portList.push_back(port);
+
+    if (!seenPorts.insert(port).second)
+      emitError(func, "port aliasing: a value reaches the signature twice "
+                      "(a result that is also an argument, or one value "
+                      "returned twice); the emitter cannot express aliased "
+                      "ports");
+
+    // Prototype and definition both ask for the port list; the names are
+    // handed out once and reused so the two always agree.
+    if (isDeclared(port))
+      return;
+
+    auto type = peelAxiType(port.getType());
+    bool isArray = isa<MemRefType>(type);
+    bool isStream = isa<StreamType>(type);
+
+    // A returned scalar is passed by pointer, which is how Vitis HLS
+    // spells an output.
+    bool isPtr = isResult && !isa<ShapedType>(port.getType());
+    if (isArray)
+      if (auto memref = dyn_cast<MemRefType>(type);
+          memref && !memref.hasStaticShape())
+        isPtr = true;
+
+    if (!given.empty() && isUsablePortName(given)) {
+      addNamedValue(port, given, isPtr);
+      return;
+    }
+
+    if (!isArray && !isStream) {
+      addNamedValue(port,
+                    isResult ? "out_scalar" + std::to_string(scalarIdx++)
+                             : "arg" + std::to_string(scalarIdx++),
+                    isPtr);
+      return;
+    }
+
+    auto role = isResult ? PortRole::Out : getPortRole(port);
+    if (role == PortRole::Unused)
+      role = PortRole::In;
+
+    // Depth-one boolean channels are the dataflow handshake tokens, not
+    // payload; saying so beats calling them streams.
+    StringRef stem = "";
+    if (isStream) {
+      auto streamType = cast<StreamType>(type);
+      stem = streamType.getElementType().isInteger(1) ? "sync_" : "strm_";
+    }
+
+    SmallString<24> name;
+    llvm::raw_svector_ostream nameOs(name);
+    nameOs << stem << getPortRolePrefix(role) << roleIdx[(unsigned)role]++;
+    addNamedValue(port, name, isPtr);
+  };
+
+  for (auto [idx, arg] : llvm::enumerate(func.getArguments())) {
+    StringRef given;
+    if (argNames && idx < argNames.size())
+      if (auto str = dyn_cast<StringAttr>(argNames[idx]))
+        given = str.getValue();
+    nameOne(arg, /*isResult=*/false, given);
+  }
+
+  if (!func.getBlocks().empty())
+    if (auto ret = dyn_cast<func::ReturnOp>(func.front().getTerminator()))
+      for (auto result : ret.getOperands())
+        nameOne(result, /*isResult=*/true, StringRef());
+
+  return portList;
+}
+
+bool ModuleEmitter::isConstParam(func::FuncOp func, unsigned idx) const {
+  auto it = constParams.find(func.getOperation());
+  return it != constParams.end() && idx < it->second.size() && it->second[idx];
+}
+
+void ModuleEmitter::emitPortDecl(Value port, bool isConst) {
+  auto type = peelAxiType(port.getType());
+
+  if (isConst)
+    os << "const ";
+  os << getDataTypeName(port.getType()) << " ";
+  if (isa<StreamType>(type))
+    os << "&";
+  os << getName(port);
+
+  if (auto arrayType = dyn_cast<MemRefType>(type))
+    if (arrayType.hasStaticShape())
+      for (auto &shape : arrayType.getShape())
+        os << "[" << shape << "]";
+}
+
+void ModuleEmitter::emitFunctionSignature(func::FuncOp func,
+                                          ArrayRef<Value> portList,
+                                          bool asPrototype) {
+  os << "void " << getEmittedFuncName(func.getName()) << "(";
+  if (portList.empty()) {
+    os << ")";
+    return;
+  }
+
+  os << "\n";
+  addIndent();
+  unsigned numArgs = func.getNumArguments();
+  for (auto [idx, port] : llvm::enumerate(portList)) {
+    indent();
+    emitPortDecl(port, idx < numArgs && isConstParam(func, idx));
+    if (idx + 1 != portList.size())
+      os << ",";
+    os << "\n";
+  }
+  reduceIndent();
+  os << ")";
+  if (asPrototype)
+    os << ";\n";
+}
+
+/// Declares a loop counter as `int i<n>`, numbered within the function.
+/// Counters read far better as `i0`/`i1` than as entries in the temporary
+/// sequence, and they are the identifiers a reader scans for.
+void ModuleEmitter::nameLoopIV(Value iv) {
+  if (isDeclared(iv)) {
+    os << getName(iv);
+    return;
+  }
+  os << getDataTypeName(iv.getType()) << " "
+     << addNamedValue(iv, "i" + std::to_string(loopIVIdx++));
+}
+
+/// Names a lifted table after what can actually be proven about its values,
+/// so the name never claims more than the data supports.
+static std::string describeTable(DenseElementsAttr attr, unsigned idx) {
+  auto type = cast<ShapedType>(attr.getType());
+  int64_t n = type.getNumElements();
+
+  SmallVector<double, 0> values;
+  if (isa<FloatType>(type.getElementType()) && n > 2) {
+    values.reserve(n);
+    for (auto element : attr.getValues<APFloat>()) {
+      APFloat copy = element;
+      bool lossy = false;
+      copy.convert(APFloat::IEEEdouble(), APFloat::rmNearestTiesToEven, &lossy);
+      values.push_back(copy.convertToDouble());
+    }
+  }
+
+  if (!values.empty()) {
+    // A constant-step ramp is a sampling grid: a frequency or spatial axis.
+    double step = values[1] - values[0];
+    bool isRamp = step != 0.0;
+    for (int64_t i = 2; i < n && isRamp; ++i)
+      isRamp =
+          std::abs((values[i] - values[i - 1]) - step) <= 1e-9 * std::abs(step);
+    if (isRamp)
+      return ("kAxis" + Twine(idx) + "_" + Twine(n)).str();
+
+    // Unit-bounded tables of 2^k-1 entries are the FFT twiddle layout; the
+    // first entry separates the sine table from the cosine one.
+    bool unitBounded = true;
+    for (double v : values)
+      unitBounded &= std::abs(v) <= 1.0;
+    int64_t points = n + 1;
+    if (unitBounded && points >= 4 && (points & (points - 1)) == 0) {
+      if (values[0] == 0.0)
+        return ("kTwiddleSin_" + Twine(points)).str();
+      if (values[0] == 1.0)
+        return ("kTwiddleCos_" + Twine(points)).str();
+    }
+  }
+
+  return ("kTable" + Twine(idx) + "_" + Twine(n)).str();
+}
+
+/// Finds the constant buffers worth lifting to file scope and works out
+/// which callee parameters can therefore be `const`.
+void ModuleEmitter::collectGlobalTables(ModuleOp module,
+                                        ArrayRef<func::FuncOp> funcs) {
+  llvm::StringSet<> usedNames;
+  unsigned tableIdx = 0;
+
+  module.walk([&](ConstBufferOp op) {
+    auto attr = dyn_cast<DenseElementsAttr>(op.getValue());
+    if (!attr || !isa<MemRefType>(op.getResult().getType()))
+      return;
+
+    // Uniquing keeps two tables that describe the same thing apart.
+    std::string base = describeTable(attr, tableIdx++);
+    std::string name = base;
+    for (unsigned suffix = 2; !usedNames.insert(name).second; ++suffix)
+      name = base + "_" + std::to_string(suffix);
+
+    state.globalTables.try_emplace(op.getResult(), name);
+    hoistedTables.insert(op.getOperation());
+  });
+
+  if (state.globalTables.empty())
+    return;
+
+  // A parameter may be const when every call passes a table or an already
+  // const parameter, so the property has to reach a fixed point.
+  for (auto func : funcs)
+    constParams[func.getOperation()] = llvm::BitVector(func.getNumArguments());
+
+  auto isConstSource = [&](Value value) {
+    if (state.globalTables.count(value))
+      return true;
+    if (auto arg = dyn_cast<BlockArgument>(value))
+      if (auto owner =
+              dyn_cast_or_null<func::FuncOp>(arg.getOwner()->getParentOp()))
+        return isConstParam(owner, arg.getArgNumber());
+    return false;
+  };
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (auto func : funcs) {
+      auto &bits = constParams[func.getOperation()];
+      for (unsigned idx = 0, e = func.getNumArguments(); idx != e; ++idx) {
+        if (bits[idx] ||
+            !isa<MemRefType>(peelAxiType(func.getArgument(idx).getType())))
+          continue;
+        bool anyCall = false, allConst = true;
+        auto uses = func.getSymbolUses(func->getParentOp());
+        if (!uses)
+          continue;
+        for (auto use : *uses) {
+          auto call = dyn_cast<func::CallOp>(use.getUser());
+          if (!call || idx >= call.getNumOperands())
+            continue;
+          anyCall = true;
+          allConst &= isConstSource(call.getOperand(idx));
+        }
+        if (anyCall && allConst) {
+          bits.set(idx);
+          changed = true;
+        }
+      }
+    }
+  }
+
+  // A table handed to a parameter that stayed mutable cannot be const
+  // itself; it still gets lifted, just without the qualifier.
+  for (auto &entry : state.globalTables) {
+    for (auto &use : entry.first.getUses()) {
+      auto call = dyn_cast<func::CallOp>(use.getOwner());
+      if (!call)
+        continue;
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (!callee || !isConstParam(callee, use.getOperandNumber())) {
+        mutableTables.insert(entry.first);
+        break;
+      }
+    }
+  }
+}
+
+void ModuleEmitter::emitGlobalTables() {
+  if (state.globalTables.empty())
+    return;
+
+  os << "//===----------------------------------------------------------"
+        "------------===//\n"
+        "// Constant tables. Lifted to file scope so the design reads as\n"
+        "// logic and the tool can map them to ROM.\n"
+        "//===----------------------------------------------------------"
+        "------------===//\n\n";
+
+  // Emit in creation order for a stable, diffable file.
+  for (auto *op : hoistedTables) {
+    auto constOp = cast<ConstBufferOp>(op);
+    Value result = constOp.getResult();
+    auto it = state.globalTables.find(result);
+    if (it == state.globalTables.end())
+      continue;
+
+    auto memrefType = cast<MemRefType>(result.getType());
+    auto elementType = memrefType.getElementType();
+    auto attr = cast<DenseElementsAttr>(constOp.getValue());
+
+    os << "static ";
+    if (!mutableTables.count(result))
+      os << "const ";
+    os << getDataTypeName(elementType) << " " << it->second;
+    for (auto &shape : memrefType.getShape())
+      os << "[" << shape << "]";
+    os << " = {";
+
+    // The declared element type already fixes the value's type, so the cast
+    // every scalar constant carries is noise across a 256-entry table.
+    bool stripCast = isa<FloatType, IndexType>(elementType);
+    unsigned perLine = elementType.getIntOrFloatBitWidth() > 32 ? 4 : 8;
+
+    unsigned elementIdx = 0;
+    for (auto element : attr.getValues<Attribute>()) {
+      auto string = getConstantString(elementType, element);
+      if (string.empty())
+        constOp.emitOpError("constant has invalid value");
+      StringRef value(string);
+      if (stripCast && value.starts_with("("))
+        value = value.drop_front(value.find(')') + 1);
+      if (elementIdx % perLine == 0)
+        os << "\n    ";
+      os << value;
+      if (++elementIdx != attr.getNumElements())
+        os << ",";
+      if (elementIdx % perLine != 0)
+        os << " ";
+    }
+    os << "\n};\n\n";
+
+    // Bind the name so every reader of the buffer resolves to the table.
+    state.nameTable[result] = SmallString<8>(StringRef(it->second));
+  }
+}
+
 void ModuleEmitter::emitFunction(func::FuncOp func) {
   if (func.getBlocks().size() != 1)
     emitError(func, "has zero or more than one basic blocks.");
 
+  // Temporaries and loop counters restart in every function.
+  state.localNameIdx = 0;
+  loopIVIdx = 0;
+  bufferIdx = 0;
+
   if (hasTopFuncAttr(func))
-    os << "/// This is top function.\n";
+    os << "/// Top function of the design.\n";
 
   if (auto timing = getTiming(func)) {
     os << "/// Latency=" << timing.getLatency();
@@ -2011,53 +2745,12 @@ void ModuleEmitter::emitFunction(func::FuncOp func) {
   if (auto resource = getResource(func)) {
     os << "/// DSP=" << resource.getDsp();
     os << ", BRAM=" << resource.getBram();
-    // os << ", LUT=" << resource.getLut();
     os << "\n";
   }
 
-  // Emit function signature.
-  os << "void " << func.getName() << "(\n";
-  addIndent();
-
-  // This vector is to record all ports of the function.
-  SmallVector<Value, 8> portList;
-
-  // Emit input arguments.
-  unsigned argIdx = 0;
-  for (auto &arg : func.getArguments()) {
-    indent();
-    auto type = peelAxiType(arg.getType());
-
-    if (isa<MemRefType>(type))
-      emitArrayDecl(arg);
-    else if (isa<StreamType>(type))
-      emitValue(arg, /*rank=*/0, /*isPtr=*/false, /*isRef=*/true);
-    else
-      emitValue(arg);
-
-    portList.push_back(arg);
-    if (argIdx++ != func.getNumArguments() - 1)
-      os << ",\n";
-  }
-
-  // Emit results.
-  auto funcReturn = cast<func::ReturnOp>(func.front().getTerminator());
-  for (auto result : funcReturn.getOperands()) {
-    os << ",\n";
-    indent();
-    // TODO: a known bug, cannot return a value twice, e.g. return %0, %0 :
-    // index, index. However, typically this should not happen.
-    if (isa<MemRefType>(result.getType()))
-      emitArrayDecl(result);
-    else
-      // In Vivado HLS, pointer indicates the value is an output.
-      emitValue(result, /*rank=*/0, /*isPtr=*/true);
-
-    portList.push_back(result);
-  }
-
-  reduceIndent();
-  os << "\n) {";
+  auto portList = assignPortNames(func);
+  emitFunctionSignature(func, portList, /*asPrototype=*/false);
+  os << " {";
   emitInfoAndNewLine(func);
 
   // Emit function body.
@@ -2073,64 +2766,126 @@ void ModuleEmitter::emitFunction(func::FuncOp func) {
 
 /// Top-level MLIR module emitter.
 void ModuleEmitter::emitModule(ModuleOp module) {
-  os << R"XXX(//===------------------------------------------------------------*- C++ -*-===//
-//
-// Automatically generated file for High-level Synthesis (HLS).
-//
-//===----------------------------------------------------------------------===//
-
-#include <algorithm>
-#include <ap_axi_sdata.h>
-#include <ap_fixed.h>
-#include <ap_int.h>
-#include <hls_math.h>
-#include <hls_stream.h>
-#include <hls_vector.h>
-#include <math.h>
-#include <stdint.h>
-#include <string.h>
-
-using namespace std;
-
-)XXX";
-
-  // Emit the multiplication primitive if required.
-  if (module.walk([](PrimMulOp op) {
-        return op.isPackMul() ? WalkResult::interrupt() : WalkResult::advance();
-      }) == WalkResult::interrupt())
-    os << R"XXX(
-void pack_mul(int8_t A[2], int8_t B, int16_t C[2]) {
-  #pragma HLS inline
-  ap_int<27> packA = (ap_int<27>)A[0] + (ap_int<27>)A[1] << 18;
-  ap_int<45> packC = packA * (ap_int<18>)B;
-  C[0] = packC.range(15, 0);
-  C[1] = packC.range(33, 18);
-}
-
-)XXX";
-
-  // Emit all functions in the call graph in a post order.
-  CallGraph graph(module);
-  llvm::SmallDenseSet<func::FuncOp> emittedFuncs;
-  for (auto node : llvm::post_order<const CallGraph *>(&graph)) {
-    if (node->isExternal())
+  // Gather the functions once: the order they are emitted in is decided
+  // below, and several decisions need the whole set up front.
+  SmallVector<func::FuncOp, 16> funcs;
+  func::FuncOp topFunc;
+  for (auto func : module.getOps<func::FuncOp>()) {
+    if (hasRuntimeAttr(func))
       continue;
-    if (auto func = node->getCallableRegion()->getParentOfType<func::FuncOp>();
-        !hasRuntimeAttr(func)) {
-      emitFunction(func);
-      emittedFuncs.insert(func);
+    funcs.push_back(func);
+    if (hasTopFuncAttr(func))
+      topFunc = func;
+  }
+
+  // Only include what the design actually uses. Emitting the full Vitis
+  // header set unconditionally drags in headers the design never touches
+  // and breaks plain-C++ csim over stub headers.
+  bool usesStream = false, usesVector = false, usesApInt = false;
+  bool usesMemCpy = false;
+  auto noteType = [&](Type type) {
+    if (!type)
+      return;
+    auto peeled = peelAxiType(type);
+    usesStream |= isa<StreamType>(peeled);
+    usesVector |= isa<VectorType>(peeled);
+    if (auto memref = dyn_cast<MemRefType>(peeled))
+      peeled = memref.getElementType();
+    if (auto streamType = dyn_cast<StreamType>(peeled))
+      peeled = streamType.getElementType();
+    if (auto intType = dyn_cast<IntegerType>(peeled))
+      usesApInt |= intType.getWidth() != 1;
+  };
+
+  for (auto func : funcs) {
+    for (auto type : func.getArgumentTypes())
+      noteType(type);
+    for (auto type : func.getResultTypes())
+      noteType(type);
+    func.walk([&](Operation *op) {
+      usesMemCpy |= isa<memref::CopyOp>(op);
+      for (auto type : op->getResultTypes())
+        noteType(type);
+      for (auto type : op->getOperandTypes())
+        noteType(type);
+    });
+  }
+
+  os << "//===------------------------------------------------------------*- "
+        "C++ -*-===//\n"
+        "//\n"
+        "// Synthesizable C++ generated by the SAR-DSL HLS emitter\n"
+        "// (sar-translate -hls-emit-hlscpp). Edits here are lost on the next\n"
+        "// build; change the kernel or the pipeline instead.\n"
+        "//\n";
+  if (topFunc)
+    os << "// Top function : " << topFunc.getName() << "\n";
+  os << "// Directives   : " << (emitVitisDirectives ? "vitis" : "vivado")
+     << "\n"
+     << "// AXI bus      : " << axiBusBits << "-bit\n"
+     << "// Sub-functions: " << (funcs.empty() ? 0 : funcs.size() - 1) << "\n"
+     << "//\n"
+        "//===------------------------------------------------------------"
+        "----------===//\n\n";
+
+  os << "#include <cmath>\n";
+  os << "#include <algorithm>\n";
+  if (usesMemCpy)
+    os << "#include <cstring>\n";
+  if (usesApInt) {
+    os << "#include <cstdint>\n";
+    os << "#include <ap_int.h>\n";
+  }
+  if (usesStream)
+    os << "#include <hls_stream.h>\n";
+  if (usesVector)
+    os << "#include <hls_vector.h>\n";
+  os << "\n";
+
+  assignFuncNames(funcs, topFunc);
+  collectGlobalTables(module, funcs);
+  emitGlobalTables();
+
+  // Order the sub-functions the way the pipeline runs, so the file reads
+  // in the same direction as the data.
+  SmallVector<func::FuncOp, 16> subFuncs;
+  for (auto func : funcs)
+    if (func != topFunc)
+      subFuncs.push_back(func);
+  llvm::stable_sort(subFuncs, [&](func::FuncOp lhs, func::FuncOp rhs) {
+    return getEmittedFuncName(lhs.getName()) <
+           getEmittedFuncName(rhs.getName());
+  });
+
+  // Vitis HLS synthesises a single translation unit, so the top function
+  // can come first -- which is what a reader wants -- as long as every
+  // callee is declared above it. Prototypes cost nothing and also make the
+  // file robust against sub-functions that call each other.
+  if (topFunc && !subFuncs.empty()) {
+    os << "//===----------------------------------------------------------"
+          "------------===//\n"
+          "// Sub-function prototypes, in dataflow order.\n"
+          "//===----------------------------------------------------------"
+          "------------===//\n\n";
+    for (auto func : subFuncs) {
+      state.localNameIdx = 0;
+      auto portList = assignPortNames(func);
+      emitFunctionSignature(func, portList, /*asPrototype=*/true);
+      os << "\n";
     }
   }
 
-  // Emit remained functions accordingly.
-  for (auto &op : *module.getBody()) {
-    if (auto func = dyn_cast<func::FuncOp>(op)) {
-      if (!emittedFuncs.count(func) && !hasRuntimeAttr(func))
-        emitFunction(func);
-    } else if (!op.hasTrait<OpTrait::ConstantLike>() &&
-               op.getName().getStringRef() != "ml_program.global")
+  if (topFunc)
+    emitFunction(topFunc);
+
+  for (auto func : subFuncs)
+    emitFunction(func);
+
+  // Anything that is not a function and not a constant is unexpected.
+  for (auto &op : *module.getBody())
+    if (!isa<func::FuncOp>(op) && !op.hasTrait<OpTrait::ConstantLike>() &&
+        op.getName().getStringRef() != "ml_program.global")
       emitError(&op, "is unsupported operation");
-  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -2145,8 +2900,8 @@ LogicalResult sar::emitHLSCpp(ModuleOp module, llvm::raw_ostream &os) {
 
 void sar::registerEmitHLSCppTranslation() {
   static TranslateFromMLIRRegistration toHLSCpp(
-      "hls-emit-hlscpp", "Translate MLIR into synthesizable C++",
-      emitHLSCpp, [&](DialectRegistry &registry) {
+      "hls-emit-hlscpp", "Translate MLIR into synthesizable C++", emitHLSCpp,
+      [&](DialectRegistry &registry) {
         registry.insert<hls::HLSDialect>();
         registerAllDialects(registry);
       });

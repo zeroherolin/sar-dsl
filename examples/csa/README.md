@@ -12,7 +12,7 @@ exercises the pure phase-multiply path of the compiler on both backends.
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
 | `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 | `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset |
-| `run_alos_hls.py` | Emit a synthesizable design at the full ALOS raster |
+| `run_alos_hls.py` | Emit the ALOS-geometry artifact set (see below) |
 
 ## Processing chain (zero Doppler centroid)
 
@@ -43,7 +43,40 @@ python examples/csa/run_point_target_cpu.py --n 512          # focus + PNG
 python examples/csa/run_point_target_hls.py --n 256     # design + csim package
 ```
 
+At `--n 512` the brightest target lands on its predicted pixel:
+
+```
+peak at (333, 358), expected (333, 358), error (+0, +0)
+  range: IRW  2.12 samples, PSLR  -31.7 dB, ISLR  -28.3 dB
+azimuth: IRW  2.20 samples, PSLR  -27.2 dB, ISLR  -22.9 dB
+```
+
+The HLS runner writes `hls_project/csa/`: the design `csa.cpp`, the
+testbench `csa_tb.cpp`, golden data in `csa_tb_data/`, the csim and
+csynth scripts (`csa_csim.tcl`, `csa_csynth.tcl`) and Vitis header
+stand-ins in `stubs/`. C simulation matches the NumPy reference to
+2.3e-10 over 65536 output samples.
+
 ![synthetic point targets](assets/csa_synthetic_512.png)
+
+## Real data (ALOS-1)
+
+```bash
+python examples/data/extract_alos.py   # once; shared by all three algorithms
+python examples/csa/run_alos_cpu.py
+python examples/csa/run_alos_hls.py
+```
+
+The full 16384x16384 scene focuses in 3.0 s on a 240-core machine,
+reaching an urban-area contrast of 0.809.
+
+`run_alos_hls.py` writes `hls_project/csa_alos/`: `csa_alos_axi.cpp` is
+the 16384x16384 design with AXI ports for synthesis, and
+`csa_alos.cpp` plus its testbench, golden data, csim/csynth scripts
+and stubs form a C-simulation package at `--csim-n` (default 1024) with the same
+radar parameters -- why two designs are needed is covered in
+[examples/README.md](../README.md#real-data-alos-1). At 1024x1024 the
+package csim-matches the reference to 3.7e-09 over 1048576 samples.
 
 Tests (`test/python/test_csa.py`) check numerical equivalence with the
 reference, point-target focusing, cross-algorithm agreement with omega-K,

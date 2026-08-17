@@ -11,7 +11,16 @@ from conftest import requires_cpu
 
 pytestmark = requires_cpu
 
+#: Reset before every test (autouse fixture below): each test draws from
+#: its own deterministic stream, so adding or reordering tests never
+#: shifts the data another test sees.
 RNG = np.random.default_rng(2026)
+
+
+@pytest.fixture(autouse=True)
+def _per_test_rng():
+    global RNG
+    RNG = np.random.default_rng(2026)
 
 
 def _c64(*shape):
@@ -435,3 +444,170 @@ def test_non_contiguous_input_handled():
     big = _f32(2 * N, 2 * N)
     view = big[::2, ::2]  # non-contiguous view
     np.testing.assert_allclose(k(view), view * np.float32(2.0), rtol=1e-6)
+
+
+# ---- cumsum -----------------------------------------------------------------
+
+
+def test_cumsum_dim0_f64():
+    N = 8
+
+    @sar.func
+    def k(x: sar.f64[N, N]) -> sar.f64[N, N]:
+        return sar.cumsum(x, dim=0)
+
+    x = _f64(N, N)
+    expected = np.cumsum(x, axis=0)
+    np.testing.assert_allclose(k(x), expected, rtol=1e-10)
+
+
+def test_cumsum_dim1_f32():
+    N, M = 5, 12
+
+    @sar.func
+    def k(x: sar.f32[N, M]) -> sar.f32[N, M]:
+        return sar.cumsum(x, dim=1)
+
+    x = _f32(N, M)
+    expected = np.cumsum(x, axis=1)
+    np.testing.assert_allclose(k(x), expected, rtol=1e-5)
+
+
+def test_cumsum_non_square():
+    """Non-square tensor, dim=0."""
+    R, C = 3, 16
+
+    @sar.func
+    def k(x: sar.f64[R, C]) -> sar.f64[R, C]:
+        return sar.cumsum(x, dim=0)
+
+    x = _f64(R, C)
+    np.testing.assert_allclose(k(x), np.cumsum(x, axis=0), rtol=1e-10)
+
+
+# ---- rank_filter / median_filter -------------------------------------------
+
+
+def test_rank_filter_min():
+    """rank=0 is the running minimum in the window."""
+    N = 16
+
+    @sar.func
+    def k(x: sar.f64[N, N]) -> sar.f64[N, N]:
+        return sar.rank_filter(x, window=5, rank=0, dim=1)
+
+    x = _f64(N, N)
+    try:
+        from scipy.ndimage import rank_filter as scipy_rf
+        expected = scipy_rf(x, rank=0, size=(1, 5), mode="nearest")
+    except ImportError:
+        # Pure-numpy fallback: clamp-replicate boundary
+        half = 2
+        expected = np.zeros_like(x)
+        for j in range(N):
+            lo, hi = max(0, j - half), min(N - 1, j + half)
+            # build padded window with edge replication
+            w = np.pad(x[:, lo:hi + 1],
+                       [(0, 0), (max(0, half - j), max(0, j + half - N + 1))],
+                       mode="edge")
+            expected[:, j] = np.sort(w, axis=1)[:, 0]
+    np.testing.assert_allclose(k(x), expected, rtol=1e-10)
+
+
+def test_median_filter_dim0():
+    """median_filter along axis 0."""
+    N = 16
+
+    @sar.func
+    def k(x: sar.f64[N, N]) -> sar.f64[N, N]:
+        return sar.median_filter(x, window=3, dim=0)
+
+    x = _f64(N, N)
+    try:
+        from scipy.ndimage import median_filter as scipy_mf
+        expected = scipy_mf(x, size=(3, 1), mode="nearest")
+    except ImportError:
+        half = 1
+        expected = np.zeros_like(x)
+        for i in range(N):
+            lo, hi = max(0, i - half), min(N - 1, i + half)
+            w = x[lo:hi + 1, :]
+            if lo == 0 and hi - lo + 1 < 3:
+                w = np.pad(w, [(3 - (hi - lo + 1), 0), (0, 0)], mode="edge")
+            elif hi == N - 1 and hi - lo + 1 < 3:
+                w = np.pad(w, [(0, 3 - (hi - lo + 1)), (0, 0)], mode="edge")
+            expected[i, :] = np.sort(w, axis=0)[1, :]
+    np.testing.assert_allclose(k(x), expected, rtol=1e-10)
+
+
+def test_median_filter_window3_known_values():
+    """Check against a hand-computed result: median of three."""
+    N = 4
+
+    @sar.func
+    def k(x: sar.f64[1, N]) -> sar.f64[1, N]:
+        return sar.median_filter(x, window=3, dim=1)
+
+    # input: [1, 3, 2, 4]
+    # window with clamp:  [1,1,3], [1,3,2], [3,2,4], [2,4,4]
+    # medians:             1,       2,       3,       4
+    x = np.array([[1.0, 3.0, 2.0, 4.0]])
+    expected = np.array([[1.0, 2.0, 3.0, 4.0]])
+    np.testing.assert_allclose(k(x), expected, rtol=1e-10)
+
+
+def test_rank_filter_median_matches_numpy_sort():
+    """rank = window//2 and window//2 == 1 for window=3."""
+    N = 12
+
+    @sar.func
+    def k(x: sar.f32[N, N]) -> sar.f32[N, N]:
+        return sar.rank_filter(x, window=3, rank=1, dim=1)
+
+    @sar.func
+    def km(x: sar.f32[N, N]) -> sar.f32[N, N]:
+        return sar.median_filter(x, window=3, dim=1)
+
+    x = _f32(N, N)
+    np.testing.assert_allclose(k(x), km(x), rtol=1e-6)
+
+
+# --------------------------------------------------------------------- #
+# ALOS geometry at a reduced raster (examples/common/params.py)
+# --------------------------------------------------------------------- #
+
+
+def test_alos_params_change_only_the_window_position():
+    """A reduced raster keeps every radar parameter; only `t_shift`, where
+    R0 sits in the sampled window, follows the raster."""
+    from dataclasses import replace
+
+    from common.params import ALOS_PARAMS, alos_params
+
+    assert alos_params(16384) is ALOS_PARAMS
+    small = alos_params(1024)
+    assert replace(small, t_shift=ALOS_PARAMS.t_shift) == ALOS_PARAMS
+    # R0 has to be inside the window, or the echo misses the raster.
+    assert 0 < small.t_shift * small.fs < 1024
+
+
+@pytest.mark.parametrize("algorithm", ["wka", "rda", "csa"])
+def test_reduced_alos_geometry_focuses_a_point_target(algorithm):
+    """The reduced ALOS raster is a real acquisition geometry, not just a
+    smaller array: a scene-center scatterer focuses to scene center."""
+    import importlib
+
+    from common.params import alos_params
+    from common.simulate import single_target_scene
+
+    n = 512
+    params = alos_params(n)
+    algo = importlib.import_module(f"{algorithm}.algorithm")
+    kernel = algo.build_kernel(n, params).compile("cpu")
+    image = kernel(single_target_scene(n, params),
+                   *algo.make_inputs(n, params))
+
+    peak = np.unravel_index(np.argmax(image), image.shape)
+    assert peak == (n // 2, n // 2)
+    # A focused response, not a smear: the peak towers over the mean.
+    assert 20.0 * np.log10(image.max() / image.mean()) > 40.0

@@ -6,8 +6,8 @@ This product includes software developed by the ScaleHLS Authors.
 The HLS dialect and its transformation passes -- everything under
 include/sar/Dialect/HLS, lib/Dialect/HLS and lib/Target/HLS -- derive from
 ScaleHLS-HIDA (https://github.com/UIUC-ChenLab/ScaleHLS-HIDA), licensed
-under the Apache License 2.0 with LLVM exceptions. Those files carry the
-original copyright notice.
+under the Apache License 2.0 with LLVM exceptions. This notice preserves
+the required attribution for that code.
 
 The derived code has been substantially modified: the dialect and passes
 were renamed into this project's namespace, the TOSA and PyTorch frontends,

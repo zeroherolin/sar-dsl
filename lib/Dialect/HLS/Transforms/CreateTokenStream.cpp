@@ -15,13 +15,13 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace sar;
 using namespace hls;
 
 namespace {
-struct CreateTokenStream : public sar::impl::CreateTokenStreamBase<CreateTokenStream> {
+struct CreateTokenStream
+    : public sar::impl::CreateTokenStreamBase<CreateTokenStream> {
   void runOnOperation() override {
     auto func = getOperation();
     auto context = func.getContext();
@@ -58,12 +58,16 @@ struct CreateTokenStream : public sar::impl::CreateTokenStreamBase<CreateTokenSt
         for (auto consumer : consumers) {
           if (consumer == producer)
             continue;
-          // Create new stream channel.
-          auto levelDiff =
-              producer.getLevel().value() - consumer.getLevel().value();
+          // Unscheduled nodes carry no level; a reversed pair would wrap an
+          // unsigned diff into a huge FIFO depth, so compute signed and keep
+          // at least one slot.
+          if (!producer.getLevel() || !consumer.getLevel())
+            continue;
+          int64_t levelDiff = std::max<int64_t>(
+              1, (int64_t)*producer.getLevel() - (int64_t)*consumer.getLevel());
           b.setInsertionPointAfterValue(buffer);
-          auto token = b.create<StreamOp>(
-              loc, StreamType::get(b.getContext(), b.getI1Type(), levelDiff),
+          auto token = StreamOp::create(
+              b, loc, StreamType::get(b.getContext(), b.getI1Type(), levelDiff),
               levelDiff);
           tokens.push_back(token);
 
@@ -76,16 +80,16 @@ struct CreateTokenStream : public sar::impl::CreateTokenStreamBase<CreateTokenSt
 
           // Construct stream write on the producer side.
           b.setInsertionPointToEnd(&producer.getBody().front());
-          auto value = b.create<arith::ConstantOp>(loc, b.getBoolAttr(true));
-          b.create<StreamWriteOp>(loc, tokenArg, value);
+          auto value = arith::ConstantOp::create(b, loc, b.getBoolAttr(true));
+          StreamWriteOp::create(b, loc, tokenArg, value);
         }
 
         // Construct a new producer node.
         b.setInsertionPoint(producer);
         auto newProducer =
-            b.create<NodeOp>(producer.getLoc(), producer.getInputs(), outputs,
-                             producer.getParams(), producer.getInputTapsAttr(),
-                             producer.getLevelAttr());
+            NodeOp::create(b, producer.getLoc(), producer.getInputs(), outputs,
+                           producer.getParams(), producer.getInputTapsAttr(),
+                           producer.getLevelAttr());
         newProducer.getBody().getBlocks().splice(
             newProducer.getBody().end(), producer.getBody().getBlocks());
         producer.erase();
@@ -109,12 +113,12 @@ struct CreateTokenStream : public sar::impl::CreateTokenStreamBase<CreateTokenSt
 
           // Construct stream write on the producer side.
           b.setInsertionPointToStart(&consumer.getBody().front());
-          b.create<StreamReadOp>(loc, Type(), tokenArg);
+          StreamReadOp::create(b, loc, Type(), tokenArg);
 
           // Construct a new consumer node.
           b.setInsertionPoint(consumer);
-          auto newConsumer = b.create<NodeOp>(
-              consumer.getLoc(), inputs, consumer.getOutputs(),
+          auto newConsumer = NodeOp::create(
+              b, consumer.getLoc(), inputs, consumer.getOutputs(),
               consumer.getParams(), inputTaps, consumer.getLevelAttr());
           newConsumer.getBody().getBlocks().splice(
               newConsumer.getBody().end(), consumer.getBody().getBlocks());

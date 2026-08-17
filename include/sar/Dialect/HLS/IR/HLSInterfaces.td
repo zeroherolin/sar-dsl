@@ -35,7 +35,7 @@ def StageLikeInterface : OpInterface<"StageLikeInterface"> {
     This interface is used to represent dataflow stage.
   }];
 
-  let methods = [    
+  let methods = [
     InterfaceMethod<"Return body region of the stage",
       "mlir::Region &", "getBody", (ins), "return $_op.getBody();">,
     InterfaceMethod<"Check whether the stage has hierarchy",

@@ -1,5 +1,8 @@
 """HLS backend tests: HLS C++ emission and subset diagnostics."""
 
+import re
+
+import numpy as np
 import pytest
 
 import sar
@@ -22,6 +25,39 @@ def test_emit_elementwise_kernel():
     source = design.source()
     assert "void phase_mul" in source
     assert "#pragma HLS" in source
+
+
+def test_top_ports_carry_kernel_parameter_names():
+    """The emitted top signature names its ports after the kernel's Python
+    parameters; complex tensors keep the name on both planes and result
+    planes stay `out<i>`."""
+
+    @sar.func
+    def named(raw: sar.c64[N, N], win_r: sar.f64[N]) -> sar.f32[N, N]:
+        return sar.cast(sar.absolute(sar.fft(raw, axis=1) * win_r), sar.f32)
+
+    source = named.compile(backend="hls").source()
+    signature = source[source.index("void named("):]
+    signature = signature[:signature.index(")")]
+    for port in ("raw_re", "raw_im", "win_r", "out0"):
+        assert port in signature, signature
+
+
+def test_reserved_parameter_names_fall_back():
+    """A parameter name the emitter cannot use verbatim (a C++ keyword, or
+    the shape of a generated name) falls back to the role-based scheme
+    instead of emitting C++ that does not compile."""
+
+    @sar.func
+    def kw(float: sar.f32[N, N],
+           in0: sar.f32[N, N]) -> sar.f32[N, N]:  # noqa: A002
+        return float + in0
+
+    source = kw.compile(backend="hls").source()
+    signature = source[source.index("void kw("):]
+    signature = signature[:signature.index(")")]
+    assert "in0" in signature and "in1" in signature
+    assert "float float" not in signature
 
 
 def test_hls_design_is_not_executable():
@@ -65,8 +101,6 @@ def test_every_construct_emits_hls():
     """Backend-symmetry gate: one kernel per DSL construct group must
     emit HLS C++ (transpose/broadcast/strided slices route to the
     HLS pipeline)."""
-    import numpy as np
-
     n = 16
 
     @sar.func
@@ -149,6 +183,111 @@ def test_testbench_csim_passes(tmp_path):
     assert result.returncode == 0, result.stdout
     assert "PASS" in result.stdout
     assert (tmp_path / "phase_csim.tcl").exists()
+    assert (tmp_path / "phase_csynth.tcl").exists()
+
+
+def test_f32_chain_csim_matches_the_cpu_backend(tmp_path):
+    """The HLS x f32 leg of the precision matrix.
+
+    A chain built with `dtype=sar.c64` must emit, csim, and agree with
+    the same build on the cpu backend to single-precision rounding --
+    the cpu FFT computes its butterflies in f64 while the HLS FFT
+    computes in the declared width, so this is a real cross-backend
+    check, not a self-comparison.
+    """
+    import subprocess
+
+    import numpy as np
+
+    from common.params import synthetic_params
+    from common.simulate import single_target_scene
+    from wka.algorithm import build_kernel, make_inputs
+    from sar.compiler.toolchain import find_tool
+
+    n = 32
+    params = synthetic_params(n)
+    kernel = build_kernel(n, params, name="wka_f32", dtype=sar.c64)
+    raw = single_target_scene(n, params).astype(np.complex64)
+    inputs = [
+        np.asarray(a, dtype=t.dtype.to_numpy())
+        for a, t in zip([raw, *make_inputs(n, params)], kernel.arg_types)
+    ]
+
+    golden = kernel.compile("cpu")(*inputs)
+    peak = float(golden.max())
+    assert peak > 1.0  # a focused target, so the tolerances below bite
+
+    design = kernel.compile(backend="hls")
+    design.write_testbench(inputs, [golden],
+                           tmp_path,
+                           rtol=1e-3,
+                           atol=peak * 1e-3)
+    clang = find_tool("clang")
+    subprocess.run([
+        clang + "++", "-O2", "-Wno-unknown-pragmas", "-I", "stubs",
+        "wka_f32.cpp", "wka_f32_tb.cpp", "-o", "csim", "-pthread"
+    ],
+                   cwd=tmp_path,
+                   check=True,
+                   capture_output=True)
+    result = subprocess.run(["./csim"],
+                            cwd=tmp_path,
+                            capture_output=True,
+                            text=True)
+    assert result.returncode == 0, result.stdout
+    assert "PASS" in result.stdout
+
+
+def test_twiddle_tables_are_shared_across_same_size_ffts():
+    """Transforms of one size share one cos and one sin table.
+
+    The emitter lifts twiddle tables to file-scope `const` arrays so the
+    tool can map them to ROM; a design whose three same-size transforms
+    each carried their own copy would spend BRAM primitives per
+    transform. One definition per table is the static half of the ROM
+    budget; whether Vitis then shares the primitives is read from the
+    synthesis report (docs/backends.md).
+    """
+    n = 32
+
+    @sar.func
+    def three(a: sar.c128[n, n], b: sar.c128[n, n]) -> sar.c128[n, n]:
+        return sar.ifft(sar.fft(a, axis=1), axis=1) * sar.fft(b, axis=1)
+
+    source = three.compile(backend="hls").source()
+    assert source.count(f"kTwiddleCos_{n}[") == 1, source
+    assert source.count(f"kTwiddleSin_{n}[") == 1, source
+    # The uniquing suffix appearing would mean a duplicate slipped in
+    # under another name.
+    assert f"kTwiddleCos_{n}_2" not in source
+
+
+def test_synthesis_script_covers_every_interface(tmp_path):
+    """`write_synthesis_script` exists for the designs csim cannot cover:
+    synthesis needs no golden data, so the AXI/stream designs get their
+    script from here. The scripts name the configured part and clock."""
+    n = 16
+
+    @sar.func
+    def scale(z: sar.c128[n, n]) -> sar.c128[n, n]:
+        return z * 2.0
+
+    for interface in ("ap_memory", "axi", "stream"):
+        design = scale.compile(backend="hls",
+                               options={
+                                   "interface": interface,
+                                   "part": "xczu9eg-ffvb1156-2-e",
+                                   "clock_ns": 4,
+                               })
+        out = tmp_path / interface
+        script = design.write_synthesis_script(out)
+        assert script == out / "scale_csynth.tcl"
+        assert (out / "scale.cpp").read_text() == design.source()
+        tcl = script.read_text()
+        assert "set_top scale" in tcl
+        assert "csynth_design" in tcl
+        assert "set_part xczu9eg-ffvb1156-2-e" in tcl
+        assert "create_clock -period 4" in tcl
 
 
 def test_scratch_is_one_line_wide():
@@ -235,8 +374,7 @@ def test_testbench_rejects_axi_with_a_reason():
     def spectrum(x: sar.c64[N, N]) -> sar.c64[N, N]:
         return sar.fft(x, axis=1)
 
-    design = spectrum.compile(backend="hls",
-                              options={"axi_interface": True})
+    design = spectrum.compile(backend="hls", options={"axi_interface": True})
     with pytest.raises(sar.LaunchError, match="AXI port"):
         design.write_testbench([], [])
 
@@ -305,8 +443,17 @@ def test_broadcast_does_not_materialize_a_plane():
                                 "axi_interface": True,
                                 "on_chip_budget": 1
                             }).source()
-    # One plane in, one out: a materialized broadcast would be a third.
-    assert len(re.findall(r"m_axi", source)) == 2, source.count("m_axi")
+    # One plane in, one out: a materialized broadcast would be a third
+    # DRAM buffer. It would land in the scratch allocation, so the check
+    # is that the scratch stayed at its 1-element placeholder size while
+    # exactly two full planes hold pragmas.
+    maxi_ports = re.findall(r"m_axi.*port=(\w+)", source)
+    placeholder = {
+        name
+        for name in maxi_ports if re.search(rf"double {name}\[1\]", source)
+    }
+    assert len(placeholder) == 1, source
+    assert len(set(maxi_ports) - placeholder) == 2, maxi_ports
 
 
 def test_streaming_passes_keep_full_rows():
@@ -382,18 +529,19 @@ def test_scratch_lands_in_block_ram():
     def spectrum(x: sar.c128[N, N]) -> sar.c128[N, N]:
         return sar.fft(x, axis=1)
 
-    source = spectrum.compile(backend="hls",
-                              options={
-                                  "axi_interface": True
-                              }).source()
+    source = spectrum.compile(backend="hls", options={
+        "axi_interface": True
+    }).source()
     assert "bind_storage" in source
     assert "impl=lutram" not in source
 
 
-def test_on_chip_budget_decides_placement():
-    """Placement is the compiler's call: a working set that fits the budget
-    stays resident, one that does not is streamed. The user picks the
-    interface, not the split."""
+def test_axi_interface_is_a_contract_not_a_placement_result():
+    """`interface` says how the host binds the kernel, so it cannot depend
+    on where the compiler put a buffer. An AXI design is AXI whether or not
+    its planes happened to fit on chip -- otherwise the host would have to
+    bind a different interface per budget, and `bundle=` would land on a
+    `bram` port, which Vitis does not accept."""
 
     def emit(n, **options):
 
@@ -401,25 +549,181 @@ def test_on_chip_budget_decides_placement():
         def spectrum(x: sar.c64[n, n]) -> sar.c64[n, n]:
             return sar.fft(x, axis=1)
 
-        spectrum.name = f"budget_{n}_{options.get('on_chip_budget', 'def')}"
+        spectrum.name = f"iface_{n}_{options.get('on_chip_budget', 'def')}"
         return spectrum.compile(backend="hls",
                                 options={
-                                    "axi_interface": True,
+                                    "interface": "axi",
                                     **options
-                                })
+                                }).source()
 
-    def is_streamed(design):
-        return "m_axi" in design.source()
+    # Comfortably resident, forced to stream, and pinned on chip.
+    for source in (emit(64), emit(64, on_chip_budget=32 * 1024),
+                   emit(256, on_chip_budget=0)):
+        modes = set(re.findall(r"#pragma HLS interface (\w+)", source))
+        assert modes == {"m_axi", "s_axilite"}, modes
+        # `bundle=` belongs to m_axi / axis / s_axilite, never to a memory
+        # port; emitting it on one is the malformed pragma this guards.
+        assert not [
+            line for line in source.splitlines()
+            if "interface bram" in line and "bundle=" in line
+        ]
 
-    # The working set is the kernel's own planes plus whatever full-size
-    # intermediates survive buffer sharing; the transform scratch is one line
-    # wide and does not enter it. Here that is just the input and the output,
-    # 64 * 64 * 8 B each, so 64 KiB total: inside the 4 MiB default, outside
-    # a 32 KiB budget.
-    assert not is_streamed(emit(64))
-    assert is_streamed(emit(64, on_chip_budget=32 * 1024))
-    # A budget of zero pins everything on chip regardless of size.
-    assert not is_streamed(emit(256, on_chip_budget=0))
+
+def test_local_interface_emits_memory_ports():
+    """The default interface hands the kernel plain arrays, which is the
+    signature the generated csim testbench drives."""
+    n = 64
+
+    @sar.func
+    def spectrum(x: sar.c64[n, n]) -> sar.c64[n, n]:
+        return sar.fft(x, axis=1)
+
+    spectrum.name = "iface_local"
+    source = spectrum.compile(backend="hls",
+                              options={
+                                  "interface": "ap_memory"
+                              }).source()
+    modes = set(re.findall(r"#pragma HLS interface (\w+)", source))
+    # `bram` is Vitis's spelling of the ap_memory protocol in the pragma.
+    assert modes == {"bram", "s_axilite"}, modes
+    assert "m_axi" not in source
+
+
+def test_bram_alias_emits_the_same_pragmas_as_ap_memory():
+    """`bram` is the deprecated spelling of the same protocol, so the two
+    must produce identical interface pragmas -- the only reason the alias
+    exists is to keep old configs working."""
+    n = 32
+
+    def pragmas(iface):
+
+        @sar.func
+        def spectrum(x: sar.c64[n, n]) -> sar.c64[n, n]:
+            return sar.fft(x, axis=1)
+
+        spectrum.name = f"iface_alias_{iface}"
+        src = spectrum.compile(backend="hls", options={
+            "interface": iface
+        }).source()
+        return sorted([
+            line.strip() for line in src.splitlines()
+            if line.strip().startswith("#pragma HLS interface")
+        ])
+
+    assert pragmas("bram") == pragmas("ap_memory")
+
+
+def test_stream_interface_emits_axis_pragmas():
+    """A streaming radar front end wants its ports as AXI4-Stream. The
+    emitter already knew how to write `axis`; this is the path from the
+    config down to it."""
+    n = 64
+
+    @sar.func
+    def spectrum(x: sar.c64[n, n]) -> sar.c64[n, n]:
+        return sar.fft(x, axis=1)
+
+    spectrum.name = "iface_stream"
+    source = spectrum.compile(backend="hls", options={
+        "interface": "stream"
+    }).source()
+    # The kernel's inputs and outputs stream. The only memory-mapped port
+    # is the fixed DRAM scratch, sitting at its 1-element placeholder size
+    # since nothing spilled here.
+    axis_ports = set(re.findall(r"interface axis port=(\w+)", source))
+    assert {"x_re", "x_im"} <= axis_ports, axis_ports
+    maxi_ports = re.findall(r"m_axi.*port=(\w+)", source)
+    assert len(maxi_ports) == 1, maxi_ports
+    assert re.search(rf"\w+ {maxi_ports[0]}\[1\]", source), maxi_ports
+    # A stream port carries no burst shaping: that describes addressed
+    # access to DRAM, which a FIFO does not perform. The placeholder moves
+    # no bulk data, so it is not shaped either.
+    assert "max_read_burst_length" not in source
+
+
+def test_stream_interface_keeps_spilled_scratch_memory_mapped():
+    """A buffer that spills to DRAM is read and written by the design, and
+    an AXI4-Stream is unidirectional and consumed once -- `axis` on such a
+    port cannot synthesize. In stream mode only the pure inputs and outputs
+    stream; the scratch stays an AXI master (PFA hit this for real)."""
+    n = 32
+
+    @sar.func
+    def two_ffts(x: sar.c64[n, n]) -> sar.c64[n, n]:
+        y = sar.fft(x, axis=1)
+        return sar.fft(y, axis=0)
+
+    two_ffts.name = "iface_stream_scratch"
+    source = two_ffts.compile(backend="hls",
+                              options={
+                                  "interface": "stream",
+                                  "on_chip_budget": 4096,
+                              }).source()
+    lines = [
+        line.strip() for line in source.splitlines()
+        if line.strip().startswith("#pragma HLS interface")
+    ]
+    maxi = [line for line in lines if " m_axi " in line]
+    axis = [line for line in lines if " axis " in line]
+
+    # The budget forces a spill, so the design has a scratch port -- and it
+    # must be memory-mapped, with burst shaping, despite the stream mode.
+    assert maxi, lines
+    assert all("max_read_burst_length" in line for line in maxi), maxi
+
+    # The kernel's own ports still stream, without burst shaping.
+    axis_ports = {line.split("port=")[1].split()[0] for line in axis}
+    assert {"x_re", "x_im"} <= axis_ports, axis_ports
+    assert all("max_read_burst_length" not in line for line in axis), axis
+
+
+@pytest.mark.parametrize("interface", ["ap_memory", "bram", "axi", "stream"])
+def test_no_memory_port_ever_carries_a_bundle(interface):
+    """`bundle=` belongs to m_axi / axis / s_axilite and is invalid on a
+    memory-mode port. Vitis rejects that combination outright, and it was a
+    real bug once -- so every interface keeps a regression test for it."""
+    n = 32
+
+    @sar.func
+    def spectrum(x: sar.c64[n, n]) -> sar.c64[n, n]:
+        return sar.fft(x, axis=1)
+
+    spectrum.name = f"iface_nobundle_{interface}"
+    source = spectrum.compile(backend="hls",
+                              options={
+                                  "interface": interface,
+                                  "top_func": "nobundle_top"
+                              }).source()
+    offenders = [
+        line for line in source.splitlines()
+        if re.search(r"interface\s+(bram|ap_memory)\b", line)
+        and "bundle=" in line
+    ]
+    assert not offenders, offenders
+
+
+def test_stream_testbench_raises_an_actionable_error(tmp_path):
+    """csim for AXI-Stream needs a FIFO-feeding harness that is not
+    implemented. Saying so beats emitting a testbench that cannot compile
+    against the design's signature."""
+    n = 16
+
+    @sar.func
+    def spectrum(x: sar.c64[n, n]) -> sar.c64[n, n]:
+        return sar.fft(x, axis=1)
+
+    spectrum.name = "iface_stream_tb"
+    design = spectrum.compile(backend="hls", options={"interface": "stream"})
+    data = np.zeros((n, n), dtype=np.complex64)
+    with pytest.raises(sar.errors.LaunchError) as excinfo:
+        design.write_testbench([data], [data], output_dir=tmp_path)
+    message = str(excinfo.value)
+    # The error has to name the cause and the way forward, not just fail.
+    assert "stream" in message
+    assert "ap_memory" in message
+    assert "FIFO" in message
+    # Nothing half-written is left behind.
+    assert not list(tmp_path.glob("*_tb.cpp"))
 
 
 def test_full_alos_raster_emits():
@@ -451,3 +755,102 @@ def test_full_alos_raster_emits():
     assert bundles, "expected AXI master ports"
     # Ports share a bundle per element type rather than taking one each.
     assert len(bundles) <= 4, sorted(bundles)
+
+
+def test_cumsum_emits_hls():
+    """The scan lowers to a loop nest the C++ emitter can carry."""
+
+    @sar.func
+    def scan(x: sar.f32[N, N]) -> sar.f32[N, N]:
+        return sar.cumsum(x, axis=1)
+
+    source = scan.compile(backend="hls").source()
+    assert "void scan" in source
+    assert "#pragma HLS" in source
+
+
+def test_cumsum_complex_emits_hls():
+    """A complex scan splits into two float scans through decomplexify."""
+
+    @sar.func
+    def cscan(x: sar.c64[N, N]) -> sar.c64[N, N]:
+        return sar.cumsum(x, axis=0)
+
+    source = cscan.compile(backend="hls").source()
+    assert "void cscan" in source
+    assert "#pragma HLS" in source
+
+
+def test_rank_filter_emits_hls():
+    """The window sort is a straight-line compare-exchange network."""
+
+    @sar.func
+    def rf(x: sar.f32[N, N]) -> sar.f32[N, N]:
+        return sar.rank_filter(x, window=5, rank=2, axis=1)
+
+    source = rf.compile(backend="hls").source()
+    assert "void rf" in source
+    assert "#pragma HLS" in source
+
+
+def test_median_filter_emits_hls():
+
+    @sar.func
+    def mf(x: sar.f32[N, N]) -> sar.f32[N, N]:
+        return sar.median_filter(x, window=3, axis=0)
+
+    source = mf.compile(backend="hls").source()
+    assert "void mf" in source
+    assert "#pragma HLS" in source
+
+
+# --------------------------------------------------------------------- #
+# Example artifact sets (examples/common/hls_artifacts.py)
+# --------------------------------------------------------------------- #
+
+
+def test_build_kernel_name_reaches_the_top_function():
+    """`name` lets two designs from one chain coexist in a directory."""
+    from common.params import alos_params
+    from wka.algorithm import build_kernel
+
+    design = build_kernel(16, alos_params(16),
+                          name="wka_alos").compile(backend="hls")
+    assert design.name == "wka_alos"
+    assert "void wka_alos(" in design.source()
+
+
+@pytest.mark.parametrize("algorithm", ["wka", "rda", "csa"])
+def test_alos_runner_emits_the_full_artifact_set(algorithm, tmp_path):
+    """Every ALOS HLS runner produces a synthesizable design *and* a
+    complete csim package, not just the design."""
+    import importlib
+
+    from common.hls_artifacts import emit_alos_artifacts
+
+    algo = importlib.import_module(f"{algorithm}.algorithm")
+    ref = importlib.import_module(f"{algorithm}.reference")
+    processor = getattr(ref, f"{algorithm.upper()}Processor")
+
+    emit_alos_artifacts(algorithm,
+                        algo.build_kernel,
+                        algo.make_inputs,
+                        processor,
+                        n=64,
+                        csim_n=32,
+                        out=tmp_path)
+
+    top = f"{algorithm}_alos"
+    for artifact in (f"{top}_axi.cpp", f"{top}_axi_csynth.tcl", f"{top}.cpp",
+                     f"{top}_tb.cpp", f"{top}_csim.tcl", f"{top}_csynth.tcl",
+                     f"{top}_tb_data", "stubs"):
+        assert (tmp_path / artifact).exists(), artifact
+    assert list((tmp_path / f"{top}_tb_data").glob("*.dat"))
+
+    # The two designs are separate symbols, so both can sit in one project.
+    assert f"void {top}(" in (tmp_path / f"{top}.cpp").read_text()
+    assert f"void {top}_axi(" in (tmp_path / f"{top}_axi.cpp").read_text()
+    # The csim script says which raster it simulates and why.
+    tcl = (tmp_path / f"{top}_csim.tcl").read_text()
+    assert "32 x 32" in tcl and f"{top}_axi.cpp" in tcl
+    assert f"set_top {top}" in tcl

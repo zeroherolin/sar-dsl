@@ -6,8 +6,6 @@ any gather operation. The Doppler-dependent factors D(fa) and Km(fa) are
 computed inside the kernel from the `fa` axis with element-wise ops.
 """
 
-from __future__ import annotations
-
 import math
 
 import numpy as np
@@ -19,8 +17,20 @@ from common.params import RadarParams, band_windows
 __all__ = ["build_kernel", "make_inputs"]
 
 
-def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
-    """Builds an `n x n` CSA imaging kernel (azimuth x range)."""
+def build_kernel(n: int,
+                 p: RadarParams,
+                 name: str = "csa",
+                 dtype=sar.c128) -> sar.Kernel:
+    """Builds an `n x n` CSA imaging kernel (azimuth x range).
+
+    `name` becomes the IR symbol and the HLS top function, so a second
+    kernel can be emitted beside the first without a symbol clash.
+    `dtype` selects the spectral working precision (`sar.c128` default,
+    `sar.c64` for a single-precision data path).
+    """
+    if dtype not in (sar.c128, sar.c64):
+        raise ValueError("dtype must be sar.c128 or sar.c64")
+    fd = sar.f64 if dtype is sar.c128 else sar.f32
 
     N = int(n)
     wavelength = p.c / p.fc
@@ -30,10 +40,8 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
     rcmc_scale = 4.0 * math.pi * p.r0 / p.c
     az_scale = 4.0 * math.pi * p.fc / p.c
 
-    @sar.func
-    def csa(raw: sar.c64[N,
-                         N], fa: sar.f64[N], fr: sar.f64[N], tau: sar.f64[N],
-            win_r: sar.f64[N], win_a: sar.f64[N]) -> sar.f32[N, N]:
+    def csa(raw: sar.c64[N, N], fa: fd[N], fr: fd[N], tau: fd[N], win_r: fd[N],
+            win_a: fd[N]) -> sar.f32[N, N]:
         ones = sar.constant(1.0, dtype=sar.f64, shape=(N, N))
 
         # Doppler-dependent factors, broadcast along range.
@@ -47,10 +55,10 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
         tau2 = sar.broadcast(tau, (N, N), dim=1)
         fr2 = sar.broadcast(fr, (N, N), dim=1)
 
-        data = sar.cast(raw, sar.c128)
+        data = sar.cast(raw, dtype)
 
         # 1. Azimuth FFT.
-        data = sar.fftshift(sar.fft(data, dim=0), dim=0)
+        data = sar.fftshift(sar.fft(data, axis=0), axis=0)
 
         # 2. Chirp scaling.
         tau_diff = tau2 - inv_d * tau_ref_scale
@@ -58,7 +66,7 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
         data = data * sar.expj(phi1)
 
         # 3. Range FFT.
-        data = sar.fftshift(sar.fft(data, dim=1), dim=1)
+        data = sar.fftshift(sar.fft(data, axis=1), axis=1)
 
         # 4. Range compression + SRC + bulk RCMC (+ range window).
         phi2 = ((fr2 * fr2) * d / km * math.pi +
@@ -66,7 +74,7 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
         data = data * sar.expj(phi2) * win_r
 
         # 5. Range IFFT.
-        data = sar.ifft(sar.ifftshift(data, dim=1), dim=1)
+        data = sar.ifft(sar.ifftshift(data, axis=1), axis=1)
 
         # 6. Azimuth compression (+ azimuth window).
         phi3 = tau2 * (d - ones) * (az_scale * p.c / 2.0)
@@ -74,10 +82,11 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
         data = data * sar.broadcast(win_a, (N, N), dim=0)
 
         # 7. Azimuth IFFT.
-        data = sar.ifft(sar.ifftshift(data, dim=0), dim=0)
+        data = sar.ifft(sar.ifftshift(data, axis=0), axis=0)
         return sar.cast(sar.absolute(data), sar.f32)
 
-    return csa
+    csa.__name__ = name
+    return sar.func(csa)
 
 
 def make_inputs(n: int, p: RadarParams):

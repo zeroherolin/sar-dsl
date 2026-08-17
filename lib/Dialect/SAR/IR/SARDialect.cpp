@@ -371,6 +371,8 @@ LogicalResult PadOp::verify() {
 
 LogicalResult ReverseOp::verify() {
   auto type = getRanked(getInput().getType());
+  // The I64Attr getter is unsigned, so a negative dim reads as a huge
+  // value and the single comparison rejects both directions.
   if (getDim() >= static_cast<uint64_t>(type.getRank()))
     return emitOpError("dim is out of range for the input rank");
   return success();
@@ -442,7 +444,7 @@ static LogicalResult verifyInterpLike(Operation *op, RankedTensorType dataTy,
 /// sar.interp1d and sar.interp1d_split.
 static LogicalResult verifyInterpKernel(Operation *op, StringRef kernel,
                                         int64_t taps, StringRef window,
-                                        double beta) {
+                                        double beta, StringRef boundary) {
   if (kernel != "nearest" && kernel != "linear" && kernel != "cubic" &&
       kernel != "sinc")
     return op->emitOpError("kernel must be one of: nearest, linear, "
@@ -459,6 +461,8 @@ static LogicalResult verifyInterpKernel(Operation *op, StringRef kernel,
     if (window == "kaiser" && (beta <= 0.0 || beta > 12.0))
       return op->emitOpError("beta must be in (0, 12]");
   }
+  if (boundary != "zero" && boundary != "edge" && boundary != "reflect")
+    return op->emitOpError("boundary must be one of: zero, edge, reflect");
   return success();
 }
 
@@ -466,7 +470,7 @@ LogicalResult Interp1DOp::verify() {
   if (getDim() > 1)
     return emitOpError("dim must be 0 or 1");
   if (failed(verifyInterpKernel(*this, getKernel(), getTaps(), getWindow(),
-                                getBeta().convertToDouble())))
+                                getBeta().convertToDouble(), getBoundary())))
     return failure();
   return verifyInterpLike(*this, getRanked(getData().getType()),
                           getRanked(getPositions().getType()));
@@ -476,10 +480,78 @@ LogicalResult Interp1DSplitOp::verify() {
   if (getDim() > 1)
     return emitOpError("dim must be 0 or 1");
   if (failed(verifyInterpKernel(*this, getKernel(), getTaps(), getWindow(),
-                                getBeta().convertToDouble())))
+                                getBeta().convertToDouble(), getBoundary())))
     return failure();
   return verifyInterpLike(*this, getRanked(getRe().getType()),
                           getRanked(getPositions().getType()));
+}
+
+//===----------------------------------------------------------------------===//
+// IterateOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult IterateOp::verify() {
+  if (static_cast<int64_t>(getTrips()) < 1)
+    return emitOpError("trips must be at least 1");
+  Block &block = getBody().front();
+  ValueRange inits = getInits();
+  if (block.getNumArguments() != inits.size() ||
+      getNumResults() != inits.size())
+    return emitOpError("carries one block argument and one result per init");
+  auto yield = cast<YieldOp>(block.getTerminator());
+  if (yield.getNumOperands() != inits.size())
+    return emitOpError("yields one value per init");
+  for (auto [index, init] : llvm::enumerate(inits)) {
+    Type type = init.getType();
+    if (block.getArgument(index).getType() != type ||
+        getResult(index).getType() != type ||
+        yield.getOperand(index).getType() != type)
+      return emitOpError("carry #")
+             << index << " must keep one type through the init, the block "
+             << "argument, the yield and the result";
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Gather2DOp
+//===----------------------------------------------------------------------===//
+
+/// Shared checks of sar.gather2d and sar.gather2d_split: `dataTy` is the
+/// (plane) type gathered from, `resultTy` the corresponding output.
+static LogicalResult verifyGatherLike(Operation *op, RankedTensorType dataTy,
+                                      RankedTensorType posTy,
+                                      RankedTensorType resultTy,
+                                      StringRef kernel, StringRef boundary) {
+  if (dataTy.getRank() != 2)
+    return op->emitOpError("expects rank-2 data");
+  if (posTy.getRank() != 2 || !posTy.getElementType().isF64())
+    return op->emitOpError("positions must be rank-2 f64 tensors");
+  if (resultTy.getShape() != posTy.getShape())
+    return op->emitOpError("result shape must match the position shape");
+  if (kernel != "nearest" && kernel != "linear")
+    return op->emitOpError("kernel must be one of: nearest, linear");
+  if (boundary != "zero" && boundary != "edge")
+    return op->emitOpError("boundary must be one of: zero, edge");
+  return success();
+}
+
+LogicalResult Gather2DOp::verify() {
+  auto dataTy = getRanked(getData().getType());
+  auto resultTy = getRanked(getResult().getType());
+  if (dataTy.getElementType() != resultTy.getElementType())
+    return emitOpError("data and result element types must match");
+  return verifyGatherLike(*this, dataTy, getRanked(getRows().getType()),
+                          resultTy, getKernel(), getBoundary());
+}
+
+LogicalResult Gather2DSplitOp::verify() {
+  auto planeTy = getRanked(getRe().getType());
+  auto resultTy = getRanked(getOutRe().getType());
+  if (planeTy.getElementType() != resultTy.getElementType())
+    return emitOpError("plane and result element types must match");
+  return verifyGatherLike(*this, planeTy, getRanked(getRows().getType()),
+                          resultTy, getKernel(), getBoundary());
 }
 
 namespace {
@@ -501,9 +573,10 @@ struct NormalizeInterp1DDim : OpRewritePattern<Interp1DOp> {
                                      op.getData());
     Value positions = TransposeOp::create(
         rewriter, loc, transposedOf(op.getPositions()), op.getPositions());
-    Value interp = Interp1DOp::create(
-        rewriter, loc, data.getType(), data, positions, /*dim=*/1,
-        op.getKernel(), op.getTaps(), op.getWindow(), op.getBeta());
+    Value interp =
+        Interp1DOp::create(rewriter, loc, data.getType(), data, positions,
+                           /*dim=*/1, op.getKernel(), op.getTaps(),
+                           op.getWindow(), op.getBeta(), op.getBoundary());
     rewriter.replaceOpWithNewOp<TransposeOp>(op, op.getType(), interp);
     return success();
   }
@@ -513,6 +586,53 @@ struct NormalizeInterp1DDim : OpRewritePattern<Interp1DOp> {
 void Interp1DOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                              MLIRContext *context) {
   results.add<NormalizeInterp1DDim>(context);
+}
+
+//===----------------------------------------------------------------------===//
+// CumsumOp / RankFilterOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult CumsumOp::verify() {
+  auto type = getRanked(getInput().getType());
+  if (type.getRank() != 2)
+    return emitOpError("expects a rank-2 input");
+  Type element = type.getElementType();
+  if (!isa<FloatType>(element) && !isa<ComplexType>(element))
+    return emitOpError("expects float or complex elements");
+  int64_t dim = getDim();
+  if (dim < 0 || dim > 1)
+    return emitOpError("dim must be 0 or 1");
+  return success();
+}
+
+LogicalResult RankFilterOp::verify() {
+  auto type = getRanked(getInput().getType());
+  if (type.getRank() != 2)
+    return emitOpError("expects a rank-2 input");
+  if (!isa<FloatType>(type.getElementType()))
+    return emitOpError("expects float elements");
+  int64_t window = getWindow();
+  if (window < 1 || window % 2 == 0)
+    return emitOpError("window must be a positive odd integer");
+  int64_t rank = getRank();
+  if (rank < 0 || rank >= window)
+    return emitOpError("rank must be in [0, window)");
+  int64_t dim = getDim();
+  if (dim < 0 || dim > 1)
+    return emitOpError("dim must be 0 or 1");
+  return success();
+}
+
+LogicalResult SortOp::verify() {
+  auto type = getRanked(getInput().getType());
+  if (type.getRank() != 2)
+    return emitOpError("expects a rank-2 input");
+  if (!isa<FloatType>(type.getElementType()))
+    return emitOpError("expects float elements");
+  int64_t dim = getDim();
+  if (dim < 0 || dim > 1)
+    return emitOpError("dim must be 0 or 1");
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

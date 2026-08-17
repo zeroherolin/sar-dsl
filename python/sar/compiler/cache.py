@@ -8,27 +8,38 @@ recompilation.
 
 The cache is bounded: once the total size exceeds
 ``SAR_DSL_CACHE_MAX_SIZE`` bytes (default 2 GiB), least-recently-used
-entries are evicted. Eviction runs at most once per process.
+entries are evicted. Eviction runs once per cache root per process.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import shutil
+import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 __all__ = ["KernelCache"]
-
-#: Eviction threshold in bytes; 0 disables pruning entirely.
-_MAX_CACHE_SIZE = int(
-    os.environ.get("SAR_DSL_CACHE_MAX_SIZE", str(2 * 1024**3)))
 
 #: Marker file recording the last use of an entry (LRU ordering).
 _ACCESS_MARKER = ".accessed"
 
-_pruned_this_process = False
+#: Entries used within this window are never evicted: a fresh marker
+#: usually means another process is compiling into the entry right now.
+_PRUNE_GRACE_SECONDS = 600
+
+#: Cache roots already pruned in this process (pruning is a full scan).
+_pruned_roots = set()
+
+
+def _max_cache_size() -> int:
+    """Eviction threshold in bytes (0 disables pruning); read per cache
+    construction rather than at import, so the environment can change it
+    in a running process."""
+    return int(os.environ.get("SAR_DSL_CACHE_MAX_SIZE", str(2 * 1024**3)))
 
 
 def _default_cache_root() -> Path:
@@ -41,28 +52,76 @@ def _default_cache_root() -> Path:
 #: Tools whose output the cache holds. Every one of them has to be in the
 #: fingerprint: a kernel passes through all of them, so rebuilding any one
 #: can change the artifacts while the source and options stay identical.
-_FINGERPRINTED_TOOLS = ("sar-opt", "sar-translate")
+#: `clang` and `mlir-translate` produce the CPU backend's final object, and
+#: libsar_runtime is linked into it, so all three belong here too.
+_FINGERPRINTED_TOOLS = ("sar-opt", "sar-translate", "mlir-translate", "clang")
+
+
+def _cpu_identity() -> str:
+    """Identity of the host CPU, as far as codegen is concerned.
+
+    `-march=native` bakes the build machine's ISA into the CPU backend's
+    artifacts, so a cache shared across machines must miss on a different
+    microarchitecture rather than serve a binary that traps. The model
+    name plus a digest of the feature flags is what actually varies the
+    output; `platform.processor()` is the fallback where /proc/cpuinfo
+    does not exist.
+    """
+    model = flags = ""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if not model and line.startswith("model name"):
+                    model = line.partition(":")[2].strip()
+                elif not flags and line.startswith("flags"):
+                    flags = line.partition(":")[2].strip()
+                if model and flags:
+                    break
+    except OSError:  # pragma: no cover - non-Linux host
+        pass
+    if model or flags:
+        return f"{model}:{hashlib.sha256(flags.encode()).hexdigest()[:12]}"
+    return platform.processor()
 
 
 def _toolchain_fingerprint() -> str:
     """Identity of the compilers that produced the cached artifacts.
 
     Each tool's size and mtime stand in for its content: rebuilding one
-    changes them, which changes every cache key. This replaces the
-    hand-maintained version counter that had to be bumped after ABI changes.
+    changes them, which changes every cache key.
     """
-    from .toolchain import find_tool
+    from .toolchain import find_runtime_library, find_tool
+
+    def stamp(path) -> bytes:
+        try:
+            info = os.stat(path) if path else None
+        except OSError:  # pragma: no cover - fingerprint is best-effort
+            info = None
+        if info is None:
+            return b"absent"
+        return f"{info.st_mtime_ns}:{info.st_size}".encode()
 
     digest = hashlib.sha256()
     for name in _FINGERPRINTED_TOOLS:
         try:
             tool = find_tool(name, required=False)
-            info = os.stat(tool) if tool else None
         except Exception:  # pragma: no cover - fingerprint is best-effort
-            info = None
+            tool = None
         digest.update(f"{name}:".encode())
-        digest.update(b"absent" if info is
-                      None else f"{info.st_mtime_ns}:{info.st_size}".encode())
+        digest.update(stamp(tool))
+    try:
+        runtime = find_runtime_library()
+    except Exception:  # pragma: no cover - fingerprint is best-effort
+        runtime = None
+    digest.update(b"libsar_runtime:")
+    digest.update(stamp(runtime))
+    # Host codegen identity: `-march=native` bakes the build machine's ISA
+    # into the artifact, so a shared cache must not hand it to a different
+    # CPU. platform.machine() alone is too coarse; the CPU model and flag
+    # set are what actually vary the output.
+    digest.update(b"host:")
+    digest.update(f"{platform.machine()}:{platform.system()}:"
+                  f"{_cpu_identity()}".encode())
     return digest.hexdigest()[:16]
 
 
@@ -79,10 +138,9 @@ def _entry_size(path: Path) -> int:
 
 def _prune_lru(root: Path, max_size: int) -> None:
     """Evicts least-recently-used entries until the cache fits `max_size`."""
-    global _pruned_this_process
-    if _pruned_this_process or max_size <= 0 or not root.is_dir():
+    if max_size <= 0 or not root.is_dir() or root in _pruned_roots:
         return
-    _pruned_this_process = True
+    _pruned_roots.add(root)
 
     entries = []
     total = 0
@@ -105,9 +163,13 @@ def _prune_lru(root: Path, max_size: int) -> None:
     if total <= max_size:
         return
 
+    fresh = time.time() - _PRUNE_GRACE_SECONDS
     entries.sort(key=lambda item: item[0])  # oldest first
-    for _, size, entry in entries:
-        if total <= max_size:
+    for used, size, entry in entries:
+        if total <= max_size or used > fresh:
+            # Recently used entries are likely being compiled into or read
+            # by a concurrent process; sorted oldest-first, everything past
+            # the first fresh one is fresh too.
             break
         try:
             shutil.rmtree(entry)
@@ -132,7 +194,7 @@ class KernelCache:
         # directory always has to exist.
         self.dir.mkdir(parents=True, exist_ok=True)
         if self.enabled:
-            _prune_lru(root, _MAX_CACHE_SIZE)
+            _prune_lru(root, _max_cache_size())
             self._touch()
 
     def _touch(self) -> None:
@@ -154,13 +216,29 @@ class KernelCache:
     def read_text(self, filename: str) -> str:
         return self.path(filename).read_text()
 
+    def read_if_cached(self, filename: str) -> Optional[str]:
+        """The cached text, or None on a miss. A hit whose read then fails
+        is also a miss: a concurrent prune in another process can drop the
+        entry between the existence check and the read."""
+        if not self.has(filename):
+            return None
+        try:
+            return self.read_text(filename)
+        except OSError:
+            return None
+
     def write_text(self, filename: str, content: str) -> Path:
         """Atomic write (temp file + rename): concurrent compilations of the
         same kernel may duplicate work but never observe partial files."""
         p = self.path(filename)
         tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex[:8]}.tmp")
-        tmp.write_text(content)
-        os.replace(tmp, p)
+        try:
+            tmp.write_text(content)
+            os.replace(tmp, p)
+        finally:
+            # A failed write or rename must not litter the entry with .tmp
+            # files; after a successful rename there is nothing to unlink.
+            tmp.unlink(missing_ok=True)
         return p
 
     def scratch_path(self, filename: str) -> Path:

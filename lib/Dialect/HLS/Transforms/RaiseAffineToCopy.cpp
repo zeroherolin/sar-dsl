@@ -16,13 +16,13 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
 
 namespace {
-struct RaiseAffineToCopy : public sar::impl::RaiseAffineToCopyBase<RaiseAffineToCopy> {
+struct RaiseAffineToCopy
+    : public sar::impl::RaiseAffineToCopyBase<RaiseAffineToCopy> {
   void runOnOperation() override {
     auto func = getOperation();
     auto builder = OpBuilder(func);
@@ -59,7 +59,11 @@ struct RaiseAffineToCopy : public sar::impl::RaiseAffineToCopyBase<RaiseAffineTo
           }))
         continue;
 
-      // Make sure the loop nest accesses each element in the memory once.
+      // Make sure the loop nest accesses each element in the memory once. A
+      // dimension reused across results -- `(d0) -> (d0, d0)` sweeps the
+      // diagonal -- covers only a slice of the buffer, and raising it to a
+      // whole-buffer copy would overwrite elements the nest never touched.
+      llvm::SmallDenseSet<unsigned, 4> seenDims;
       auto exprAndShapeRange = llvm::zip(load.getAffineMap().getResults(),
                                          load.getMemRefType().getShape());
       if (llvm::any_of(exprAndShapeRange, [&](auto exprAndShape) {
@@ -69,6 +73,8 @@ struct RaiseAffineToCopy : public sar::impl::RaiseAffineToCopyBase<RaiseAffineTo
             if (auto constExpr = dyn_cast<AffineConstantExpr>(expr))
               return constExpr.getValue() != 0 || shape != 1;
             else if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+              if (!seenDims.insert(dimExpr.getPosition()).second)
+                return true;
               auto index = load.getMapOperands()[dimExpr.getPosition()];
               return shapeMap.lookup(index) != shape;
             } else
@@ -78,8 +84,8 @@ struct RaiseAffineToCopy : public sar::impl::RaiseAffineToCopyBase<RaiseAffineTo
 
       // Replace the loop nest with a copy op.
       builder.setInsertionPoint(band.front());
-      builder.create<memref::CopyOp>(band.front().getLoc(), load.getMemref(),
-                                     store.getMemref());
+      memref::CopyOp::create(builder, band.front().getLoc(), load.getMemref(),
+                             store.getMemref());
       band.front().erase();
     }
   }

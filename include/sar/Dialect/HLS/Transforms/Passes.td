@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- Passes.td - HLS dialect transformation passes -------*- tablegen -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -8,8 +8,6 @@
 #define SAR_DIALECT_HLS_TRANSFORMS_PASSES_TD
 
 include "mlir/Pass/PassBase.td"
-
-
 
 def FuncPreprocess : Pass<"hls-func-preprocess", "func::FuncOp"> {
   let dependentDialects = [
@@ -39,7 +37,6 @@ def BalanceDataflowNode :
   let constructor = "mlir::sar::createBalanceDataflowNodePass()";
 }
 
-
 def ConvertDataflowToFunc :
       Pass<"hls-convert-dataflow-to-func", "ModuleOp"> {
   let summary = "Convert dataflow to function dialect";
@@ -56,8 +53,6 @@ def CreateDataflowFromAffine :
   let summary = "Create dataflow hierarchy from affine loops";
   let constructor = "mlir::sar::createCreateDataflowFromAffinePass()";
 }
-
-
 
 def CreateTokenStream : Pass<"hls-create-token-stream", "func::FuncOp"> {
   let dependentDialects = [
@@ -111,11 +106,6 @@ def LowerDataflow : Pass<"hls-lower-dataflow", "func::FuncOp"> {
 
   let summary = "Lower dataflow from task level to node level";
   let constructor = "mlir::sar::createLowerDataflowPass()";
-
-  let options = [
-    Option<"splitExternalAccess", "split-external-access", "bool",
-           /*default=*/"true", "whether split external memory accesses">
-  ];
 }
 
 def ParallelizeDataflowNode :
@@ -124,7 +114,7 @@ def ParallelizeDataflowNode :
   let description = [{
     This pass calculates the overall loop unroll factor of each dataflow node
     based on the amount of associated computations. Then, unroll and jam from
-    the outermost loop until the overall unroll factor reaches the caculated
+    the outermost loop until the overall unroll factor reaches the calculated
     factor. Optionally, optimize the loop order after the unrolling.
   }];
   let constructor = "mlir::sar::createParallelizeDataflowNodePass()";
@@ -143,14 +133,49 @@ def ParallelizeDataflowNode :
 
 def PlaceDataflowBuffer :
       Pass<"hls-place-dataflow-buffer", "func::FuncOp"> {
+  let dependentDialects = [
+    "mlir::sar::hls::HLSDialect", "mlir::affine::AffineDialect",
+    "mlir::arith::ArithDialect", "mlir::func::FuncDialect",
+    "mlir::linalg::LinalgDialect", "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect", "mlir::tensor::TensorDialect",
+    "mlir::vector::VectorDialect",
+    "mlir::bufferization::BufferizationDialect"];
+
   let summary = "Place dataflow buffers";
+  let description = [{
+    Bind each buffer to an on-chip memory tier, or to DRAM when no tier has
+    room. A buffer's tier follows its measured size: one small enough to
+    sit in distributed RAM without competing with the logic goes to LUTRAM,
+    a contiguous plane large enough to fill ultra RAM blocks goes to URAM,
+    the rest go to block RAM. Tiers are charged in whole primitives -- a
+    36Kb block holding one kilobyte is spent -- so the budgets cannot
+    over-promise. A tier budget of 0 means that tier is unbounded; the
+    lutram-max/uram-min thresholds steer between tiers either way.
+
+    Buffers at or above `threshold` elements move to DRAM -- that is what
+    lets scene size grow past the device -- except constant buffers, which
+    are the ROM tables the design needs on entry and never stream.
+    Function arguments are placed too and count against the same budgets:
+    an interface array occupies the same primitives as a local buffer.
+  }];
   let constructor = "mlir::sar::createPlaceDataflowBufferPass()";
 
   let options = [
     Option<"threshold", "threshold", "unsigned", /*default=*/"1024",
-           "Positive number: the threshold of placing external buffers">,
-    Option<"placeExternalBuffer", "place-external-buffer", "bool",
-           /*default=*/"true", "Place buffers in external buffers">
+           "Element count at or above which a buffer is placed in DRAM">,
+    Option<"bramBytes", "bram-bytes", "unsigned", /*default=*/"0",
+           "Block RAM the design may occupy, in bytes (0 is unbounded)">,
+    Option<"uramBytes", "uram-bytes", "unsigned", /*default=*/"0",
+           "Ultra RAM the design may occupy, in bytes (0 is unbounded)">,
+    Option<"lutramBytes", "lutram-bytes", "unsigned", /*default=*/"0",
+           "Distributed RAM the design may occupy, in bytes (0 is "
+           "unbounded)">,
+    Option<"lutramMaxBytes", "lutram-max-bytes", "unsigned",
+           /*default=*/"256",
+           "Buffer size, in bytes, at or below which distributed RAM is "
+           "preferred">,
+    Option<"uramMinBytes", "uram-min-bytes", "unsigned", /*default=*/"36864",
+           "Buffer size, in bytes, at or above which ultra RAM is preferred">
   ];
 }
 
@@ -179,67 +204,8 @@ def StreamDataflowTask : Pass<"hls-stream-dataflow-task", "func::FuncOp"> {
 }
 
 //===----------------------------------------------------------------------===//
-// Tensor-related Passes
-//===----------------------------------------------------------------------===//
-
-
-
-
-
-
-//===----------------------------------------------------------------------===//
 // Loop-related Passes
 //===----------------------------------------------------------------------===//
-
-def AffineLoopFusion : Pass<"hls-affine-loop-fusion", "func::FuncOp"> {
-  let dependentDialects = [
-    "mlir::sar::hls::HLSDialect", "mlir::affine::AffineDialect",
-    "mlir::arith::ArithDialect", "mlir::func::FuncDialect",
-    "mlir::linalg::LinalgDialect", "mlir::memref::MemRefDialect",
-    "mlir::scf::SCFDialect", "mlir::tensor::TensorDialect",
-    "mlir::vector::VectorDialect",
-    "mlir::bufferization::BufferizationDialect"];
-
-  let summary = "Fuse affine loop nests";
-  let description = [{
-    This pass performs fusion of loop nests using a slicing-based approach. It
-    combines two fusion strategies: producer-consumer fusion and sibling fusion.
-    Producer-consumer fusion is aimed at fusing pairs of loops where the first
-    one writes to a memref that the second reads. Sibling fusion targets pairs
-    of loops that share no dependences between them but that load from the same
-    memref. The fused loop nests, when possible, are rewritten to access
-    significantly smaller local buffers instead of the original memref's, and
-    the latter are often either completely optimized away or contracted. This
-    transformation leads to enhanced locality and lower memory footprint through
-    the elimination or contraction of temporaries/intermediate memref's. These
-    benefits are sometimes achieved at the expense of redundant computation
-    through a cost model that evaluates available choices such as the depth at
-    which a source slice should be materialized in the designation slice.
-  }];
-  let constructor = "mlir::sar::createAffineLoopFusionPass()";
-
-  let options = [
-    Option<"computeToleranceThreshold", "fusion-compute-tolerance", "double",
-           /*default=*/"0.30f", "Fractional increase in additional computation "
-                                "tolerated while fusing">,
-    Option<"fastMemorySpace", "fusion-fast-mem-space", "unsigned",
-           /*default=*/"0",
-           "Faster memory space number to promote fusion buffers to">,
-    Option<"localBufSizeThreshold", "fusion-local-buf-threshold", "uint64_t",
-           /*default=*/"0", "Threshold size (KiB) for promoting local buffers "
-                            "to fast memory space">,
-    Option<"maximalFusion", "fusion-maximal", "bool", /*default=*/"false",
-           "Enables maximal loop fusion">,
-    Option<"affineFusionMode", "mode", "enum AffineFusionMode",
-           "AffineFusionMode::Greedy", "fusion mode to attempt",
-           "llvm::cl::values(clEnumValN(AffineFusionMode::Greedy,"
-           " \"greedy\", \"Perform greedy fusion\"), "
-           "clEnumValN( AffineFusionMode::ProducerConsumer, "
-           "\"producer\", \"Perform only producer-consumer fusion\"), "
-           "clEnumValN( AffineFusionMode::Sibling, "
-           "\"sibling\", \"Perform only sibling fusion\"))">
-    ];
-}
 
 def AffineLoopOrderOpt :
       Pass<"hls-affine-loop-order-opt", "func::FuncOp"> {
@@ -291,8 +257,6 @@ def AffineLoopTile : Pass<"hls-affine-loop-tile", "func::FuncOp"> {
   ];
 }
 
-
-
 def RemoveVariableBound :
       Pass<"hls-remove-variable-bound", "func::FuncOp"> {
   let summary = "Try to remove variable loop bounds";
@@ -319,40 +283,17 @@ def AffineStoreForward : Pass<"hls-affine-store-forward", "func::FuncOp"> {
 
   let summary = "Forward store to load, including conditional stores";
   let description = [{
-    This pass is similar to scal-repl, but supports to forward stores located in
-    if statements.
+    This pass is similar to scal-repl, but supports forwarding stores located
+    in if statements.
   }];
   let constructor = "mlir::sar::createAffineStoreForwardPass()";
 }
-
 
 def CollapseMemrefUnitDims :
       Pass<"hls-collapse-memref-unit-dims", "func::FuncOp"> {
   let summary = "Collapse memref's unit dimensions";
   let constructor = "mlir::sar::createCollapseMemrefUnitDimsPass()";
 }
-
-
-def CreateLocalBuffer : Pass<"hls-create-local-buffer", "func::FuncOp"> {
-  let dependentDialects = [
-    "mlir::sar::hls::HLSDialect", "mlir::affine::AffineDialect",
-    "mlir::arith::ArithDialect", "mlir::func::FuncDialect",
-    "mlir::linalg::LinalgDialect", "mlir::memref::MemRefDialect",
-    "mlir::scf::SCFDialect", "mlir::tensor::TensorDialect",
-    "mlir::vector::VectorDialect",
-    "mlir::bufferization::BufferizationDialect"];
-
-  let summary = "Promote external buffer to on-chip buffer";
-  let constructor = "mlir::sar::createCreateLocalBufferPass()";
-
-  let options = [
-    Option<"externalBufferOnly", "external-buffer-only", "bool",
-           /*default=*/"true", "only handle external buffers">,
-    Option<"registerOnly", "register-only", "bool",
-           /*default=*/"false", "only registers or single-element buffers">
-  ];
-}
-
 
 def LowerCopyToAffine : Pass<"hls-lower-copy-to-affine", "func::FuncOp"> {
   let dependentDialects = [
@@ -387,10 +328,10 @@ def RaiseAffineToCopy : Pass<"hls-raise-affine-to-copy", "func::FuncOp"> {
 
 def ReduceInitialInterval :
       Pass<"hls-reduce-initial-interval", "func::FuncOp"> {
-  let summary = "Try to reduce the intiail interval";
+  let summary = "Try to reduce the initiation interval";
   let description = [{
-    This pass try to reduce the II by optimizing the commutative operator trees
-    and iteration variables.
+    This pass tries to reduce the II by optimizing the commutative operator
+    trees and iteration variables.
   }];
   let constructor = "mlir::sar::createReduceInitialIntervalPass()";
 }
@@ -451,26 +392,14 @@ def ArrayPartition : Pass<"hls-array-partition", "ModuleOp"> {
     Option<"lutramMaxBits", "lutram-max-bits", "unsigned",
            /*default=*/"1024",
            "Bank size, in bits, below which distributed RAM is used">,
+    Option<"lutramBytes", "lutram-bytes", "unsigned", /*default=*/"0",
+           "Distributed RAM the design may occupy, in bytes (0 is "
+           "unbounded). Banking stops promoting into it once spent, so a "
+           "bank that would overrun the budget keeps the tier placement "
+           "already chose for it">,
     Option<"maxFactor", "max-factor", "unsigned", /*default=*/"32",
            "Positive number: the largest array partition factor to apply">
   ];
-}
-
-def CreateHLSPrimitive : Pass<"hls-create-hls-primitive", "func::FuncOp"> {
-  let dependentDialects = [
-    "mlir::sar::hls::HLSDialect", "mlir::affine::AffineDialect",
-    "mlir::arith::ArithDialect", "mlir::func::FuncDialect",
-    "mlir::linalg::LinalgDialect", "mlir::memref::MemRefDialect",
-    "mlir::scf::SCFDialect", "mlir::tensor::TensorDialect",
-    "mlir::vector::VectorDialect",
-    "mlir::bufferization::BufferizationDialect"];
-
-  let summary = "Create HLS C++ multiplification primitives";
-  let description = [{
-    This pass will convert 8-bits multiplifications to HLS C++ primitives in
-    order to utilize DSP instances in FPGA.
-  }];
-  let constructor = "mlir::sar::createCreateHLSPrimitivePass()";
 }
 
 def CreateAxiInterface : Pass<"hls-create-axi-interface", "ModuleOp"> {
@@ -492,10 +421,12 @@ def CreateAxiInterface : Pass<"hls-create-axi-interface", "ModuleOp"> {
 
   let options = [
     Option<"topFunc", "top-func", "std::string", /*default=*/"\"main\"",
-           "The top function for HLS synthesis">
+           "The top function for HLS synthesis">,
+    Option<"streamInterface", "stream-interface", "bool", /*default=*/"false",
+           "Bundle top-level ports as AXI4-Stream (axis) rather than AXI4 "
+           "memory-mapped masters">
   ];
 }
-
 
 def LoopPipelining : Pass<"hls-loop-pipelining", "func::FuncOp"> {
   let dependentDialects = [
@@ -521,10 +452,6 @@ def LoopPipelining : Pass<"hls-loop-pipelining", "func::FuncOp"> {
   ];
 }
 
-
-
-#endif // SAR_DIALECT_HLS_TRANSFORMS_PASSES_TD
-
 def CreateMemrefSubview :
       Pass<"hls-create-memref-subview", "func::FuncOp"> {
   let summary = "Create subviews based on loop analysis";
@@ -547,4 +474,4 @@ def CreateMemrefSubview :
   ];
 }
 
-
+#endif // SAR_DIALECT_HLS_TRANSFORMS_PASSES_TD

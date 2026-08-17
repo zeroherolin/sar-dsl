@@ -14,7 +14,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -23,7 +22,7 @@ using namespace hls;
 /// Apply loop pipelining to the input loop, all inner loops are automatically
 /// fully unrolled.
 bool sar::applyLoopPipelining(AffineLoopBand &band, unsigned pipelineLoc,
-                                   unsigned targetII) {
+                              unsigned targetII) {
   auto targetLoop = band[pipelineLoc];
 
   if (auto directive = getLoopDirective(targetLoop))

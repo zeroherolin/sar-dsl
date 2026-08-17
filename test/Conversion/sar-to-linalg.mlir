@@ -3,6 +3,10 @@
 // Reversal reaches linalg as an indexing map rather than a gather.
 // CHECK-DAG: #[[REV:.*]] = affine_map<(d0, d1) -> (d0, -d1 + 7)>
 
+// So does the fftshift rotation, which keeps the read an affine function
+// of the loop indices instead of a data-dependent extract.
+// CHECK-DAG: #[[SHIFT:.*]] = affine_map<(d0, d1) -> (d0, (d1 + 4) mod 8)>
+
 // CHECK-LABEL: func.func @binary
 func.func @binary(%a: tensor<4x8xf32>, %b: tensor<4x8xf32>) -> tensor<4x8xf32> {
   // CHECK: tensor.empty()
@@ -47,12 +51,15 @@ func.func @broadcast(%v: tensor<8xf32>) -> tensor<4x8xf32> {
   return %0 : tensor<4x8xf32>
 }
 
+// The rotation rides on the input's indexing map rather than on a gather
+// in the body, so the read stays an affine function of the loop indices.
 // CHECK-LABEL: func.func @fftshift
 func.func @fftshift(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
   // CHECK: linalg.generic
-  // CHECK: linalg.index
-  // CHECK: arith.remui
-  // CHECK: tensor.extract
+  // CHECK-SAME: indexing_maps = [#[[SHIFT]], #{{.*}}]
+  // CHECK-SAME: ins(%{{.*}} : tensor<4x8xf32>)
+  // CHECK-NOT: arith.remui
+  // CHECK-NOT: tensor.extract
   %0 = sar.fftshift %x {dim = 1 : i64} : tensor<4x8xf32>
   return %0 : tensor<4x8xf32>
 }
@@ -158,4 +165,81 @@ func.func @reverse_gather(%x: tensor<4x8xf64>) -> tensor<4x8xf64> {
   // CHECK-NOT: tensor.extract
   %0 = sar.reverse %x {dim = 1 : i64} : tensor<4x8xf64>
   return %0 : tensor<4x8xf64>
+}
+
+// CHECK-LABEL: func.func @cumsum_dim1
+func.func @cumsum_dim1(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
+  // Verify it becomes a scf.for nest; the inner for has an iter_arg.
+  // CHECK: scf.for
+  // CHECK: scf.for
+  // CHECK: tensor.insert
+  // CHECK: scf.yield
+  %0 = sar.cumsum %x {dim = 1 : i64} : tensor<4x8xf32>
+  return %0 : tensor<4x8xf32>
+}
+
+// CHECK-LABEL: func.func @cumsum_dim0
+func.func @cumsum_dim0(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
+  // CHECK: scf.for
+  %0 = sar.cumsum %x {dim = 0 : i64} : tensor<4x8xf32>
+  return %0 : tensor<4x8xf32>
+}
+
+// CHECK-LABEL: func.func @rank_filter_window3
+func.func @rank_filter_window3(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
+  // The body is a straight-line compare-exchange network (bubble sort):
+  // three compare-exchanges for window=3, yield the median (rank=1).
+  // CHECK: linalg.generic
+  // CHECK-DAG: arith.minimumf
+  // CHECK-DAG: arith.maximumf
+  %0 = sar.rank_filter %x {window = 3 : i64, rank = 1 : i64, dim = 1 : i64} : tensor<4x8xf32>
+  return %0 : tensor<4x8xf32>
+}
+
+// The 2-D gather is one parallel sweep whose body loads through clamped,
+// select-masked indices -- no control flow, HLS-pipelineable.
+// CHECK-LABEL: func.func @gather2d_lowering
+func.func @gather2d_lowering(%d: tensor<8x8xcomplex<f64>>,
+                             %r: tensor<4x4xf64>, %c: tensor<4x4xf64>)
+    -> tensor<4x4xcomplex<f64>> {
+  // CHECK: linalg.generic
+  // CHECK: arith.minsi
+  // CHECK: arith.maxsi
+  // CHECK: tensor.extract
+  // CHECK: arith.select
+  %0 = sar.gather2d %d, %r, %c
+      : (tensor<8x8xcomplex<f64>>, tensor<4x4xf64>, tensor<4x4xf64>)
+      -> tensor<4x4xcomplex<f64>>
+  return %0 : tensor<4x4xcomplex<f64>>
+}
+
+// The split form gathers both planes in one generic, so the tap indices
+// are computed once per element.
+// CHECK-LABEL: func.func @gather2d_split_lowering
+func.func @gather2d_split_lowering(%re: tensor<8x8xf64>, %im: tensor<8x8xf64>,
+                                   %r: tensor<4x4xf64>, %c: tensor<4x4xf64>)
+    -> (tensor<4x4xf64>, tensor<4x4xf64>) {
+  // CHECK: linalg.generic
+  // CHECK: tensor.extract
+  // CHECK-NOT: sar.gather2d_split
+  %0:2 = sar.gather2d_split %re, %im, %r, %c
+      : (tensor<8x8xf64>, tensor<8x8xf64>, tensor<4x4xf64>, tensor<4x4xf64>)
+      -> (tensor<4x4xf64>, tensor<4x4xf64>)
+  return %0#0, %0#1 : tensor<4x4xf64>, tensor<4x4xf64>
+}
+
+// A compiled loop becomes scf.for over tensors: the carries map onto
+// iter_args and the trip count onto constant bounds.
+// CHECK-LABEL: func.func @iterate_lowering
+func.func @iterate_lowering(%z: tensor<4x4xf64>) -> tensor<4x4xf64> {
+  // CHECK: %[[FOR:.*]] = scf.for {{.*}} iter_args(%[[ACC:.*]] = %arg0)
+  // CHECK: scf.yield
+  // CHECK-NOT: sar.iterate
+  %0 = sar.iterate(%z) {trips = 6 : i64}
+      : (tensor<4x4xf64>) -> tensor<4x4xf64> {
+  ^bb0(%acc: tensor<4x4xf64>):
+    %1 = sar.mul %acc, %acc : tensor<4x4xf64>
+    sar.yield %1 : tensor<4x4xf64>
+  }
+  return %0 : tensor<4x4xf64>
 }

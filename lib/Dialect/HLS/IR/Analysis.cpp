@@ -82,8 +82,6 @@ ComplexityAnalysis::calculateBlockComplexity(Block *block) const {
       }
       complexity += ifComplexity;
     }
-    // else if (!op.hasTrait<OpTrait::IsTerminator>())
-    //   complexity += 1;
   }
   return complexity;
 }
@@ -110,7 +108,8 @@ getBufferIndexDepthsAndStrides(NodeOp node, Value buffer) {
       memref = read.getMemRef();
       map = read.getAffineMap();
       operands = read.getMapOperands();
-    } else if (auto write = dyn_cast<mlir::affine::AffineWriteOpInterface>(op)) {
+    } else if (auto write =
+                   dyn_cast<mlir::affine::AffineWriteOpInterface>(op)) {
       memref = write.getMemRef();
       map = write.getAffineMap();
       operands = write.getMapOperands();
@@ -258,7 +257,6 @@ CorrelationAnalysis::CorrelationAnalysis(func::FuncOp func) {
             // clang-format on
         );
 
-        // correlations.push_back(corr);
         nodeCorrelationMap[producer].push_back(corr);
         nodeCorrelationMap[consumer].push_back(corr);
       }

@@ -1,4 +1,4 @@
-//===- FuseElementwise.cpp - Fusion that weighs a plane against a recompute ===//
+//===- FuseElementwise.cpp - Recompute-aware element-wise fusion ----------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

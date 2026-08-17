@@ -53,8 +53,8 @@ public:
         if (i.value() >= 0 && i.value() < (int64_t)targetToSourceMap.size())
           assert((int64_t)i.index() == targetToSourceMap[i.value()] &&
                  "mismatched source-to-target map");
-        else if (i.value() != -1)
-          assert("invalid source-to-target map");
+        else
+          assert(i.value() == -1 && "invalid source-to-target map");
     }
 
     if (!targetToSourceMap.empty()) {
@@ -65,8 +65,8 @@ public:
         if (i.value() >= 0 && i.value() < (int64_t)sourceToTargetMap.size())
           assert((int64_t)i.index() == sourceToTargetMap[i.value()] &&
                  "mismatched target-to-source map");
-        else if (i.value() != -1)
-          assert("invalid target-to-source map");
+        else
+          assert(i.value() == -1 && "invalid target-to-source map");
     }
 
     assert(getNodeLoopBand(sourceNode).size() == sourceScaleFactors.size() &&
@@ -84,8 +84,8 @@ public:
 
   /// Check whether a node is source node.
   bool isSourceNode(NodeOp currentNode) const {
-    assert(currentNode == sourceNode ||
-           currentNode == targetNode && "invalid input node");
+    assert((currentNode == sourceNode || currentNode == targetNode) &&
+           "invalid input node");
     return currentNode == sourceNode;
   }
 
@@ -127,8 +127,12 @@ public:
         scaledFactor = 1.0;
         roundedFlag = true;
       }
-      assert(scaledFactor == (unsigned)scaledFactor &&
-             "scaled factor is not integer");
+      // A non-integer ratio between the two bands cannot be expressed as an
+      // unroll factor; round it and report, rather than assert on input.
+      if (scaledFactor != (unsigned)scaledFactor) {
+        scaledFactor = std::max(1.0f, std::floor(scaledFactor));
+        roundedFlag = true;
+      }
       scaledFactors.push_back(scaledFactor);
     }
     return {scaledFactors, roundedFlag};
@@ -178,8 +182,9 @@ public:
   auto end() { return nodeCorrelationMap.end(); }
 
 private:
-  // SmallVector<Correlation> correlations;
-  llvm::SmallDenseMap<NodeOp, CorrelationList> nodeCorrelationMap;
+  /// A MapVector: consumers build worklists by iterating this map, and the
+  /// order has to be the walk order, not pointer order.
+  llvm::MapVector<NodeOp, CorrelationList> nodeCorrelationMap;
 };
 
 } // namespace sar

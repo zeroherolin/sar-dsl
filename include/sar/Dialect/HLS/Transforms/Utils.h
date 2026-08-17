@@ -47,34 +47,25 @@ bool applyLoopUnrollJam(AffineLoopBand &band, FactorList unrollFactors);
 /// Fully unroll all loops insides of a loop block.
 bool applyFullyLoopUnrolling(Block &block, unsigned maxIterNum = 10);
 
-/// Apply the specified array partition factors and kinds.
 /// Applies `factors`/`kinds` to `array`. A bank holding fewer than
-/// `lutramMaxBits` bits is placed in distributed RAM.
+/// `lutramMaxBits` bits is placed in distributed RAM, so long as
+/// `lutramBitsBudget` (0 = unbounded) still has room; `lutramBitsUsed`
+/// carries the running total across every array in a design.
 bool applyArrayPartition(Value array, ArrayRef<unsigned> factors,
                          ArrayRef<hls::PartitionKind> kinds,
                          bool updateFuncSignature = true,
-                         unsigned lutramMaxBits = 1024);
+                         unsigned lutramMaxBits = 1024,
+                         uint64_t lutramBitsBudget = 0,
+                         uint64_t *lutramBitsUsed = nullptr);
 
 /// Find the suitable array partition factors and kinds for all arrays in the
 /// targeted function.
-bool applyAutoArrayPartition(func::FuncOp func,
-                             unsigned lutramMaxBits = 1024,
-                             unsigned maxFactor = 32);
+bool applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits = 1024,
+                             unsigned maxFactor = 32,
+                             uint64_t lutramBitsBudget = 0,
+                             uint64_t *lutramBitsUsed = nullptr);
 
 bool applyFuncPreprocess(func::FuncOp func, bool topFunc);
-
-/// Apply memory optimizations.
-bool applyMemoryOpts(func::FuncOp func);
-
-/// Apply optimization strategy to a loop band. The ancestor function is also
-/// passed in because the post-tiling optimizations have to take function as
-/// target, e.g. canonicalizer and array partition.
-bool applyOptStrategy(AffineLoopBand &band, func::FuncOp func,
-                      FactorList tileList, unsigned targetII);
-
-/// Apply optimization strategy to a function.
-bool applyOptStrategy(func::FuncOp func, ArrayRef<FactorList> tileLists,
-                      ArrayRef<unsigned> targetIIs);
 
 } // namespace sar
 } // namespace mlir

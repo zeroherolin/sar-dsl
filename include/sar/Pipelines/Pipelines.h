@@ -41,11 +41,27 @@ struct SARBufferPipelineOptions
       *this, "transpose-block-bytes",
       llvm::cl::desc("On-chip bytes a staged transpose block may occupy"),
       llvm::cl::init(0)};
+
+  /// Whether `convert-sar-interp-to-affine` may emit the banded gather. The
+  /// test pipeline toggles this off to validate the banded path numerically,
+  /// and a backend rollout can disable it globally without touching the pass.
+  Option<bool> interpEnableBandedGather{
+      *this, "interp-enable-banded-gather",
+      llvm::cl::desc("Allow the banded interpolation gather"),
+      llvm::cl::init(true)};
+
+  /// How many consecutive Stockham stages share a scratch slot. Zero keeps
+  /// the full unroll, where each stage owns its line and the transform is a
+  /// chain a dataflow backend can overlap; k > 0 trades that overlap for
+  /// fewer live scratch buffers, which is on-chip area.
+  Option<unsigned> fftStageGroup{
+      *this, "fft-stage-group",
+      llvm::cl::desc("Stockham stages per scratch slot (0 = full unroll)"),
+      llvm::cl::init(0)};
 };
 
-/// Lowers SAR kernels to linalg-on-tensors. This is the hand-off level for
-/// HLS-oriented backends, which run their own
-/// bufferization and loop transformations.
+/// Lowers SAR kernels to linalg-on-tensors: the hand-off level for external
+/// backends that run their own bufferization and loop transformations.
 void buildSARToLinalgPipeline(OpPassManager &pm);
 
 /// Lowers SAR kernels all the way to the LLVM dialect for CPU execution.

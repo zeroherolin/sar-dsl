@@ -3,7 +3,7 @@
 collection, compile the kernel and save a PNG.
 
 Usage:
-    python run_point_target_cpu.py [--n 512] [--output pfa_cpu.png]
+    python run_point_target_cpu.py [--n 512] [--output PATH]
 """
 
 import argparse
@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 _EXAMPLES = Path(__file__).resolve().parents[1]
+_HERE = Path(__file__).resolve().parent
 sys.path[:0] = [
     str(_EXAMPLES),
     str(_EXAMPLES.parent / "python"),
@@ -21,6 +22,7 @@ sys.path[:0] = [
 ]
 
 from common.plot import save_db_image  # noqa: E402
+from common.quality import print_focus_quality  # noqa: E402
 from pfa.algorithm import build_kernel, make_inputs  # noqa: E402
 from pfa.geometry import Geometry  # noqa: E402
 from metrics import measure_cut  # noqa: E402
@@ -32,7 +34,8 @@ def main() -> None:
                         type=int,
                         default=512,
                         help="raster size (power of two)")
-    parser.add_argument("--output", default="pfa_cpu.png")
+    parser.add_argument("--output",
+                        default=str(_HERE / "assets" / "pfa_cpu.png"))
     args = parser.parse_args()
 
     n = args.n
@@ -56,6 +59,8 @@ def main() -> None:
         row, col = n + int(round(2 * y)), n + int(round(2 * x))
         window = filtered[row - 2:row + 3, col - 2:col + 3]
         assert window.max() == filtered[row, col], (x, y)
+    print(f"      all {len(targets)} scatterers on their predicted pixels")
+    print_focus_quality(uniform)
     i, j = np.unravel_index(np.argmax(uniform), uniform.shape)
     for name, image in (("uniform", uniform), ("SVA", filtered)):
         cut = measure_cut(image[i, :])
@@ -63,6 +68,7 @@ def main() -> None:
               f"IRW {cut['irw'] / 2:.2f} cells")
 
     output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
     print(f"[3/3] Saving {output} ...")
     save_db_image(
         filtered, str(output),

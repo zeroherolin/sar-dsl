@@ -84,10 +84,13 @@ class TensorType:
         if len(self.shape) < 1:
             raise ValueError("SAR tensors must have rank >= 1")
         for dim in self.shape:
-            if not isinstance(dim, (int, np.integer)) or dim <= 0:
+            if isinstance(
+                    dim,
+                    bool) or not isinstance(dim,
+                                            (int, np.integer)) or dim <= 0:
                 raise ValueError(
-                    f"SAR tensor shapes must be static and positive, got "
-                    f"{self.shape}")
+                    f"SAR tensor shapes must be static positive integers, "
+                    f"got {self.shape}")
 
     @property
     def rank(self) -> int:
@@ -180,6 +183,27 @@ class DenseAttr:
 
 
 @dataclass
+class Region:
+    """A single-block region: block arguments, body, and the values the
+    terminating `sar.yield` carries."""
+
+    arguments: List[Value]
+    operations: List[Operation] = field(default_factory=list)
+    yields: List[Value] = field(default_factory=list)
+
+    def render(self, indent: str) -> str:
+        args = ", ".join(f"{v.name}: {v.type.mlir}" for v in self.arguments)
+        lines = ["({", f"{indent}^bb0({args}):"]
+        for op in self.operations:
+            lines.append(f"{indent}  {op.render(indent + '  ')}")
+        names = ", ".join(v.name for v in self.yields)
+        types = ", ".join(v.type.mlir for v in self.yields)
+        lines.append(f'{indent}  "sar.yield"({names}) : ({types}) -> ()')
+        lines.append(f"{indent}}})")
+        return "\n".join(lines)
+
+
+@dataclass
 class Operation:
     """A single operation in generic MLIR form."""
 
@@ -189,9 +213,18 @@ class Operation:
     attributes: Dict[str, object] = field(default_factory=dict)
     unit_attributes: Tuple[str, ...] = ()
     results: List[Value] = field(default_factory=list)
+    region: Optional[Region] = None
 
-    def render(self) -> str:
-        results = ", ".join(v.name for v in self.results)
+    def render(self, indent: str = "  ") -> str:
+        # Several results print as one group (`%3:2 = ...`), which later
+        # uses name per index (`%3#0`).
+        if len(self.results) > 1:
+            base = self.results[0].name.split("#")[0]
+            prefix = f"{base}:{len(self.results)} = "
+        elif self.results:
+            prefix = f"{self.results[0].name} = "
+        else:
+            prefix = ""
         operands = ", ".join(v.name for v in self.operands)
 
         attr_parts = [
@@ -199,26 +232,38 @@ class Operation:
         ]
         attr_parts += list(self.unit_attributes)
         props = f" <{{{', '.join(attr_parts)}}}>" if attr_parts else ""
+        region = f" {self.region.render(indent)}" if self.region else ""
 
         operand_types = ", ".join(v.type.mlir for v in self.operands)
         result_types = ", ".join(t.mlir for t in self.result_types)
         signature = f"({operand_types}) -> ({result_types})"
 
-        prefix = f"{results} = " if results else ""
-        return f'{prefix}"{self.op_name}"({operands}){props} : {signature}'
+        return (f'{prefix}"{self.op_name}"({operands}){props}{region}'
+                f" : {signature}")
 
 
 class Function:
     """A function under construction; owns SSA numbering."""
 
-    def __init__(self, name: str, arg_types: Sequence[TensorType]):
+    def __init__(self,
+                 name: str,
+                 arg_types: Sequence[TensorType],
+                 arg_names: Optional[Sequence[str]] = None):
         self.name = name
         self.arguments: List[Value] = [
             Value(f"%arg{i}", t) for i, t in enumerate(arg_types)
         ]
+        #: Python parameter names, carried into the IR as `sar.arg_names`
+        #: so emission backends can name ports after them.
+        self.arg_names: Optional[List[str]] = (list(arg_names)
+                                               if arg_names else None)
         self.operations: List[Operation] = []
         self.returned: Optional[List[Value]] = None
         self._next_id = 0
+        #: Emission targets: the function body, plus one frame per open
+        #: region (`push_region`). `emit` appends to the innermost.
+        self._frames: List[List[Operation]] = [self.operations]
+        self._open_regions: List[Region] = []
 
     def _new_value(self, type: TensorType) -> Value:
         value = Value(f"%{self._next_id}", type)
@@ -237,8 +282,53 @@ class Function:
         op = Operation(op_name, list(operands), [result_type],
                        dict(attributes or {}), tuple(unit_attributes))
         op.results = [self._new_value(result_type)]
-        self.operations.append(op)
+        self._frames[-1].append(op)
         return op.results[0]
+
+    # -- Region-carrying operations (`sar.iterate`) --------------------------
+
+    def push_region(self, arg_types: Sequence[TensorType]) -> List[Value]:
+        """Opens a region: ops emitted until the matching `pop_region` land
+        in it. Returns the region's block arguments."""
+        region = Region([self._new_value(t) for t in arg_types])
+        self._open_regions.append(region)
+        self._frames.append(region.operations)
+        return region.arguments
+
+    def pop_region(self, yields: Sequence[Value]) -> Region:
+        """Closes the innermost region, attaching its yielded values."""
+        self._frames.pop()
+        region = self._open_regions.pop()
+        region.yields = list(yields)
+        return region
+
+    def abort_region(self) -> None:
+        """Discards the innermost region (tracing its body raised)."""
+        self._frames.pop()
+        self._open_regions.pop()
+
+    def emit_region_op(
+        self,
+        op_name: str,
+        operands: Sequence[Value],
+        result_types: Sequence[TensorType],
+        region: Region,
+        attributes: Optional[Dict[str, object]] = None,
+    ) -> List[Value]:
+        """Appends an operation holding `region`, with one result group."""
+        op = Operation(op_name, list(operands), list(result_types),
+                       dict(attributes or {}))
+        op.region = region
+        base = self._next_id
+        self._next_id += 1
+        if len(result_types) == 1:
+            op.results = [Value(f"%{base}", result_types[0])]
+        else:
+            op.results = [
+                Value(f"%{base}#{i}", t) for i, t in enumerate(result_types)
+            ]
+        self._frames[-1].append(op)
+        return op.results
 
     def set_return(self, values: Sequence[Value]) -> None:
         self.returned = list(values)
@@ -252,7 +342,13 @@ class Function:
         assert self.returned is not None, "function has no return yet"
         args = ", ".join(f"{v.name}: {v.type.mlir}" for v in self.arguments)
         rets = ", ".join(t.mlir for t in self.result_types)
-        lines = [f"{indent}func.func @{self.name}({args}) -> ({rets}) {{"]
+        attrs = ""
+        if self.arg_names:
+            names = ", ".join(f'"{n}"' for n in self.arg_names)
+            attrs = f" attributes {{sar.arg_names = [{names}]}}"
+        lines = [
+            f"{indent}func.func @{self.name}({args}) -> ({rets}){attrs} {{"
+        ]
         for op in self.operations:
             lines.append(f"{indent}  {op.render()}")
         ret_vals = ", ".join(v.name for v in self.returned)

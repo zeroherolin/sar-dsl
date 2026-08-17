@@ -15,7 +15,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 #define DEBUG_TYPE "array-partition"
 
 using namespace mlir;
@@ -80,9 +79,10 @@ static void updateSubFuncs(func::FuncOp func, Builder builder) {
 
 /// Apply the specified array partition factors and kinds.
 bool sar::applyArrayPartition(Value array, ArrayRef<unsigned> factors,
-                                   ArrayRef<hls::PartitionKind> kinds,
-                                   bool updateFuncSignature,
-                                   unsigned lutramMaxBits) {
+                              ArrayRef<hls::PartitionKind> kinds,
+                              bool updateFuncSignature, unsigned lutramMaxBits,
+                              uint64_t lutramBitsBudget,
+                              uint64_t *lutramBitsUsed) {
   auto arrayType = dyn_cast<MemRefType>(array.getType());
   if (!arrayType || isExtBuffer(array) || !arrayType.hasStaticShape() ||
       (int64_t)factors.size() != arrayType.getRank() ||
@@ -130,8 +130,25 @@ bool sar::applyArrayPartition(Value array, ArrayRef<unsigned> factors,
   // block RAM primitive holds -- into LUTs, and a design with a hundred of
   // them asks for more distributed RAM than the device has.
   auto elementBits = arrayType.getElementTypeBitWidth();
-  if ((uint64_t)actualDepth * elementBits < lutramMaxBits)
-    kindAttr = MemoryKindAttr::get(array.getContext(), MemoryKind::LUTRAM_2P);
+  uint64_t bankBits = (uint64_t)actualDepth * elementBits;
+  if (bankBits < lutramMaxBits) {
+    // Distributed RAM comes out of the SLICEM LUTs the datapath is built
+    // from, so it is the one tier that has to be rationed against the
+    // budget here as well: past it, the bank keeps whatever placement
+    // already chose rather than quietly overdrawing the fabric.
+    uint64_t banks = 1;
+    for (unsigned f : factors)
+      banks *= std::max(1u, f);
+    uint64_t cost = bankBits * banks;
+    bool affordable =
+        lutramBitsBudget == 0 ||
+        (lutramBitsUsed && *lutramBitsUsed + cost <= lutramBitsBudget);
+    if (affordable) {
+      if (lutramBitsUsed)
+        *lutramBitsUsed += cost;
+      kindAttr = MemoryKindAttr::get(array.getContext(), MemoryKind::LUTRAM_2P);
+    }
+  }
   array.setType(MemRefType::get(
       arrayType.getShape(), arrayType.getElementType(), layoutAttr, kindAttr));
 
@@ -179,7 +196,8 @@ static AffineValueMap getAffineValueMap(Operation *op) {
     operands = loadOp.getMapOperands();
     map = loadOp.getAffineMap();
 
-  } else if (auto storeOp = dyn_cast<mlir::affine::AffineWriteOpInterface>(op)) {
+  } else if (auto storeOp =
+                 dyn_cast<mlir::affine::AffineWriteOpInterface>(op)) {
     operands = storeOp.getMapOperands();
     map = storeOp.getAffineMap();
 
@@ -221,7 +239,7 @@ getDimAccessMaps(Operation *op, AffineValueMap valueMap, int64_t dim) {
   if (!permuteMap)
     return maps;
 
-  // Traverse each dimension of the transfered vector.
+  // Traverse each dimension of the transferred vector.
   for (unsigned i = 0, e = permuteMap.getNumResults(); i < e; ++i) {
     auto dimExpr = dyn_cast<AffineDimExpr>(permuteMap.getResult(i));
 
@@ -260,9 +278,9 @@ SmallVector<int64_t> createPermutationMap(ArrayRef<Value> vec1,
 
 /// Find the suitable array partition factors and kinds for all arrays in the
 /// targeted function.
-bool sar::applyAutoArrayPartition(func::FuncOp func,
-                                       unsigned lutramMaxBits,
-                                       unsigned maxFactor) {
+bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
+                                  unsigned maxFactor, uint64_t lutramBitsBudget,
+                                  uint64_t *lutramBitsUsed) {
   // Check whether the input function is pipelined.
   bool funcPipeline = false;
   if (auto attr = getFuncDirective(func))
@@ -287,8 +305,11 @@ bool sar::applyAutoArrayPartition(func::FuncOp func,
   // tentatively we always pick the one with the largest partition factor as the
   // final partition strategy. This "partitionsMap" is used to hold the current
   // partition strategy of each memref.
+  // A MapVector: the final application loop below spends the LUTRAM budget
+  // first come, first served, so iteration order has to be the program
+  // order the accesses were collected in, not pointer order.
   using Partition = std::pair<PartitionKind, int64_t>;
-  DenseMap<Value, SmallVector<Partition, 4>> partitionsMap;
+  llvm::MapVector<Value, SmallVector<Partition, 4>> partitionsMap;
 
   // Traverse all blocks that requires to be considered.
   for (auto block : targetBlocks) {
@@ -482,12 +503,14 @@ bool sar::applyAutoArrayPartition(func::FuncOp func,
   // Apply partition to all sub-functions and traverse all function to update
   // the "partitionsMap".
   func.walk([&](func::CallOp op) {
-    auto callee = SymbolTable::lookupNearestSymbolFrom(op, op.getCalleeAttr());
-    auto subFunc = dyn_cast<func::FuncOp>(callee);
-    assert(subFunc && "callable is not a function operation");
+    auto subFunc = dyn_cast_or_null<func::FuncOp>(
+        SymbolTable::lookupNearestSymbolFrom(op, op.getCalleeAttr()));
+    if (!subFunc)
+      return;
 
     // Apply array partition to the sub-function.
-    applyAutoArrayPartition(subFunc, lutramMaxBits, maxFactor);
+    applyAutoArrayPartition(subFunc, lutramMaxBits, maxFactor, lutramBitsBudget,
+                            lutramBitsUsed);
 
     for (auto [type, operand] :
          llvm::zip(subFunc.getArgumentTypes(), op.getOperands())) {
@@ -529,7 +552,8 @@ bool sar::applyAutoArrayPartition(func::FuncOp func,
     if (llvm::any_of(kinds, [](PartitionKind kind) {
           return kind != PartitionKind::NONE;
         }))
-      applyArrayPartition(memref, factors, kinds, false, lutramMaxBits);
+      applyArrayPartition(memref, factors, kinds, false, lutramMaxBits,
+                          lutramBitsBudget, lutramBitsUsed);
 
     if (auto axiPort = memref.getDefiningOp<AxiPortOp>()) {
       auto axiType = AxiType::get(memref.getContext(), memref.getType());
@@ -551,11 +575,14 @@ bool sar::applyAutoArrayPartition(func::FuncOp func,
 }
 
 namespace {
-struct ArrayPartition
-    : public sar::impl::ArrayPartitionBase<ArrayPartition> {
+struct ArrayPartition : public sar::impl::ArrayPartitionBase<ArrayPartition> {
+  using sar::impl::ArrayPartitionBase<ArrayPartition>::ArrayPartitionBase;
+
   ArrayPartition() = default;
-  explicit ArrayPartition(unsigned argLutramMaxBits, unsigned argMaxFactor) {
+  ArrayPartition(unsigned argLutramMaxBits, unsigned argLutramBytes,
+                 unsigned argMaxFactor) {
     lutramMaxBits = argLutramMaxBits;
+    lutramBytes = argLutramBytes;
     maxFactor = argMaxFactor;
   }
 
@@ -577,12 +604,16 @@ struct ArrayPartition
       emitError(module.getLoc(), "fail to find the top function");
       return signalPassFailure();
     }
-    applyAutoArrayPartition(topFunc, lutramMaxBits, maxFactor);
+    uint64_t lutramBitsUsed = 0;
+    applyAutoArrayPartition(topFunc, lutramMaxBits, maxFactor,
+                            (uint64_t)lutramBytes * 8, &lutramBitsUsed);
   }
 };
 } // namespace
 
 std::unique_ptr<Pass> sar::createArrayPartitionPass(unsigned lutramMaxBits,
-                                                         unsigned maxFactor) {
-  return std::make_unique<ArrayPartition>(lutramMaxBits, maxFactor);
+                                                    unsigned lutramBytes,
+                                                    unsigned maxFactor) {
+  return std::make_unique<ArrayPartition>(lutramMaxBits, lutramBytes,
+                                          maxFactor);
 }

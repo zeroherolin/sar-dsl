@@ -16,7 +16,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -95,7 +94,6 @@ struct FuseMultiConsumer : public OpRewritePattern<ScheduleOp> {
         hasChanged = true;
       }
     }
-    // schedule.setIsLegalAttr(rewriter.getUnitAttr());
     return success(hasChanged);
   }
 };
@@ -110,8 +108,7 @@ static void collectBypassNodes(
   unsigned maxDiff = 1;
   for (auto node : map.lookup(targetLevel)) {
     for (auto output : node.getOutputs()) {
-      if (isa<BlockArgument>(output) &&
-          node.getScheduleOp().isDependenceFree())
+      if (isa<BlockArgument>(output) && node.getScheduleOp().isDependenceFree())
         continue;
 
       // DRAM buffer is not considered - the dependencies associated with them
@@ -121,9 +118,14 @@ static void collectBypassNodes(
 
       SmallVector<std::pair<unsigned, NodeOp>, 4> bypassNodes;
       for (auto consumer : getDependentConsumers(output, node)) {
-        auto diff = node.getLevel().value() - consumer.getLevel().value();
+        // Unscheduled nodes carry no level; unsigned wrap on a reversed
+        // pair would fabricate a huge diff, so compute signed.
+        if (!node.getLevel() || !consumer.getLevel())
+          continue;
+        int64_t diff =
+            (int64_t)*node.getLevel() - (int64_t)*consumer.getLevel();
         if (diff > 1)
-          bypassNodes.push_back({diff, consumer});
+          bypassNodes.push_back({(unsigned)diff, consumer});
       }
       if (bypassNodes.empty())
         continue;
@@ -193,7 +195,6 @@ struct FuseBypassPath : public OpRewritePattern<ScheduleOp> {
 };
 } // namespace
 
-
 /// Whether any external buffer in `schedule` is written by more than one node.
 ///
 /// That is the signature of a DRAM buffer being reused across lifetimes that
@@ -215,7 +216,8 @@ static bool hasSharedExternalBuffer(ScheduleOp schedule) {
 }
 
 namespace {
-struct LegalizeDataflow : public sar::impl::LegalizeDataflowBase<LegalizeDataflow> {
+struct LegalizeDataflow
+    : public sar::impl::LegalizeDataflowBase<LegalizeDataflow> {
   void runOnOperation() override {
     auto func = getOperation();
     auto context = func.getContext();
@@ -228,8 +230,7 @@ struct LegalizeDataflow : public sar::impl::LegalizeDataflowBase<LegalizeDataflo
 
     func.walk([&](ScheduleOp schedule) {
       (void)applyOpPatternsGreedily(
-          ArrayRef<Operation *>{schedule.getOperation()},
-          frozenPatterns);
+          ArrayRef<Operation *>{schedule.getOperation()}, frozenPatterns);
 
       if (llvm::all_of(schedule.getOps<NodeOp>(),
                        [](NodeOp node) { return node.getLevel(); }) &&

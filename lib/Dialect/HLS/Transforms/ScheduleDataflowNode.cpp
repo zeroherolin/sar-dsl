@@ -16,7 +16,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace sar;
 using namespace hls;
@@ -71,7 +70,7 @@ struct ScheduleDataflowNode
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<ALAPScheduleNode>(context, ignoreViolations.getValue());
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+    (void)applyPatternsGreedily(func, std::move(patterns));
   }
 };
 } // namespace

@@ -11,7 +11,7 @@ demonstrated on both synthetic point targets and a real ALOS-1 dataset.
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
 | `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 | `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset (16384x16384) |
-| `run_alos_hls.py` | Emit a synthesizable design at the full ALOS raster |
+| `run_alos_hls.py` | Emit the ALOS-geometry artifact set (see below) |
 | `assets/` | Reference imagery |
 
 ## Processing chain
@@ -37,7 +37,21 @@ python examples/wka/run_point_target_cpu.py --n 512          # focus + PNG
 python examples/wka/run_point_target_hls.py --n 256     # design + csim package
 ```
 
-Each simulated point target focuses to roughly one resolution cell:
+The CPU runner reports where the brightest target landed and its
+impulse response; at `--n 512` each target focuses to roughly one
+resolution cell:
+
+```
+peak at (333, 358), expected (333, 358), error (+0, +0)
+  range: IRW  2.12 samples, PSLR  -31.7 dB, ISLR  -28.6 dB
+azimuth: IRW  2.20 samples, PSLR  -27.1 dB, ISLR  -22.9 dB
+```
+
+The HLS runner writes `hls_project/wka/`: the design `wka.cpp`, the
+testbench `wka_tb.cpp`, golden data in `wka_tb_data/`, the csim and
+csynth scripts (`wka_csim.tcl`, `wka_csynth.tcl`) and Vitis header
+stand-ins in `stubs/`. C simulation matches the NumPy reference to
+2.3e-10 over all 65536 output samples.
 
 ![synthetic point targets](assets/wka_synthetic_512.png)
 
@@ -47,12 +61,30 @@ Each simulated point target focuses to roughly one resolution cell:
 # from the repository root; the dataset is shared by all three algorithms
 python examples/data/extract_alos.py   # CEOS L1.0 -> alos_raw_...bin (2 GiB)
 python examples/wka/run_alos_cpu.py        # tens of GiB of RAM at full size
-python examples/wka/run_alos_hls.py   # emit the design at the same size
+python examples/wka/run_alos_hls.py   # emit the artifacts at that geometry
 ```
 
-The full 16384x16384 scene focuses in about 3.6 seconds on a large
-multi-core machine (fused element-wise kernels under OpenMP; multithreaded
-FFT/interpolation runtime). The effective radar velocity in `ALOS_PARAMS` is
-autofocus-calibrated by image-contrast maximization over the urban area:
+The full 16384x16384 scene focuses in 4.6 s on a 240-core machine
+(fused element-wise kernels under OpenMP; multithreaded FFT/interpolation
+runtime), reaching an urban-area contrast of 0.810
+(`benchmarks/metrics.py:urban_contrast`, higher is sharper). The
+effective radar velocity in `ALOS_PARAMS` is autofocus-calibrated by
+image-contrast maximization over the urban area:
 
 ![San Francisco Bay](assets/san_francisco_wka.png)
+
+`run_alos_hls.py` writes `hls_project/wka_alos/` with two designs,
+because no single design can be both synthesizable at scene size and
+simulatable:
+
+| Artifact | What it is |
+|---|---|
+| `wka_alos_axi.cpp` + `_axi_csynth.tcl` | the 16384x16384 design, `axi_interface=True`: streamed planes become AXI master ports, with its synthesis script |
+| `wka_alos.cpp` + `_tb.cpp` + `_csim.tcl` + `_csynth.tcl` + `_tb_data/` + `stubs/` | csim package at `--csim-n` (default 1024), same radar parameters |
+
+Why the AXI design is not simulated, and how the csim package keeps the
+acquisition's radar constants while rescaling only `t_shift`, is
+covered in [examples/README.md](../README.md#real-data-alos-1). At
+1024x1024 the reduced package focuses to IRW 1.65 samples in range
+(PSLR -30.9 dB) and csim-matches the reference to 4.7e-10 over
+1048576 samples.

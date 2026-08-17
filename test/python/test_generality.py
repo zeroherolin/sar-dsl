@@ -66,6 +66,11 @@ def _shapes(n):
                                            (n, n),
                                            dim=1)),
         ("corner", lambda x: sar.transpose(sar.transpose(x) * 2.0) + 1.0),
+        ("cumsum", lambda x: sar.cumsum(x, axis=1)),
+        ("rank_filter",
+         lambda x: sar.rank_filter(sar.absolute(x), window=3, rank=1, axis=1)),
+        ("median", lambda x: sar.median_filter(sar.absolute(x), 3, axis=1)),
+        ("sort", lambda x: sar.sort(sar.absolute(x), axis=1)),
     ]
 
 

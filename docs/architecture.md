@@ -66,7 +66,7 @@ because that syntax is stable regardless of custom assembly formats.
 
 ### 3. CPU execution model
 
-The `sar-to-llvm` pipeline (registered in `sar-opt`) does the entire descent:
+The `sar-to-llvm-pipeline` (registered in `sar-opt`) does the entire descent:
 
 1. `convert-sar-signal-to-runtime`: `sar.fft`/`sar.ifft`/`sar.interp1d`
    become calls to `libsar_runtime` using the documented
@@ -88,6 +88,18 @@ The `sar-to-llvm` pipeline (registered in `sar-opt`) does the entire descent:
    deallocation, **linalg -> scf.parallel -> OpenMP dialect** (linked
    against LLVM's libomp), complex->standard, and the usual LLVM
    conversions with `-O3 -march=native` codegen.
+
+   On this path the sharing runs with `allow-retype`; the mechanism, and
+   why the affine path leaves it off, are described with the pass in
+   [dialect.md](dialect.md#transformations-and-lowering-paths).
+
+   What the sharing can reach is bounded by what escapes. A buffer handed to
+   anything that returns a memref or a tensor may be aliased past the span
+   the scan measures, so it is left alone; on the CPU path that covers the
+   FFT and interpolation staging buffers, which reach the runtime through a
+   `memref.cast`. Those chains therefore save little here, and the sharing
+   that matters for them happens on the affine path, where the same
+   transforms are loop nests rather than calls.
 
 The Python launcher allocates result arrays with numpy and invokes
 `_mlir_ciface_<kernel>` via ctypes with strided memref descriptors.
@@ -178,18 +190,24 @@ All kernels follow the split-complex affine path (`sar-to-affine-pipeline`):
    masked with selects -- the loop bodies stay straight-line, which
    keeps HLS pipelining applicable. Position and weight arithmetic is
    f64, mirroring the CPU runtime.
-4. The bufferized affine IR enters the HLS pipeline (`-hls-pipeline`),
+4. `sar.gather2d` lowers like the interpolation -- clamped,
+   select-masked loads in a straight-line body -- and compiled loops
+   (`sar.iterate`) reach this flow as `scf.for`; since a dataflow task
+   may not yield values, `sar-demote-loop-carries` first rewrites the
+   buffer carry into side effects (the body iterates in the init buffer,
+   a per-iteration copy replaces the yield).
+5. The bufferized affine IR enters the HLS pipeline (`-hls-pipeline`),
    which builds the dataflow hierarchy, places buffers on or off chip and
    shapes the interfaces; `sar-translate` then emits Vitis HLS C++.
 
 With that, every SAR operation lowers in the affine flow and complete
-imaging chains (omega-K, range-Doppler, chirp scaling) emit as single
-HLS designs. Correctness is checked at two levels: the identical affine
+imaging chains (omega-K, range-Doppler, chirp scaling, polar format)
+emit as single HLS designs. Correctness is checked at two levels: the identical affine
 IR is compiled to native code by `--sar-affine-to-llvm-pipeline` and
 checked against numpy (validating the lowering's arithmetic), and the
 emitted C++ itself C-simulates against a generated testbench -- all four
-imaging chains match their NumPy references bit-exactly at f32 output
-precision.
+imaging chains pass, matching their NumPy references to rounding
+distance (`benchmarks/README.md` tabulates the errors).
 
 ## The HLS dialect
 

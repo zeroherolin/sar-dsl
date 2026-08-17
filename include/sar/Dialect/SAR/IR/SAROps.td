@@ -8,6 +8,7 @@
 #define SAR_DIALECT_SAR_IR_SAROPS_TD
 
 include "mlir/IR/OpAsmInterface.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "sar/Dialect/SAR/IR/SARDialect.td"
@@ -438,7 +439,8 @@ def SAR_Interp1DOp
 
     For `sinc`, `window` selects the taper over the support: `rect`,
     `hann` (default), `hamming`, or `kaiser` with shape parameter
-    `beta`. Out-of-range taps contribute zero for every kernel.
+    `beta`. Taps that fall outside the row are resolved by `boundary`
+    (below), which applies to every kernel.
 
     This is the orthogonal primitive underlying SAR interpolation
     stages: Stolt remapping (omega-K) and range cell migration
@@ -448,6 +450,11 @@ def SAR_Interp1DOp
     `dim` selects the resampled axis (default 1, i.e. per row);
     canonicalization normalizes `dim = 0` into transposes around the
     `dim = 1` form, which is the only one the lowerings implement.
+
+    `boundary` controls what happens when a tap index falls outside `[0, N-1]`:
+    - `zero` (default): out-of-range taps contribute zero.
+    - `edge`: clamp the source index to the nearest valid sample.
+    - `reflect`: mirror the index about the boundary, repeating the edge sample (`-1` reads sample 0): numpy's `pad(mode="symmetric")` and scipy.ndimage's `mode="reflect"`.
   }];
   let arguments = (ins SAR_ComplexTensor:$data,
                        SAR_FloatTensor:$positions,
@@ -455,13 +462,81 @@ def SAR_Interp1DOp
                        DefaultValuedAttr<StrAttr, "\"sinc\"">:$kernel,
                        DefaultValuedAttr<I64Attr, "8">:$taps,
                        DefaultValuedAttr<StrAttr, "\"hann\"">:$window,
-                       DefaultValuedAttr<F64Attr, "2.5">:$beta);
+                       DefaultValuedAttr<F64Attr, "2.5">:$beta,
+                       DefaultValuedAttr<StrAttr, "\"zero\"">:$boundary);
   let results = (outs SAR_ComplexTensor:$result);
   let assemblyFormat = [{
     $data `,` $positions attr-dict `:` functional-type(operands, results)
   }];
   let hasVerifier = 1;
   let hasCanonicalizer = 1;
+}
+
+def SAR_Gather2DOp
+    : SAR_Op<"gather2d", [Pure, AllTypesMatch<["rows", "cols"]>]> {
+  let summary = "2-D gather at data-dependent positions";
+  let description = [{
+    Samples a rank-2 tensor at fractional 2-D positions: for every output
+    element, `rows` and `cols` name the source coordinates to read.
+
+    ```
+    out[i, j] = data[rows[i, j], cols[i, j]]
+    ```
+
+    The output takes the shape of the position tensors, which is
+    independent of the data shape -- a backprojection gathers a pulse
+    raster onto an image grid.
+
+    `kernel` selects the sampling:
+    - `nearest`: one tap at the rounded coordinates
+    - `linear`:  bilinear over the four surrounding samples
+
+    `boundary` resolves taps outside the data extent, per axis:
+    - `zero` (default): out-of-range taps contribute zero
+    - `edge`: indices clamp to the nearest valid sample
+
+    This is the orthogonal primitive beyond per-line interpolation
+    (`sar.interp1d`): both coordinates may be arbitrary functions of the
+    output position, which is the access pattern of time-domain
+    backprojection.
+  }];
+  let arguments = (ins SAR_ComplexTensor:$data,
+                       SAR_FloatTensor:$rows,
+                       SAR_FloatTensor:$cols,
+                       DefaultValuedAttr<StrAttr, "\"linear\"">:$kernel,
+                       DefaultValuedAttr<StrAttr, "\"zero\"">:$boundary);
+  let results = (outs SAR_ComplexTensor:$result);
+  let assemblyFormat = [{
+    $data `,` $rows `,` $cols attr-dict `:`
+    functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+def SAR_Gather2DSplitOp : SAR_Op<"gather2d_split", [Pure,
+    AllTypesMatch<["rows", "cols"]>,
+    AllTypesMatch<["re", "im"]>,
+    AllTypesMatch<["out_re", "out_im"]>]> {
+  let summary = "split-complex 2-D gather at data-dependent positions";
+  let description = [{
+    The split-complex form of `sar.gather2d`, produced by
+    `sar-decomplexify` for targets without complex arithmetic. Semantics
+    match `sar.gather2d` with the complex tensor represented as separate
+    real and imaginary planes.
+
+    Compiler-internal: the frontend never emits this op. Write
+    `sar.gather2d` and let decomplexify produce it.
+  }];
+  let arguments = (ins SAR_FloatTensor:$re, SAR_FloatTensor:$im,
+                       SAR_FloatTensor:$rows, SAR_FloatTensor:$cols,
+                       DefaultValuedAttr<StrAttr, "\"linear\"">:$kernel,
+                       DefaultValuedAttr<StrAttr, "\"zero\"">:$boundary);
+  let results = (outs SAR_FloatTensor:$out_re, SAR_FloatTensor:$out_im);
+  let assemblyFormat = [{
+    $re `,` $im `,` $rows `,` $cols attr-dict `:`
+    functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
 }
 
 def SAR_Interp1DSplitOp : SAR_Op<"interp1d_split", [Pure,
@@ -483,11 +558,128 @@ def SAR_Interp1DSplitOp : SAR_Op<"interp1d_split", [Pure,
                        DefaultValuedAttr<StrAttr, "\"sinc\"">:$kernel,
                        DefaultValuedAttr<I64Attr, "8">:$taps,
                        DefaultValuedAttr<StrAttr, "\"hann\"">:$window,
-                       DefaultValuedAttr<F64Attr, "2.5">:$beta);
+                       DefaultValuedAttr<F64Attr, "2.5">:$beta,
+                       DefaultValuedAttr<StrAttr, "\"zero\"">:$boundary);
   let results = (outs SAR_FloatTensor:$out_re, SAR_FloatTensor:$out_im);
   let assemblyFormat = [{
     $re `,` $im `,` $positions attr-dict `:` functional-type(operands, results)
   }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Compiled loops
+//===----------------------------------------------------------------------===//
+
+def SAR_IterateOp : SAR_Op<"iterate", [RecursiveMemoryEffects,
+    SingleBlockImplicitTerminator<"YieldOp">]> {
+  let summary = "counted loop with tensor-carried state";
+  let description = [{
+    Applies the body `trips` times, feeding each iteration's yielded
+    values to the next as the block arguments. Unlike trace-time Python
+    loops, which unroll, this stays a single loop in the compiled design.
+
+    The block argument types, the operand types, the result types and
+    the yielded types all match, position by position. The trip count is
+    a compile-time constant and the body cannot observe the iteration
+    index.
+
+    Lowers to `scf.for` with tensor-carried `iter_args`
+    (`convert-sar-to-linalg`); `sar-decomplexify` splits complex carries
+    into (re, im) plane pairs first on targets without complex support.
+  }];
+  let arguments = (ins Variadic<SAR_Tensor>:$inits, I64Attr:$trips);
+  let results = (outs Variadic<SAR_Tensor>:$results);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    `(` $inits `)` attr-dict `:` functional-type($inits, $results) $body
+  }];
+  let hasVerifier = 1;
+
+  // The default builders cannot infer the variadic result types (they
+  // mirror the init types); the one builder every caller needs is spelled
+  // out instead.
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "::mlir::TypeRange":$results, "::mlir::ValueRange":$inits,
+                   "::mlir::IntegerAttr":$trips), [{
+      $_state.addOperands(inits);
+      $_state.addTypes(results);
+      $_state.addAttribute(getTripsAttrName($_state.name), trips);
+      $_state.addRegion();
+    }]>
+  ];
+}
+
+def SAR_YieldOp : SAR_Op<"yield", [Pure, ReturnLike, Terminator,
+    HasParent<"IterateOp">]> {
+  let summary = "yields the carried values of one `sar.iterate` step";
+  let arguments = (ins Variadic<SAR_Tensor>:$results);
+  let assemblyFormat = "$results attr-dict `:` type($results)";
+  let builders = [
+    OpBuilder<(ins), "build($_builder, $_state, ::mlir::ValueRange());">
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// Prefix scan / order-statistic
+//===----------------------------------------------------------------------===//
+
+def SAR_CumsumOp : SAR_Op<"cumsum", [Pure, SameOperandsAndResultType]> {
+  let summary = "prefix sum (cumulative sum) along one axis of a rank-2 tensor";
+  let description = [{
+    Computes the inclusive prefix sum along axis `dim` of a rank-2 tensor:
+
+    - `dim = 0`: `result[i, j] = sum_{k=0}^{i} input[k, j]`
+    - `dim = 1`: `result[i, j] = sum_{k=0}^{j} input[i, k]`
+
+    Accepted element types: `f32`, `f64`, `complex<f32>`, `complex<f64>`.
+    The scan is sequential; it is not decomposed into a parallel tree.
+  }];
+  let arguments = (ins SAR_FloatOrComplexTensor:$input, I64Attr:$dim);
+  let results = (outs SAR_FloatOrComplexTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($result)";
+  let hasVerifier = 1;
+}
+
+def SAR_RankFilterOp : SAR_Op<"rank_filter", [Pure, SameOperandsAndResultType]> {
+  let summary = "windowed order-statistic filter along one axis of a rank-2 tensor";
+  let description = [{
+    Applies an order-statistic filter along axis `dim`: for every position a
+    window of `window` elements (clamped at boundaries) is sorted and the
+    element at index `rank` (0-based, ascending order) is written to the result.
+
+    - `rank = 0` is the minimum, `rank = window - 1` is the maximum,
+      `rank = window / 2` (floor) is the median.
+    - `window` must be a positive odd integer.
+    - `0 <= rank < window`.
+    - Boundary: indices out of range are clamped to the nearest valid index.
+    - Element type must be float (`f32` or `f64`); complex ordering is
+      undefined, so complex inputs are rejected by the verifier.
+  }];
+  let arguments = (ins SAR_FloatTensor:$input, I64Attr:$window,
+                       I64Attr:$rank, I64Attr:$dim);
+  let results = (outs SAR_FloatTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($result)";
+  let hasVerifier = 1;
+}
+
+def SAR_SortOp : SAR_Op<"sort", [Pure, SameOperandsAndResultType]> {
+  let summary = "sorts each line of a rank-2 tensor along one axis";
+  let description = [{
+    Sorts every line along axis `dim` into ascending order (numpy `sort`):
+
+    - `dim = 0`: each column is sorted independently.
+    - `dim = 1`: each row is sorted independently.
+
+    Element type must be float (`f32` or `f64`); complex ordering is
+    undefined, so complex inputs are rejected by the verifier. The sort is
+    a compare-exchange network over the static extent, so it carries no
+    data-dependent control flow.
+  }];
+  let arguments = (ins SAR_FloatTensor:$input, I64Attr:$dim);
+  let results = (outs SAR_FloatTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($result)";
   let hasVerifier = 1;
 }
 

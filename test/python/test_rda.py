@@ -53,6 +53,8 @@ def test_rda_focuses_point_target(setup):
 
     window = image[i - 3:i + 4, j - 3:j + 4]
     energy_fraction = (window**2).sum() / (image**2).sum()
+    # Looser than WKA's 0.9 gate: residual RCMC interpolation error
+    # leaves some energy outside the 7x7 window.
     assert energy_fraction > 0.8
 
 

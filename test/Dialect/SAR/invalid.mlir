@@ -161,3 +161,136 @@ func.func @cast_int_to_complex(%x: tensor<4xi64>)
   %0 = sar.cast %x : tensor<4xi64> -> tensor<4xcomplex<f64>>
   return %0 : tensor<4xcomplex<f64>>
 }
+
+// -----
+
+func.func @cumsum_rank3(%x: tensor<2x4x8xf32>) -> tensor<2x4x8xf32> {
+  // expected-error @+1 {{expects a rank-2 input}}
+  %0 = sar.cumsum %x {dim = 0 : i64} : tensor<2x4x8xf32>
+  return %0 : tensor<2x4x8xf32>
+}
+
+// -----
+
+func.func @cumsum_bad_dim(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
+  // expected-error @+1 {{dim must be 0 or 1}}
+  %0 = sar.cumsum %x {dim = 2 : i64} : tensor<4x8xf32>
+  return %0 : tensor<4x8xf32>
+}
+
+// -----
+
+func.func @cumsum_int(%x: tensor<4x8xi32>) -> tensor<4x8xi32> {
+  // Integer elements are excluded by the operand type constraint.
+  // expected-error @+1 {{must be statically shaped tensor of}}
+  %0 = sar.cumsum %x {dim = 1 : i64} : tensor<4x8xi32>
+  return %0 : tensor<4x8xi32>
+}
+
+// -----
+
+func.func @rank_filter_even_window(%x: tensor<8x16xf32>) -> tensor<8x16xf32> {
+  // expected-error @+1 {{window must be a positive odd integer}}
+  %0 = sar.rank_filter %x {window = 4 : i64, rank = 2 : i64, dim = 1 : i64} : tensor<8x16xf32>
+  return %0 : tensor<8x16xf32>
+}
+
+// -----
+
+func.func @rank_filter_rank_oob(%x: tensor<8x16xf32>) -> tensor<8x16xf32> {
+  // expected-error @+1 {{rank must be in [0, window)}}
+  %0 = sar.rank_filter %x {window = 5 : i64, rank = 5 : i64, dim = 1 : i64} : tensor<8x16xf32>
+  return %0 : tensor<8x16xf32>
+}
+
+// -----
+
+func.func @rank_filter_bad_dim(%x: tensor<8x16xf32>) -> tensor<8x16xf32> {
+  // expected-error @+1 {{dim must be 0 or 1}}
+  %0 = sar.rank_filter %x {window = 3 : i64, rank = 1 : i64, dim = 2 : i64} : tensor<8x16xf32>
+  return %0 : tensor<8x16xf32>
+}
+
+// -----
+
+func.func @rank_filter_complex(%x: tensor<8x16xcomplex<f32>>) -> tensor<8x16xcomplex<f32>> {
+  // Ordering is undefined for complex: the operand type constraint rejects it.
+  // expected-error @+1 {{must be statically shaped tensor of}}
+  %0 = sar.rank_filter %x {window = 3 : i64, rank = 1 : i64, dim = 1 : i64} : tensor<8x16xcomplex<f32>>
+  return %0 : tensor<8x16xcomplex<f32>>
+}
+
+// -----
+
+func.func @sort_complex(%x: tensor<8x16xcomplex<f64>>) -> tensor<8x16xcomplex<f64>> {
+  // expected-error @+1 {{must be statically shaped tensor of}}
+  %0 = sar.sort %x {dim = 1 : i64} : tensor<8x16xcomplex<f64>>
+  return %0 : tensor<8x16xcomplex<f64>>
+}
+
+// -----
+
+func.func @sort_bad_dim(%x: tensor<8x16xf32>) -> tensor<8x16xf32> {
+  // expected-error @+1 {{dim must be 0 or 1}}
+  %0 = sar.sort %x {dim = 2 : i64} : tensor<8x16xf32>
+  return %0 : tensor<8x16xf32>
+}
+
+// -----
+
+func.func @interp_bad_boundary(%data: tensor<4x8xcomplex<f64>>, %pos: tensor<4x8xf64>)
+    -> tensor<4x8xcomplex<f64>> {
+  // expected-error @+1 {{boundary must be one of: zero, edge, reflect}}
+  %0 = sar.interp1d %data, %pos {boundary = "wrap"}
+      : (tensor<4x8xcomplex<f64>>, tensor<4x8xf64>)
+      -> (tensor<4x8xcomplex<f64>>)
+  return %0 : tensor<4x8xcomplex<f64>>
+}
+
+// -----
+
+func.func @gather_bad_kernel(%d: tensor<8x8xcomplex<f64>>,
+                             %p: tensor<4x4xf64>) -> tensor<4x4xcomplex<f64>> {
+  // expected-error @+1 {{kernel must be one of: nearest, linear}}
+  %0 = sar.gather2d %d, %p, %p {kernel = "cubic"}
+      : (tensor<8x8xcomplex<f64>>, tensor<4x4xf64>, tensor<4x4xf64>)
+      -> tensor<4x4xcomplex<f64>>
+  return %0 : tensor<4x4xcomplex<f64>>
+}
+
+// -----
+
+func.func @gather_bad_shape(%d: tensor<8x8xcomplex<f64>>,
+                            %p: tensor<4x4xf64>) -> tensor<8x8xcomplex<f64>> {
+  // expected-error @+1 {{result shape must match the position shape}}
+  %0 = sar.gather2d %d, %p, %p
+      : (tensor<8x8xcomplex<f64>>, tensor<4x4xf64>, tensor<4x4xf64>)
+      -> tensor<8x8xcomplex<f64>>
+  return %0 : tensor<8x8xcomplex<f64>>
+}
+
+// -----
+
+func.func @iterate_bad_trips(%z: tensor<4x4xf64>) -> tensor<4x4xf64> {
+  // expected-error @+1 {{trips must be at least 1}}
+  %0 = sar.iterate(%z) {trips = 0 : i64}
+      : (tensor<4x4xf64>) -> tensor<4x4xf64> {
+  ^bb0(%acc: tensor<4x4xf64>):
+    sar.yield %acc : tensor<4x4xf64>
+  }
+  return %0 : tensor<4x4xf64>
+}
+
+// -----
+
+func.func @iterate_type_drift(%z: tensor<4x4xf64>, %w: tensor<4x4xf32>)
+    -> tensor<4x4xf64> {
+  // expected-error @+1 {{carry #0 must keep one type}}
+  %0 = sar.iterate(%z) {trips = 2 : i64}
+      : (tensor<4x4xf64>) -> tensor<4x4xf64> {
+  ^bb0(%acc: tensor<4x4xf32>):
+    %1 = sar.cast %acc : tensor<4x4xf32> -> tensor<4x4xf64>
+    sar.yield %1 : tensor<4x4xf64>
+  }
+  return %0 : tensor<4x4xf64>
+}

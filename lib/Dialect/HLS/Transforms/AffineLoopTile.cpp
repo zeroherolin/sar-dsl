@@ -17,7 +17,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -198,7 +197,7 @@ static bool tilingCapturesReuse(AffineForOp loop) {
 /// Apply loop tiling to the input loop band and sink all intra-tile loops to
 /// the innermost loop with the original loop order.
 bool sar::applyLoopTiling(AffineLoopBand &band, FactorList tileList,
-                               bool loopNormalize, bool annotatePointLoop) {
+                          bool loopNormalize, bool annotatePointLoop) {
   assert(!band.empty() && "no loops provided");
   if (!isPerfectlyNested(band))
     return false;
@@ -269,8 +268,8 @@ bool sar::applyLoopTiling(AffineLoopBand &band, FactorList tileList,
 
 /// Reduces each tile size to the largest divisor of the corresponding trip
 /// count (if the trip count is known).
-void sar::adjustToDivisorsOfTripCounts(
-    ArrayRef<AffineForOp> band, SmallVectorImpl<unsigned> *tileSizes) {
+void sar::adjustToDivisorsOfTripCounts(ArrayRef<AffineForOp> band,
+                                       SmallVectorImpl<unsigned> *tileSizes) {
   assert(band.size() == tileSizes->size() && "invalid tile size count");
   for (unsigned i = 0, e = band.size(); i < e; i++) {
     unsigned &tSizeAdjusted = (*tileSizes)[i];
@@ -297,8 +296,7 @@ void sar::adjustToDivisorsOfTripCounts(
 
 namespace {
 /// A pass to perform loop tiling on all suitable loop nests of a Function.
-struct AffineLoopTile
-    : public sar::impl::AffineLoopTileBase<AffineLoopTile> {
+struct AffineLoopTile : public sar::impl::AffineLoopTileBase<AffineLoopTile> {
   AffineLoopTile() = default;
   explicit AffineLoopTile(unsigned loopTileSize, unsigned argTileBufferBytes) {
     tileSize = loopTileSize;
@@ -309,7 +307,6 @@ struct AffineLoopTile
     // Bands of loops to tile.
     std::vector<SmallVector<AffineForOp, 6>> bands;
     getLoopBands(getOperation().front(), bands);
-    // getTileableBands(getOperation(), &bands);
 
     // Tile each band.
     for (auto &band : bands) {
@@ -377,8 +374,7 @@ struct AffineLoopTile
 
 /// Creates a pass to perform loop tiling on all suitable loop nests of a
 /// Function.
-std::unique_ptr<Pass>
-sar::createAffineLoopTilePass(unsigned loopTileSize,
-                                   unsigned tileBufferBytes) {
+std::unique_ptr<Pass> sar::createAffineLoopTilePass(unsigned loopTileSize,
+                                                    unsigned tileBufferBytes) {
   return std::make_unique<AffineLoopTile>(loopTileSize, tileBufferBytes);
 }

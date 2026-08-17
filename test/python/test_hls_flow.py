@@ -1,23 +1,29 @@
-"""End-to-end validation of the HLS (affine) flow on complete algorithms.
+"""End-to-end numerical validation of the HLS (affine) flow.
 
-Two complementary checks per algorithm:
-1. numerical: the exact IR handed to the HLS pipeline is compiled for
-   the CPU
-   through `sar-affine-to-llvm-pipeline` and compared against the NumPy
-   reference;
-2. emission: the HLS backend produces Vitis HLS C++ for the full
-   kernel (skipped when the HLS toolchain is absent).
+The exact IR handed to the HLS pipeline is compiled for the CPU through
+`sar-affine-to-llvm-pipeline` and compared against the NumPy reference,
+for every complete algorithm (wka, rda, csa, pfa). HLS *emission* tests
+live in the per-algorithm files (test_wka.py, test_rda.py, ...).
 """
 
 import numpy as np
 import pytest
 
-from conftest import requires_cpu, requires_hls
+from conftest import requires_cpu
 from conftest import compile_split_kernel as _compile_split_kernel
 from conftest import run_split as _run_split
 
 from common.params import synthetic_params
 from common.simulate import demo_scene
+from csa.algorithm import build_kernel as build_csa_kernel
+from csa.algorithm import make_inputs as csa_inputs
+from csa.reference import CSAProcessor
+from pfa.algorithm import build_kernel as build_pfa_kernel
+from pfa.geometry import Geometry
+from pfa.reference import PFAProcessor
+from rda.algorithm import build_kernel as build_rda_kernel
+from rda.algorithm import make_inputs as rda_inputs
+from rda.reference import RDAProcessor
 from wka.algorithm import build_kernel as build_wka_kernel
 from wka.algorithm import make_inputs as wka_inputs
 from wka.reference import WKAProcessor
@@ -45,6 +51,16 @@ def scene():
     ('{kernel = "cubic"}', dict(kernel="cubic")),
     ('{taps = 16 : i64, window = "kaiser", beta = 4.0 : f64}',
      dict(taps=16, window="kaiser", beta=4.0)),
+    ('{boundary = "edge"}', dict(boundary="edge")),
+    ('{boundary = "reflect"}', dict(boundary="reflect")),
+    ('{kernel = "nearest", boundary = "edge"}',
+     dict(kernel="nearest", boundary="edge")),
+    ('{kernel = "nearest", boundary = "reflect"}',
+     dict(kernel="nearest", boundary="reflect")),
+    ('{kernel = "linear", boundary = "edge"}',
+     dict(kernel="linear", boundary="edge")),
+    ('{kernel = "cubic", boundary = "reflect"}',
+     dict(kernel="cubic", boundary="reflect")),
 ])
 def test_affine_interp1d_matches_runtime(tmp_path, attrs, kwargs):
     n, m = 8, 32
@@ -108,25 +124,74 @@ def test_wka_affine_ir_matches_numpy(scene, tmp_path):
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-6 * peak)
 
 
-@requires_hls
-def test_wka_emits_hls_design(scene):
-    """The headline: the complete omega-K kernel becomes one HLS design."""
-    params, _ = scene
-    n = 64  # keep the the HLS pipeline optimization time in check
-    design = build_wka_kernel(n,
-                              synthetic_params(n)).compile(backend="hls")
-    source = design.source()
-    assert "void wka" in source
-    assert "#pragma HLS" in source
+@requires_cpu
+def test_rda_affine_ir_matches_numpy(scene, tmp_path):
+    """The full range-Doppler chain in HLS-flavored IR, executed on CPU."""
+    params, raw = scene
+    kernel = build_rda_kernel(N, params)
+    lib, fn = _compile_split_kernel(kernel.to_mlir(),
+                                    "rda",
+                                    tmp_path,
+                                    pipeline="--sar-affine-to-llvm-pipeline")
+
+    range_ref, fa, tau, win_a = rda_inputs(N, params)
+    re = np.ascontiguousarray(raw.real)
+    im = np.ascontiguousarray(raw.imag)
+    # Decomplexify splits each complex argument into adjacent re/im planes.
+    rr_re = np.ascontiguousarray(range_ref.real)
+    rr_im = np.ascontiguousarray(range_ref.imag)
+    (out, ) = _run_split(fn, [re, im, rr_re, rr_im, fa, tau, win_a], [(N, N)],
+                         np.float32)
+
+    ref = RDAProcessor(N, params).process(raw)
+    peak = float(ref.max())
+    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-6 * peak)
 
 
-@requires_hls
-def test_rda_emits_hls_design():
-    from rda.algorithm import build_kernel as build_rda_kernel
+@requires_cpu
+def test_csa_affine_ir_matches_numpy(scene, tmp_path):
+    """The full chirp-scaling chain in HLS-flavored IR, executed on CPU."""
+    params, raw = scene
+    kernel = build_csa_kernel(N, params)
+    lib, fn = _compile_split_kernel(kernel.to_mlir(),
+                                    "csa",
+                                    tmp_path,
+                                    pipeline="--sar-affine-to-llvm-pipeline")
 
-    n = 64
-    design = build_rda_kernel(n,
-                              synthetic_params(n)).compile(backend="hls")
-    source = design.source()
-    assert "void rda" in source
-    assert "#pragma HLS" in source
+    fa, fr, tau, win_r, win_a = csa_inputs(N, params)
+    re = np.ascontiguousarray(raw.real)
+    im = np.ascontiguousarray(raw.imag)
+    (out, ) = _run_split(fn, [re, im, fa, fr, tau, win_r, win_a], [(N, N)],
+                         np.float32)
+
+    ref = CSAProcessor(N, params).process(raw)
+    peak = float(ref.max())
+    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-6 * peak)
+
+
+@requires_cpu
+def test_pfa_affine_ir_matches_numpy(tmp_path):
+    """The full PFA + SVA chain in HLS-flavored IR, executed on CPU."""
+    n = 64  # PFA is the heaviest chain (2n x 2n image); keep it snappy
+    geometry = Geometry(n)
+    kernel = build_pfa_kernel(n, geometry)
+    lib, fn = _compile_split_kernel(kernel.to_mlir(),
+                                    "pfa",
+                                    tmp_path,
+                                    pipeline="--sar-affine-to-llvm-pipeline")
+
+    rng = np.random.default_rng(42)
+    raw = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    re = np.ascontiguousarray(raw.real)
+    im = np.ascontiguousarray(raw.imag)
+    out_uniform, out_sva = _run_split(fn, [re, im], [(2 * n, 2 * n),
+                                                     (2 * n, 2 * n)],
+                                      np.float64)
+
+    ref_uniform, ref_sva = PFAProcessor(n, geometry).process(raw)
+    peak = float(ref_uniform.max())
+    np.testing.assert_allclose(out_uniform,
+                               ref_uniform,
+                               rtol=1e-6,
+                               atol=1e-9 * peak)
+    np.testing.assert_allclose(out_sva, ref_sva, rtol=1e-6, atol=1e-9 * peak)

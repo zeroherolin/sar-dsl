@@ -1,36 +1,27 @@
-# Build artifacts
+# Build and packaging
 build/
-*.o
-*.so
-
-# Python
-__pycache__/
-*.pyc
-*.egg-info/
 dist/
+*.egg-info/
+python/sar/_build_config.py
+
+# Tool caches
+__pycache__/
 .pytest_cache/
 .ruff_cache/
-python/sar/_build_config.py
-# backend plugins are linked/copied in from third_party/
-python/sar/backends/*
-!python/sar/backends/__init__.py
-!python/sar/backends/base.py
+.cache/
 
-# Editors (shared VS Code settings are committed; user state is not)
+# Editors and assistants
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
 .idea/
-.cache/
+.agent/
+.claude/
+.codex/
+.DS_Store
 
-# Example outputs / large data (committed assets under examples/*/assets
-# are unaffected: generated outputs land in the working directory)
+# Example outputs and datasets
 examples/data/ALPSRP*
 examples/data/*.bin
 *_cpu.png
-*_hls.cpp
 hls_project/
-/san_francisco_*.png
-
-# OS
-.DS_Store

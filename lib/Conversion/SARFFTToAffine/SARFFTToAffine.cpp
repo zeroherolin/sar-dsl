@@ -18,8 +18,8 @@
 //     Y[q + s (2p + 1)] = (a - b) * w,   w = exp(-+ 2 pi i p / n_cur)
 //
 // Twiddle factors are precomputed into constant memref globals; X and Y are
-// one scratch line per stage, which keeps the unrolled stages a chain rather
-// than a cycle -- see emitStockham.
+// scratch lines drawn from a pool, which keeps the unrolled stages a chain
+// rather than a cycle -- see emitStockham and scratchSlots.
 //
 // Sizes that are not powers of two go through Bluestein's chirp-z
 // reduction, which expresses the DFT as a convolution that a padded
@@ -130,35 +130,70 @@ materializeTwiddles(PatternRewriter &rewriter, Location loc, ModuleOp module,
           memref::GetGlobalOp::create(rewriter, loc, twiddleType, sinName)};
 }
 
+/// Returns the number of distinct scratch-buffer slots required for a
+/// `stages`-stage transform when stages are grouped into groups of
+/// `stageGroup` (0 = full unroll = one slot per intermediate stage).
+///
+/// With full unroll (stageGroup == 0), every intermediate stage writes its own
+/// buffer, giving stages-1 slots in total.
+///
+/// With stageGroup == k, stages are packed into ceil(stages/k) groups; the
+/// first stage reads the input and the last writes the destination, so the
+/// groups in between need ceil(stages/k) - 1 slots. Two is the floor once
+/// more than one stage writes scratch: a Stockham butterfly reads
+/// X[q + sp], X[q + s(p + m)] and writes Y[q + 2sp], Y[q + s(2p + 1)], so a
+/// stage whose source and destination were the same line would overwrite
+/// values a later iteration still has to read.
+static int scratchSlots(int stages, unsigned stageGroup) {
+  int intermediates = stages - 1;
+  if (intermediates <= 0)
+    return 0;
+  if (stageGroup == 0)
+    return intermediates; // full unroll
+  int groups = (stages + static_cast<int>(stageGroup) - 1) /
+               static_cast<int>(stageGroup);
+  int slots = groups - 1;
+  if (slots < 2)
+    slots = intermediates < 2 ? intermediates : 2;
+  return slots > intermediates ? intermediates : slots;
+}
+
 /// Emits the statically unrolled Stockham stages for a transform of size
 /// `length`, for the line selected by `lineIV`.
 ///
-/// The caller owns the line loop and passes one scratch line per intermediate
-/// stage, so the working set is O(length * log2(length)) rather than
-/// O(lines * length): a 16384-point transform needs a few megabytes of
-/// scratch whatever the scene height, which keeps it on chip.
+/// The caller owns the line loop and passes scratch lines whose count is
+/// determined by `scratchSlots()` -- see that function's comment for the
+/// trade-off.  The working set is O(length * scratchSlots) whatever the
+/// scene height.
 ///
-/// Each stage reads the previous stage's buffer and writes its own. Reusing
-/// two buffers in ping-pong would be smaller, but it makes the stages a cycle
-/// in the dataflow graph -- the backend then cannot order them and falls back
-/// to running the whole transform sequentially. Distinct buffers keep the
-/// stages a chain, which is what lets a dataflow backend overlap one line's
-/// late stages with the next line's early ones.
+/// Each group reads the previous group's output and writes its own. Reusing
+/// two buffers in ping-pong across all stages would be smaller but turns the
+/// stage chain into a cycle in the dataflow graph -- the backend cannot order
+/// a cycle and falls back to sequential execution. Distinct group buffers keep
+/// the transform a chain, which is what lets a dataflow backend overlap one
+/// line's late groups with the next line's early groups.
 ///
 /// Stage 0 reads `srcRe`/`srcIm` and the last stage writes `dstRe`/`dstIm`
 /// (scaled by `scale` when set), so the transform costs exactly its
 /// log2(length) butterfly passes -- no copy in, no copy out.
+///
+/// `stageGroup` is the grouping parameter forwarded from the pass option:
+/// 0 (default) gives each stage its own scratch, maximising pipeline
+/// parallelism; k > 0 gives every k consecutive stages one shared scratch
+/// slot, reducing live buffers at the cost of pipeline granularity.
 static void emitStockham(PatternRewriter &rewriter, Location loc,
                          MLIRContext *ctx, int64_t length, Value lineIV,
                          Value srcRe, Value srcIm,
                          ArrayRef<std::pair<Value, Value>> scratch, Value dstRe,
                          Value dstIm, Value cosBuf, Value sinBuf, bool inverse,
-                         Value scale, StorageMapFn srcDstMap) {
+                         Value scale, StorageMapFn srcDstMap,
+                         unsigned stageGroup) {
   auto pDim = getAffineDimExpr(1, ctx);
   auto qDim = getAffineDimExpr(2, ctx);
   int stages = llvm::Log2_64(length);
-  assert(scratch.size() >= static_cast<size_t>(stages - 1) &&
-         "one scratch line per intermediate stage");
+  int slots = scratchSlots(stages, stageGroup);
+  assert(scratch.size() >= static_cast<size_t>(slots) &&
+         "not enough scratch lines for the chosen stage grouping");
 
   // Scratch is a single line, so it is indexed by the element expression
   // alone; the source and destination keep the caller's 2-D layout.
@@ -173,8 +208,13 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
     Value nxtRe, nxtIm;
     bool nxtIsScratch = t != stages - 1;
     if (nxtIsScratch) {
-      nxtRe = scratch[t].first;
-      nxtIm = scratch[t].second;
+      // Round-robin over the scratch pool: full unroll makes `t % slots`
+      // the identity (one line per stage); a grouped pool sends later
+      // stages back onto earlier lines. The pool never shrinks below two
+      // (see scratchSlots), so no butterfly is emitted in place.
+      const auto &slot = scratch[t % slots];
+      nxtRe = slot.first;
+      nxtIm = slot.second;
     } else {
       nxtRe = dstRe;
       nxtIm = dstIm;
@@ -275,7 +315,12 @@ static void hostFFT(std::vector<std::complex<double>> &data) {
 }
 
 struct FFTSplitToAffinePattern : OpRewritePattern<FFTSplitOp> {
-  using OpRewritePattern::OpRewritePattern;
+  FFTSplitToAffinePattern(MLIRContext *context, unsigned stageGroup)
+      : OpRewritePattern<FFTSplitOp>(context), stageGroup(stageGroup) {}
+
+  /// How many consecutive Stockham stages share one scratch slot; 0 keeps
+  /// the full unroll (one slot per intermediate stage).
+  unsigned stageGroup;
 
   LogicalResult matchAndRewrite(FFTSplitOp op,
                                 PatternRewriter &rewriter) const override {
@@ -318,11 +363,11 @@ struct FFTSplitToAffinePattern : OpRewritePattern<FFTSplitOp> {
     if (llvm::isPowerOf2_64(length))
       emitPowerOfTwo(rewriter, loc, ctx, module, length, lines, elemType,
                      bufferType, inRe, inIm, outBufRe, outBufIm, inverse,
-                     storageMap);
+                     storageMap, stageGroup);
     else
       emitBluestein(rewriter, loc, ctx, module, length, dim, lines, elemType,
                     tensorType, inRe, inIm, outBufRe, outBufIm, inverse,
-                    storageMap);
+                    storageMap, stageGroup);
 
     // Scratch buffers are not deallocated here: the CPU validation path
     // runs the ownership-based deallocation pipeline (which rejects
@@ -344,12 +389,16 @@ private:
   /// The stages read the input in place of a copy-in pass and write the
   /// result in place of a copy-out pass, so the whole transform is exactly
   /// its log2(L) butterfly passes.
+  ///
+  /// `stageGroup` is forwarded from the pass option; 0 gives each
+  /// intermediate stage its own scratch line (full unroll), while k > 0
+  /// packs every k consecutive stages into one scratch slot.
   static void emitPowerOfTwo(PatternRewriter &rewriter, Location loc,
                              MLIRContext *ctx, ModuleOp module, int64_t length,
                              int64_t lines, FloatType elemType,
                              MemRefType bufferType, Value inRe, Value inIm,
                              Value outBufRe, Value outBufIm, bool inverse,
-                             StorageMapFn storageMap) {
+                             StorageMapFn storageMap, unsigned stageGroup) {
     auto [cosBuf, sinBuf] =
         materializeTwiddles(rewriter, loc, module, length, elemType);
 
@@ -359,13 +408,13 @@ private:
           rewriter, loc,
           rewriter.getFloatAttr(elemType, 1.0 / static_cast<double>(length)));
 
-    // Stage 0 reads the input and the last stage writes the result, so the
-    // stages in between each need one scratch line. That is all the working
-    // set the transform has, whatever the scene height.
+    // Stage 0 reads the input and the last stage writes the result; the
+    // number of scratch slots between them depends on the grouping.
     int stages = llvm::Log2_64(length);
+    int slots = scratchSlots(stages, stageGroup);
     auto lineType = MemRefType::get({length}, elemType);
     SmallVector<std::pair<Value, Value>> scratch;
-    for (int t = 0; t + 1 < stages; ++t)
+    for (int i = 0; i < slots; ++i)
       scratch.emplace_back(
           memref::AllocOp::create(rewriter, loc, lineType).getResult(),
           memref::AllocOp::create(rewriter, loc, lineType).getResult());
@@ -377,7 +426,7 @@ private:
     rewriter.setInsertionPointToStart(lineLoop.getBody());
     emitStockham(rewriter, loc, ctx, length, lineLoop.getInductionVar(), inRe,
                  inIm, scratch, outBufRe, outBufIm, cosBuf, sinBuf, inverse,
-                 scale, storageMap);
+                 scale, storageMap, stageGroup);
   }
 
   /// Bluestein's chirp-z reduction for non-power-of-two sizes.
@@ -390,7 +439,7 @@ private:
                             int64_t dim, int64_t lines, FloatType elemType,
                             RankedTensorType tensorType, Value inRe, Value inIm,
                             Value outBufRe, Value outBufIm, bool inverse,
-                            StorageMapFn storageMap) {
+                            StorageMapFn storageMap, unsigned stageGroup) {
     auto pDim = getAffineDimExpr(1, ctx);
 
     // Bluestein convolves two length-n sequences, so the circular
@@ -398,9 +447,9 @@ private:
     int64_t padded = llvm::NextPowerOf2(2 * length - 1);
 
     // ---- host-folded constants ---------------------------------------- //
-    // chirp w[j] = exp(-i pi j^2 / n). exp has period 2 pi i, so j^2 can be
-    // reduced modulo 2n first; folding j before squaring keeps the product
-    // from overflowing for large transforms.
+    // chirp w[j] = exp(-i pi j^2 / n). exp has period 2 pi i, so j^2 is
+    // reduced modulo 2n before entering the angle; the int64 product j*j
+    // cannot overflow for any realistic transform (j < n << 2^31).
     SmallVector<double> chirpCos, chirpSin;
     chirpCos.reserve(length);
     chirpSin.reserve(length);
@@ -470,10 +519,12 @@ private:
 
     // The two transforms get their own stage buffers. Sharing them would put
     // both on the same scratch and turn the chain into a cycle, which is the
-    // one shape a dataflow backend cannot schedule.
+    // one shape a dataflow backend cannot schedule. Within each transform the
+    // grouping option decides how many slots the stages draw from.
     int paddedStages = llvm::Log2_64(padded);
+    int paddedSlots = scratchSlots(paddedStages, stageGroup);
     SmallVector<std::pair<Value, Value>> fwdScratch, invScratch;
-    for (int t = 0; t + 1 < paddedStages; ++t) {
+    for (int i = 0; i < paddedSlots; ++i) {
       fwdScratch.emplace_back(alloc(), alloc());
       invScratch.emplace_back(alloc(), alloc());
     }
@@ -531,7 +582,7 @@ private:
     // ---- forward transform, pointwise product, inverse transform ------ //
     emitStockham(rewriter, loc, ctx, padded, lineIV, stageRe, stageIm,
                  fwdScratch, specRe, specIm, cosBuf, sinBuf,
-                 /*inverse=*/false, /*scale=*/nullptr, scratchMap);
+                 /*inverse=*/false, /*scale=*/nullptr, scratchMap, stageGroup);
 
     elementLoop(0, padded, [&](ValueRange ops) {
       Value ar = load(specRe, lineMap, ops), ai = load(specIm, lineMap, ops);
@@ -545,7 +596,7 @@ private:
 
     emitStockham(rewriter, loc, ctx, padded, lineIV, prodRe, prodIm, invScratch,
                  convRe, convIm, cosBuf, sinBuf,
-                 /*inverse=*/true, /*scale=*/nullptr, scratchMap);
+                 /*inverse=*/true, /*scale=*/nullptr, scratchMap, stageGroup);
 
     // ---- post-multiply by the chirp, cropping back to n --------------- //
     // `emitStockham` emits butterflies only, so the 1/M the convolution
@@ -572,6 +623,9 @@ private:
 
 struct ConvertSARFFTToAffinePass
     : sar::impl::ConvertSARFFTToAffineBase<ConvertSARFFTToAffinePass> {
+  using sar::impl::ConvertSARFFTToAffineBase<
+      ConvertSARFFTToAffinePass>::ConvertSARFFTToAffineBase;
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
 
@@ -580,7 +634,7 @@ struct ConvertSARFFTToAffinePass
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
     RewritePatternSet patterns(context);
-    patterns.add<FFTSplitToAffinePattern>(context);
+    patterns.add<FFTSplitToAffinePattern>(context, fftStageGroup);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))

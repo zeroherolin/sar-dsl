@@ -36,6 +36,9 @@ class MathDialect;
 namespace memref {
 class MemRefDialect;
 } // namespace memref
+namespace scf {
+class SCFDialect;
+} // namespace scf
 namespace tensor {
 class TensorDialect;
 } // namespace tensor

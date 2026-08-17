@@ -20,11 +20,28 @@ two pieces that go beyond straight op chaining:
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, measure, save a PNG |
 | `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 
-PFA is a spotlight-mode algorithm, so unlike the stripmap examples
-([wka](../wka/), [rda](../rda/), [csa](../csa/)) there is no
-`run_alos_cpu.py`: the ALOS-1 product is stripmap data, which those three
-process. The synthetic collection in `geometry.py` provides the
-spotlight phase history instead.
+## Why there is no ALOS runner
+
+The stripmap examples ([wka](../wka/), [rda](../rda/), [csa](../csa/)) each
+carry `run_alos_cpu.py` and `run_alos_hls.py`; PFA carries neither, and
+that is a property of the algorithm, not a gap.
+
+PFA assumes a **spotlight** collection: the antenna stares at one fixed
+scene center, so every pulse samples the 2-D wavenumber support of the
+*same* patch along a radial arc, and the collection is a polar sector
+that two 1-D interpolations reformat onto a rectangular grid. The ALOS-1
+PALSAR product here is Fine Beam Single stripmap -- a continuous 16.4 s
+strip of 35344 pulses (`data/.../workreport`) with the beam fixed
+relative to the platform, so each pulse illuminates a different patch.
+There is no common scene center for the strip and therefore no polar
+sector to reformat.
+
+Running PFA on it would first require cutting the strip into
+sub-apertures short enough for the beam to count as staring and
+processing each patch separately. That is a different algorithm
+(sub-aperture/spotlight-from-stripmap decomposition), not the chain in
+`algorithm.py`, so this directory synthesizes its spotlight phase
+history in `geometry.py` instead.
 
 ## Processing chain
 
@@ -46,15 +63,22 @@ polar phase history (one arc per pulse)
 ```bash
 # from the repository root, after `make build`
 python examples/pfa/run_point_target_cpu.py --n 512       # focus + PNG
-python examples/pfa/run_point_target_hls.py --n 128  # design + csim package
+python examples/pfa/run_point_target_hls.py --n 256  # design + csim package
 ```
+
+`run_point_target_hls.py` writes `hls_project/pfa/`: the design
+`pfa.cpp`, the testbench `pfa_tb.cpp`, golden data in `pfa_tb_data/`,
+the csim and csynth scripts (`pfa_csim.tcl`, `pfa_csynth.tcl`) and
+Vitis header stand-ins in `stubs/`.
+The kernel has two results, so the package carries two golden planes.
 
 SVA removes the -13 dB sidelobes of the uniform weighting with *zero*
-mainlobe broadening -- the property no amplitude window has:
+mainlobe broadening -- the property no amplitude window has. At
+`--n 512`:
 
 ```
-uniform: range PSLR  -13.3 dB, IRW 0.91 cells
-    SVA: range PSLR  -23.3 dB, IRW 0.91 cells
+uniform: range PSLR  -13.3 dB, IRW 0.90 cells
+    SVA: range PSLR  -23.3 dB, IRW 0.89 cells
 ```
 
 ![uniform vs SVA impulse response](../../benchmarks/assets/sva_response.png)

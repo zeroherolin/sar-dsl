@@ -9,13 +9,15 @@
 #include "mlir/InitAllExtensions.h"
 #include "mlir/Tools/mlir-lsp-server/MlirLspServerMain.h"
 
+#include "sar/Dialect/HLS/IR/HLS.h"
 #include "sar/Dialect/SAR/IR/SARDialect.h"
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
-  registry.insert<mlir::sar::SARDialect>();
+  // Both in-tree dialects, so IR from any pipeline stage opens cleanly.
+  registry.insert<mlir::sar::SARDialect, mlir::sar::hls::HLSDialect>();
 
   return mlir::failed(mlir::MlirLspServerMain(argc, argv, registry));
 }

@@ -15,7 +15,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace sar;
 using namespace hls;
@@ -63,7 +62,7 @@ struct InsertForkNode : public OpRewritePattern<NodeOp> {
 
       // Insert a buffer for each consumer.
       for (auto consumer : consumers) {
-        auto buffer = rewriter.create<BufferOp>(loc, output.getType());
+        auto buffer = BufferOp::create(rewriter, loc, output.getType());
         output.replaceUsesWithIf(
             buffer, [&](OpOperand &use) { return use.getOwner() == consumer; });
         buffers.push_back(buffer);
@@ -71,7 +70,7 @@ struct InsertForkNode : public OpRewritePattern<NodeOp> {
       }
 
       // Create a new fork node.
-      auto fork = rewriter.create<NodeOp>(loc, output, buffers);
+      auto fork = NodeOp::create(rewriter, loc, output, buffers);
       auto block = rewriter.createBlock(&fork.getBody());
       auto outputArg = block->addArgument(output.getType(), output.getLoc());
       auto bufferArgs = block->addArguments(ValueRange(buffers), bufferLocs);
@@ -79,7 +78,7 @@ struct InsertForkNode : public OpRewritePattern<NodeOp> {
       // Create explicit copy from the original output to the buffers.
       rewriter.setInsertionPointToStart(block);
       for (auto bufferArg : bufferArgs)
-        rewriter.create<memref::CopyOp>(loc, outputArg, bufferArg);
+        memref::CopyOp::create(rewriter, loc, outputArg, bufferArg);
     }
     return success(hasChanged);
   }
@@ -95,7 +94,7 @@ struct EliminateMultiConsumer
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<InsertForkNode>(context);
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+    (void)applyPatternsGreedily(func, std::move(patterns));
   }
 };
 } // namespace

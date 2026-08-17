@@ -1,10 +1,19 @@
 """Exception types shared across the SAR-DSL Python components."""
 
-__all__ = ["SARError", "ToolchainError", "CompilationError", "LaunchError"]
+__all__ = [
+    "SARError", "TraceError", "ToolchainError", "CompilationError",
+    "LaunchError"
+]
 
 
 class SARError(Exception):
     """Base class for SAR-DSL errors."""
+
+
+class TraceError(SARError, TypeError):
+    """Raised when a kernel is traced with inconsistent types or shapes.
+
+    Also a `TypeError`: a mistyped tensor expression is a type error."""
 
 
 class ToolchainError(SARError):

@@ -1,5 +1,4 @@
 add_mlir_library(HLSTransforms
-  AffineLoopFusion.cpp
   AffineLoopOrderOpt.cpp
   AffineLoopPerfection.cpp
   AffineLoopTile.cpp
@@ -13,8 +12,6 @@ add_mlir_library(HLSTransforms
   LoopUnrolling.cpp
   CreateAxiInterface.cpp
   CreateDataflowFromAffine.cpp
-  CreateHLSPrimitive.cpp
-  CreateLocalBuffer.cpp
   CreateTokenStream.cpp
   EliminateMultiConsumer.cpp
   EliminateMultiProducer.cpp
@@ -33,7 +30,6 @@ add_mlir_library(HLSTransforms
   SimplifyAffineIf.cpp
   SimplifyCopy.cpp
   StreamDataflowTask.cpp
-  Utils.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/sar/Dialect/HLS/Transforms

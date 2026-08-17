@@ -1,0 +1,94 @@
+# Shipped defaults for the SAR-DSL HLS backend.
+#
+# Target device: AMD (Xilinx) Virtex UltraScale+ VU13P (XCVU13P).
+# Device capacity per DS890 / XMP103: 94.5 Mb block RAM (2688 x 36 Kb),
+# 360 Mb UltraRAM (1280 x 288 Kb), 12288 DSP48E2 slices.
+#
+# The on-chip budgets are half of what the device holds. Placement runs
+# before synthesis and charges a buffer in whole primitives, so what the
+# device is finally asked for is always more than what was counted here;
+# half leaves room for that error and for the logic's own memory.
+#
+# Every key below is also a `kernel.compile(backend="hls", options={...})`
+# key, and an option beats this file. Point $SAR_DSL_HLS_CONFIG (or
+# options={"config": "..."}) at a copy to retarget a whole project.
+
+# --- On-chip memory ---------------------------------------------------
+
+# Block RAM the design may occupy, in bytes: half of 94.5 Mb.
+bram_bytes: 6193152
+
+# UltraRAM the design may occupy, in bytes: half of 360 Mb.
+uram_bytes: 23592960
+
+# Distributed RAM, in bytes: a quarter of the device's 27.5 Mb -- not
+# half like the other tiers, because this RAM is carved out of the same
+# SLICEM LUTs the datapath is built from; a quarter leaves the fabric its
+# own shift registers and small FIFOs.
+lutram_bytes: 901120
+
+# On-chip bytes the working set may occupy before full-scene planes are
+# streamed from DRAM; null sums the tiers above (29.3 MiB). 0 pins
+# everything on chip whatever the scene size.
+on_chip_budget: null
+
+# --- Device thresholds ------------------------------------------------
+
+# Physical size of one UltraRAM block on the VU13P, in bytes (288 Kb).
+# Buffers at or above this size are placed in URAM because one primitive
+# already holds them without waste. The value is a device fact: the
+# number must agree with the UltraRAM geometry, not with the workload.
+uram_min_bytes: 36864
+
+# --- Interfaces -------------------------------------------------------
+
+# Top-function ports: `ap_memory` (Vitis ap_memory protocol) keeps the
+# kernel's own arrays, the signature the generated csim testbench can
+# drive; `axi` wraps each streamed buffer in an AXI master, which is the
+# design handed to Vitis; `stream` emits AXI-Stream (axis) pragmas on
+# the top-level stream ports. `bram` is a deprecated alias for
+# `ap_memory` and is still accepted.
+interface: ap_memory
+
+# Data width of the AXI masters, in bits. A beat narrower than the bus
+# wastes the rest of it, so ports widen towards this number.
+axi_bus_bits: 512
+
+# Beats a burst may carry at full bus width; AXI4 caps it at 256, and a
+# port whose contiguous run is shorter bursts that run instead.
+axi_max_burst_length: 256
+
+# Full-length bursts in flight per direction. This and the two keys above
+# are the read/write buffering a port may occupy: a port whose bursts come
+# out shorter gets proportionally more of them, up to the Vitis cap of 32.
+axi_max_outstanding: 16
+
+# --- Vitis scripts ----------------------------------------------------
+
+# Device part the generated csim/csynth scripts name. It must be the
+# device the memory budgets above describe; retargeting a project means
+# changing both together.
+part: xcvu13p-fhgb2104-2-e
+
+# Target clock period of the generated scripts, in ns. 10 ns (100 MHz)
+# is a conservative starting point; tighten it once the design meets
+# timing there.
+clock_ns: 10.0
+
+# --- Precision --------------------------------------------------------
+
+# Data-path precision the kernel must carry: `native` accepts the declared
+# dtypes, `f32`/`f64` reject a kernel that would synthesize the other
+# width -- an f64 butterfly costs several times the DSPs of an f32 one.
+precision: native
+
+# Name of the emitted top function; null takes the kernel's name.
+top_func: null
+
+# --- Not configured here ----------------------------------------------
+#
+# Optimization strategy (FFT stage grouping, loop tiling, banded gathers,
+# the buffer-sharing and off-chip thresholds) is derived by the compiler;
+# `design.config.provenance` marks those keys `derived`, and the policy
+# lives in `autotune.py`. Pinning one as a compile option is a diagnostic
+# act -- see docs/backends.md.

@@ -15,7 +15,7 @@ from .params import RadarParams
 
 __all__ = [
     "PointTarget", "simulate_point_targets", "demo_scene",
-    "single_target_scene"
+    "single_target_scene", "target_pixel"
 ]
 
 
@@ -71,3 +71,16 @@ def demo_scene(n: int, p: RadarParams) -> Tuple[np.ndarray, List[PointTarget]]:
 def single_target_scene(n: int, p: RadarParams) -> np.ndarray:
     """Raw echoes of a lone scene-center scatterer (focus-quality tests)."""
     return simulate_point_targets(n, p, [PointTarget(0.0, 0.0, 1.0)])
+
+
+def target_pixel(target: PointTarget, n: int, p: RadarParams):
+    """(row, col) the focused image peaks at for `target`.
+
+    Range: R0 lands `t_shift` into the sampled window, and a slant-range
+    offset moves the echo by one sample per `c / 2 Fs` metres. Azimuth:
+    the aperture is centered on scene center, so an along-track offset
+    moves the target by one pulse per `Vr / PRF` metres.
+    """
+    col = p.t_shift * p.fs + target.range_offset * 2.0 * p.fs / p.c
+    row = n / 2.0 + target.azimuth_offset * p.prf / p.vr
+    return int(round(row)), int(round(col))

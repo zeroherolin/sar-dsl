@@ -64,13 +64,23 @@ def sva2d(img):
     return sar.transpose(sva_range(sar.transpose(sva_range(img))))
 
 
-def build_kernel(n: int, geom: Geometry) -> sar.Kernel:
+def build_kernel(n: int,
+                 geom: Geometry,
+                 name: str = "pfa",
+                 dtype=sar.c128) -> sar.Kernel:
     """Builds the `n x n` PFA kernel for the given collection geometry.
 
     The geometry-dependent operators are defined here so the grid scalars
     (sample spacings, axis origins) bake into the IR at trace time, like
-    the radar parameters of the sibling algorithms.
+    the radar parameters of the sibling algorithms. `name` becomes the IR
+    symbol and the HLS top function. `dtype` selects the data-path
+    precision; the collection axes stay f64 either way, since they feed
+    `interp1d` positions.
     """
+    if dtype not in (sar.c128, sar.c64):
+        raise ValueError("dtype must be sar.c128 or sar.c64")
+    fd = sar.f64 if dtype is sar.c128 else sar.f32
+
     N = int(n)
     dk = geom.k[1] - geom.k[0]
     dtheta = geom.theta[1] - geom.theta[0]
@@ -105,15 +115,19 @@ def build_kernel(n: int, geom: Geometry) -> sar.Kernel:
         keystone = sar.interp1d(data, pos_range, axis=1)
         return sar.interp1d(keystone, pos_cross, axis=0)
 
-    @sar.func
-    def pfa(data: sar.c128[N, N], theta: sar.f64[N], u: sar.f64[N],
-            v: sar.f64[N]) -> (sar.f64[2 * N, 2 * N], sar.f64[2 * N, 2 * N]):
-        image = compress(polar_to_rect(data, theta, u, v))
+    def pfa(data: dtype[N, N]) -> (fd[2 * N, 2 * N], fd[2 * N, 2 * N]):
+        # The collection axes are fixed by the geometry the kernel was
+        # built for, so they bake in as constants (like the radar
+        # parameters of the sibling algorithms) rather than being passed
+        # as ports: an HLS design then carries 4 I/O planes instead of 7.
+        image = compress(polar_to_rect(data, geom.theta, geom.u, geom.v))
         return abs(image), abs(sva2d(image))
 
-    return pfa
+    pfa.__name__ = name
+    return sar.func(pfa)
 
 
 def make_inputs(n: int, geom: Geometry):
-    """Host-provided inputs: the collection axes."""
-    return geom.theta, geom.u, geom.v
+    """Host-provided inputs: none -- the collection axes bake into the IR
+    at trace time, so the kernel takes only the phase history."""
+    return ()

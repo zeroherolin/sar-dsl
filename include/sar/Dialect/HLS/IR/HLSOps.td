@@ -339,57 +339,22 @@ def StreamWriteOp : HLSOp<"dataflow.stream_write", []> {
 // AXI-related Operations
 //===----------------------------------------------------------------------===//
 
-def BufferVectorizeOp : HLSOp<"buffer_vectorize", [ViewLikeOpInterface,
-      NoMemoryEffect]> {
-  let summary = "Vectorize a buffer from scalar element to vector element";
-
-  let arguments = (ins AnyBuffer:$input);
-  let results = (outs StaticShapeMemRefOf<[AnyVectorOfNonZeroRank]>:$output);
-  let assemblyFormat = "$input attr-dict `:` type($input) `to` type($output)";
-
-  let hasFolder = 1;
-  let hasVerifier = 1;
-  let extraClassDeclaration = [{
-    Value getViewSource() { return getInput(); }
-    MemRefType getInputType() {
-      return cast<MemRefType>(getInput().getType());
-    }
-    VectorType getOutputVectorType() {
-      return cast<VectorType>(getType().getElementType());
-    }
-  }];
-}
-
-def BufferDevectorizeOp : HLSOp<"buffer_devectorize", [ViewLikeOpInterface,
-      NoMemoryEffect]> {
-  let summary = "Devectorize a buffer from vector element to scalar element";
-
-  let arguments = (ins StaticShapeMemRefOf<[AnyVectorOfNonZeroRank]>:$input);
-  let results = (outs AnyBuffer:$output);
-  let assemblyFormat = "$input attr-dict `:` type($input) `to` type($output)";
-
-  let hasVerifier = 1;
-  let extraClassDeclaration = [{
-    Value getViewSource() { return getInput(); }
-    MemRefType getInputType() {
-      return cast<MemRefType>(getInput().getType());
-    }
-    VectorType getInputVectorType() {
-      return cast<VectorType>(getInputType().getElementType());
-    }
-  }];
-}
-
 def AxiBundleOp : HLSOp<"axi.bundle", [NoMemoryEffect,
     HasParent<"func::FuncOp">]> {
-  let summary = "Represent an bundle of axi ports";
+  let summary = "Represent a bundle of axi ports";
 
   let arguments = (ins StrAttr:$name);
   let results = (outs BundleType:$bundle);
   let assemblyFormat = "$name attr-dict `:` type($bundle)";
 }
 
-def AxiPortOp : HLSOp<"axi.port", [NoMemoryEffect, HasParent<"func::FuncOp">]> {
+// Deliberately not `NoMemoryEffect`: the op declares a hardware interface,
+// and its pragma must be emitted even when the design never touches the
+// port. The DRAM scratch port exists whether or not anything spilled this
+// round -- that is what keeps the top signature independent of placement
+// decisions -- and marking the op pure let DCE erase exactly that port,
+// leaving a bare argument with no interface pragma at all.
+def AxiPortOp : HLSOp<"axi.port", [HasParent<"func::FuncOp">]> {
   let summary = "Represent an axi port";
 
   let arguments = (ins BundleType:$bundle, AnyAxi:$axi);
@@ -428,59 +393,6 @@ def AxiPackOp : HLSOp<"axi.pack", [NoMemoryEffect, HasParent<"func::FuncOp">]> {
   }];
 }
 
-//===----------------------------------------------------------------------===//
-// Primitive Operations
-//===----------------------------------------------------------------------===//
-
-def PrimMulOp : HLSOp<"prim.mul", [NoMemoryEffect]> {
-  let summary = "Multiplication primitive operation";
-  let description = [{
-    This primitive performs C = A * B, where A and B are 8-bits integers, while
-    C is 16-bits integer. If C/A/B is vector, the length of vector must be two.
-    There are 4 different cases on this:
-
-    1) vec(C) = vec(A) * vec(B)
-    2) vec(C) = vec(A) * B
-    3) vec(C) = A * vec(B)
-    4) C = A * B
-
-    Note that case 2/3 could use the double pumping technique such that we can
-    packing the two multiplications into one DSP instance. Please refer to
-    "Xilinx WP486: Deep Learning with INT8 Optimization on Xilinx Devices" for
-    more information.
-  }];
-
-  let arguments = (ins AnyTypeOf<[I8, VectorOfLengthAndType<[2], [I8]>]>:$A,
-                       AnyTypeOf<[I8, VectorOfLengthAndType<[2], [I8]>]>:$B);
-  let results = (outs AnyTypeOf<[I16, VectorOfLengthAndType<[2], [I16]>]>:$C);
-
-  let hasVerifier = 1;
-  let extraClassDeclaration = [{
-    /// Check whether is a packed multiplication.
-    bool isPackMul();
-  }];
-}
-
-def PrimCastOp : HLSOp<"prim.cast", [
-      NoMemoryEffect, SameOperandsAndResultShape]> {
-  let summary = "Cast primitive operation";
-  let description = [{
-    This operation is super exterimental and should be substituted by the new
-    type casting operations in arith dialect.
-  }];
-
-  let arguments = (ins 
-    AnyTypeOf<[I8, I16, I32,
-               VectorOfLengthAndType<[2], [I8, I16, I32]>]>:$input
-  );
-  let results = (outs
-    AnyTypeOf<[I8, I16, I32,
-               VectorOfLengthAndType<[2], [I8, I16, I32]>]>:$output
-  );
-
-  let hasCanonicalizer = 1;
-}
-
 def AffineSelectOp : HLSOp<"affine.select", [NoMemoryEffect]> {
   let summary = "if-then-else operation";
 
@@ -507,13 +419,6 @@ def AffineSelectOp : HLSOp<"affine.select", [NoMemoryEffect]> {
     /// Sets the integer set with its operands.
     void setConditional(IntegerSet set, ValueRange operands);
   }];
-}
-
-def VectorInitOp : HLSOp<"vector.init", [NoMemoryEffect]> {
-  let summary = "Initialize a vector";
-
-  let results = (outs AnyVectorOfNonZeroRank:$output);
-  let assemblyFormat = "attr-dict `:` type($output)";
 }
 
 #endif // SAR_DIALECT_HLS_IR_HLSOPS_TD

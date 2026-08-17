@@ -28,6 +28,12 @@ def extract_alos_raw(input_file,
     # Each line: 412-byte prefix + Nr interleaved 8-bit (I, Q) pairs.
     nr_actual = (record_len - 412) // 2
     print(f"Detected range samples (Nr): {nr_actual}")
+    if not 0 < nr_actual <= target_nr:
+        raise ValueError(
+            f"detected {nr_actual} range samples per line, which does not "
+            f"fit the {target_nr}-sample padded raster -- check that the "
+            "input is a CEOS L1.0 image file (IMG-*), or raise target_nr "
+            f"to at least {nr_actual}")
 
     line_dtype = np.dtype([
         ("header", "V412"),
@@ -65,18 +71,34 @@ def extract_alos_raw(input_file,
 
 
 if __name__ == "__main__":
-    # Input and output both live next to this script, where the per-algorithm
-    # run_alos_cpu.py runners expect them.
+    import argparse
+
+    # Input and output defaults live next to this script, where the
+    # per-algorithm run_alos_cpu.py runners expect them.
     here = os.path.dirname(os.path.abspath(__file__))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input",
+                        default=os.path.join(here, "ALPSRP275140740-L1.0",
+                                             "IMG-HH-ALPSRP275140740-H1.0__A"),
+                        help="CEOS L1.0 image file (IMG-*)")
+    parser.add_argument("--output",
+                        default=os.path.join(here, "alos_raw_16384x16384.bin"),
+                        help="complex64 binary written for the runners")
+    parser.add_argument(
+        "--start-line",
+        type=int,
+        # 14000 places the 16384-line block over San Francisco Bay and the
+        # city grid (the hero image in the README); the function default of
+        # 2000 is a generic offset that merely skips the ramp-up lines at
+        # the start of the acquisition.
+        default=14000,
+        help="first azimuth line of the extracted block")
+    args = parser.parse_args()
+
     extract_alos_raw(
-        input_file=os.path.join(here, "ALPSRP275140740-L1.0",
-                                "IMG-HH-ALPSRP275140740-H1.0__A"),
-        output_file=os.path.join(here, "alos_raw_16384x16384.bin"),
+        input_file=args.input,
+        output_file=args.output,
         target_na=16384,
         target_nr=16384,
-        # start_line=14000 places the 16384-line block over San Francisco
-        # Bay and the city grid (the hero image in the README); the function
-        # default of 2000 is a generic offset that skips the ramp-up lines
-        # at the start of the acquisition.
-        start_line=14000,
+        start_line=args.start_line,
     )

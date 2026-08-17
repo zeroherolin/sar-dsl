@@ -17,7 +17,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -53,8 +52,8 @@ struct SplitScheduleExternalBufferAccess : public OpRewritePattern<ScheduleOp> {
     }
 
     if (hasChanged) {
-      auto newSchedule = rewriter.create<ScheduleOp>(
-          schedule.getLoc(), newOperands, schedule.getIsLegalAttr());
+      auto newSchedule = ScheduleOp::create(
+          rewriter, schedule.getLoc(), newOperands, schedule.getIsLegalAttr());
       rewriter.inlineRegionBefore(scheduleBody, newSchedule.getBody(),
                                   newSchedule.getBody().end());
       rewriter.eraseOp(schedule);
@@ -136,8 +135,8 @@ struct SplitNodeExternalBufferAccess : public OpRewritePattern<NodeOp> {
     }
 
     if (hasChanged) {
-      auto newNode = rewriter.create<NodeOp>(node.getLoc(), newInputs,
-                                             newOutputs, node.getParams());
+      auto newNode = NodeOp::create(rewriter, node.getLoc(), newInputs,
+                                    newOutputs, node.getParams());
       rewriter.inlineRegionBefore(nodeBody, newNode.getBody(),
                                   newNode.getBody().end());
       rewriter.eraseOp(node);
@@ -166,8 +165,8 @@ struct InlineSchedule : public OpRewritePattern<ScheduleOp> {
       if (auto func = dyn_cast<func::FuncOp>(schedule->getParentOp()))
         setFuncDirective(func, /*pipeline=*/false, /*targetInterval=*/1,
                          /*dataflow=*/true);
-      else if (auto loop =
-                   dyn_cast<mlir::affine::AffineForOp>(schedule->getParentOp())) {
+      else if (auto loop = dyn_cast<mlir::affine::AffineForOp>(
+                   schedule->getParentOp())) {
         // If the schedule is located inside of a loop nest, try to coalesce
         // them into a flattened loop.
         AffineLoopBand band;
@@ -194,8 +193,9 @@ struct ConvertNodeToFunc : public OpRewritePattern<NodeOp> {
                                 PatternRewriter &rewriter) const override {
     // Create a new sub-function.
     rewriter.setInsertionPoint(node->getParentOfType<func::FuncOp>());
-    auto subFunc = rewriter.create<func::FuncOp>(
-        node.getLoc(), prefix.str() + "_node" + std::to_string(nodeIdx++),
+    auto subFunc = func::FuncOp::create(
+        rewriter, node.getLoc(),
+        prefix.str() + "_node" + std::to_string(nodeIdx++),
         rewriter.getFunctionType(node.getOperandTypes(), TypeRange()));
 
     // FIXME: A better method to judge whether to inline the node.
@@ -207,7 +207,7 @@ struct ConvertNodeToFunc : public OpRewritePattern<NodeOp> {
     rewriter.inlineRegionBefore(node.getBodyRegion(), subFunc.getBody(),
                                 subFunc.end());
     rewriter.setInsertionPointToEnd(&subFunc.front());
-    rewriter.create<func::ReturnOp>(rewriter.getUnknownLoc());
+    func::ReturnOp::create(rewriter, rewriter.getUnknownLoc());
 
     // Replace original with a function call.
     rewriter.setInsertionPoint(node);
@@ -238,22 +238,16 @@ struct ConvertDataflowToFunc
       mlir::RewritePatternSet patterns(context);
       patterns.add<SplitScheduleExternalBufferAccess>(context);
       patterns.add<SplitNodeExternalBufferAccess>(context);
-      (void)applyPatternsAndFoldGreedily(module, std::move(patterns));
+      (void)applyPatternsGreedily(module, std::move(patterns));
     }
 
     for (auto func :
          llvm::make_early_inc_range(module.getOps<func::FuncOp>())) {
-      ConversionTarget target(*context);
-      target.addIllegalOp<ScheduleOp, NodeOp>();
-      target.addLegalOp<func::FuncOp, func::ReturnOp, func::CallOp>();
-
       unsigned nodeIdx = 0;
       mlir::RewritePatternSet patterns(context);
       patterns.add<InlineSchedule>(context);
       patterns.add<ConvertNodeToFunc>(context, func.getName(), nodeIdx);
-      (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
-      // if (failed(applyPartialConversion(func, target, std::move(patterns))))
-      //   return signalPassFailure();
+      (void)applyPatternsGreedily(func, std::move(patterns));
     }
 
     // Remove memref global operations.

@@ -43,9 +43,14 @@ struct InsertCopyNode : public OpRewritePattern<NodeOp> {
 
       SmallVector<std::pair<unsigned, NodeOp>, 4> worklist;
       for (auto consumer : getDependentConsumers(output, node)) {
-        auto diff = node.getLevel().value() - consumer.getLevel().value();
+        // Unscheduled nodes carry no level; unsigned wrap on a reversed
+        // pair would fabricate a huge diff, so compute signed.
+        if (!node.getLevel() || !consumer.getLevel())
+          continue;
+        int64_t diff =
+            (int64_t)*node.getLevel() - (int64_t)*consumer.getLevel();
         if (diff > 1)
-          worklist.push_back({diff, consumer});
+          worklist.push_back({(unsigned)diff, consumer});
       }
       if (worklist.empty())
         continue;
@@ -76,12 +81,12 @@ struct InsertCopyNode : public OpRewritePattern<NodeOp> {
         auto loc = rewriter.getUnknownLoc();
         rewriter.setInsertionPoint(currentNode);
         auto newBuf =
-            rewriter.create<BufferOp>(loc, output.getType()).getMemref();
+            BufferOp::create(rewriter, loc, output.getType()).getMemref();
 
         // Construct a new node for data copy.
         rewriter.setInsertionPointAfter(currentNode);
-        auto newNode = rewriter.create<NodeOp>(loc, ValueRange(currentBuf),
-                                               ValueRange(newBuf));
+        auto newNode = NodeOp::create(rewriter, loc, ValueRange(currentBuf),
+                                      ValueRange(newBuf));
         newNode.setLevelAttr(
             rewriter.getI32IntegerAttr(node.getLevel().value() + 1 - i));
         auto block = rewriter.createBlock(&newNode.getBody());
@@ -90,8 +95,8 @@ struct InsertCopyNode : public OpRewritePattern<NodeOp> {
 
         // Create an explicit copy operation.
         rewriter.setInsertionPointToStart(block);
-        rewriter.create<memref::CopyOp>(loc, block->getArgument(0),
-                                        block->getArgument(1));
+        memref::CopyOp::create(rewriter, loc, block->getArgument(0),
+                               block->getArgument(1));
 
         // Replace all uses at the current level.
         llvm::SmallDenseSet<Operation *, 4> consumers;
@@ -120,7 +125,7 @@ struct BalanceDataflowNode
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<InsertCopyNode>(context);
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+    (void)applyPatternsGreedily(func, std::move(patterns));
   }
 };
 } // namespace

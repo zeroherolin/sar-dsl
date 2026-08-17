@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
-__all__ = ["RadarParams", "ALOS_PARAMS", "synthetic_params", "band_windows"]
+__all__ = [
+    "RadarParams", "ALOS_PARAMS", "alos_params", "synthetic_params",
+    "band_windows"
+]
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,25 @@ ALOS_PARAMS = RadarParams(
     pulse_len=27.0e-6,
     t_shift=4800.0 / 32000000.00,
 )
+
+
+def alos_params(n: int) -> RadarParams:
+    """ALOS-1 parameters for an `n`-sample range window.
+
+    Only `t_shift` depends on `n`: it says where the reference range sits
+    in the sampled window, which is a property of the recording, not of
+    the radar. The product puts R0 at sample 4800, so any window long
+    enough to hold it (and the trailing chirp) keeps the recorded value
+    and is a true sub-window of the acquisition. A shorter window would
+    place R0 past its own end -- the echo would miss the raster entirely
+    -- so it centres R0 instead. Everything the radar itself fixes (`fc`,
+    `fs`, PRF, `Vr`, `R0`, `Kr`, `Tp`) is the acquisition's at every size,
+    which is what makes a reduced raster exercise the real geometry.
+    """
+    r0_sample = ALOS_PARAMS.t_shift * ALOS_PARAMS.fs
+    if r0_sample + 0.5 * ALOS_PARAMS.pulse_len * ALOS_PARAMS.fs < n:
+        return ALOS_PARAMS
+    return replace(ALOS_PARAMS, t_shift=n / (2.0 * ALOS_PARAMS.fs))
 
 
 def _hann_band(n: int, frac: float) -> np.ndarray:

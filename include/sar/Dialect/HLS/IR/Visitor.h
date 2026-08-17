@@ -33,8 +33,7 @@ public:
         .template Case<
             // HLS dialect operations.
             BufferOp, ConstBufferOp, StreamOp, StreamReadOp, StreamWriteOp,
-            AxiBundleOp, AxiPortOp, AxiPackOp, PrimMulOp, PrimCastOp,
-            hls::AffineSelectOp, hls::VectorInitOp,
+            AxiBundleOp, AxiPortOp, AxiPackOp, hls::AffineSelectOp,
 
             // Function operations.
             func::CallOp, func::ReturnOp,
@@ -44,14 +43,15 @@ public:
             scf::ReduceReturnOp, scf::YieldOp,
 
             // Affine statements.
-            affine::AffineForOp, affine::AffineIfOp, affine::AffineParallelOp, affine::AffineApplyOp,
-            affine::AffineMaxOp, affine::AffineMinOp, affine::AffineLoadOp, affine::AffineStoreOp,
-            affine::AffineVectorLoadOp, affine::AffineVectorStoreOp, affine::AffineYieldOp,
+            affine::AffineForOp, affine::AffineIfOp, affine::AffineParallelOp,
+            affine::AffineApplyOp, affine::AffineMaxOp, affine::AffineMinOp,
+            affine::AffineLoadOp, affine::AffineStoreOp,
+            affine::AffineVectorLoadOp, affine::AffineVectorStoreOp,
+            affine::AffineYieldOp,
 
             // Vector statements.
-            vector::InsertOp, vector::ExtractOp,
-            vector::TransferReadOp, vector::TransferWriteOp,
-            vector::BroadcastOp,
+            vector::InsertOp, vector::ExtractOp, vector::TransferReadOp,
+            vector::TransferWriteOp, vector::BroadcastOp,
 
             // Memref statements.
             memref::AllocOp, memref::AllocaOp, memref::LoadOp, memref::StoreOp,
@@ -79,19 +79,20 @@ public:
             arith::SelectOp, arith::ConstantOp, arith::TruncIOp,
             arith::TruncFOp, arith::ExtUIOp, arith::ExtSIOp, arith::ExtFOp,
             arith::IndexCastOp, arith::UIToFPOp, arith::SIToFPOp,
-            arith::FPToSIOp, arith::FPToUIOp>(
-            [&](auto opNode) -> ResultType {
-              return thisCast->visitOp(opNode, args...);
-            })
+            arith::FPToSIOp, arith::FPToUIOp>([&](auto opNode) -> ResultType {
+          return thisCast->visitOp(opNode, args...);
+        })
         .Default([&](auto opNode) -> ResultType {
           return thisCast->visitInvalidOp(op, args...);
         });
   }
 
-  /// This callback is invoked on any invalid operations.
+  /// This callback is invoked on operations no visitor lists at all. It
+  /// reports "not mine" like visitUnhandledOp does: the dispatcher that
+  /// tried every visitor is the one that knows the op is unsupported, and
+  /// its diagnostic is the one that carries a failure state.
   ResultType visitInvalidOp(Operation *op, ExtraArgs... args) {
-    op->emitOpError("is unsupported operation.");
-    abort();
+    return ResultType();
   }
 
   /// This callback is invoked on any operations that are not handled by the
@@ -114,10 +115,7 @@ public:
   HANDLE(AxiBundleOp);
   HANDLE(AxiPortOp);
   HANDLE(AxiPackOp);
-  HANDLE(PrimMulOp);
-  HANDLE(PrimCastOp);
   HANDLE(hls::AffineSelectOp);
-  HANDLE(hls::VectorInitOp);
 
   // Control flow operations.
   HANDLE(func::CallOp);

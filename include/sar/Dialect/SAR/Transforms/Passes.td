@@ -33,20 +33,58 @@ def SARReuseBuffers : Pass<"sar-reuse-buffers", "::mlir::func::FuncOp"> {
     imaging chain ends up holding dozens of full rasters even though it is a
     sequence of whole-raster passes with only a handful live at a time. This
     pass runs a linear scan over the function body and lets a buffer whose
-    last use has passed carry a later one of the same type.
+    last use has passed carry a later one.
+
+    Sharing needs the scan to order operations by execution, which holds only
+    for a single straight-line block; a function with branches is left alone.
+    A buffer with a live alias -- anything handing out a memref or a tensor,
+    including `memref.subview` and `bufferization.to_tensor` -- is never a
+    candidate, so a shared allocation can never be reached through a view of
+    the buffer it replaced.
 
     `min-elements` selects which buffers take part. Below it a buffer acts as
     a dataflow channel, where distinct producers are what let a backend
     pipeline the stages; at and above it the buffer is memory, where sharing
     is free. Give it the same threshold the backend uses to place buffers off
     chip and the two decisions stay consistent.
+
+    `allow-retype` extends sharing to buffers of *different* element type.
+    Their footprints are compared in bytes rather than their types in full, a
+    retired buffer backing a newer one that fits inside it; the group then
+    allocates `memref<Nxi8>` and each member reinterprets it with
+    `memref.view`. This is worth a mixed-precision chain -- an f32 plane and
+    a c64 plane of half the element count cost one allocation, not two -- but
+    it only suits a target that addresses bytes. It is off by default and the
+    HLS path leaves it off: there a buffer becomes a typed on-chip array
+    whose width drives banking and partitioning, and the C++ emitter has no
+    reinterpretation to emit.
   }];
   let dependentDialects = [
-    "::mlir::func::FuncDialect", "::mlir::memref::MemRefDialect"
+    "::mlir::arith::ArithDialect", "::mlir::func::FuncDialect",
+    "::mlir::memref::MemRefDialect"
   ];
   let options = [
     Option<"minElements", "min-elements", "uint64_t", /*default=*/"0",
-           "Only share buffers holding at least this many elements">
+           "Only share buffers holding at least this many elements">,
+    Option<"allowRetype", "allow-retype", "bool", /*default=*/"false",
+           "Also share between buffers of different element type, through a "
+           "byte-addressed backing allocation reinterpreted by memref.view">
+  ];
+}
+
+def SARDemoteLoopCarries
+    : Pass<"sar-demote-loop-carries", "::mlir::func::FuncOp"> {
+  let summary = "Rewrite buffer-carried scf.for loops into side effects";
+  let description = [{
+    After bufferization a compiled loop (`sar.iterate`) carries memrefs
+    through `iter_args`. Targets whose dataflow model forbids tasks with
+    results (HLS) need the carry as side effects instead: the body reads
+    and writes the init buffer directly and a copy at the end of each
+    iteration makes the yielded buffer current. The dead `iter_args` are
+    left for canonicalization to fold away.
+  }];
+  let dependentDialects = [
+    "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect"
   ];
 }
 

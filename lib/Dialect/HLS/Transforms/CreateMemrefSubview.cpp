@@ -15,7 +15,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -49,7 +48,8 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
       operands = SmallVector<Value, 4>(loadOp.getMapOperands());
       map = loadOp.getAffineMap();
       memref = loadOp.getMemRef();
-    } else if (auto storeOp = dyn_cast<mlir::affine::AffineWriteOpInterface>(op)) {
+    } else if (auto storeOp =
+                   dyn_cast<mlir::affine::AffineWriteOpInterface>(op)) {
       operands = SmallVector<Value, 4>(storeOp.getMapOperands());
       map = storeOp.getAffineMap();
       memref = storeOp.getMemRef();
@@ -175,8 +175,8 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
       AffineValueMap offsetMap(AffineMap::get(numDims, numSymbols, offsetExpr),
                                operands);
       (void)offsetMap.canonicalize();
-      auto offsetOp = b.create<AffineApplyOp>(loc, offsetMap.getAffineMap(),
-                                              offsetMap.getOperands());
+      auto offsetOp = AffineApplyOp::create(b, loc, offsetMap.getAffineMap(),
+                                            offsetMap.getOperands());
       bufOffsets.push_back(offsetOp.getResult());
     }
 
@@ -190,13 +190,11 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
     auto sourceType = cast<MemRefType>(memref.getType());
     auto resultType = cast<MemRefType>(memref::SubViewOp::inferResultType(
         sourceType, bufOffsets, bufSizes, bufStrides));
-    resultType = MemRefType::get(resultType.getShape(),
-                                 resultType.getElementType(),
-                                 resultType.getLayout(),
-                                 sourceType.getMemorySpace());
-    auto subview = b.create<memref::SubViewOp>(loc, resultType, memref,
-                                               bufOffsets, bufSizes,
-                                               bufStrides);
+    resultType =
+        MemRefType::get(resultType.getShape(), resultType.getElementType(),
+                        resultType.getLayout(), sourceType.getMemorySpace());
+    auto subview = memref::SubViewOp::create(b, loc, resultType, memref,
+                                             bufOffsets, bufSizes, bufStrides);
     memref.replaceUsesWithIf(subview.getResult(), [&](OpOperand &use) {
       return use.getOwner() == op;
     });

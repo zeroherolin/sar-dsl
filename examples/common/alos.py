@@ -21,6 +21,14 @@ def load_raw(path: str) -> np.ndarray:
         raise SystemExit(
             f"{bin_path} not found -- extract the CEOS product first with "
             "`python examples/data/extract_alos.py`")
+    expected = SIZE * SIZE * np.dtype(np.complex64).itemsize
+    actual = bin_path.stat().st_size
+    if actual != expected:
+        raise SystemExit(
+            f"{bin_path}: expected {SIZE}x{SIZE} complex64 "
+            f"({expected / 2**30:.0f} GiB), got {actual} bytes -- the file "
+            "is truncated or was extracted with different settings; "
+            "re-run `python examples/data/extract_alos.py`")
     return np.fromfile(bin_path, dtype=np.complex64).reshape((SIZE, SIZE))
 
 

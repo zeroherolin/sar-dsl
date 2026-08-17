@@ -12,8 +12,9 @@ make test        # lit + pytest, everything must pass
 
 `make build` writes `python/sar/_build_config.py`, which points the Python
 package at `build/bin`. If the tools move, or you want to run against a
-different build tree, `SAR_DSL_TOOL_DIR` overrides that directory; see
-[docs/backends.md](docs/backends.md) for the per-tool overrides.
+different build tree, add its tool directory to `SAR_DSL_TOOL_PATH`, or
+pin a single tool with `SAR_DSL_TOOL_<NAME>` (e.g. `SAR_DSL_TOOL_SAR_OPT`);
+see [docs/backends.md](docs/backends.md) for the discovery order.
 
 ## Editor setup
 
@@ -60,6 +61,8 @@ CI runs the same hooks on every push.
   is the gate.
 - **Folds must be bit-exact.** Rewrites that can change floating-point
   results (even by one ULP) do not belong in canonicalization.
+- **User-visible changes get a [CHANGELOG](CHANGELOG.md) entry** under
+  `Unreleased`.
 
 ## Adding functionality
 
@@ -75,5 +78,5 @@ CI runs the same hooks on every push.
 The `hls` dialect and its passes (`include/sar/Dialect/HLS`,
 `lib/Dialect/HLS`, `lib/Target/HLS`) are ordinary in-tree code: change
 them like any other pass, and `test/Dialect/HLS/*.mlir` covers them.
-They derive from ScaleHLS-HIDA -- see [NOTICE](NOTICE) -- so files
-carrying the original copyright header keep it.
+They derive from ScaleHLS-HIDA; the attribution lives in
+[NOTICE](NOTICE) and must stay intact.

@@ -12,7 +12,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -49,6 +48,12 @@ struct TransposeNest {
 
 /// The band level `map`'s last result varies fastest along, if that is a
 /// bare induction variable of the band.
+///
+/// The writes are held to this stricter form. Staging reorders iterations,
+/// which is only sound when each writes its own element, and a bare
+/// induction variable is what makes the sweep a permutation of the axis --
+/// an expression like `d floordiv 2` reads one level but sends two
+/// iterations to the same address.
 static std::optional<unsigned> fastestLevel(AffineMap map, ValueRange operands,
                                             ValueRange ivs) {
   if (map.getNumResults() == 0)
@@ -57,6 +62,41 @@ static std::optional<unsigned> fastestLevel(AffineMap map, ValueRange operands,
   if (!dim || dim.getPosition() >= operands.size())
     return std::nullopt;
   auto iv = llvm::find(ivs, operands[dim.getPosition()]);
+  if (iv == ivs.end())
+    return std::nullopt;
+  return (unsigned)std::distance(ivs.begin(), iv);
+}
+
+/// The band level a *read*'s last result sweeps, allowing the index to be
+/// any expression of a single induction variable.
+///
+/// A shift folded into the map -- what an `fftshift` fused into a corner
+/// turn leaves behind -- makes the last result an expression such as
+/// `(d0 + 64) mod n`. It still sweeps exactly one level, and staging only
+/// needs to know which: both halves of the rewrite re-express the map
+/// through the same substitution, so a block element and the address it
+/// came from stay paired whatever shape the expression has. Reads need no
+/// permutation guarantee -- fetching a value twice is harmless -- which is
+/// why this is the read-side rule only.
+static std::optional<unsigned> sweptLevel(AffineMap map, ValueRange operands,
+                                          ValueRange ivs) {
+  if (map.getNumResults() == 0)
+    return std::nullopt;
+
+  // Exactly one dimension makes the sweep unambiguous; none is a broadcast,
+  // and several would mean the level cannot be swapped on its own.
+  llvm::SmallDenseSet<unsigned> positions;
+  map.getResult(map.getNumResults() - 1).walk([&](AffineExpr expr) {
+    if (auto dim = dyn_cast<AffineDimExpr>(expr))
+      positions.insert(dim.getPosition());
+  });
+  if (positions.size() != 1)
+    return std::nullopt;
+
+  unsigned position = *positions.begin();
+  if (position >= operands.size())
+    return std::nullopt;
+  auto iv = llvm::find(ivs, operands[position]);
   if (iv == ivs.end())
     return std::nullopt;
   return (unsigned)std::distance(ivs.begin(), iv);
@@ -107,14 +147,31 @@ static std::optional<TransposeNest> matchTranspose(affine::AffineForOp outer) {
       loads.push_back(load);
     } else if (auto write = dyn_cast<affine::AffineStoreOp>(op)) {
       stores.push_back(write);
-    } else if (isa<affine::AffineForOp, affine::AffineIfOp>(op)) {
-      // A nested region would carry induction variables the rewrite does
-      // not know how to re-express.
+    } else if (op->getNumRegions() != 0) {
+      // A nested region would carry induction variables -- and accesses --
+      // the rewrite does not know how to re-express. This covers non-affine
+      // control flow too: the replay clones such an op whole, so an access
+      // inside it would keep naming the erased band.
       retargetable = false;
     }
   });
   if (!retargetable || stores.empty())
     return std::nullopt;
+
+  // Every use of a band induction variable must be an index the rewrite
+  // re-expresses: a load or store *map* operand. An IV flowing anywhere
+  // else -- into arithmetic, or a store's value -- would survive the
+  // rewrite as a reference to the erased band.
+  for (Value iv : ivs)
+    for (OpOperand &use : iv.getUses()) {
+      Operation *owner = use.getOwner();
+      bool isLoadIndex =
+          isa<affine::AffineLoadOp>(owner) && use.getOperandNumber() >= 1;
+      bool isStoreIndex =
+          isa<affine::AffineStoreOp>(owner) && use.getOperandNumber() >= 2;
+      if (!isLoadIndex && !isStoreIndex)
+        return std::nullopt;
+    }
 
   auto accessesOnlyIVs = [&](ValueRange operands) {
     return llvm::all_of(operands,
@@ -122,8 +179,10 @@ static std::optional<TransposeNest> matchTranspose(affine::AffineForOp outer) {
   };
   auto staged = [](MemRefType type) {
     // A block only helps a buffer whose last axis is not the one being
-    // swept; a vector has no other axis to stage against.
-    return type.getRank() >= 2 && type.hasStaticShape();
+    // swept; a vector has no other axis to stage against. The element has
+    // to have a measurable width for the block to be budgeted.
+    return type.getRank() >= 2 && type.hasStaticShape() &&
+           type.getElementType().isIntOrFloat();
   };
 
   std::optional<unsigned> destLevel;
@@ -153,7 +212,7 @@ static std::optional<TransposeNest> matchTranspose(affine::AffineForOp outer) {
       return std::nullopt;
     if (!staged(load.getMemRefType()))
       continue;
-    auto level = fastestLevel(load.getAffineMap(), load.getMapOperands(), ivs);
+    auto level = sweptLevel(load.getAffineMap(), load.getMapOperands(), ivs);
     if (!level || *level == *destLevel)
       continue;
     // One read nest fills every block, so the reads have to agree on which
@@ -332,8 +391,8 @@ struct SARStageTransposes
     SmallVector<TransposeNest> toStage;
     for (auto &nest : nests) {
       bool contained = false;
-      for (Operation *p = nest.band.front()->getParentOp();
-           p && !contained; p = p->getParentOp())
+      for (Operation *p = nest.band.front()->getParentOp(); p && !contained;
+           p = p->getParentOp())
         contained = outermost.contains(p);
       if (contained)
         continue;

@@ -180,9 +180,10 @@ def test_method_and_alias_symmetry():
 def test_numpy_spelling_aliases():
     """Names numpy exposes under two spellings work under both here too:
     `concat` (numpy 2.0 / Array API) beside `concatenate`, `abs` beside
-    `absolute`, `db` beside `mag2db`."""
+    `absolute`, `conjugate` beside `conj`, `db` beside `mag2db`."""
     assert sar.concat is sar.concatenate
     assert sar.abs is sar.absolute
+    assert sar.conjugate is sar.conj
     assert sar.db is sar.mag2db
 
     rng = np.random.default_rng(43)
@@ -193,6 +194,66 @@ def test_numpy_spelling_aliases():
         return sar.concat([x, x], axis=1)
 
     np.testing.assert_allclose(k(a), np.concatenate([a, a], axis=1))
+
+
+def test_every_op_with_a_method_form_matches_its_free_function():
+    """The numpy-style method surface: every method or property a numpy
+    user reaches for delegates to the free function with the same name.
+    Pinned pairwise so a new op with a natural method form is added to
+    both spellings or fails here."""
+    rng = np.random.default_rng(35)
+    a = rng.standard_normal((N, M))
+    z = (rng.standard_normal((N, M)) + 1j * rng.standard_normal(
+        (N, M))).astype(np.complex128)
+
+    @sar.func
+    def methods(x, w):
+        return (x.transpose(), w.conjugate(), x.clip(-0.5, 0.5), x.round(),
+                x.cumsum(axis=1), x.std(), x.var(), (+x) - x)
+
+    t, cj, cl, rd, cs, sd, vr, zero = methods(a, z)
+    np.testing.assert_allclose(t, a.T)
+    np.testing.assert_allclose(cj, np.conj(z))
+    np.testing.assert_allclose(cl, np.clip(a, -0.5, 0.5))
+    # sar.round rounds half away from zero (Matlab); the inputs here are
+    # generic reals, where the two conventions agree.
+    np.testing.assert_allclose(rd, np.round(a))
+    np.testing.assert_allclose(cs, np.cumsum(a, axis=1), rtol=1e-12)
+    np.testing.assert_allclose(sd, a.std(), rtol=1e-12)
+    np.testing.assert_allclose(vr, a.var(), rtol=1e-12)
+    np.testing.assert_allclose(zero, np.zeros_like(a))
+
+
+def test_shape_introspection_matches_numpy():
+    """`.ndim`, `.size` and `len()` answer during tracing, numpy-style."""
+
+    @sar.func
+    def k(x: sar.f64[4, 3]) -> sar.f64[4, 3]:
+        assert x.ndim == x.rank == 2
+        assert x.size == 12
+        assert len(x) == 4
+        return x
+
+    k.to_mlir()
+
+
+def test_scalar_conversions_and_ufuncs_are_rejected_clearly():
+    """`float(x)` and `np.conj(x)` cannot mean anything during tracing;
+    both must fail with a diagnostic, not with silent object arrays."""
+
+    @sar.func
+    def to_float(x: sar.f64[4, 3]) -> sar.f64[4, 3]:
+        return x * float(x)
+
+    with pytest.raises(sar.TraceError, match="cannot convert"):
+        to_float.to_mlir()
+
+    @sar.func
+    def ufunc(x: sar.c128[4, 3]) -> sar.c128[4, 3]:
+        return np.conj(x)
+
+    with pytest.raises(TypeError):
+        ufunc.to_mlir()
 
 
 def test_axis_is_accepted_wherever_dim_is():

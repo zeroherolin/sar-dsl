@@ -107,6 +107,27 @@ func.func @reductions(%x: tensor<4x8xf64>, %z: tensor<4x8xcomplex<f64>>)
   return %0, %1, %2, %3 : tensor<4xf64>, tensor<8xf64>, tensor<4xi64>, tensor<4xcomplex<f64>>
 }
 
+// CHECK-LABEL: func.func @cumsum_f32
+func.func @cumsum_f32(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
+  // CHECK: sar.cumsum %{{.*}} {dim = 1 : i64} : tensor<4x8xf32>
+  %0 = sar.cumsum %x {dim = 1 : i64} : tensor<4x8xf32>
+  return %0 : tensor<4x8xf32>
+}
+
+// CHECK-LABEL: func.func @cumsum_complex
+func.func @cumsum_complex(%x: tensor<4x8xcomplex<f64>>) -> tensor<4x8xcomplex<f64>> {
+  // CHECK: sar.cumsum %{{.*}} {dim = 0 : i64} : tensor<4x8xcomplex<f64>>
+  %0 = sar.cumsum %x {dim = 0 : i64} : tensor<4x8xcomplex<f64>>
+  return %0 : tensor<4x8xcomplex<f64>>
+}
+
+// CHECK-LABEL: func.func @rank_filter_median
+func.func @rank_filter_median(%x: tensor<8x16xf32>) -> tensor<8x16xf32> {
+  // CHECK: sar.rank_filter %{{.*}} {dim = 1 : i64, rank = 3 : i64, window = 7 : i64} : tensor<8x16xf32>
+  %0 = sar.rank_filter %x {window = 7 : i64, rank = 3 : i64, dim = 1 : i64} : tensor<8x16xf32>
+  return %0 : tensor<8x16xf32>
+}
+
 // CHECK-LABEL: func.func @layout
 func.func @layout(%x: tensor<4x8xf64>) -> tensor<7x8xf64> {
   // CHECK: sar.slice %{{.*}} {offsets = array<i64: 1, 0>, sizes = array<i64: 2, 8>, strides = array<i64: 1, 1>}
@@ -142,48 +163,30 @@ func.func @interp_kernels(%z: tensor<8x4xcomplex<f64>>, %p: tensor<8x4xf64>)
   return %0, %1 : tensor<8x4xcomplex<f64>>, tensor<8x4xcomplex<f64>>
 }
 
-// CHECK-LABEL: func.func @strided_slice
-func.func @strided_slice(%x: tensor<4x16xf64>) -> tensor<4x8xf64> {
-  // CHECK: sar.slice %{{.*}} {offsets = array<i64: 0, 1>, sizes = array<i64: 4, 8>, strides = array<i64: 1, 2>}
-  %0 = sar.slice %x {offsets = array<i64: 0, 1>, sizes = array<i64: 4, 8>, strides = array<i64: 1, 2>} : tensor<4x16xf64> -> tensor<4x8xf64>
-  return %0 : tensor<4x8xf64>
+// CHECK-LABEL: func.func @gather
+func.func @gather(%d: tensor<8x8xcomplex<f64>>, %r: tensor<4x4xf64>,
+                  %c: tensor<4x4xf64>) -> tensor<4x4xcomplex<f64>> {
+  // CHECK: sar.gather2d %{{.*}}, %{{.*}}, %{{.*}} {boundary = "edge", kernel = "nearest"}
+  %0 = sar.gather2d %d, %r, %c {kernel = "nearest", boundary = "edge"}
+      : (tensor<8x8xcomplex<f64>>, tensor<4x4xf64>, tensor<4x4xf64>)
+      -> tensor<4x4xcomplex<f64>>
+  // CHECK: sar.gather2d
+  %1 = sar.gather2d %0, %r, %c
+      : (tensor<4x4xcomplex<f64>>, tensor<4x4xf64>, tensor<4x4xf64>)
+      -> tensor<4x4xcomplex<f64>>
+  return %1 : tensor<4x4xcomplex<f64>>
 }
 
-// CHECK-LABEL: func.func @interp_dim0
-func.func @interp_dim0(%z: tensor<8x4xcomplex<f64>>, %p: tensor<8x4xf64>)
-    -> tensor<8x4xcomplex<f64>> {
-  // CHECK: sar.interp1d %{{.*}}, %{{.*}} {dim = 0 : i64}
-  %0 = sar.interp1d %z, %p {dim = 0 : i64}
-      : (tensor<8x4xcomplex<f64>>, tensor<8x4xf64>)
-      -> (tensor<8x4xcomplex<f64>>)
-  return %0 : tensor<8x4xcomplex<f64>>
-}
-
-// CHECK-LABEL: func.func @non_pow2_fft
-func.func @non_pow2_fft(%z: tensor<4x12xcomplex<f64>>)
-    -> tensor<4x12xcomplex<f64>> {
-  // CHECK: sar.fft %{{.*}} {dim = 1 : i64} : tensor<4x12xcomplex<f64>>
-  %0 = sar.fft %z {dim = 1 : i64} : tensor<4x12xcomplex<f64>>
-  return %0 : tensor<4x12xcomplex<f64>>
-}
-
-// CHECK-LABEL: func.func @selection
-func.func @selection(%a: tensor<4x8xf64>, %b: tensor<4x8xf64>,
-                     %z: tensor<4x8xcomplex<f64>>,
-                     %w: tensor<4x8xcomplex<f64>>)
-    -> (tensor<4x8xf64>, tensor<4x8xcomplex<f64>>) {
-  // CHECK: sar.cmp %{{.*}}, %{{.*}} {predicate = "gt"} : tensor<4x8xf64>
-  %0 = sar.cmp %a, %b {predicate = "gt"} : tensor<4x8xf64>
-  // CHECK: sar.where %{{.*}}, %{{.*}}, %{{.*}} : (tensor<4x8xf64>, tensor<4x8xf64>, tensor<4x8xf64>)
-  %1 = sar.where %0, %a, %b : (tensor<4x8xf64>, tensor<4x8xf64>, tensor<4x8xf64>) -> (tensor<4x8xf64>)
-  // CHECK: sar.where %{{.*}}, %{{.*}}, %{{.*}} : (tensor<4x8xf64>, tensor<4x8xcomplex<f64>>, tensor<4x8xcomplex<f64>>)
-  %2 = sar.where %0, %z, %w : (tensor<4x8xf64>, tensor<4x8xcomplex<f64>>, tensor<4x8xcomplex<f64>>) -> (tensor<4x8xcomplex<f64>>)
-  return %1, %2 : tensor<4x8xf64>, tensor<4x8xcomplex<f64>>
-}
-
-// CHECK-LABEL: func.func @reverse
-func.func @reverse(%x: tensor<4x8xcomplex<f32>>) -> tensor<4x8xcomplex<f32>> {
-  // CHECK: sar.reverse %{{.*}} {dim = 1 : i64} : tensor<4x8xcomplex<f32>>
-  %0 = sar.reverse %x {dim = 1 : i64} : tensor<4x8xcomplex<f32>>
-  return %0 : tensor<4x8xcomplex<f32>>
+// CHECK-LABEL: func.func @iterate
+func.func @iterate(%z: tensor<8x8xcomplex<f64>>, %f: tensor<8x8xcomplex<f64>>)
+    -> tensor<8x8xcomplex<f64>> {
+  // CHECK: sar.iterate(%{{.*}}) {trips = 4 : i64}
+  // CHECK: sar.yield
+  %0 = sar.iterate(%z) {trips = 4 : i64}
+      : (tensor<8x8xcomplex<f64>>) -> tensor<8x8xcomplex<f64>> {
+  ^bb0(%acc: tensor<8x8xcomplex<f64>>):
+    %1 = sar.mul %acc, %f : tensor<8x8xcomplex<f64>>
+    sar.yield %1 : tensor<8x8xcomplex<f64>>
+  }
+  return %0 : tensor<8x8xcomplex<f64>>
 }

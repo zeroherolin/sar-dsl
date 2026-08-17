@@ -16,5 +16,5 @@ config.excludes = ["CMakeLists.txt", "python"]
 llvm_config.use_default_substitutions()
 
 tool_dirs = [config.sar_dsl_tools_dir, config.llvm_tools_dir]
-llvm_config.add_tool_substitutions(["sar-opt", "mlir-opt", "FileCheck"],
-                                   tool_dirs)
+llvm_config.add_tool_substitutions(
+    ["sar-opt", "sar-translate", "mlir-opt", "FileCheck"], tool_dirs)

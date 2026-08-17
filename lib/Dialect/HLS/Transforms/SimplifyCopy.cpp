@@ -17,7 +17,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 #define DEBUG_TYPE "hls-simplify-copy"
 
 using namespace mlir;
@@ -37,7 +36,7 @@ struct SplitElementwiseGenericOp : public OpRewritePattern<linalg::GenericOp> {
       if (input.get() == output.get())
         return failure();
 
-      rewriter.create<memref::CopyOp>(op.getLoc(), input.get(), output.get());
+      memref::CopyOp::create(rewriter, op.getLoc(), input.get(), output.get());
       input.set(output.get());
       return success();
     }
@@ -208,7 +207,7 @@ struct SimplifyCopy : public sar::impl::SimplifyCopyBase<SimplifyCopy> {
     mlir::RewritePatternSet patterns(context);
     patterns.add<SplitElementwiseGenericOp>(context);
     patterns.add<SimplifyBufferCopy>(context);
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+    (void)applyPatternsGreedily(func, std::move(patterns));
   }
 };
 } // namespace

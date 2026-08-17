@@ -15,7 +15,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -65,7 +64,10 @@ static LogicalResult collapseMemref(Value memref) {
       newResults.push_back(map.getResult(dim));
     auto newMap = AffineMap::get(map.getNumDims(), map.getNumSymbols(),
                                  newResults, map.getContext());
-    user->setAttr("map", AffineMapAttr::get(newMap));
+    // Both affine.load and affine.store spell their map attribute this way;
+    // take the name from the op rather than hardcoding it.
+    user->setAttr(affine::AffineLoadOp::getMapAttrStrName(),
+                  AffineMapAttr::get(newMap));
   }
 
   // Update tile layout - remove the collapsed dimensions.
@@ -126,9 +128,8 @@ struct CollapseMemrefUnitDims
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<CollapseFuncMemref>(context);
-    (void)applyOpPatternsGreedily(
-        ArrayRef<Operation *>{func.getOperation()},
-        std::move(patterns));
+    (void)applyOpPatternsGreedily(ArrayRef<Operation *>{func.getOperation()},
+                                  std::move(patterns));
   }
 };
 } // namespace

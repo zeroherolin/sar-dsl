@@ -13,6 +13,10 @@
 // transforms are computed in double precision regardless of the storage
 // precision.
 //
+// The library also backs the compiled kernel's buffer allocation, through
+// the `_mlir_memref_to_llvm_*` hooks the CPU pipeline lowers `memref.alloc`
+// onto (see the plane pool below).
+//
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
@@ -20,15 +24,148 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 #include "sar/Runtime/RuntimeEnums.h"
 
 namespace {
+
+//===----------------------------------------------------------------------===//
+// Plane pool
+//===----------------------------------------------------------------------===//
+//
+// A kernel invocation allocates its intermediate planes, writes them once
+// and frees them. At scene scale each plane is gigabytes, so libc serves it
+// with a fresh mmap and returns it on free -- and the next invocation
+// faults and zeroes every page again before the first useful store. That
+// first touch, not the arithmetic, is what a full-size run spends most of
+// its time on: 4 GiB costs ~1.5 s to fault in against ~0.03 s to rewrite.
+//
+// The pool keeps freed blocks mapped and hands them back to the next
+// request of the same shape, so the pages are faulted once per process
+// rather than once per call. It is not a general allocator: the only
+// requests it ever sees are a kernel's own buffers, a handful of large
+// blocks per call in a repeating pattern.
+//
+// Retention is bounded by the peak the kernel itself reached -- the pool
+// never holds more than was live at once, so a process that could run the
+// kernel can hold its cache. `SAR_RT_POOL_MAX_BYTES` overrides the bound;
+// 0 disables pooling and every block goes straight back to libc.
+//
+// Only blocks worth the bookkeeping are pooled. Below `kPoolMinBytes` a
+// buffer is not what a first touch is spent on, and libc's own free lists
+// already serve it without a round trip to the kernel; leaving those to
+// libc is also what keeps the pool's block list a dozen entries long, so
+// the linear scans below stay cheap.
+
+class PlanePool {
+public:
+  static constexpr size_t kPoolMinBytes = 1u << 20;
+
+  static PlanePool &instance() {
+    static PlanePool pool;
+    return pool;
+  }
+
+  void *allocate(size_t size, size_t alignment) {
+    if (size == 0)
+      return nullptr;
+    bool pooled = enabled && size >= kPoolMinBytes;
+    if (pooled) {
+      std::lock_guard<std::mutex> guard(mutex);
+      for (size_t i = 0; i < cache.size(); ++i) {
+        // Exact-size reuse only. Kernel buffers repeat their shapes call
+        // after call, so a looser fit would only trade pages for slack.
+        if (cache[i].size != size || cache[i].alignment < alignment)
+          continue;
+        void *ptr = cache[i].ptr;
+        cachedBytes -= cache[i].size;
+        cache[i] = cache.back();
+        cache.pop_back();
+        liveBytes += size;
+        peakLiveBytes = std::max(peakLiveBytes, liveBytes);
+        return ptr;
+      }
+    }
+
+    void *ptr = nullptr;
+    if (posix_memalign(&ptr, std::max(alignment, sizeof(void *)), size) != 0) {
+      // The generated kernel code does not check this pointer, so a silent
+      // nullptr would resurface as a segfault far from the cause.
+      std::fprintf(stderr,
+                   "sar_runtime: failed to allocate %zu bytes "
+                   "(alignment %zu)\n",
+                   size, alignment);
+      return nullptr;
+    }
+    if (pooled) {
+      std::lock_guard<std::mutex> guard(mutex);
+      blocks.push_back({ptr, size, alignment});
+      liveBytes += size;
+      peakLiveBytes = std::max(peakLiveBytes, liveBytes);
+    }
+    return ptr;
+  }
+
+  void release(void *ptr) {
+    if (!ptr)
+      return;
+    if (enabled) {
+      std::lock_guard<std::mutex> guard(mutex);
+      // Blocks libc served directly are not listed here and fall through.
+      for (size_t i = 0; i < blocks.size(); ++i) {
+        if (blocks[i].ptr != ptr)
+          continue;
+        Block block = blocks[i];
+        liveBytes -= block.size;
+        size_t bound = limit ? limit : peakLiveBytes;
+        if (cachedBytes + block.size <= bound) {
+          cache.push_back(block);
+          cachedBytes += block.size;
+          return;
+        }
+        blocks[i] = blocks.back();
+        blocks.pop_back();
+        free(ptr);
+        return;
+      }
+    }
+    free(ptr);
+  }
+
+private:
+  struct Block {
+    void *ptr;
+    size_t size;
+    size_t alignment;
+  };
+
+  PlanePool() {
+    if (const char *env = std::getenv("SAR_RT_POOL_MAX_BYTES")) {
+      char *end = nullptr;
+      long long value = std::strtoll(env, &end, 10);
+      if (end != env && value >= 0) {
+        limit = static_cast<size_t>(value);
+        enabled = value != 0;
+      }
+    }
+  }
+
+  std::mutex mutex;
+  std::vector<Block> blocks; // every live block the pool handed out
+  std::vector<Block> cache;  // freed blocks kept mapped for reuse
+  size_t liveBytes = 0;
+  size_t cachedBytes = 0;
+  size_t peakLiveBytes = 0;
+  size_t limit = 0;
+  bool enabled = true;
+};
 
 //===----------------------------------------------------------------------===//
 // MLIR memref descriptors
@@ -57,12 +194,15 @@ template <typename T, int Rank> struct MemRefDescriptor {
 /// thread budget), then falls back to the hardware concurrency.
 unsigned runtimeWorkerCount() {
   static const unsigned cached = [] {
+    // Cap requests well above any real machine but below where thread
+    // construction itself would fail.
+    constexpr long kMaxWorkers = 4096;
     for (const char *var : {"SAR_RT_NUM_THREADS", "OMP_NUM_THREADS"}) {
       if (const char *env = std::getenv(var)) {
         char *end = nullptr;
         long value = std::strtol(env, &end, 10);
         if (end != env && value > 0)
-          return static_cast<unsigned>(value);
+          return static_cast<unsigned>(std::min(value, kMaxWorkers));
       }
     }
     return std::max(1u, std::thread::hardware_concurrency());
@@ -180,14 +320,13 @@ public:
       m <<= 1;
     pow2 = std::make_unique<FFTPlan>(m);
 
-    // chirp[k] = exp(-j pi k^2 / n). exp has period 2 pi i, so k^2 can be
-    // reduced modulo 2n first; folding k before squaring keeps the product
-    // from overflowing for large transforms.
+    // chirp[k] = exp(-j pi k^2 / n). exp has period 2 pi i, so k^2 is
+    // reduced modulo 2n before entering the angle; the int64 product k*k
+    // cannot overflow for any realistic transform (k < n << 2^31).
     chirp.resize(n);
     for (int64_t k = 0; k < n; ++k) {
       int64_t sq = ((k % (2 * n)) * k) % (2 * n);
-      double angle =
-          -M_PI * static_cast<double>(sq) / static_cast<double>(n);
+      double angle = -M_PI * static_cast<double>(sq) / static_cast<double>(n);
       chirp[k] = std::complex<double>(std::cos(angle), std::sin(angle));
     }
 
@@ -294,15 +433,18 @@ double sinc(double x) {
   return std::sin(px) / px;
 }
 
-// Kernel / window encodings shared with the lowering pass.
+// Kernel / window / boundary encodings shared with the lowering pass.
 using sar_rt::kCubic;
+using sar_rt::kEdge;
 using sar_rt::kHamming;
 using sar_rt::kHann;
 using sar_rt::kKaiser;
 using sar_rt::kLinear;
 using sar_rt::kNearest;
 using sar_rt::kRect;
+using sar_rt::kReflect;
 using sar_rt::kSinc;
+using sar_rt::kZero;
 
 /// Modified Bessel function of the first kind, order zero (power series;
 /// the term test exits well before the bound for the beta range the
@@ -317,6 +459,23 @@ double besselI0(double x) {
       break;
   }
   return sum;
+}
+
+/// Applies the boundary policy to an out-of-range index. Returns a valid
+/// in-bounds index or -1 for kZero when the index is unmappable.
+inline int64_t applyBoundary(int64_t idx, int64_t cols, int64_t boundary) {
+  if (idx >= 0 && idx < cols)
+    return idx;
+  if (boundary == kZero)
+    return -1;
+  if (boundary == kEdge)
+    return std::max<int64_t>(0, std::min<int64_t>(cols - 1, idx));
+  // kReflect: mirror about the boundaries.
+  if (idx < 0)
+    idx = -idx - 1;
+  else
+    idx = 2 * cols - idx - 1;
+  return std::max<int64_t>(0, std::min<int64_t>(cols - 1, idx));
 }
 
 /// Window taper evaluated at t = d / (taps/2), |t| <= 1 on the support.
@@ -337,16 +496,26 @@ double interpWindow(int64_t window, double t, double beta, double invI0Beta) {
 }
 
 /// Kernel-based sample of a (double-precision) row at a fractional
-/// position; out-of-range taps contribute zero.
+/// position. Boundary policy resolves out-of-range taps: zero, edge-clamp,
+/// or reflect.
 inline std::complex<double> sampleInterp(const std::complex<double> *row,
                                          int64_t cols, double position,
                                          int64_t kernel, int64_t taps,
                                          int64_t window, double beta,
-                                         double invI0Beta) {
+                                         double invI0Beta, int64_t boundary) {
   if (kernel == kNearest) {
     int64_t idx = static_cast<int64_t>(std::floor(position + 0.5));
-    if (idx < 0 || idx >= cols)
+    if (boundary == kZero && (idx < 0 || idx >= cols))
       return {0.0, 0.0};
+    if (boundary == kEdge)
+      idx = std::max<int64_t>(0, std::min<int64_t>(cols - 1, idx));
+    else if (boundary == kReflect && (idx < 0 || idx >= cols)) {
+      if (idx < 0)
+        idx = -idx - 1;
+      else
+        idx = 2 * cols - idx - 1;
+      idx = std::max<int64_t>(0, std::min<int64_t>(cols - 1, idx));
+    }
     return row[idx];
   }
 
@@ -356,8 +525,8 @@ inline std::complex<double> sampleInterp(const std::complex<double> *row,
 
   if (kernel == kLinear) {
     for (int64_t k = 0; k <= 1; ++k) {
-      int64_t idx = idxInt + k;
-      if (idx < 0 || idx >= cols)
+      int64_t idx = applyBoundary(idxInt + k, cols, boundary);
+      if (idx < 0)
         continue;
       acc += row[idx] * (k == 0 ? 1.0 - frac : frac);
     }
@@ -370,8 +539,8 @@ inline std::complex<double> sampleInterp(const std::complex<double> *row,
     double w[4] = {-0.5 * s3 + s2 - 0.5 * s, 1.5 * s3 - 2.5 * s2 + 1.0,
                    -1.5 * s3 + 2.0 * s2 + 0.5 * s, 0.5 * s3 - 0.5 * s2};
     for (int64_t k = -1; k <= 2; ++k) {
-      int64_t idx = idxInt + k;
-      if (idx < 0 || idx >= cols)
+      int64_t idx = applyBoundary(idxInt + k, cols, boundary);
+      if (idx < 0)
         continue;
       acc += row[idx] * w[k + 1];
     }
@@ -381,10 +550,10 @@ inline std::complex<double> sampleInterp(const std::complex<double> *row,
   // Windowed sinc over `taps` taps centred on the position.
   int64_t half = taps / 2;
   for (int64_t k = 1 - half; k <= half; ++k) {
-    int64_t idx = idxInt + k;
-    if (idx < 0 || idx >= cols)
+    int64_t idx = applyBoundary(idxInt + k, cols, boundary);
+    if (idx < 0)
       continue;
-    double dist = position - static_cast<double>(idx);
+    double dist = position - static_cast<double>(idxInt + k);
     double weight =
         sinc(dist) *
         interpWindow(window, dist / static_cast<double>(half), beta, invI0Beta);
@@ -398,7 +567,7 @@ template <typename Scalar>
 void interp1d2d(const MemRefDescriptor<std::complex<Scalar>, 2> *data,
                 const MemRefDescriptor<double, 2> *positions,
                 MemRefDescriptor<std::complex<Scalar>, 2> *out, int64_t kernel,
-                int64_t taps, int64_t window, double beta) {
+                int64_t taps, int64_t window, double beta, int64_t boundary) {
   int64_t rows = data->sizes[0];
   int64_t cols = data->sizes[1];
   double invI0Beta = window == kKaiser ? 1.0 / besselI0(beta) : 1.0;
@@ -412,7 +581,7 @@ void interp1d2d(const MemRefDescriptor<std::complex<Scalar>, 2> *data,
       for (int64_t j = 0; j < cols; ++j) {
         std::complex<double> acc =
             sampleInterp(row.data(), cols, positions->at(i, j), kernel, taps,
-                         window, beta, invI0Beta);
+                         window, beta, invI0Beta, boundary);
         out->at(i, j) = std::complex<Scalar>(static_cast<Scalar>(acc.real()),
                                              static_cast<Scalar>(acc.imag()));
       }
@@ -428,12 +597,45 @@ void interp1d2d(const MemRefDescriptor<std::complex<Scalar>, 2> *data,
 
 extern "C" {
 
+//===----------------------------------------------------------------------===//
+// Buffer allocation
+//===----------------------------------------------------------------------===//
+//
+// `finalize-memref-to-llvm` is configured with `use-generic-functions`, so
+// a kernel's `memref.alloc` calls these instead of malloc/aligned_alloc,
+// and its buffers come from the pool above.
+
+/// ABI-boundary shape check. These entry points form a C ABI that foreign
+/// callers can reach directly, so a mismatch aborts with a diagnostic in
+/// every build -- an assert would vanish under NDEBUG and turn the mismatch
+/// into an out-of-bounds write.
+static void requireMatchingShapes(bool ok, const char *what) {
+  if (!ok) {
+    std::fprintf(stderr, "sar_runtime: %s\n", what);
+    std::abort();
+  }
+}
+
+void *_mlir_memref_to_llvm_alloc(int64_t size) {
+  return PlanePool::instance().allocate(static_cast<size_t>(size),
+                                        sizeof(void *));
+}
+
+void *_mlir_memref_to_llvm_aligned_alloc(int64_t alignment, int64_t size) {
+  return PlanePool::instance().allocate(static_cast<size_t>(size),
+                                        static_cast<size_t>(alignment));
+}
+
+void _mlir_memref_to_llvm_free(void *ptr) {
+  PlanePool::instance().release(ptr);
+}
+
 void _mlir_ciface_sar_rt_fft_1d_c64(
     MemRefDescriptor<std::complex<float>, 1> *in,
     MemRefDescriptor<std::complex<float>, 1> *out, int64_t /*dim*/,
     bool inverse) {
-  assert(in->sizes[0] == out->sizes[0] &&
-         "FFT output shape must match input shape");
+  requireMatchingShapes(in->sizes[0] == out->sizes[0],
+                        "fft_1d_c64: output shape must match input shape");
   fft1d<float>(in, out, inverse);
 }
 
@@ -441,24 +643,26 @@ void _mlir_ciface_sar_rt_fft_1d_c128(
     MemRefDescriptor<std::complex<double>, 1> *in,
     MemRefDescriptor<std::complex<double>, 1> *out, int64_t /*dim*/,
     bool inverse) {
-  assert(in->sizes[0] == out->sizes[0] &&
-         "FFT output shape must match input shape");
+  requireMatchingShapes(in->sizes[0] == out->sizes[0],
+                        "fft_1d_c128: output shape must match input shape");
   fft1d<double>(in, out, inverse);
 }
 
 void _mlir_ciface_sar_rt_fft_2d_c64(
     MemRefDescriptor<std::complex<float>, 2> *in,
     MemRefDescriptor<std::complex<float>, 2> *out, int64_t dim, bool inverse) {
-  assert(in->sizes[0] == out->sizes[0] && in->sizes[1] == out->sizes[1] &&
-         "FFT output shape must match input shape");
+  requireMatchingShapes(in->sizes[0] == out->sizes[0] &&
+                            in->sizes[1] == out->sizes[1],
+                        "fft_2d_c64: output shape must match input shape");
   fft2d<float>(in, out, dim, inverse);
 }
 
 void _mlir_ciface_sar_rt_fft_2d_c128(
     MemRefDescriptor<std::complex<double>, 2> *in,
     MemRefDescriptor<std::complex<double>, 2> *out, int64_t dim, bool inverse) {
-  assert(in->sizes[0] == out->sizes[0] && in->sizes[1] == out->sizes[1] &&
-         "FFT output shape must match input shape");
+  requireMatchingShapes(in->sizes[0] == out->sizes[0] &&
+                            in->sizes[1] == out->sizes[1],
+                        "fft_2d_c128: output shape must match input shape");
   fft2d<double>(in, out, dim, inverse);
 }
 
@@ -466,26 +670,29 @@ void _mlir_ciface_sar_rt_interp1d_2d_c64(
     MemRefDescriptor<std::complex<float>, 2> *data,
     MemRefDescriptor<double, 2> *positions,
     MemRefDescriptor<std::complex<float>, 2> *out, int64_t kernel, int64_t taps,
-    int64_t window, double beta) {
-  assert(data->sizes[0] == positions->sizes[0] &&
-         data->sizes[1] == positions->sizes[1] &&
-         "interp1d positions shape must match data shape");
-  assert(data->sizes[0] == out->sizes[0] && data->sizes[1] == out->sizes[1] &&
-         "interp1d output shape must match data shape");
-  interp1d2d<float>(data, positions, out, kernel, taps, window, beta);
+    int64_t window, double beta, int64_t boundary) {
+  requireMatchingShapes(data->sizes[0] == positions->sizes[0] &&
+                            data->sizes[1] == positions->sizes[1],
+                        "interp1d_2d_c64: positions shape must match data");
+  requireMatchingShapes(data->sizes[0] == out->sizes[0] &&
+                            data->sizes[1] == out->sizes[1],
+                        "interp1d_2d_c64: output shape must match data");
+  interp1d2d<float>(data, positions, out, kernel, taps, window, beta, boundary);
 }
 
 void _mlir_ciface_sar_rt_interp1d_2d_c128(
     MemRefDescriptor<std::complex<double>, 2> *data,
     MemRefDescriptor<double, 2> *positions,
     MemRefDescriptor<std::complex<double>, 2> *out, int64_t kernel,
-    int64_t taps, int64_t window, double beta) {
-  assert(data->sizes[0] == positions->sizes[0] &&
-         data->sizes[1] == positions->sizes[1] &&
-         "interp1d positions shape must match data shape");
-  assert(data->sizes[0] == out->sizes[0] && data->sizes[1] == out->sizes[1] &&
-         "interp1d output shape must match data shape");
-  interp1d2d<double>(data, positions, out, kernel, taps, window, beta);
+    int64_t taps, int64_t window, double beta, int64_t boundary) {
+  requireMatchingShapes(data->sizes[0] == positions->sizes[0] &&
+                            data->sizes[1] == positions->sizes[1],
+                        "interp1d_2d_c128: positions shape must match data");
+  requireMatchingShapes(data->sizes[0] == out->sizes[0] &&
+                            data->sizes[1] == out->sizes[1],
+                        "interp1d_2d_c128: output shape must match data");
+  interp1d2d<double>(data, positions, out, kernel, taps, window, beta,
+                     boundary);
 }
 
 } // extern "C"

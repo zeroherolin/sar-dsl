@@ -19,9 +19,8 @@ requires_cpu = pytest.mark.skipif(
     not _backend_available("cpu"),
     reason="CPU backend toolchain not available (build the project first)")
 
-requires_hls = pytest.mark.skipif(
-    not _backend_available("hls"),
-    reason="HLS toolchain not available")
+requires_hls = pytest.mark.skipif(not _backend_available("hls"),
+                                  reason="HLS toolchain not available")
 
 
 # Shared utilities for split-complex affine/HLS testing

@@ -6,9 +6,11 @@ add_llvm_executable(sar-lsp-server
 
   DEPENDS
   SARDialectIncGen
+  HLSDialectIncGen
 )
 target_link_libraries(sar-lsp-server PRIVATE
   SARDialect
+  HLSDialect
   ${dialect_libs}
   ${extension_libs}
   MLIRRegisterAllDialects

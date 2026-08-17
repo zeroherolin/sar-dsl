@@ -2,7 +2,8 @@
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
-// The integer encodings of `sar.interp1d`'s `kernel` and `window` attributes
+// The integer encodings of `sar.interp1d`'s `kernel`, `window` and
+// `boundary` attributes
 // as passed across the runtime C ABI. Included by both the lowering
 // (lib/Conversion/SARSignalToRuntime) and the runtime implementation
 // (runtime/SARRuntime.cpp), which is dependency-free C++ -- so this header
@@ -29,6 +30,12 @@ enum InterpWindow : int64_t {
   kHann = 1,
   kHamming = 2,
   kKaiser = 3,
+};
+
+enum InterpBoundary : int64_t {
+  kZero = 0,
+  kEdge = 1,
+  kReflect = 2,
 };
 
 } // namespace sar_rt

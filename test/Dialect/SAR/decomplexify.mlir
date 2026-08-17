@@ -13,6 +13,17 @@ func.func @complex_mul(%a: tensor<4xcomplex<f64>>, %b: tensor<4xcomplex<f64>>)
   return %0 : tensor<4xcomplex<f64>>
 }
 
+// The frontend's `sar.arg_names` splits with the arguments it names: a
+// complex parameter keeps its name on both planes.
+// CHECK-LABEL: func.func @named_args
+// CHECK-SAME: attributes {sar.arg_names = ["raw_re", "raw_im", "win"]}
+func.func @named_args(%a: tensor<4xcomplex<f64>>, %w: tensor<4xf64>)
+    -> tensor<4xcomplex<f64>>
+    attributes {sar.arg_names = ["raw", "win"]} {
+  %0 = sar.mul %a, %a : tensor<4xcomplex<f64>>
+  return %0 : tensor<4xcomplex<f64>>
+}
+
 // CHECK-LABEL: func.func @complex_from_planes
 func.func @complex_from_planes(%p: tensor<8xf32>) -> tensor<8xcomplex<f32>> {
   // CHECK-DAG: sar.cos %arg0
@@ -122,4 +133,45 @@ func.func @where_selects_planes(%m: tensor<4xf32>, %a: tensor<4xcomplex<f32>>,
   // CHECK-DAG: sar.where %[[M]], %[[AIM]], %[[BIM]]
   %0 = sar.where %m, %a, %b : (tensor<4xf32>, tensor<4xcomplex<f32>>, tensor<4xcomplex<f32>>) -> (tensor<4xcomplex<f32>>)
   return %0 : tensor<4xcomplex<f32>>
+}
+
+// CHECK-LABEL: func.func @cumsum_planes
+// CHECK-SAME: (%[[RE:.*]]: tensor<4x8xf32>, %[[IM:.*]]: tensor<4x8xf32>)
+func.func @cumsum_planes(%z: tensor<4x8xcomplex<f32>>) -> tensor<4x8xcomplex<f32>> {
+  // A prefix sum is linear, so each plane scans on its own.
+  // CHECK-DAG: sar.cumsum %[[RE]] {dim = 1 : i64}
+  // CHECK-DAG: sar.cumsum %[[IM]] {dim = 1 : i64}
+  %0 = sar.cumsum %z {dim = 1 : i64} : tensor<4x8xcomplex<f32>>
+  return %0 : tensor<4x8xcomplex<f32>>
+}
+
+// A complex gather splits into one gather per plane, sharing the (real)
+// position tensors.
+// CHECK-LABEL: func.func @gather_planes
+func.func @gather_planes(%d: tensor<8x8xcomplex<f64>>, %r: tensor<4x4xf64>,
+                         %c: tensor<4x4xf64>) -> tensor<4x4xcomplex<f64>> {
+  // CHECK: sar.gather2d_split %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}
+  // CHECK-NOT: complex
+  %0 = sar.gather2d %d, %r, %c
+      : (tensor<8x8xcomplex<f64>>, tensor<4x4xf64>, tensor<4x4xf64>)
+      -> tensor<4x4xcomplex<f64>>
+  return %0 : tensor<4x4xcomplex<f64>>
+}
+
+// A complex loop carry expands into an adjacent (re, im) pair, and the
+// body is rewritten inside the loop.
+// CHECK-LABEL: func.func @iterate_carries
+func.func @iterate_carries(%z: tensor<4x4xcomplex<f64>>)
+    -> tensor<4x4xcomplex<f64>> {
+  // CHECK: sar.iterate(%{{.*}}, %{{.*}}) {trips = 3 : i64} : (tensor<4x4xf64>, tensor<4x4xf64>)
+  // CHECK: ^bb0(%{{.*}}: tensor<4x4xf64>, %{{.*}}: tensor<4x4xf64>):
+  // CHECK: sar.yield %{{.*}}, %{{.*}} : tensor<4x4xf64>, tensor<4x4xf64>
+  // CHECK-NOT: complex
+  %0 = sar.iterate(%z) {trips = 3 : i64}
+      : (tensor<4x4xcomplex<f64>>) -> tensor<4x4xcomplex<f64>> {
+  ^bb0(%acc: tensor<4x4xcomplex<f64>>):
+    %1 = sar.mul %acc, %acc : tensor<4x4xcomplex<f64>>
+    sar.yield %1 : tensor<4x4xcomplex<f64>>
+  }
+  return %0 : tensor<4x4xcomplex<f64>>
 }

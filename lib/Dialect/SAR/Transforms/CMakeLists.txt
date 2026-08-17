@@ -3,6 +3,7 @@ add_mlir_library(SARTransforms
   FuseElementwise.cpp
   LowerCopy.cpp
   EmitCInterface.cpp
+  DemoteLoopCarries.cpp
   ReuseBuffers.cpp
   StageTransposes.cpp
 
@@ -18,7 +19,6 @@ add_mlir_library(SARTransforms
   MLIRAffineDialect
   MLIRLinalgDialect
   MLIRLinalgTransforms
-  MLIRAffineUtils
   MLIRMemRefDialect
   MLIRIR
   MLIRPass

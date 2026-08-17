@@ -16,7 +16,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -75,7 +74,7 @@ struct RemoveRedundantIf : public OpRewritePattern<mlir::affine::AffineIfOp> {
 } // namespace
 
 namespace {
-/// FIXME: More conprehensive intervening operation analysis.
+/// FIXME: More comprehensive intervening operation analysis.
 struct MergeSameIf : public OpRewritePattern<func::FuncOp> {
   using OpRewritePattern<func::FuncOp>::OpRewritePattern;
 
@@ -130,12 +129,13 @@ static bool applySimplifyAffineIf(func::FuncOp func) {
   mlir::RewritePatternSet patterns(context);
   patterns.add<RemoveRedundantIf>(context);
   patterns.add<MergeSameIf>(context);
-  (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+  (void)applyPatternsGreedily(func, std::move(patterns));
   return true;
 }
 
 namespace {
-struct SimplifyAffineIf : public sar::impl::SimplifyAffineIfBase<SimplifyAffineIf> {
+struct SimplifyAffineIf
+    : public sar::impl::SimplifyAffineIfBase<SimplifyAffineIf> {
   void runOnOperation() override { applySimplifyAffineIf(getOperation()); }
 };
 } // namespace

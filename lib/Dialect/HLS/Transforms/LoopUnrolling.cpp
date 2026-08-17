@@ -28,17 +28,15 @@ bool sar::applyFullyLoopUnrolling(Block &block, unsigned maxIterNum) {
     });
 
     if (hasFullyUnrolled)
-      break;
-
-    if (i == 7)
-      return false;
+      return true;
   }
-  return true;
+  // The iteration budget ran out with loops still standing.
+  return false;
 }
 
 /// Apply unroll and jam to the loop band with the given overall unroll factor.
 bool sar::applyLoopUnrollJam(AffineLoopBand &band,
-                                  unsigned overallUnrollFactor) {
+                             unsigned overallUnrollFactor) {
   assert(!band.empty() && "no loops provided");
   if (overallUnrollFactor == 1)
     return true;
@@ -49,8 +47,7 @@ bool sar::applyLoopUnrollJam(AffineLoopBand &band,
 }
 
 /// Apply unroll and jam to the loop band with the given unroll factors.
-bool sar::applyLoopUnrollJam(AffineLoopBand &band,
-                                  FactorList unrollFactors) {
+bool sar::applyLoopUnrollJam(AffineLoopBand &band, FactorList unrollFactors) {
   assert(!band.empty() && "no loops provided");
   if (llvm::all_of(unrollFactors, [](unsigned factor) { return factor == 1; }))
     return true;
@@ -67,5 +64,3 @@ bool sar::applyLoopUnrollJam(AffineLoopBand &band,
       band.push_back(loop);
   return result;
 }
-
-

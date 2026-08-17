@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "sar/Dialect/HLS/IR/HLS.h"
+#include "llvm/ADT/MapVector.h"
 
 namespace mlir {
 namespace sar {
@@ -110,11 +111,11 @@ getDistributedFactors(unsigned factor,
 /// Distribute the given factor evenly on all loop levels. The generated factors
 /// are garanteed to be divisors of the factors in given "costrFactorsList".
 /// This method can fail due to non-constant loop bounds.
-LogicalResult
-getEvenlyDistributedFactors(unsigned maxFactor, FactorList &factors,
-                            const SmallVectorImpl<mlir::affine::AffineForOp> &band,
-                            const SmallVectorImpl<FactorList> &constrFactors,
-                            bool powerOf2Constr = false);
+LogicalResult getEvenlyDistributedFactors(
+    unsigned maxFactor, FactorList &factors,
+    const SmallVectorImpl<mlir::affine::AffineForOp> &band,
+    const SmallVectorImpl<FactorList> &constrFactors,
+    bool powerOf2Constr = false);
 
 /// Return a pair which indicates whether the if statement is always true or
 /// false, respectively. The returned result is one-hot.
@@ -126,9 +127,12 @@ bool checkSameIfStatement(affine::AffineIfOp lhsOp, affine::AffineIfOp rhsOp);
 /// Parse array attributes.
 SmallVector<int64_t, 8> getIntArrayAttrValue(Operation *op, StringRef name);
 
-/// For storing all affine memory access operations (including affine::AffineLoadOp, and
-/// affine::AffineStoreOp) indexed by the corresponding memref.
-using MemAccessesMap = DenseMap<Value, SmallVector<Operation *, 16>>;
+/// For storing all affine memory access operations (including
+/// affine::AffineLoadOp, and affine::AffineStoreOp) indexed by the
+/// corresponding memref. A MapVector, so iteration follows the program order
+/// the block was walked in rather than pointer values -- consumers allocate
+/// budgets while iterating, and the outcome has to be the same on every run.
+using MemAccessesMap = llvm::MapVector<Value, SmallVector<Operation *, 16>>;
 
 /// Collect all load and store operations in the block and return them in "map".
 void getMemAccessesMap(Block &block, MemAccessesMap &map,
@@ -139,15 +143,12 @@ bool crossRegionDominates(Operation *a, Operation *b);
 /// Check if the lhsOp and rhsOp are in the same block. If so, return their
 /// ancestors that are located at the same block. Note that in this check,
 /// affine::AffineIfOp is transparent.
-std::optional<std::pair<Operation *, Operation *>> checkSameLevel(Operation *lhsOp,
-                                                             Operation *rhsOp);
-
-unsigned getCommonSurroundingLoops(Operation *A, Operation *B,
-                                   AffineLoopBand *band);
+std::optional<std::pair<Operation *, Operation *>>
+checkSameLevel(Operation *lhsOp, Operation *rhsOp);
 
 /// Calculate the upper and lower bound of the affine map if possible.
-std::optional<std::pair<int64_t, int64_t>> getBoundOfAffineMap(AffineMap map,
-                                                          ValueRange operands);
+std::optional<std::pair<int64_t, int64_t>>
+getBoundOfAffineMap(AffineMap map, ValueRange operands);
 
 /// Calculate partition factors through analyzing the "memrefType" and return
 /// them in "factors". Meanwhile, the overall partition number is calculated and
@@ -174,8 +175,10 @@ bool getParallelAndReductionLoopBand(const AffineLoopBand &band,
 /// Get the whole loop band given the outermost or innermost loop and return it
 /// in "band". Meanwhile, the return value is the innermost or outermost loop of
 /// this loop band.
-affine::AffineForOp getLoopBandFromOutermost(affine::AffineForOp forOp, AffineLoopBand &band);
-affine::AffineForOp getLoopBandFromInnermost(affine::AffineForOp forOp, AffineLoopBand &band);
+affine::AffineForOp getLoopBandFromOutermost(affine::AffineForOp forOp,
+                                             AffineLoopBand &band);
+affine::AffineForOp getLoopBandFromInnermost(affine::AffineForOp forOp,
+                                             AffineLoopBand &band);
 
 /// Collect all loop bands in the "block" and return them in "bands". If
 /// "allowHavingChilds" is true, loop bands containing more than 1 other loop
@@ -184,15 +187,9 @@ affine::AffineForOp getLoopBandFromInnermost(affine::AffineForOp forOp, AffineLo
 void getLoopBands(Block &block, AffineLoopBands &bands,
                   bool allowHavingChilds = false);
 
-void getArrays(Block &block, SmallVectorImpl<Value> &arrays,
-               bool allowArguments = true);
-
 std::optional<unsigned> getAverageTripCount(affine::AffineForOp forOp);
 
-bool checkDependence(Operation *A, Operation *B);
-
 func::FuncOp getTopFunc(ModuleOp module, std::string topFuncName = "");
-
 
 /// Ensure that all operations that could be executed after `start`
 /// (noninclusive) and prior to `memOp` (e.g. on a control flow/op path between
@@ -243,8 +240,10 @@ bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref) {
 
       // If the side effect comes from an affine read or write, try to prove the
       // side effecting `op` cannot reach `memOp`.
-      if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(op) &&
-          isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(memOp)) {
+      if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(
+              op) &&
+          isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(
+              memOp)) {
         affine::MemRefAccess srcAccess(op);
         affine::MemRefAccess destAccess(memOp);
 
@@ -277,9 +276,10 @@ bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref) {
           unsigned d;
           affine::FlatAffineValueConstraints dependenceConstraints;
           for (d = nsLoops + 1; d > minSurroundingLoops; d--) {
-            affine::DependenceResult result = affine::checkMemrefAccessDependence(
-                srcAccess, destAccess, d, &dependenceConstraints,
-                /*dependenceComponents=*/nullptr);
+            affine::DependenceResult result =
+                affine::checkMemrefAccessDependence(
+                    srcAccess, destAccess, d, &dependenceConstraints,
+                    /*dependenceComponents=*/nullptr);
             // A dependence failure or the presence of a dependence implies a
             // side effect.
             if (!noDependence(result)) {
@@ -386,63 +386,7 @@ bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref) {
   return !hasSideEffect;
 }
 
-//===----------------------------------------------------------------------===//
-// PtrLikeMemRefAccess Struct Declaration
-//===----------------------------------------------------------------------===//
-
-/// Encapsulates a memref load or store access information.
-struct PtrLikeMemRefAccess {
-  Value memref = nullptr;
-  affine::AffineValueMap accessMap;
-
-  void *impl = nullptr;
-
-  /// Constructs a affine::MemRefAccess from a load or store operation.
-  explicit PtrLikeMemRefAccess(Operation *opInst);
-
-  PtrLikeMemRefAccess(const void *impl) : impl(const_cast<void *>(impl)) {}
-
-  bool operator==(const PtrLikeMemRefAccess &rhs) const;
-
-  llvm::hash_code getHashValue() {
-    return llvm::hash_combine(memref, accessMap.getAffineMap(),
-                              accessMap.getOperands(), impl);
-  }
-};
-
-using ReverseOpIteratorsMap =
-    DenseMap<PtrLikeMemRefAccess,
-             SmallVector<std::reverse_iterator<Operation **>, 16>>;
-using OpIteratorsMap =
-    DenseMap<PtrLikeMemRefAccess, SmallVector<Operation **, 16>>;
-
 } // namespace sar
 } // namespace mlir
-
-//===----------------------------------------------------------------------===//
-// Make PtrLikeMemRefAccess eligible as key of DenseMap
-//===----------------------------------------------------------------------===//
-
-namespace llvm {
-
-template <> struct DenseMapInfo<mlir::sar::PtrLikeMemRefAccess> {
-  static mlir::sar::PtrLikeMemRefAccess getEmptyKey() {
-    auto pointer = llvm::DenseMapInfo<void *>::getEmptyKey();
-    return mlir::sar::PtrLikeMemRefAccess(pointer);
-  }
-  static mlir::sar::PtrLikeMemRefAccess getTombstoneKey() {
-    auto pointer = llvm::DenseMapInfo<void *>::getTombstoneKey();
-    return mlir::sar::PtrLikeMemRefAccess(pointer);
-  }
-  static unsigned getHashValue(mlir::sar::PtrLikeMemRefAccess access) {
-    return access.getHashValue();
-  }
-  static bool isEqual(mlir::sar::PtrLikeMemRefAccess lhs,
-                      mlir::sar::PtrLikeMemRefAccess rhs) {
-    return lhs == rhs;
-  }
-};
-
-} // namespace llvm
 
 #endif // SAR_DIALECT_HLS_IR_UTILS_H

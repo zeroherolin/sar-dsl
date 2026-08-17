@@ -19,7 +19,7 @@ them to native CPU code or synthesizable FPGA designs.
      alt="San Francisco Bay, ALOS-1 raw echoes focused by the SAR-DSL omega-K kernel"/>
 
 *San Francisco Bay: 16384 x 16384 raw ALOS-1 echoes focused by a single
-compiled omega-K kernel in 3.6 seconds.*
+compiled omega-K kernel in 4.6 seconds.*
 
 </div>
 
@@ -38,12 +38,13 @@ compiled omega-K kernel in 3.6 seconds.*
   backend emits Vitis HLS C++ for FPGA synthesis. Every SAR operation has
   an HLS lowering — FFTs as bit-reversal-free Stockham affine loops,
   interpolation as straight-line masked gathers — so **complete imaging
-  chains emit as single FPGA designs**, each with a generated
-  C-simulation testbench that all four algorithms pass bit-exactly.
+  chains emit as single FPGA designs**, each validated by a generated
+  C-simulation testbench against the NumPy reference.
   New targets plug in as [backend packages](docs/backends.md) without
   core changes.
 - **A real dialect, not a wrapper.** A small orthogonal IR (spectral,
-  element-wise, reductions, selection, layout) with
+  element-wise, reductions, selection, layout, data-dependent gathers,
+  compiled loops with tensor carries) with
   MLIR-verified domain invariants, bit-exact canonicalization folds and
   trace-time spectral-domain diagnostics — plus a Matlab/scipy-familiar
   vocabulary (`fft2`, `matched_filter`, `dechirp`, `mag2db`, `sinc`,
@@ -215,17 +216,21 @@ The point-target and SVA figures regenerate with
 
 ## Performance
 
-Full omega-K imaging chain, 240-core x86-64 server
-([benchmarks/](benchmarks/)):
+Full omega-K imaging chain, 240-core x86-64 server. `cold` is the first
+call after compilation in a fresh process, `warm` the minimum of 5 timed
+calls after 3 warmup passes; full ladders and methodology in
+[benchmarks/README.md](benchmarks/README.md):
 
-| Scene | SAR-DSL (cpu) | NumPy reference | Speedup |
-|-------|--------------:|----------------:|--------:|
-| 1024 x 1024 synthetic | 0.22 s | 0.49 s | 2.2x |
-| 4096 x 4096 synthetic | 0.80 s | 6.36 s | 8.0x |
-| 16384 x 16384 ALOS-1 | 3.6 s | ~15 min* | ~250x |
+| Scene | cold | warm | NumPy reference | Speedup |
+|-------|-----:|-----:|----------------:|--------:|
+| 1024 x 1024 synthetic | 0.380 s | 0.245 s | 0.48 s | 1.9x |
+| 4096 x 4096 synthetic | 1.079 s | 0.477 s | 7.57 s | 15.9x |
+| 16384 x 16384 ALOS-1 | 4.6 s | — | ~15 min* | ~195x |
 
 <sup>* extrapolated; the reference Stolt loop is impractical at this
-size.</sup>
+size. Synthetic speedups are warm vs. NumPy; the ALOS row compares its
+cold time, as no warm ALOS figure is published
+([benchmarks/README.md](benchmarks/README.md)).</sup>
 
 ## Getting started
 
@@ -261,6 +266,7 @@ python examples/wka/run_alos_cpu.py
 | Document | Contents |
 |----------|----------|
 | [docs/matlab-users.md](docs/matlab-users.md) | Coming from Matlab: indexing, name mapping, conventions |
+| [docs/python-api.md](docs/python-api.md) | Python API reference: every public name, one line each |
 | [docs/architecture.md](docs/architecture.md) | Layering, design decisions and their rationale |
 | [docs/dialect.md](docs/dialect.md) | The `sar` dialect reference: ops, passes, pipelines |
 | [docs/defining-ops.md](docs/defining-ops.md) | Defining operators with `@sar.op` |
@@ -288,14 +294,15 @@ scripts/                 toolchain build scripts
 
 ## Status and roadmap
 
-SAR-DSL is a research compiler. Current limits, by design or pending work
-(see [docs/roadmap.md](docs/roadmap.md)):
+SAR-DSL is a research compiler. One property holds by policy rather
+than by pending work: every DSL construct compiles to every backend,
+with no capability asymmetry between them —
+`test/python/test_backend_symmetry.py` is the gate. Current limits, by
+design or pending work (see [docs/roadmap.md](docs/roadmap.md)):
 
 - All shapes are static: one compile per geometry.
-- Every DSL construct compiles to every backend, with no capability
-  asymmetry between them.
-- HLS designs C-simulate bit-exactly against their generated testbenches,
-  but on-device place-and-route/timing closure is left to Vitis. Scene
+- HLS designs pass their generated C-simulation testbenches, but
+  on-device place-and-route/timing closure is left to Vitis. Scene
   size is bounded by DRAM rather than by the device: the full
   16384 x 16384 ALOS raster emits as a single design, with the backend
   deciding what stays on chip ([docs/backends.md](docs/backends.md)).
@@ -312,4 +319,5 @@ MIT — see [LICENSE](LICENSE). Built on
 [LLVM/MLIR](https://mlir.llvm.org/); the HLS dialect and its passes derive
 from [ScaleHLS-HIDA](https://github.com/UIUC-ChenLab/ScaleHLS-HIDA)
 (Apache-2.0 with LLVM exceptions, see [NOTICE](NOTICE)). Sample imagery
-derives from JAXA ALOS-1 PALSAR data.
+derives from JAXA ALOS-1 PALSAR data (original data © JAXA/METI); the
+raw product itself is not redistributed here.

@@ -84,8 +84,22 @@ class CompiledKernel:
         self._library = ctypes.CDLL(self.library_path)
         self._fn = getattr(self._library, f"_mlir_ciface_{name}")
         self._fn.restype = None
+        # One descriptor pointer per tensor, inputs then results. Declaring
+        # them lets ctypes reject an arity mismatch instead of corrupting
+        # the stack when metadata and library disagree.
+        self._fn.argtypes = [
+            ctypes.POINTER(_descriptor_type(t.rank))
+            for t in list(arg_types) + list(result_types)
+        ]
 
     def __call__(self, *arrays):
+        """Runs the kernel on numpy arrays, returning new output arrays.
+
+        Inputs must match the declared shapes and dtypes exactly. A
+        non-contiguous input (a slice, a transpose view) is copied whole
+        into a contiguous buffer before the call; pass contiguous arrays
+        to avoid the copy on large planes.
+        """
         if len(arrays) != len(self.arg_types):
             raise LaunchError(
                 f"kernel '{self.name}' takes {len(self.arg_types)} "

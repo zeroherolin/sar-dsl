@@ -15,7 +15,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace sar;
 using namespace hls;
@@ -42,7 +41,7 @@ struct StreamTaskIOs : public OpRewritePattern<TaskOp> {
       auto loc = rewriter.getUnknownLoc();
       rewriter.setInsertionPoint(op.getYieldOp());
       auto &output = op.getYieldOp()->getOpOperand(result.getResultNumber());
-      auto stream = rewriter.create<ToStreamOp>(loc, streamType, output.get());
+      auto stream = ToStreamOp::create(rewriter, loc, streamType, output.get());
       output.set(stream);
 
       // Create to_value op at the begining of every task user.
@@ -54,7 +53,7 @@ struct StreamTaskIOs : public OpRewritePattern<TaskOp> {
 
       for (auto taskUser : taskUsers) {
         rewriter.setInsertionPointToStart(&taskUser.getBody().front());
-        auto value = rewriter.create<ToValueOp>(loc, type, result);
+        auto value = ToValueOp::create(rewriter, loc, type, result);
         result.replaceUsesWithIf(value, [&](OpOperand &use) {
           return taskUser->isAncestor(use.getOwner()) &&
                  use.getOwner() != value;
@@ -73,7 +72,7 @@ struct ConvertToStreamWrite : public OpRewritePattern<ToStreamOp> {
   LogicalResult matchAndRewrite(ToStreamOp op,
                                 PatternRewriter &rewriter) const override {
     rewriter.setInsertionPointAfter(op);
-    rewriter.create<StreamWriteOp>(op.getLoc(), op.getStream(), op.getValue());
+    StreamWriteOp::create(rewriter, op.getLoc(), op.getStream(), op.getValue());
     rewriter.setInsertionPoint(op);
     rewriter.replaceOpWithNewOp<StreamOp>(
         op, op.getType(), cast<StreamType>(op.getType()).getDepth());
@@ -114,7 +113,8 @@ struct HoistStream : public OpRewritePattern<OpType> {
 } // namespace
 
 namespace {
-struct StreamDataflowTask : public sar::impl::StreamDataflowTaskBase<StreamDataflowTask> {
+struct StreamDataflowTask
+    : public sar::impl::StreamDataflowTaskBase<StreamDataflowTask> {
   void runOnOperation() override {
     auto func = getOperation();
     auto context = func.getContext();
@@ -125,7 +125,7 @@ struct StreamDataflowTask : public sar::impl::StreamDataflowTaskBase<StreamDataf
     patterns.add<ConvertToStreamRead>(context);
     patterns.add<HoistStream<DispatchOp>>(context);
     patterns.add<HoistStream<TaskOp>>(context);
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+    (void)applyPatternsGreedily(func, std::move(patterns));
   }
 };
 } // namespace

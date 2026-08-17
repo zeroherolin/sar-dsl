@@ -17,6 +17,8 @@ import numpy as np
 _REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(_REPO / "python"), str(_REPO / "examples")]
 
+import sar  # noqa: E402
+
 from common.params import synthetic_params  # noqa: E402
 from common.simulate import single_target_scene  # noqa: E402
 
@@ -44,9 +46,34 @@ class Chain:
     compile_kernel: Callable
     run: Callable  # (kernel) -> image(s)
     run_reference: Callable  # () -> numpy reference image(s)
+    #: The exact argument list `run` passes to the kernel, `[raw, *inputs]`.
+    #: Exposed so a caller that has to drive the same kernel by another
+    #: route -- an HLS testbench, say -- uses the very same arrays rather
+    #: than rebuilding them and risking a silent mismatch.
+    args: List[np.ndarray] = None
+    #: The underlying (untraced) kernel, for its declared argument and
+    #: result types.
+    kernel: object = None
 
 
-def _stripmap(name: str, n: int) -> Chain:
+def _chain(name: str, kernel, raw, inputs, run_reference) -> Chain:
+    """Assembles a Chain around a built (untraced) kernel: the argument
+    arrays are cast to whatever the kernel declares, so one code path
+    serves both precisions."""
+    args = [
+        np.asarray(a, dtype=t.dtype.to_numpy())
+        for a, t in zip([raw, *inputs], kernel.arg_types)
+    ]
+    return Chain(name,
+                 lambda backend="cpu", **opts: kernel.compile(
+                     backend=backend, options=opts or None),
+                 lambda k: k(*args),
+                 run_reference,
+                 args,
+                 kernel)
+
+
+def _stripmap(name: str, n: int, dtype) -> Chain:
     processor = {
         "wka": "WKAProcessor",
         "rda": "RDAProcessor",
@@ -58,43 +85,47 @@ def _stripmap(name: str, n: int) -> Chain:
                   processor)
 
     params = synthetic_params(n)
-    raw = single_target_scene(n, params)
-    inputs = alg.make_inputs(n, params)
-    return Chain(
-        name,
-        lambda backend="cpu", **opts: alg.build_kernel(n, params).compile(
-            backend=backend, options=opts or None),
-        lambda kernel: kernel(raw, *inputs),
-        lambda: ref(n, params).process(raw))
+    kernel = alg.build_kernel(
+        n,
+        params,
+        name=name if dtype is sar.c128 else f"{name}_c64",
+        dtype=dtype)
+    return _chain(
+        name, kernel, single_target_scene(n,
+                                          params), alg.make_inputs(n, params),
+        lambda: ref(n, params).process(single_target_scene(n, params)))
 
 
-def _pfa(name: str, n: int) -> Chain:
+def _pfa(name: str, n: int, dtype) -> Chain:
     from pfa.algorithm import build_kernel, make_inputs
     from pfa.geometry import Geometry
     from pfa.reference import PFAProcessor
 
     geometry = Geometry(n)
+    kernel = build_kernel(n,
+                          geometry,
+                          name=name if dtype is sar.c128 else f"{name}_c64",
+                          dtype=dtype)
     raw = geometry.simulate(geometry.demo_targets())
-    inputs = make_inputs(n, geometry)
-    return Chain(
-        name,
-        lambda backend="cpu", **opts: build_kernel(n, geometry).compile(
-            backend=backend, options=opts or None),
-        lambda kernel: kernel(raw, *inputs),
-        lambda: PFAProcessor(n, geometry).process(raw))
+    return _chain(name, kernel, raw, make_inputs(n, geometry),
+                  lambda: PFAProcessor(n, geometry).process(raw))
 
 
-def load(name: str, n: int) -> Chain:
-    """Sets up `name` for an `n`-sized scene (polar-grid edge for PFA)."""
+def load(name: str, n: int, dtype=sar.c128) -> Chain:
+    """Sets up `name` for an `n`-sized scene (polar-grid edge for PFA).
+    `dtype` selects the working precision the kernel is built with."""
     if name not in ALL:
         raise ValueError(f"unknown algorithm {name!r}; known: {ALL}")
-    return (_pfa if name == "pfa" else _stripmap)(name, n)
+    return (_pfa if name == "pfa" else _stripmap)(name, n, dtype)
 
 
-def focus_point_target(n: int) -> List[Tuple[str, np.ndarray]]:
-    """Focuses a single scene-center scatterer with every stripmap chain."""
+def focus_point_target(
+        n: int,
+        algs: Tuple[str, ...] = STRIPMAP) -> List[Tuple[str, np.ndarray]]:
+    """Focuses a single scene-center scatterer with the selected stripmap
+    chains (all of them by default)."""
     images = []
-    for name in STRIPMAP:
+    for name in algs:
         chain = load(name, n)
         kernel = chain.compile_kernel()
         images.append((name, np.asarray(chain.run(kernel), dtype=np.float64)))

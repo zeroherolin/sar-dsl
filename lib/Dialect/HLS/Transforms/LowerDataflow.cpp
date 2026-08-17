@@ -17,10 +17,31 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace sar;
 using namespace hls;
+
+/// Live-in values ordered by their first use inside `body`. `Liveness`
+/// hands back a pointer-keyed set whose iteration order varies from run to
+/// run; taken as-is it would decide node operand order -- and through the
+/// dataflow-to-func conversion, the emitted sub-function argument order --
+/// making two runs of the same compilation differ textually.
+static SmallVector<Value> orderedLiveins(const Liveness::ValueSetT &liveins,
+                                         Block &body) {
+  SmallVector<Value> ordered;
+  llvm::SmallPtrSet<Value, 16> seen;
+  body.walk([&](Operation *op) {
+    for (Value operand : op->getOperands())
+      if (liveins.contains(operand) && seen.insert(operand).second)
+        ordered.push_back(operand);
+  });
+  // A live-in always has a use in the block, so this is dead in practice;
+  // appending any stragglers beats silently dropping them.
+  for (Value livein : liveins)
+    if (!seen.contains(livein))
+      ordered.push_back(livein);
+  return ordered;
+}
 
 namespace {
 struct LowerDispatchToSchedule : public OpRewritePattern<DispatchOp> {
@@ -39,7 +60,7 @@ struct LowerDispatchToSchedule : public OpRewritePattern<DispatchOp> {
     SmallVector<Location, 8> inputLocs;
 
     auto liveins = Liveness(dispatch).getLiveIn(&dispatch.getBody().front());
-    for (auto livein : liveins) {
+    for (auto livein : orderedLiveins(liveins, dispatch.getBody().front())) {
       if (dispatch.getBody().isAncestor(livein.getParentRegion()))
         continue;
       inputs.push_back(livein);
@@ -48,7 +69,7 @@ struct LowerDispatchToSchedule : public OpRewritePattern<DispatchOp> {
 
     rewriter.setInsertionPoint(dispatch);
     auto schedule =
-        rewriter.create<ScheduleOp>(rewriter.getUnknownLoc(), inputs);
+        ScheduleOp::create(rewriter, rewriter.getUnknownLoc(), inputs);
     auto scheduleBlock = rewriter.createBlock(&schedule.getBody());
 
     auto inputArgs = scheduleBlock->addArguments(ValueRange(inputs), inputLocs);
@@ -87,7 +108,7 @@ struct LowerTaskToNode : public OpRewritePattern<TaskOp> {
     SmallVector<Location, 8> paramLocs;
 
     auto liveins = Liveness(task).getLiveIn(&task.getBody().front());
-    for (auto livein : liveins) {
+    for (auto livein : orderedLiveins(liveins, task.getBody().front())) {
       if (task.getBody().isAncestor(livein.getParentRegion()))
         continue;
 
@@ -107,8 +128,8 @@ struct LowerTaskToNode : public OpRewritePattern<TaskOp> {
     }
 
     rewriter.setInsertionPoint(task);
-    auto node = rewriter.create<NodeOp>(rewriter.getUnknownLoc(), inputs,
-                                        outputs, params);
+    auto node = NodeOp::create(rewriter, rewriter.getUnknownLoc(), inputs,
+                               outputs, params);
     auto nodeBlock = rewriter.createBlock(&node.getBody());
 
     auto inputArgs = nodeBlock->addArguments(ValueRange(inputs), inputLocs);
@@ -137,11 +158,6 @@ struct LowerTaskToNode : public OpRewritePattern<TaskOp> {
 
 namespace {
 struct LowerDataflow : public sar::impl::LowerDataflowBase<LowerDataflow> {
-  LowerDataflow() = default;
-  explicit LowerDataflow(bool argSplitExternalAccess) {
-    splitExternalAccess = argSplitExternalAccess;
-  }
-
   void runOnOperation() override {
     auto func = getOperation();
     auto context = func.getContext();
@@ -174,7 +190,6 @@ struct LowerDataflow : public sar::impl::LowerDataflowBase<LowerDataflow> {
 };
 } // namespace
 
-std::unique_ptr<Pass>
-sar::createLowerDataflowPass(bool splitExternalAccess) {
-  return std::make_unique<LowerDataflow>(splitExternalAccess);
+std::unique_ptr<Pass> sar::createLowerDataflowPass() {
+  return std::make_unique<LowerDataflow>();
 }

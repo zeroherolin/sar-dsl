@@ -22,6 +22,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+#include "sar/Analysis/DisplacementRange.h"
 #include "sar/Conversion/Passes.h"
 #include "sar/Dialect/SAR/IR/SARDialect.h"
 #include "sar/Dialect/SAR/IR/SAROps.h"
@@ -47,6 +48,7 @@ struct InterpSpec {
   int64_t taps;
   StringRef window;
   double beta;
+  StringRef boundary;
 };
 
 /// Modified Bessel I0 for the host-side normalization constant.
@@ -135,13 +137,19 @@ static Value emitSincWindow(ScalarBuilder &s, const InterpSpec &spec, Value t) {
   return s.mul(sum, s.cst(1.0 / besselI0(spec.beta)));
 }
 
-/// Emits the kernel-based gather from one row of (re, im) buffers at
-/// fractional position `posF64`. Returns the (re, im) accumulators in f64.
-/// Taps are statically unrolled; out-of-range taps read a clamped index and
-/// are masked to zero weight, keeping the body free of control flow.
-static std::pair<Value, Value>
-emitInterpGather(ScalarBuilder &s, const InterpSpec &spec, Value reBuf,
-                 Value imBuf, Value row, Value posF64, int64_t cols) {
+/// Emits the kernel-based gather at fractional position `posF64`. Returns the
+/// (re, im) accumulators in f64. Taps are statically unrolled; the boundary
+/// policy resolves out-of-range taps with selects, keeping the body free of
+/// control flow.
+///
+/// `loadAt` supplies the source sample for an already-clamped i64 column
+/// index, so the full-plane and banded paths share the tap arithmetic.
+using SourceLoader = llvm::function_ref<std::pair<Value, Value>(Value)>;
+
+static std::pair<Value, Value> emitInterpGather(ScalarBuilder &s,
+                                                const InterpSpec &spec,
+                                                Value posF64, int64_t cols,
+                                                SourceLoader loadAt) {
   OpBuilder &b = s.b;
   Location loc = s.loc;
 
@@ -167,7 +175,6 @@ emitInterpGather(ScalarBuilder &s, const InterpSpec &spec, Value reBuf,
   Value frac = s.sub(base, idx0F);
 
   Value zeroI = arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(0));
-  Value maxI = arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(cols - 1));
   Value colsI = arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(cols));
 
   Value one = s.cst(1.0);
@@ -199,14 +206,28 @@ emitInterpGather(ScalarBuilder &s, const InterpSpec &spec, Value reBuf,
         arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, idxK, colsI);
     Value inBounds = arith::AndIOp::create(b, loc, inLo, inHi);
 
-    Value clamped = arith::MinSIOp::create(
-        b, loc, arith::MaxSIOp::create(b, loc, idxK, zeroI), maxI);
-    Value col = arith::IndexCastOp::create(b, loc, b.getIndexType(), clamped);
+    // The sample index the boundary policy resolves to. `zero` and `edge`
+    // both hand the raw index to the loader, which clamps it; they differ
+    // only in whether the tap keeps its weight below. `reflect` mirrors the
+    // index here, so the loader's clamp becomes a no-op.
+    Value fetchIdx = idxK;
+    if (spec.boundary == "reflect") {
+      Value negRefl = arith::SubIOp::create(
+          b, loc, arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(-1)),
+          idxK);
+      Value hiRefl = arith::SubIOp::create(
+          b, loc,
+          arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(2 * cols - 1)),
+          idxK);
+      Value overHi =
+          arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sge, idxK, colsI);
+      fetchIdx = arith::SelectOp::create(b, loc, overHi, hiRefl, idxK);
+      Value underLo =
+          arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, idxK, zeroI);
+      fetchIdx = arith::SelectOp::create(b, loc, underLo, negRefl, fetchIdx);
+    }
 
-    Value vRe =
-        s.toF64(memref::LoadOp::create(b, loc, reBuf, ValueRange{row, col}));
-    Value vIm =
-        s.toF64(memref::LoadOp::create(b, loc, imBuf, ValueRange{row, col}));
+    auto [vRe, vIm] = loadAt(fetchIdx);
 
     Value weight;
     if (spec.kernel == "nearest") {
@@ -216,7 +237,9 @@ emitInterpGather(ScalarBuilder &s, const InterpSpec &spec, Value reBuf,
     } else if (spec.kernel == "cubic") {
       weight = cubicW[k + 1];
     } else {
-      // w(d) = sinc(d) * window(d / (taps/2)), numpy sinc convention.
+      // w(d) = sinc(d) * window(d / (taps/2)), numpy sinc convention. The
+      // distance stays measured against the unresolved tap index: the policy
+      // changes which sample is fetched, not where the kernel is centred.
       Value dist = s.sub(posF64, arith::SIToFPOp::create(b, loc, s.f64, idxK));
       Value pd = s.mul(dist, s.cst(M_PI));
       Value sincRaw = s.div(s.sin(pd), pd);
@@ -227,12 +250,24 @@ emitInterpGather(ScalarBuilder &s, const InterpSpec &spec, Value reBuf,
       Value t = s.mul(dist, s.cst(1.0 / double(spec.taps / 2)));
       weight = s.mul(sinc, emitSincWindow(s, spec, t));
     }
-    weight = arith::SelectOp::create(b, loc, inBounds, weight, zero);
+    if (spec.boundary == "zero")
+      weight = arith::SelectOp::create(b, loc, inBounds, weight, zero);
 
     accRe = s.add(accRe, s.mul(vRe, weight));
     accIm = s.add(accIm, s.mul(vIm, weight));
   }
   return {accRe, accIm};
+}
+
+/// Clamps an i64 column index into [0, cols-1] and returns it as an index.
+static Value clampToColumn(ScalarBuilder &s, Value idxI64, int64_t cols) {
+  OpBuilder &b = s.b;
+  Location loc = s.loc;
+  Value zeroI = arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(0));
+  Value maxI = arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(cols - 1));
+  Value clamped = arith::MinSIOp::create(
+      b, loc, arith::MaxSIOp::create(b, loc, idxI64, zeroI), maxI);
+  return arith::IndexCastOp::create(b, loc, b.getIndexType(), clamped);
 }
 
 /// Materializes a tensor as a buffer (identity layout).
@@ -249,8 +284,156 @@ static Value toResultTensor(PatternRewriter &rewriter, Location loc,
       rewriter, loc, type, alloc, /*restrict=*/true, /*writable=*/true);
 }
 
+/// Returns the smallest power of two >= n (n > 0).
+static int64_t nextPow2(int64_t n) {
+  int64_t p = 1;
+  while (p < n)
+    p <<= 1;
+  return p;
+}
+
+/// Emits the full-plane gather loop nest inside an already-positioned builder.
+/// `emitInterpGather` receives the raw column index before clamping; it also
+/// needs the global column bounds for its in-bounds mask.
+static void emitFullPlaneBody(OpBuilder &b, Location loc, ScalarBuilder &s,
+                              const InterpSpec &spec, Value reBuf, Value imBuf,
+                              Value posBuf, Value outRe, Value outIm,
+                              int64_t rows, int64_t cols, Type elemType) {
+  auto rowLoop = affine::AffineForOp::create(b, loc, 0, rows);
+  {
+    OpBuilder::InsertionGuard g(b);
+    b.setInsertionPointToStart(rowLoop.getBody());
+    auto colLoop = affine::AffineForOp::create(b, loc, 0, cols);
+    b.setInsertionPointToStart(colLoop.getBody());
+    Value i = rowLoop.getInductionVar();
+    Value j = colLoop.getInductionVar();
+    Value pos = affine::AffineLoadOp::create(b, loc, posBuf, ValueRange{i, j});
+
+    // Named lambda: a function_ref bound to a temporary would dangle.
+    auto loader = [&](Value idxI64) -> std::pair<Value, Value> {
+      Value col = clampToColumn(s, idxI64, cols);
+      Value vRe =
+          s.toF64(memref::LoadOp::create(b, loc, reBuf, ValueRange{i, col}));
+      Value vIm =
+          s.toF64(memref::LoadOp::create(b, loc, imBuf, ValueRange{i, col}));
+      return {vRe, vIm};
+    };
+
+    auto [accRe, accIm] = emitInterpGather(s, spec, pos, cols, loader);
+    affine::AffineStoreOp::create(b, loc, s.fromF64(accRe, elemType), outRe,
+                                  ValueRange{i, j});
+    affine::AffineStoreOp::create(b, loc, s.fromF64(accIm, elemType), outIm,
+                                  ValueRange{i, j});
+  }
+}
+
+/// Emits the banded gather loop nest.
+///
+/// The window for output column j is source columns [j + bandLo, j + bandHi],
+/// exactly `bandW` wide (a power of two), so it slides by one as j advances
+/// and one new sample per column keeps it current. That is the line-buffer
+/// shape: each source row is read once, sequentially, instead of `taps`
+/// scattered reads per output element.
+///
+/// Residency invariant: at the gather in iteration j, `band[t & (bandW-1)]`
+/// holds source column t for every t in [j + bandLo, j + bandHi]. bandW being
+/// a power of two makes those bandW indices occupy distinct slots, and the
+/// push for column j overwrites exactly the index leaving the window.
+///
+/// Out-of-row source indices are clamped on staging, exactly as the
+/// full-plane path clamps them; those taps still receive zero weight in the
+/// gather, so a clamped value never reaches the accumulator.
+static void emitBandedBody(OpBuilder &b, Location loc, ScalarBuilder &s,
+                           const InterpSpec &spec, Value reBuf, Value imBuf,
+                           Value posBuf, Value outRe, Value outIm, int64_t rows,
+                           int64_t cols, Type elemType, int64_t bandLo,
+                           int64_t bandW) {
+  assert(bandW > 0 && (bandW & (bandW - 1)) == 0 && "bandW must be a pow2");
+  int64_t bandHi = bandLo + bandW - 1;
+  Type srcElem = cast<MemRefType>(reBuf.getType()).getElementType();
+  MemRefType bandType = MemRefType::get({bandW}, srcElem);
+
+  Value bandRe = memref::AllocOp::create(b, loc, bandType);
+  Value bandIm = memref::AllocOp::create(b, loc, bandType);
+
+  Value maskI =
+      arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(bandW - 1));
+  Value bandHiI =
+      arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(bandHi));
+  Value bandLoI =
+      arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(bandLo));
+
+  // Stages source column `srcColI64` (clamped into the row) into its slot.
+  auto stageColumn = [&](Value i, Value srcColI64) {
+    Value col = clampToColumn(s, srcColI64, cols);
+    Value slot = arith::IndexCastOp::create(
+        b, loc, b.getIndexType(),
+        arith::AndIOp::create(b, loc, srcColI64, maskI));
+    memref::StoreOp::create(
+        b, loc, memref::LoadOp::create(b, loc, reBuf, ValueRange{i, col}),
+        bandRe, ValueRange{slot});
+    memref::StoreOp::create(
+        b, loc, memref::LoadOp::create(b, loc, imBuf, ValueRange{i, col}),
+        bandIm, ValueRange{slot});
+  };
+
+  auto rowLoop = affine::AffineForOp::create(b, loc, 0, rows);
+  {
+    OpBuilder::InsertionGuard g(b);
+    b.setInsertionPointToStart(rowLoop.getBody());
+    Value i = rowLoop.getInductionVar();
+
+    // Prime slots for source columns [bandLo, bandHi); the push in iteration
+    // j = 0 supplies the last one.
+    if (bandW > 1) {
+      auto primeLoop = affine::AffineForOp::create(b, loc, 0, bandW - 1);
+      OpBuilder::InsertionGuard g2(b);
+      b.setInsertionPointToStart(primeLoop.getBody());
+      Value t = arith::IndexCastOp::create(b, loc, b.getI64Type(),
+                                           primeLoop.getInductionVar());
+      stageColumn(i, arith::AddIOp::create(b, loc, t, bandLoI));
+    }
+
+    auto colLoop = affine::AffineForOp::create(b, loc, 0, cols);
+    {
+      OpBuilder::InsertionGuard g2(b);
+      b.setInsertionPointToStart(colLoop.getBody());
+      Value j = colLoop.getInductionVar();
+      Value jI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), j);
+
+      // Slide the window: bring in source column j + bandHi.
+      stageColumn(i, arith::AddIOp::create(b, loc, jI64, bandHiI));
+
+      Value pos =
+          affine::AffineLoadOp::create(b, loc, posBuf, ValueRange{i, j});
+      // Named lambda: a function_ref bound to a temporary would dangle.
+      auto loader = [&](Value idxI64) -> std::pair<Value, Value> {
+        Value slot = arith::IndexCastOp::create(
+            b, loc, b.getIndexType(),
+            arith::AndIOp::create(b, loc, idxI64, maskI));
+        Value vRe =
+            s.toF64(memref::LoadOp::create(b, loc, bandRe, ValueRange{slot}));
+        Value vIm =
+            s.toF64(memref::LoadOp::create(b, loc, bandIm, ValueRange{slot}));
+        return {vRe, vIm};
+      };
+
+      auto [accRe, accIm] = emitInterpGather(s, spec, pos, cols, loader);
+      affine::AffineStoreOp::create(b, loc, s.fromF64(accRe, elemType), outRe,
+                                    ValueRange{i, j});
+      affine::AffineStoreOp::create(b, loc, s.fromF64(accIm, elemType), outIm,
+                                    ValueRange{i, j});
+    }
+  }
+}
+
 struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
-  using OpRewritePattern::OpRewritePattern;
+  bool enableBandedGather;
+  int64_t profitThreshold;
+
+  Interp1DSplitLowering(MLIRContext *ctx, bool enableBanded, int64_t thresh)
+      : OpRewritePattern(ctx), enableBandedGather(enableBanded),
+        profitThreshold(thresh) {}
 
   LogicalResult matchAndRewrite(Interp1DSplitOp op,
                                 PatternRewriter &rewriter) const override {
@@ -273,27 +456,54 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
     Value outRe = memref::AllocOp::create(rewriter, loc, bufferType);
     Value outIm = memref::AllocOp::create(rewriter, loc, bufferType);
 
-    auto rowLoop = affine::AffineForOp::create(rewriter, loc, 0, rows);
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(rowLoop.getBody());
-      auto colLoop = affine::AffineForOp::create(rewriter, loc, 0, cols);
-      rewriter.setInsertionPointToStart(colLoop.getBody());
-      Value i = rowLoop.getInductionVar();
-      Value j = colLoop.getInductionVar();
+    InterpSpec spec{op.getKernel(), static_cast<int64_t>(op.getTaps()),
+                    op.getWindow(), op.getBeta().convertToDouble(),
+                    op.getBoundary()};
 
-      ScalarBuilder s{rewriter, loc, rewriter.getF64Type()};
-      Value pos =
-          affine::AffineLoadOp::create(rewriter, loc, posBuf, ValueRange{i, j});
-      InterpSpec spec{op.getKernel(), static_cast<int64_t>(op.getTaps()),
-                      op.getWindow(), op.getBeta().convertToDouble()};
-      auto [accRe, accIm] =
-          emitInterpGather(s, spec, reBuf, imBuf, i, pos, cols);
-      affine::AffineStoreOp::create(rewriter, loc, s.fromF64(accRe, elemType),
-                                    outRe, ValueRange{i, j});
-      affine::AffineStoreOp::create(rewriter, loc, s.fromF64(accIm, elemType),
-                                    outIm, ValueRange{i, j});
+    // Derive tap offsets from the spec for band width accounting.
+    int64_t tapLo = 1 - spec.taps / 2, tapHi = spec.taps / 2;
+    if (spec.kernel == "nearest") {
+      tapLo = tapHi = 0;
+    } else if (spec.kernel == "linear") {
+      tapLo = 0;
+      tapHi = 1;
+    } else if (spec.kernel == "cubic") {
+      tapLo = -1;
+      tapHi = 2;
     }
+
+    // Attempt banded path when enabled. `reflect` is excluded: a mirrored
+    // index jumps back inside the row, outside the sliding window the band
+    // holds, so the residency invariant would not cover it. `edge` is safe --
+    // staging already clamps, so a slot outside the row holds the edge sample.
+    bool useBanded = false;
+    int64_t bandLo = 0, bandW = 0;
+    if (enableBandedGather && spec.boundary != "reflect") {
+      auto range = computeDisplacementRange(op.getPositions(), /*dim=*/1);
+      if (range) {
+        int64_t dLo = static_cast<int64_t>(std::floor(range->lo));
+        int64_t dHi = static_cast<int64_t>(std::ceil(range->hi));
+        // Band must cover the displacement range plus the tap support.
+        int64_t rawLo = dLo + tapLo;
+        int64_t rawW = (dHi - dLo) + (tapHi - tapLo + 1);
+        int64_t w = nextPow2(std::max<int64_t>(rawW, 1));
+        if (cols / w >= profitThreshold) {
+          bandLo = rawLo;
+          bandW = w;
+          useBanded = true;
+        }
+      }
+    }
+
+    FloatType f64 = rewriter.getF64Type();
+    ScalarBuilder s{rewriter, loc, f64};
+
+    if (useBanded)
+      emitBandedBody(rewriter, loc, s, spec, reBuf, imBuf, posBuf, outRe, outIm,
+                     rows, cols, elemType, bandLo, bandW);
+    else
+      emitFullPlaneBody(rewriter, loc, s, spec, reBuf, imBuf, posBuf, outRe,
+                        outIm, rows, cols, elemType);
 
     rewriter.replaceOp(op, {toResultTensor(rewriter, loc, tensorType, outRe),
                             toResultTensor(rewriter, loc, tensorType, outIm)});
@@ -303,6 +513,8 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
 
 struct ConvertSARInterpToAffinePass
     : sar::impl::ConvertSARInterpToAffineBase<ConvertSARInterpToAffinePass> {
+  using ConvertSARInterpToAffineBase::ConvertSARInterpToAffineBase;
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
 
@@ -311,7 +523,8 @@ struct ConvertSARInterpToAffinePass
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
     RewritePatternSet patterns(context);
-    patterns.add<Interp1DSplitLowering>(context);
+    patterns.add<Interp1DSplitLowering>(context, enableBandedGather,
+                                        bandedProfitThreshold);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))

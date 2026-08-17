@@ -15,11 +15,15 @@ import time
 from pathlib import Path
 
 _EXAMPLES = Path(__file__).resolve().parents[1]
+_HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(_EXAMPLES), str(_EXAMPLES.parent / "python")]
 
 from common.alos import SIZE, load_raw, save_scene  # noqa: E402
-from common.params import ALOS_PARAMS  # noqa: E402
+from common.params import alos_params  # noqa: E402
+from common.quality import print_scene_contrast  # noqa: E402
 from wka.algorithm import build_kernel, make_inputs  # noqa: E402
+
+PARAMS = alos_params(SIZE)
 
 
 def main() -> None:
@@ -27,24 +31,28 @@ def main() -> None:
     parser.add_argument("--bin",
                         default=str(_EXAMPLES / "data" /
                                     "alos_raw_16384x16384.bin"))
-    parser.add_argument("--output", default="san_francisco_wka.png")
+    parser.add_argument("--output",
+                        default=str(_HERE / "assets" /
+                                    "san_francisco_wka.png"))
     args = parser.parse_args()
 
     print(f"[1/4] Loading {args.bin} ...")
     raw = load_raw(args.bin)
 
     print("[2/4] Compiling the WKA kernel ...")
-    kernel = build_kernel(SIZE, ALOS_PARAMS).compile("cpu")
+    kernel = build_kernel(SIZE, PARAMS).compile("cpu")
 
     print("[3/4] Running WKA imaging (this is the heavy part) ...")
     t0 = time.time()
-    image = kernel(raw, *make_inputs(SIZE, ALOS_PARAMS))
+    image = kernel(raw, *make_inputs(SIZE, PARAMS))
     print(f"      focused in {time.time() - t0:.1f} s")
+    print_scene_contrast(image)
     del raw
 
     output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
     print(f"[4/4] Post-processing and saving {output} ...")
-    save_scene(image, ALOS_PARAMS, str(output),
+    save_scene(image, PARAMS, str(output),
                "San Francisco Bay (ALOS-1, SAR-DSL omega-K)")
     print("done.")
 

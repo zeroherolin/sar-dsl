@@ -7,6 +7,20 @@ name = "sar-dsl"
 description = "MLIR-based domain-specific compiler for SAR imaging pipelines"
 readme = "README.md"
 license = { file = "LICENSE" }
+authors = [{ name = "SAR-DSL contributors" }]
+keywords = ["SAR", "MLIR", "compiler", "DSL", "HLS", "FPGA", "radar"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Compilers",
+]
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 dynamic = ["version"]
@@ -20,6 +34,12 @@ examples = ["matplotlib>=3.7"]
 
 [tool.setuptools]
 package-dir = { "" = "python" }
+
+[tool.setuptools.package-data]
+# PEP 561 marker: the package ships inline type annotations.
+"sar" = ["py.typed"]
+# The HLS backend reads its defaults from this file at compile time.
+"sar.backends.hls" = ["hls_config.yaml"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
@@ -44,7 +64,5 @@ select = ["F", "E", "W"]
 [tool.ruff.lint.per-file-ignores]
 # Embedded MLIR strings keep one op per line regardless of width.
 "test/python/test_affine_fft.py" = ["E501"]
-# The signal vocabulary re-export deliberately sits below the core defs.
-"python/sar/language/__init__.py" = ["E402"]
 # Lit configs use globals injected by the lit runner.
 "test/lit.cfg.py" = ["F821"]

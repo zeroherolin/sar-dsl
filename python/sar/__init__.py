@@ -17,17 +17,20 @@ Quick start::
 
 from ._version import __version__
 from .backends import get_backend, list_backends
+from .backends.hls import HLSConfigError
 from .compiler import compile  # noqa: A001 - deliberate builtin shadow
-from .errors import CompilationError, LaunchError, SARError, ToolchainError
+from .errors import (CompilationError, LaunchError, SARError, ToolchainError,
+                     TraceError)
 from .language import DomainWarning, PrecisionWarning, func, op
 from .language import (Kernel, Tensor, absolute, angle, argmax, argmin, atan2,
                        broadcast, c64, c128, cast, ceil, clip, concat,
-                       concatenate, conj, constant, cos, exp, expj, f32, f64,
-                       fft, fftshift, floor, i32, i64, ifft, ifftshift, imag,
-                       interp1d, log, make_complex, maximum, minimum, pad,
-                       real, sign, sin, sqrt, transpose, where)
+                       concatenate, conj, conjugate, constant, cos, exp, expj,
+                       f32, f64, fft, fftshift, floor, gather2d, i32, i64,
+                       ifft, ifftshift, imag, interp1d, iterate, log,
+                       make_complex, maximum, minimum, pad, real, sign, sin,
+                       sqrt, transpose, where)
 from .language import abs, max, min, round, sum  # noqa: A004 - numpy
-from .language import flip
+from .language import flip, cumsum, rank_filter, median_filter, sort
 from .language.signal import (blackman, circshift, db, db2mag, db2pow, dechirp,
                               fft2, hamming, hanning, hypot, ifft2, kaiser,
                               log2, log10, mag2db, matched_filter, mean,
@@ -64,6 +67,7 @@ __all__ = [
     "clip",
     "where",
     "conj",
+    "conjugate",
     "real",
     "imag",
     "angle",
@@ -112,16 +116,24 @@ __all__ = [
     "kaiser",
     "taylorwin",
     "interp1d",
+    "gather2d",
+    "iterate",
     "stolt_interp",
+    "cumsum",
+    "rank_filter",
+    "median_filter",
+    "sort",
     # driver
     "compile",
     "get_backend",
     "list_backends",
     # errors and diagnostics
     "SARError",
+    "TraceError",
     "ToolchainError",
     "CompilationError",
     "LaunchError",
+    "HLSConfigError",
     "DomainWarning",
     "PrecisionWarning",
 ]

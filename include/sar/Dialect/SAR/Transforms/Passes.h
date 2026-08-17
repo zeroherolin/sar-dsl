@@ -15,6 +15,9 @@ namespace mlir {
 namespace func {
 class FuncDialect;
 } // namespace func
+namespace scf {
+class SCFDialect;
+} // namespace scf
 
 namespace sar {
 

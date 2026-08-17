@@ -30,6 +30,14 @@ ranked tensors with **static shapes**; supported element types are `f32`,
 | `sar.reduce {kind, dim}` | rank-2 -> rank-1 along `dim`; `kind` is `sum` (float/complex) or `max`/`min` (float); rank-1 inputs are normalized to `1 x n` by the frontend |
 | `sar.argmax {dim}` | rank-2 float -> rank-1 i64 indices (numpy `argmax`: first occurrence on ties) |
 
+## Scan and order-statistics
+
+| Op | Semantics |
+|----|-----------|
+| `sar.cumsum {dim}` | rank-2 float or complex -> same shape; inclusive prefix sum along `dim` (numpy `cumsum`). The scan is sequential -- it is not decomposed into a parallel tree. For complex tensors, `sar-decomplexify` splits it into two independent float scans |
+| `sar.rank_filter {window, rank, dim}` | rank-2 float -> same shape; windowed order-statistic filter along `dim`. `window` must be a positive odd integer; `rank` (0-based) selects the element of the sorted window (0 = min, `window//2` = median, `window-1` = max). Boundary: clamp |
+| `sar.sort {dim}` | rank-2 float -> same shape; sorts each line along `dim` into ascending order (numpy `sort`). The sort is a compare-exchange network over the static extent, so it carries no data-dependent control flow |
+
 ## Data movement
 
 | Op | Semantics |
@@ -49,8 +57,17 @@ ranked tensors with **static shapes**; supported element types are `f32`,
 | `sar.fft {dim}` | unscaled forward DFT along `dim` (numpy convention); any size >= 2 on both backends (radix-2 where the size allows, Bluestein's chirp-z reduction otherwise) |
 | `sar.ifft {dim}` | inverse DFT scaled by `1/N` |
 | `sar.fft_split {dim, inverse?}` | split-complex FFT on (re, im) float planes; produced by `sar-decomplexify`, not by the frontend |
-| `sar.interp1d {dim?, kernel?, taps?, window?, beta?}` | resampling along `dim` (default 1) at fractional `positions` (f64 tensor) with a selectable kernel: `nearest`, `linear`, `cubic` (Keys) or `sinc` (default: 8 taps); sinc taper: `rect`/`hann`/`hamming`/`kaiser(beta)`. The orthogonal primitive behind Stolt remapping and RCMC |
+| `sar.interp1d {dim?, kernel?, taps?, window?, beta?, boundary?}` | resampling along `dim` (default 1) at fractional `positions` (f64 tensor) with a selectable kernel: `nearest`, `linear`, `cubic` (Keys) or `sinc` (default: 8 taps); sinc taper: `rect`/`hann`/`hamming`/`kaiser(beta)`. `boundary` controls out-of-range taps: `zero` (default), `edge` (clamp), or `reflect` (mirror repeating the edge sample, i.e. numpy `symmetric`). The orthogonal primitive behind Stolt remapping and RCMC |
 | `sar.interp1d_split` | split-complex form of `sar.interp1d`; produced by `sar-decomplexify` |
+| `sar.gather2d {kernel?, boundary?}` | 2-D gather at data-dependent positions: `out[i,j] = data[rows[i,j], cols[i,j]]` with both coordinates arbitrary functions of the output position (the access pattern of time-domain backprojection). `kernel`: `nearest` or `linear` (bilinear); `boundary`: `zero` (default) or `edge`. The output takes the position shape, independent of the data shape |
+| `sar.gather2d_split` | split-complex form of `sar.gather2d`; produced by `sar-decomplexify` |
+
+## Compiled loops
+
+| Op | Semantics |
+|----|-----------|
+| `sar.iterate {trips}` | counted loop with tensor-carried state: applies its region `trips` times, feeding each iteration's `sar.yield` to the next as block arguments. Stays a single loop in the design (a Python `for` unrolls at trace time). Carry types match position by position; the body cannot observe the iteration index. Lowers to `scf.for` over tensors (`convert-sar-to-linalg`); the HLS path then demotes the carries to side effects (`sar-demote-loop-carries`). Frontend: `sar.iterate(n, body, *carries)` |
+| `sar.yield` | terminates one `sar.iterate` step with the next iteration's carried values |
 
 Exact formulas are documented on the ops themselves
 (`include/sar/Dialect/SAR/IR/SAROps.td`).
@@ -101,9 +118,15 @@ Passes:
   functions (kernel entry points) so the ctypes launcher finds the
   `_mlir_ciface_*` wrappers; private declarations keep plain C symbols.
 - `--sar-reuse-buffers` (Transforms): lets a buffer whose last use has
-  passed carry a later one of the same type. `min-elements` selects which
-  buffers take part -- below it a buffer is a dataflow channel, at and
-  above it it is memory.
+  passed carry a later one. `min-elements` selects which buffers take part
+  -- below it a buffer is a dataflow channel, at and above it it is memory.
+  `allow-retype` drops the requirement that the two agree on element type:
+  footprints are compared in bytes, a retired buffer backing a newer one
+  that fits inside it, and the group allocates `memref<Nxi8>` that each
+  member reinterprets with `memref.view`. Only the CPU path enables it; the
+  HLS emitter has no reinterpretation to emit. Buffers with a live alias
+  (anything returning a memref or a tensor) and functions with branches are
+  left alone either way.
 - `--sar-fuse-elementwise` (Transforms): fuses an element-wise producer
   into every consumer above `min-elements`, recomputing rather than
   materialising a whole raster.
@@ -112,6 +135,11 @@ Passes:
   bounds the block.
 - `--sar-lower-copy` (Transforms): expands `memref.copy`, which lowers to
   a runtime-library call neither backend links, into an affine sweep.
+- `--sar-demote-loop-carries` (Transforms): rewrites the buffer-carried
+  `scf.for` a compiled loop bufferizes into as side effects -- the body
+  iterates in the init buffer and a per-iteration copy replaces the yield
+  -- because the HLS dataflow model forbids tasks with results. The affine
+  pipeline runs it; the CPU path keeps the carried form.
 
 Registered pipelines (see `lib/Pipelines/`):
 
@@ -121,6 +149,12 @@ Registered pipelines (see `lib/Pipelines/`):
   that run their own bufferization and loop transformations. The in-tree
   HLS backend does not use it -- it takes the affine hand-off below.
 - `--sar-to-affine-pipeline`: split-complex affine/memref hand-off; this
-  is what the HLS backend compiles from.
+  is what the HLS backend compiles from. Options: `fft-stage-group`
+  (Stockham stages per scratch slot, 0 = full unroll),
+  `reuse-buffer-min-elements` and `recompute-min-elements` (the sharing
+  and recompute thresholds of the passes above),
+  `transpose-block-bytes` (staged corner-turn block size; 0 leaves
+  transposes unstaged) and `interp-enable-banded-gather` (allow the
+  banded interpolation gather).
 - `--sar-affine-to-llvm-pipeline`: the affine path continued to LLVM, used
   to validate the Stockham lowering numerically on CPU.

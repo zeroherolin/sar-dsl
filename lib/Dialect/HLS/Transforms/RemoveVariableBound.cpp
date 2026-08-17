@@ -16,7 +16,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -47,8 +46,8 @@ bool sar::applyRemoveVariableBound(AffineLoopBand &band) {
         // Create if operation in the front of the innermost perfect loop.
         builder.setInsertionPointToStart(innermostLoop.getBody());
         auto ifOp =
-            builder.create<AffineIfOp>(loop.getLoc(), ifCondition, ifOperands,
-                                       /*withElseRegion=*/false);
+            AffineIfOp::create(builder, loop.getLoc(), ifCondition, ifOperands,
+                               /*withElseRegion=*/false);
 
         // Move all operations in the innermost perfect loop into the new
         // created AffineIf region.
@@ -81,8 +80,8 @@ bool sar::applyRemoveVariableBound(AffineLoopBand &band) {
         // Create if operation in the front of the innermost perfect loop.
         builder.setInsertionPointToStart(innermostLoop.getBody());
         auto ifOp =
-            builder.create<AffineIfOp>(loop.getLoc(), ifCondition, ifOperands,
-                                       /*withElseRegion=*/false);
+            AffineIfOp::create(builder, loop.getLoc(), ifCondition, ifOperands,
+                               /*withElseRegion=*/false);
 
         // Move all operations in the innermost perfect loop into the new
         // created AffineIf region.

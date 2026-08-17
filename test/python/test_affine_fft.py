@@ -1,9 +1,8 @@
 """Numerical validation of the split-complex affine (Stockham) FFT path.
 
-The `sar-affine-to-llvm-pipeline` compiles the same IR the HLS backend
-hands to the HLS pipeline, so passing here validates the HLS lowering's arithmetic
-without needing an HLS simulator. The decomplexified ABI splits every
-complex tensor into (re, im) float planes, in order, inputs before results.
+`sar-affine-to-llvm-pipeline` compiles the same IR the HLS backend hands
+to synthesis, so these checks validate the HLS lowering's arithmetic
+without needing an HLS simulator.
 """
 
 import numpy as np
@@ -12,11 +11,6 @@ import pytest
 from conftest import requires_cpu, compile_split_kernel, run_split
 
 pytestmark = requires_cpu
-
-# Backwards-compatible aliases (the helpers moved to conftest.py so other
-# test modules can share them without private cross-file imports).
-_compile_split_kernel = compile_split_kernel
-_run_split = run_split
 
 
 @pytest.mark.parametrize("n,m,dim", [(4, 8, 1), (8, 16, 0), (16, 16, 1)])
@@ -27,13 +21,13 @@ func.func @k(%x: tensor<{n}x{m}xcomplex<f64>>) -> tensor<{n}x{m}xcomplex<f64>> {
   return %0 : tensor<{n}x{m}xcomplex<f64>>
 }}
 """
-    lib, fn = _compile_split_kernel(mlir, "k", tmp_path)
+    lib, fn = compile_split_kernel(mlir, "k", tmp_path)
 
     rng = np.random.default_rng(9)
     x = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
     re, im = np.ascontiguousarray(x.real), np.ascontiguousarray(x.imag)
 
-    out_re, out_im = _run_split(fn, [re, im], [(n, m), (n, m)], np.float64)
+    out_re, out_im = run_split(fn, [re, im], [(n, m), (n, m)], np.float64)
     ref = np.fft.fft(x, axis=dim)
     np.testing.assert_allclose(out_re + 1j * out_im,
                                ref,
@@ -50,13 +44,13 @@ func.func @rt(%x: tensor<{n}x{m}xcomplex<f64>>) -> tensor<{n}x{m}xcomplex<f64>> 
   return %1 : tensor<{n}x{m}xcomplex<f64>>
 }}
 """
-    lib, fn = _compile_split_kernel(mlir, "rt", tmp_path)
+    lib, fn = compile_split_kernel(mlir, "rt", tmp_path)
 
     rng = np.random.default_rng(10)
     x = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
     re, im = np.ascontiguousarray(x.real), np.ascontiguousarray(x.imag)
 
-    out_re, out_im = _run_split(fn, [re, im], [(n, m), (n, m)], np.float64)
+    out_re, out_im = run_split(fn, [re, im], [(n, m), (n, m)], np.float64)
     np.testing.assert_allclose(out_re + 1j * out_im, x, rtol=1e-12, atol=1e-12)
 
 
@@ -68,14 +62,14 @@ func.func @k1(%x: tensor<{n}xcomplex<f32>>) -> tensor<{n}xcomplex<f32>> {{
   return %0 : tensor<{n}xcomplex<f32>>
 }}
 """
-    lib, fn = _compile_split_kernel(mlir, "k1", tmp_path)
+    lib, fn = compile_split_kernel(mlir, "k1", tmp_path)
 
     rng = np.random.default_rng(11)
     x = (rng.standard_normal(n) + 1j * rng.standard_normal(n))
     re = np.ascontiguousarray(x.real, dtype=np.float32)
     im = np.ascontiguousarray(x.imag, dtype=np.float32)
 
-    out_re, out_im = _run_split(fn, [re, im], [(n, ), (n, )], np.float32)
+    out_re, out_im = run_split(fn, [re, im], [(n, ), (n, )], np.float32)
     ref = np.fft.fft(x)
     np.testing.assert_allclose(out_re + 1j * out_im, ref, rtol=1e-4, atol=1e-3)
 
@@ -93,13 +87,13 @@ func.func @ca(%z: tensor<{n}x{m}xcomplex<f64>>) -> tensor<{n}x{m}xf64> {{
   return %1 : tensor<{n}x{m}xf64>
 }}
 """
-    lib, fn = _compile_split_kernel(mlir, "ca", tmp_path)
+    lib, fn = compile_split_kernel(mlir, "ca", tmp_path)
 
     rng = np.random.default_rng(13)
     z = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
     re, im = np.ascontiguousarray(z.real), np.ascontiguousarray(z.imag)
 
-    (out, ) = _run_split(fn, [re, im], [(n, m)], np.float64)
+    (out, ) = run_split(fn, [re, im], [(n, m)], np.float64)
     np.testing.assert_allclose(out,
                                np.angle(np.conj(z)),
                                rtol=1e-12,
@@ -121,15 +115,16 @@ func.func @stage(%d: tensor<{n}x{m}xcomplex<f64>>, %p: tensor<{n}x{m}xf64>)
   return %2 : tensor<{n}x{m}xcomplex<f64>>
 }}
 """
-    lib, fn = _compile_split_kernel(mlir, "stage", tmp_path)
+    lib, fn = compile_split_kernel(mlir, "stage", tmp_path)
 
     rng = np.random.default_rng(12)
     d = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
     p = rng.standard_normal((n, m))
     re, im = np.ascontiguousarray(d.real), np.ascontiguousarray(d.imag)
 
-    out_re, out_im = _run_split(fn, [re, im, np.ascontiguousarray(p)],
-                                [(n, m), (n, m)], np.float64)
+    out_re, out_im = run_split(fn, [re, im, np.ascontiguousarray(p)], [(n, m),
+                                                                       (n, m)],
+                               np.float64)
     ref = np.fft.fft(d * np.exp(1j * p), axis=1)
     np.testing.assert_allclose(out_re + 1j * out_im,
                                ref,
@@ -155,11 +150,11 @@ module {{
     return %r, %i : tensor<{lines}x{n}xf64>, tensor<{lines}x{n}xf64>
   }}
 }}"""
-    lib, fn = _compile_split_kernel(mlir, "bz", tmp_path)
+    lib, fn = compile_split_kernel(mlir, "bz", tmp_path)
     rng = np.random.default_rng(n)
     re = rng.standard_normal((lines, n))
     im = rng.standard_normal((lines, n))
-    out_re, out_im = _run_split(fn, [re, im], [(lines, n)] * 2, np.float64)
+    out_re, out_im = run_split(fn, [re, im], [(lines, n)] * 2, np.float64)
 
     ref = np.fft.fft(re + 1j * im, axis=1)
     np.testing.assert_allclose(out_re + 1j * out_im,
@@ -187,11 +182,11 @@ module {{
     return %r, %i : tensor<1x{n}xf64>, tensor<1x{n}xf64>
   }}
 }}"""
-    lib, fn = _compile_split_kernel(mlir, "imp", tmp_path)
+    lib, fn = compile_split_kernel(mlir, "imp", tmp_path)
     re = np.zeros((1, n))
     re[0, 0] = 1.0
-    out_re, out_im = _run_split(fn, [re, np.zeros((1, n))], [(1, n)] * 2,
-                                np.float64)
+    out_re, out_im = run_split(fn, [re, np.zeros((1, n))], [(1, n)] * 2,
+                               np.float64)
     np.testing.assert_allclose(out_re, np.ones((1, n)), atol=1e-12)
     np.testing.assert_allclose(out_im, np.zeros((1, n)), atol=1e-12)
 
@@ -210,10 +205,109 @@ module {{
     return %r, %i : tensor<{lines}x{n}xf64>, tensor<{lines}x{n}xf64>
   }}
 }}"""
-    lib, fn = _compile_split_kernel(mlir, "rt", tmp_path)
+    lib, fn = compile_split_kernel(mlir, "rt", tmp_path)
     rng = np.random.default_rng(7)
     re = rng.standard_normal((lines, n))
     im = rng.standard_normal((lines, n))
-    out_re, out_im = _run_split(fn, [re, im], [(lines, n)] * 2, np.float64)
+    out_re, out_im = run_split(fn, [re, im], [(lines, n)] * 2, np.float64)
     np.testing.assert_allclose(out_re, re, rtol=1e-11, atol=1e-11)
     np.testing.assert_allclose(out_im, im, rtol=1e-11, atol=1e-11)
+
+
+# --------------------------------------------------------------------- #
+# Stockham stage grouping (`fft-stage-group`)
+# --------------------------------------------------------------------- #
+#
+# Grouping decides how many consecutive Stockham stages share a scratch
+# line. It is an area/throughput knob and must not move a single bit of
+# the result, so every case below is checked against the same reference
+# as the ungrouped lowering.
+
+
+def _stage_group_pipeline(group: int) -> str:
+    return f"--sar-affine-to-llvm-pipeline=fft-stage-group={group}"
+
+
+@pytest.mark.parametrize("group", [0, 1, 2, 3, 99])
+def test_affine_fft_stage_group_matches_numpy(group, tmp_path):
+    """A power-of-two transform is bit-comparable under any grouping.
+
+    `group=99` exceeds log2(N) and exercises the saturating end of the
+    range, where the pool collapses to the two-line floor a Stockham
+    butterfly needs (it reads and writes different lines, so a single
+    shared buffer would be an in-place transform and wrong).
+    """
+    n, m = 4, 64
+    mlir = f"""
+module {{
+  func.func @g(%re: tensor<{n}x{m}xf64>, %im: tensor<{n}x{m}xf64>)
+      -> (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>) {{
+    %r, %i = sar.fft_split %re, %im {{dim = 1 : i64}} : tensor<{n}x{m}xf64>
+    return %r, %i : tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>
+  }}
+}}"""
+    lib, fn = compile_split_kernel(mlir,
+                                   "g",
+                                   tmp_path,
+                                   pipeline=_stage_group_pipeline(group))
+    rng = np.random.default_rng(21)
+    re = rng.standard_normal((n, m))
+    im = rng.standard_normal((n, m))
+    out_re, out_im = run_split(fn, [re, im], [(n, m)] * 2, np.float64)
+    np.testing.assert_allclose(out_re + 1j * out_im,
+                               np.fft.fft(re + 1j * im, axis=1),
+                               rtol=1e-12,
+                               atol=1e-12)
+
+
+@pytest.mark.parametrize("group", [0, 1, 2])
+def test_affine_bluestein_stage_group_matches_numpy(group, tmp_path):
+    """Grouping also reaches the two padded transforms Bluestein runs."""
+    lines, n = 2, 12
+    mlir = f"""
+module {{
+  func.func @bg(%re: tensor<{lines}x{n}xf64>, %im: tensor<{lines}x{n}xf64>)
+      -> (tensor<{lines}x{n}xf64>, tensor<{lines}x{n}xf64>) {{
+    %r, %i = sar.fft_split %re, %im {{dim = 1 : i64}} : tensor<{lines}x{n}xf64>
+    return %r, %i : tensor<{lines}x{n}xf64>, tensor<{lines}x{n}xf64>
+  }}
+}}"""
+    lib, fn = compile_split_kernel(mlir,
+                                   "bg",
+                                   tmp_path,
+                                   pipeline=_stage_group_pipeline(group))
+    rng = np.random.default_rng(22)
+    re = rng.standard_normal((lines, n))
+    im = rng.standard_normal((lines, n))
+    out_re, out_im = run_split(fn, [re, im], [(lines, n)] * 2, np.float64)
+    np.testing.assert_allclose(out_re + 1j * out_im,
+                               np.fft.fft(re + 1j * im, axis=1),
+                               rtol=1e-11,
+                               atol=1e-11)
+
+
+def test_affine_ifft_roundtrip_under_stage_group(tmp_path):
+    """The 1/L an inverse transform applies rides on the final stage's
+    stores, which grouping moves onto a shared line; a roundtrip pins that
+    the scaling still happens exactly once."""
+    n, m = 4, 32
+    mlir = f"""
+module {{
+  func.func @rtg(%re: tensor<{n}x{m}xf64>, %im: tensor<{n}x{m}xf64>)
+      -> (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>) {{
+    %fr, %fi = sar.fft_split %re, %im {{dim = 1 : i64}} : tensor<{n}x{m}xf64>
+    %r, %i = sar.fft_split %fr, %fi {{dim = 1 : i64, inverse}}
+        : tensor<{n}x{m}xf64>
+    return %r, %i : tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>
+  }}
+}}"""
+    lib, fn = compile_split_kernel(mlir,
+                                   "rtg",
+                                   tmp_path,
+                                   pipeline=_stage_group_pipeline(2))
+    rng = np.random.default_rng(23)
+    re = rng.standard_normal((n, m))
+    im = rng.standard_normal((n, m))
+    out_re, out_im = run_split(fn, [re, im], [(n, m)] * 2, np.float64)
+    np.testing.assert_allclose(out_re, re, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(out_im, im, rtol=1e-12, atol=1e-12)

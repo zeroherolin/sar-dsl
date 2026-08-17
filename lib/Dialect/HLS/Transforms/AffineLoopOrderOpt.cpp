@@ -18,7 +18,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 #define DEBUG_TYPE "hls"
 
 using namespace mlir;
@@ -31,8 +30,7 @@ using namespace sar;
 /// moved to an as outer as possible location of the input loop band. If
 /// "reverse" is true, as inner as possible.
 bool sar::applyAffineLoopOrderOpt(AffineLoopBand &band,
-                                       ArrayRef<unsigned> permMap,
-                                       bool reverse) {
+                                  ArrayRef<unsigned> permMap, bool reverse) {
   LLVM_DEBUG(llvm::dbgs() << "Loop order opt ";);
   assert(!band.empty() && "no loops provided");
 
@@ -133,7 +131,8 @@ bool sar::applyAffineLoopOrderOpt(AffineLoopBand &band,
 }
 
 namespace {
-struct AffineLoopOrderOpt : public sar::impl::AffineLoopOrderOptBase<AffineLoopOrderOpt> {
+struct AffineLoopOrderOpt
+    : public sar::impl::AffineLoopOrderOptBase<AffineLoopOrderOpt> {
   void runOnOperation() override {
     // Collect all target loop bands.
     AffineLoopBands targetBands;

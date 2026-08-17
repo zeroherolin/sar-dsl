@@ -30,7 +30,14 @@ def register_backend(cls: Type[BaseBackend]) -> None:
     _registry[cls.name] = cls
 
 
+def _register_from(module) -> None:
+    backend_cls = getattr(module, "Backend", None)
+    if backend_cls is not None:
+        register_backend(backend_cls)
+
+
 def _load_backend_module(name: str, directory: Path) -> None:
+    """Loads an out-of-tree backend package from `directory`."""
     init = directory / "__init__.py"
     compiler = directory / "compiler.py"
     source = compiler if compiler.exists() else init
@@ -53,9 +60,7 @@ def _load_backend_module(name: str, directory: Path) -> None:
         except Exception:
             del sys.modules[module_name]
             raise
-    backend_cls = getattr(module, "Backend", None)
-    if backend_cls is not None:
-        register_backend(backend_cls)
+    _register_from(module)
 
 
 def _discover() -> None:
@@ -64,13 +69,18 @@ def _discover() -> None:
         return
     _discovered = True
 
-    # 1. Built-in subpackages of sar.backends.
+    # 1. Built-in subpackages of sar.backends, imported under their real
+    # names: loading them from their file paths would execute each module
+    # a second time under an alias, duplicating every class object
+    # (`isinstance(design, sar.backends.hls.HLSDesign)` would be False for
+    # a design the registry built).
     package_dir = Path(__file__).parent
     for child in sorted(package_dir.iterdir()):
         if child.is_dir() and (child / "compiler.py").exists():
-            _load_backend_module(child.name, child)
+            _register_from(
+                importlib.import_module(f"sar.backends.{child.name}.compiler"))
 
-    # 2. Explicit search path.
+    # 2. Explicit search path (out-of-tree backends).
     for entry in os.environ.get("SAR_DSL_BACKEND_PATH", "").split(os.pathsep):
         if entry:
             path = Path(entry)

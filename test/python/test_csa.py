@@ -50,6 +50,8 @@ def test_csa_focuses_point_target(setup):
 
     window = image[i - 3:i + 4, j - 3:j + 4]
     energy_fraction = (window**2).sum() / (image**2).sum()
+    # Looser than WKA's 0.9 gate: residual chirp-scaling (bulk RCMC)
+    # error leaves some energy outside the 7x7 window.
     assert energy_fraction > 0.8
 
 
@@ -79,8 +81,7 @@ def test_csa_emits_hls_design():
     import re
 
     n = 64
-    design = build_csa_kernel(n,
-                              synthetic_params(n)).compile(backend="hls")
+    design = build_csa_kernel(n, synthetic_params(n)).compile(backend="hls")
     source = design.source()
     assert "void csa" in source
     assert "#pragma HLS" in source

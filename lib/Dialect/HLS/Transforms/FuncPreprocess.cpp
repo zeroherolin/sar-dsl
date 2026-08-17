@@ -17,7 +17,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -154,12 +153,13 @@ struct MulIRaisePattern : public OpRewritePattern<arith::MulIOp> {
 } // namespace
 
 bool sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
-  // auto builder = OpBuilder(func);
   auto context = func.getContext();
 
   // We constrain functions to only contain one block.
-  if (!llvm::hasSingleElement(func))
+  if (!llvm::hasSingleElement(func)) {
     func.emitError("has more than one basic blocks.");
+    return false;
+  }
 
   // Set top function attribute.
   if (isTopFunc)
@@ -173,20 +173,6 @@ bool sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
       setParallelAttr(loop);
   });
 
-  // We always don't return results in HLS. Instead, we convert results to
-  // function parameters. Therefore, we insert BufferOp when an arguments or
-  // result of ConstantOp are directly connected to ReturnOp.
-  // TODO: We should introduce pointer types here.
-  // auto returnOp = func.front().getTerminator();
-  // for (auto &use : llvm::make_early_inc_range(returnOp->getOpOperands()))
-  //   if (dyn_cast<BlockArgument>(use.get()) ||
-  //       isa<arith::ConstantOp>(use.get().getDefiningOp())) {
-  //     builder.setInsertionPoint(returnOp);
-  //     auto value = builder.create<DataflowBufferOp>(
-  //         returnOp->getLoc(), use.get().getType(), use.get(), /*depth=*/1);
-  //     use.set(value);
-  //   }
-
   mlir::RewritePatternSet patterns(context);
   patterns.add<MemrefLoadRaisePattern>(context);
   patterns.add<MemrefStoreRaisePattern>(context);
@@ -196,16 +182,19 @@ bool sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
   patterns.add<AllocaDemotePattern>(context);
   sar::populateBufferConversionPatterns(patterns);
   vector::populateVectorTransferLoweringPatterns(patterns);
-  (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+  (void)applyPatternsGreedily(func, std::move(patterns));
 
-  // We don't support any scf or memref operations.
-  if (WalkResult::interrupt() == func.walk([&](Operation *op) {
-        if (isa<scf::SCFDialect, memref::MemRefDialect>(op->getDialect()))
-          return WalkResult::interrupt();
-        return WalkResult::advance();
-      }))
-    return false;
-  return true;
+  // Report whether scf or memref ops remain. Not a hard failure: the pass
+  // runs again mid-pipeline where views and copies legitimately still
+  // exist, and the emitter is the authoritative rejector of anything that
+  // survives to the end.
+  return !func.walk([&](Operation *op) {
+                if (isa<scf::SCFDialect, memref::MemRefDialect>(
+                        op->getDialect()))
+                  return WalkResult::interrupt();
+                return WalkResult::advance();
+              })
+              .wasInterrupted();
 }
 
 namespace {
@@ -216,12 +205,17 @@ struct FuncPreprocess : public sar::impl::FuncPreprocessBase<FuncPreprocess> {
   void runOnOperation() override {
     auto func = getOperation();
     auto isTop = func.getName() == topFunc;
-    applyFuncPreprocess(func, isTop);
+    // The residue report is advisory (see applyFuncPreprocess); only a
+    // malformed function is a failure.
+    if (!llvm::hasSingleElement(func)) {
+      applyFuncPreprocess(func, isTop);
+      return signalPassFailure();
+    }
+    (void)applyFuncPreprocess(func, isTop);
   }
 };
 } // namespace
 
-std::unique_ptr<Pass>
-sar::createFuncPreprocessPass(std::string hlsTopFunc) {
+std::unique_ptr<Pass> sar::createFuncPreprocessPass(std::string hlsTopFunc) {
   return std::make_unique<FuncPreprocess>(hlsTopFunc);
 }

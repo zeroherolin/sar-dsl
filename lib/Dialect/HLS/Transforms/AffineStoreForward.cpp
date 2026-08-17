@@ -19,7 +19,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -70,7 +69,8 @@ forwardStoreToLoad(mlir::affine::AffineReadOpInterface loadOp,
     // as start for intervening effect searching.
     Operation *startOp = storeOp;
     if (startOp->getParentRegion() != loadOp->getParentRegion()) {
-      if (auto ifOp = dyn_cast<mlir::affine::AffineIfOp>(storeOp->getParentOp()))
+      if (auto ifOp =
+              dyn_cast<mlir::affine::AffineIfOp>(storeOp->getParentOp()))
         if (isValid(ifOp, loadOp) && !ifAlwaysTrueOrFalse(ifOp).second)
           startOp = ifOp;
     }
@@ -85,9 +85,12 @@ forwardStoreToLoad(mlir::affine::AffineReadOpInterface loadOp,
                                                       loadOp.getMemRef()))
       continue;
 
-    // We now have a candidate for forwarding.
-    assert(lastWriteStoreOp == nullptr &&
-           "multiple simulataneous replacement stores");
+    // We now have a candidate for forwarding. Two candidates that both
+    // dominate the load with no intervening write should be impossible; if
+    // the analysis ever disagrees, forwarding either would be a guess, so
+    // bail out rather than pick one.
+    if (lastWriteStoreOp)
+      return loadOp;
     lastWriteStoreOp = storeOp;
   }
 
@@ -109,10 +112,11 @@ forwardStoreToLoad(mlir::affine::AffineReadOpInterface loadOp,
     // Create a load and select op as the new value to write.
     auto builder = OpBuilder(ifOp);
     builder.setInsertionPoint(lastWriteStoreOp);
-    auto newLoad = cast<mlir::affine::AffineReadOpInterface>(builder.clone(*loadOp));
-    auto select = builder.create<hls::AffineSelectOp>(
-        ifOp.getLoc(), ifOp.getIntegerSet(), ifOp.getOperands(), storeVal,
-        newLoad.getValue());
+    auto newLoad =
+        cast<mlir::affine::AffineReadOpInterface>(builder.clone(*loadOp));
+    auto select = hls::AffineSelectOp::create(
+        builder, ifOp.getLoc(), ifOp.getIntegerSet(), ifOp.getOperands(),
+        storeVal, newLoad.getValue());
     ifOp->erase();
 
     auto valueIdx = llvm::find(lastWriteStoreOp->getOperands(), storeVal) -
@@ -167,14 +171,16 @@ static void findUnusedStore(mlir::affine::AffineWriteOpInterface writeA,
     Operation *targetA = writeA;
     Operation *targetB = writeB;
     if (targetA->getParentRegion() != targetB->getParentRegion()) {
-      if (auto ifOpA = dyn_cast<mlir::affine::AffineIfOp>(writeA->getParentOp())) {
+      if (auto ifOpA =
+              dyn_cast<mlir::affine::AffineIfOp>(writeA->getParentOp())) {
         if (isValid(ifOpA, writeB))
           targetA = ifOpA;
-        if (auto ifOpB = dyn_cast<mlir::affine::AffineIfOp>(writeB->getParentOp()))
+        if (auto ifOpB =
+                dyn_cast<mlir::affine::AffineIfOp>(writeB->getParentOp()))
           if (checkSameIfStatement(ifOpA, ifOpB))
             targetB = ifOpB;
-      } else if (auto ifOpB =
-                     dyn_cast<mlir::affine::AffineIfOp>(writeB->getParentOp())) {
+      } else if (auto ifOpB = dyn_cast<mlir::affine::AffineIfOp>(
+                     writeB->getParentOp())) {
         if (isValid(ifOpB, writeA))
           targetB = ifOpB;
       }
@@ -198,8 +204,8 @@ static void findUnusedStore(mlir::affine::AffineWriteOpInterface writeA,
 
       auto builder = OpBuilder(ifOp);
       builder.setInsertionPoint(writeB);
-      auto select = builder.create<hls::AffineSelectOp>(
-          ifOp.getLoc(), ifOp.getIntegerSet(), ifOp.getOperands(),
+      auto select = hls::AffineSelectOp::create(
+          builder, ifOp.getLoc(), ifOp.getIntegerSet(), ifOp.getOperands(),
           writeB.getValueToStore(), writeA.getValueToStore());
       ifOp->erase();
 
@@ -226,29 +232,6 @@ static void findUnusedStore(mlir::affine::AffineWriteOpInterface writeA,
 static void loadCSE(mlir::affine::AffineReadOpInterface loadA,
                     SmallVectorImpl<Operation *> &loadOpsToErase,
                     DominanceInfo &domInfo) {
-  // FIXME: This is not safe!!! After task is created from affine, we should not
-  // apply this as the dependencies cannot be identified correctly.
-  // if (auto buffer = loadA.getMemRef().getDefiningOp<BufferOp>())
-  //   if (auto initValue = buffer.getInitValue())
-  //     if (llvm::all_of(buffer->getUsers(), [&](Operation *user) {
-  //           if (auto store = dyn_cast<mlir::affine::AffineWriteOpInterface>(user)) {
-  //             if (crossRegionDominates(store, loadA))
-  //               return false;
-  //             if (checkDependence(store, loadA))
-  //               return false;
-  //             return true;
-  //           }
-  //           return true;
-  //         })) {
-  //       auto builder = OpBuilder(loadA);
-  //       builder.setInsertionPoint(loadA);
-  //       auto constantInitValue = builder.create<arith::ConstantOp>(
-  //           loadA.getLoc(), initValue.value());
-  //       loadA.getValue().replaceAllUsesWith(constantInitValue);
-  //       loadOpsToErase.push_back(loadA);
-  //       return;
-  //     }
-
   SmallVector<mlir::affine::AffineReadOpInterface, 4> loadCandidates;
   for (auto *user : loadA.getMemRef().getUsers()) {
     auto loadB = dyn_cast<mlir::affine::AffineReadOpInterface>(user);
@@ -284,11 +267,12 @@ static void loadCSE(mlir::affine::AffineReadOpInterface loadA,
   // to minimize the subsequent need to loadCSE
   Value loadB;
   for (mlir::affine::AffineReadOpInterface option : loadCandidates) {
-    if (llvm::all_of(loadCandidates, [&](mlir::affine::AffineReadOpInterface depStore) {
-          return depStore == option ||
-                 domInfo.dominates(option.getOperation(),
-                                   depStore.getOperation());
-        })) {
+    if (llvm::all_of(loadCandidates,
+                     [&](mlir::affine::AffineReadOpInterface depStore) {
+                       return depStore == option ||
+                              domInfo.dominates(option.getOperation(),
+                                                depStore.getOperation());
+                     })) {
       loadB = option.getValue();
       break;
     }
@@ -391,7 +375,8 @@ static bool applyAffineStoreForward(func::FuncOp func) {
 }
 
 namespace {
-struct AffineStoreForward : public sar::impl::AffineStoreForwardBase<AffineStoreForward> {
+struct AffineStoreForward
+    : public sar::impl::AffineStoreForwardBase<AffineStoreForward> {
   void runOnOperation() override { applyAffineStoreForward(getOperation()); }
 };
 } // namespace

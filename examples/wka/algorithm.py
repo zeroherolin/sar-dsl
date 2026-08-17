@@ -20,19 +20,29 @@ from common.params import RadarParams, band_windows
 __all__ = ["build_kernel", "make_inputs"]
 
 
-def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
-    """Builds an `n x n` WKA imaging kernel for the given parameters."""
+def build_kernel(n: int,
+                 p: RadarParams,
+                 name: str = "wka",
+                 dtype=sar.c128) -> sar.Kernel:
+    """Builds an `n x n` WKA imaging kernel for the given parameters.
+
+    `name` becomes the IR symbol and the HLS top function, so a second
+    kernel can be emitted beside the first without a symbol clash.
+    `dtype` is the spectral working precision: `sar.c128` (default)
+    mirrors numpy.fft's promotion in the reference implementation,
+    `sar.c64` keeps the whole data path single-precision -- see
+    `benchmarks/run_precision.py` for what that trades.
+    """
+    if dtype not in (sar.c128, sar.c64):
+        raise ValueError("dtype must be sar.c128 or sar.c64")
+    fd = sar.f64 if dtype is sar.c128 else sar.f32
 
     N = int(n)
     fa = np.fft.fftshift(np.fft.fftfreq(N, d=1.0 / p.prf))
     fr = np.fft.fftshift(np.fft.fftfreq(N, d=1.0 / p.fs))
 
-    @sar.func
-    def wka(raw: sar.c64[N, N], win_r: sar.f64[N],
-            win_a: sar.f64[N]) -> sar.f32[N, N]:
-        # All spectral processing runs in double precision, mirroring
-        # numpy.fft's promotion behaviour in the reference implementation.
-        data = sar.cast(raw, sar.c128)
+    def wka(raw: sar.c64[N, N], win_r: fd[N], win_a: fd[N]) -> sar.f32[N, N]:
+        data = sar.cast(raw, dtype)
 
         # 2-D forward spectrum: range FFT, corner turn, azimuth FFT.
         data = sar.fftshift(sar.fft(data, axis=1), axis=1)
@@ -76,7 +86,8 @@ def build_kernel(n: int, p: RadarParams) -> sar.Kernel:
 
         return sar.cast(sar.absolute(data), sar.f32)
 
-    return wka
+    wka.__name__ = name
+    return sar.func(wka)
 
 
 def make_inputs(n: int, p: RadarParams):

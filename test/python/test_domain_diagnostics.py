@@ -106,3 +106,68 @@ def test_warnings_can_be_escalated():
         warnings.simplefilter("error", sar.DomainWarning)
         with pytest.raises(sar.DomainWarning):
             k.to_mlir()
+
+
+def test_centered_and_uncentered_spectra_warn():
+    """Multiplying a shifted spectrum by an unshifted one: same domain, but
+    the phase reference differs by a half-band rotation."""
+
+    @sar.func
+    def k(z: sar.c64[N, N], y: sar.c64[N, N]) -> sar.c64[N, N]:
+        return sar.fftshift(sar.fft(z, dim=1), dim=1) * sar.fft(y, dim=1)
+
+    assert any("centered spectrum" in m for m in _messages(k))
+
+
+def test_matched_centering_is_silent():
+
+    @sar.func
+    def k(z: sar.c64[N, N], y: sar.c64[N, N]) -> sar.c64[N, N]:
+        a = sar.fftshift(sar.fft(z, dim=1), dim=1)
+        b = sar.fftshift(sar.fft(y, dim=1), dim=1)
+        return a * b
+
+    assert _messages(k) == []
+
+
+def test_domain_state_survives_circshift():
+    """A roll keeps every axis in its domain, so the tracker must not lose
+    the state across one -- otherwise a double FFT slips through."""
+
+    @sar.func
+    def k(z: sar.c64[N, N]) -> sar.c64[N, N]:
+        rolled = sar.circshift(sar.fft(z, dim=1), 3, dim=1)
+        return sar.fft(rolled, dim=1)
+
+    assert any("already in the frequency domain" in m for m in _messages(k))
+
+
+def test_warning_blames_the_kernel_line():
+    """The report has to point at user code, not at the DSL internals, or
+    module-scoped warning filters cannot match it."""
+
+    @sar.func
+    def k(z: sar.c64[N, N]) -> sar.c64[N, N]:
+        return sar.fft(sar.fft(z, dim=1), dim=1)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        k.to_mlir()
+    hits = [w for w in caught if issubclass(w.category, sar.DomainWarning)]
+    assert hits and all(w.filename == __file__ for w in hits)
+
+
+def test_warnings_repeat_on_every_trace():
+    """`to_mlir` reuses the first trace (so its warnings fire once), but an
+    explicit re-trace is not memoized: escalating the filter after a first
+    call still has to fire."""
+
+    @sar.func
+    def k(z: sar.c64[N, N]) -> sar.c64[N, N]:
+        return sar.fft(sar.fft(z, dim=1), dim=1)
+
+    assert _messages(k)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        k.trace()
+    assert [w for w in caught if issubclass(w.category, sar.DomainWarning)]

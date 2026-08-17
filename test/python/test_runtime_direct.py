@@ -123,9 +123,16 @@ def test_fft_roundtrip(runtime_lib, descriptor):
 
 _KERNEL_IDS = {"nearest": 0, "linear": 1, "cubic": 2, "sinc": 3}
 _WINDOW_HANN = 1
+_BOUNDARY_IDS = {"zero": 0, "edge": 1, "reflect": 2}
 
 
-def _call_interp(runtime_lib, descriptor, data, positions, kernel, taps):
+def _call_interp(runtime_lib,
+                 descriptor,
+                 data,
+                 positions,
+                 kernel,
+                 taps,
+                 boundary="zero"):
     out = np.empty_like(data)
     symbol = ("_mlir_ciface_sar_rt_interp1d_2d_c64" if data.dtype
               == np.complex64 else "_mlir_ciface_sar_rt_interp1d_2d_c128")
@@ -136,7 +143,8 @@ def _call_interp(runtime_lib, descriptor, data, positions, kernel, taps):
     out_desc = descriptor(out)
     fn(ctypes.byref(data_desc), ctypes.byref(pos_desc), ctypes.byref(out_desc),
        ctypes.c_int64(_KERNEL_IDS[kernel]), ctypes.c_int64(taps),
-       ctypes.c_int64(_WINDOW_HANN), ctypes.c_double(2.5))
+       ctypes.c_int64(_WINDOW_HANN), ctypes.c_double(2.5),
+       ctypes.c_int64(_BOUNDARY_IDS[boundary]))
     return out
 
 
@@ -203,6 +211,42 @@ def test_interp1d_fractional_positions_bounded(runtime_lib, descriptor):
     interior = out[:, 2:-2]
     assert np.isfinite(interior).all()
     assert np.abs(interior).max() < 10.0 * np.abs(data).max()
+
+
+def test_interp1d_edge_boundary_at_runtime(runtime_lib, descriptor):
+    """Edge boundary policy clamps out-of-range taps to the endpoint."""
+    data = np.arange(8, dtype=np.complex128).reshape(1, 8)
+    positions = np.array([[-1.0, 0.0, 7.0, 8.0, 3.0, 4.0, 5.0, 6.0]])
+
+    out = _call_interp(runtime_lib,
+                       descriptor,
+                       data,
+                       positions,
+                       "nearest",
+                       1,
+                       boundary="edge")
+    # nearest rounds to -1, 0, 7, 8, 3, 4, 5, 6; edge clamps into [0, 7].
+    np.testing.assert_allclose(out, [[0, 0, 7, 7, 3, 4, 5, 6]],
+                               rtol=1e-12,
+                               atol=1e-12)
+
+
+def test_interp1d_reflect_boundary_at_runtime(runtime_lib, descriptor):
+    """Reflect boundary policy mirrors out-of-range taps back inside."""
+    data = np.arange(8, dtype=np.complex128).reshape(1, 8)
+    positions = np.array([[-1.0, -2.0, 8.0, 9.0, 3.0, 4.0, 5.0, 6.0]])
+
+    out = _call_interp(runtime_lib,
+                       descriptor,
+                       data,
+                       positions,
+                       "nearest",
+                       1,
+                       boundary="reflect")
+    # nearest rounds to -1, -2, 8, 9; mirrored to 0, 1, 7, 6.
+    np.testing.assert_allclose(out, [[0, 1, 7, 6, 3, 4, 5, 6]],
+                               rtol=1e-12,
+                               atol=1e-12)
 
 
 # --------------------------------------------------------------------------- #

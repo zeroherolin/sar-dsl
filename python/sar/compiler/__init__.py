@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from typing import Optional
 
 from ..backends import KernelMetadata, get_backend
@@ -17,7 +16,6 @@ def compile(kernel, backend: str = "cpu", options: Optional[dict] = None):
     Returns the backend-specific launcher: a callable executing the kernel
     for execution backends, or an artifact handle for emission backends.
     """
-    options = dict(options or {})
     backend_cls = get_backend(backend)
     backend_obj = backend_cls()
 
@@ -26,13 +24,18 @@ def compile(kernel, backend: str = "cpu", options: Optional[dict] = None):
         name=kernel.name,
         arg_types=list(kernel.arg_types),
         result_types=list(kernel.declared_result_types),
-        options=options,
+        options=dict(options or {}),
+        param_names=getattr(kernel, "param_names", None),
     )
 
-    stages = OrderedDict()
+    stages = {}
     backend_obj.add_stages(stages, metadata)
 
-    cache = KernelCache(module_text, backend, options)
+    # Keyed on `metadata.options`, not the caller's `options`: `add_stages`
+    # may rewrite them into their fully resolved form (the HLS backend
+    # folds in its config files), and it is the resolved set that
+    # identifies the artifacts.
+    cache = KernelCache(module_text, backend, metadata.options)
     artifact = module_text
     for stage_fn in stages.values():
         artifact = stage_fn(artifact, metadata, cache)

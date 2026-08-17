@@ -16,7 +16,6 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
@@ -45,13 +44,13 @@ struct LowerCopy : public OpRewritePattern<memref::CopyOp> {
 
     // Create explicit memory copy using an affine loop nest.
     SmallVector<Value, 4> ivs;
-    auto constantZero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto constantZero = arith::ConstantIndexOp::create(rewriter, loc, 0);
     for (auto dimSize : memrefType.getShape()) {
       if (dimSize == 1) {
         ivs.push_back(constantZero);
         continue;
       }
-      auto loop = rewriter.create<mlir::affine::AffineForOp>(loc, 0, dimSize);
+      auto loop = mlir::affine::AffineForOp::create(rewriter, loc, 0, dimSize);
       setParallelAttr(loop);
       // If the copy op is not external, we consider the loop as point loop
       // that needs to be optimized later.
@@ -62,9 +61,10 @@ struct LowerCopy : public OpRewritePattern<memref::CopyOp> {
     }
 
     // Create affine load/store operations.
-    auto value =
-        rewriter.create<mlir::affine::AffineLoadOp>(loc, copy.getSource(), ivs);
-    rewriter.create<mlir::affine::AffineStoreOp>(loc, value, copy.getTarget(), ivs);
+    auto value = mlir::affine::AffineLoadOp::create(rewriter, loc,
+                                                    copy.getSource(), ivs);
+    mlir::affine::AffineStoreOp::create(rewriter, loc, value, copy.getTarget(),
+                                        ivs);
 
     rewriter.eraseOp(copy);
     return success();
@@ -76,7 +76,8 @@ private:
 } // namespace
 
 namespace {
-struct LowerCopyToAffine : public sar::impl::LowerCopyToAffineBase<LowerCopyToAffine> {
+struct LowerCopyToAffine
+    : public sar::impl::LowerCopyToAffineBase<LowerCopyToAffine> {
   LowerCopyToAffine() = default;
   LowerCopyToAffine(bool argInternalCopyOnly) {
     internalCopyOnly = argInternalCopyOnly;
@@ -90,12 +91,11 @@ struct LowerCopyToAffine : public sar::impl::LowerCopyToAffineBase<LowerCopyToAf
     // Lower copy operation.
     mlir::RewritePatternSet patterns(context);
     patterns.add<LowerCopy>(context, internalCopyOnly);
-    (void)applyPatternsAndFoldGreedily(module, std::move(patterns));
+    (void)applyPatternsGreedily(module, std::move(patterns));
   }
 };
 } // namespace
 
-std::unique_ptr<Pass>
-sar::createLowerCopyToAffinePass(bool internalCopyOnly) {
+std::unique_ptr<Pass> sar::createLowerCopyToAffinePass(bool internalCopyOnly) {
   return std::make_unique<LowerCopyToAffine>(internalCopyOnly);
 }

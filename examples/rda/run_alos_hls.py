@@ -1,41 +1,33 @@
 #!/usr/bin/env python3
-"""Range-Doppler on the HLS backend at the full ALOS-1 scene size.
+"""Range-Doppler on the HLS backend at ALOS-1 scene geometry.
 
-Emits a synthesizable Vitis HLS C++ design for the 16384 x 16384 raster
-the San Francisco example processes on the CPU. Unlike the point-target
-runner this one compiles with `axi_interface=True`, which is what makes
-the size reachable: the raw echoes, the output and the full-size
-intermediates become AXI master ports backed by DRAM, leaving only the
-constant tables and the one-line transform scratch on chip. Intermediates
-whose lifetimes do not overlap share a plane, and ports of the same
-element type share one bundle, so the design presents a dozen ports on a
-couple of interfaces rather than one per intermediate.
+Emits the full artifact set: a synthesizable design at the 16384 x 16384
+raster the San Francisco example processes on the CPU, and a
+C-simulation package at a smaller raster with the same radar parameters.
+`examples/common/hls_artifacts.py` explains why the two cannot be one
+design.
 
 The RCMC gather keeps its interpolation weights on chip alongside the
 range reference, so the streamed set is the planes themselves.
 
-This runner emits the design only. A C-simulation package needs golden
-data for every top-level port, and the promoted intermediate ports have
-none; use `run_point_target_hls.py` for a csim-able package, and
-validate the arithmetic there.
-
-No raw data is read: the design is a function of the geometry, not of the
-samples.
+No raw data is read: the design is a function of the geometry, not of
+the samples.
 
 Usage:
-    python run_alos_hls.py [--n 16384] [--output hls_project/rda_alos]
+    python run_alos_hls.py [--n 16384] [--csim-n 1024]
+                           [--output PATH] [--no-testbench]
 """
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 _EXAMPLES = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(_EXAMPLES), str(_EXAMPLES.parent / "python")]
 
-from common.params import ALOS_PARAMS  # noqa: E402
-from rda.algorithm import build_kernel  # noqa: E402
+from common.hls_artifacts import emit_alos_artifacts  # noqa: E402
+from rda.algorithm import build_kernel, make_inputs  # noqa: E402
+from rda.reference import RDAProcessor  # noqa: E402
 
 
 def main() -> None:
@@ -43,35 +35,28 @@ def main() -> None:
     parser.add_argument("--n",
                         type=int,
                         default=16384,
-                        help="raster size (power of two)")
+                        help="raster of the synthesizable design")
+    parser.add_argument("--csim-n",
+                        type=int,
+                        default=1024,
+                        help="raster of the C-simulation package")
     parser.add_argument("--output",
-                        default="hls_project/rda_alos",
-                        help="directory for the emitted design")
+                        default=str(_EXAMPLES / "hls_project" / "rda_alos"),
+                        help="artifact directory")
+    parser.add_argument("--no-testbench",
+                        action="store_true",
+                        help="emit the designs only")
     args = parser.parse_args()
 
-    n = args.n
-    print(f"[1/2] Emitting the {n}x{n} RDA kernel through HLS ...")
-    started = time.time()
-    design = build_kernel(n,
-                          ALOS_PARAMS).compile(backend="hls",
-                                               options={"axi_interface": True})
-    source = design.source()
-    print(f"      emitted in {time.time() - started:.1f} s")
-
-    out = Path(args.output).resolve()
-    out.mkdir(parents=True, exist_ok=True)
-    target = out / "rda_alos.cpp"
-    target.write_text(source)
-
-    ports = source.count("m_axi")
-    bundles = len({
-        line.split("bundle=")[1].split()[0]
-        for line in source.splitlines() if "m_axi" in line
-    })
-    print(f"[2/2] Saved {target}")
-    print(f"done: {source.count(chr(10))} lines of HLS C++ "
-          f"(flow=affine, top function 'rda'); "
-          f"{ports} AXI ports on {bundles} bundle(s)")
+    emit_alos_artifacts("rda",
+                        build_kernel,
+                        make_inputs,
+                        RDAProcessor,
+                        n=args.n,
+                        csim_n=args.csim_n,
+                        out=Path(args.output).resolve(),
+                        testbench=not args.no_testbench)
+    print("done: csim with `vitis_hls -f rda_alos_csim.tcl`")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,6 @@
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
 
-
 using namespace mlir;
 using namespace sar;
 using namespace hls;
@@ -75,8 +74,15 @@ struct ConvertGetGlobalToConstBuffer
                                 PatternRewriter &rewriter) const override {
     auto global = SymbolTable::lookupNearestSymbolFrom<memref::GlobalOp>(
         op, op.getNameAttr());
-    rewriter.replaceOpWithNewOp<ConstBufferOp>(op, global.getType(),
-                                               global.getConstantInitValue());
+    if (!global)
+      return op.emitOpError("refers to a global that does not exist"),
+             failure();
+    auto init = global.getConstantInitValue();
+    if (!init)
+      return op.emitOpError("refers to a global without a constant "
+                            "initializer, which has no on-chip form"),
+             failure();
+    rewriter.replaceOpWithNewOp<ConstBufferOp>(op, global.getType(), init);
     return success();
   }
 };

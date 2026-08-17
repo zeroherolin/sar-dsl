@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `labeled` lets the full-build job below be requested on a PR by
+    # attaching the `full-ci` label; the other types are the defaults.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
   schedule:
     # Nightly full build: the toolchain-dependent suites (lit, e2e imaging
@@ -34,7 +37,7 @@ jobs:
       # Most of the suite self-skips here (no toolchain), so a green run says
       # little on its own. Pin the floor of tests that must actually execute:
       # it only ever grows, and it fails loudly if a toolchain-free test is
-      # accidentally marked `requires_cpu` / `requires_scalehls`.
+      # accidentally marked `requires_cpu` / `requires_hls`.
       - name: Guard against silent coverage loss
         run: |
           PASSED=$(grep -oE '[0-9]+ passed' pytest.out | tail -1 | cut -d' ' -f1)
@@ -47,13 +50,15 @@ jobs:
             exit 1
           fi
 
-  # The full build (LLVM + ScaleHLS + sar-opt + lit + e2e) takes hours from
-  # scratch, so it runs nightly and on demand, with the toolchain trees
-  # cached between runs.
+  # The full build (LLVM + sar-opt + lit + e2e) takes hours from scratch, so
+  # it runs nightly, on demand, and on PRs labeled `full-ci`, with the
+  # toolchain tree cached between runs.
   full-build:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'schedule'
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'full-ci'))
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
@@ -61,13 +66,12 @@ jobs:
         with:
           submodules: false
 
-      # The submodule gitlink SHAs key the toolchain caches. They are read
-      # from the superproject tree, so this works before `submodule update`.
-      - name: Resolve submodule revisions
+      # The submodule gitlink SHA keys the toolchain cache. It is read from
+      # the superproject tree, so this works before `submodule update`.
+      - name: Resolve submodule revision
         id: subrev
         run: |
           echo "llvm=$(git rev-parse HEAD:externals/llvm-project)" >> "$GITHUB_OUTPUT"
-          echo "scalehls=$(git rev-parse HEAD:externals/ScaleHLS-HIDA)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-python@v5
         with:
@@ -82,27 +86,14 @@ jobs:
           path: externals/llvm-project/build
           key: llvm-${{ runner.os }}-${{ steps.subrev.outputs.llvm }}-${{ hashFiles('scripts/build-llvm.sh') }}
 
-      - name: Cache ScaleHLS-HIDA build
-        id: cache-scalehls
-        uses: actions/cache@v4
-        with:
-          path: externals/ScaleHLS-HIDA/build
-          key: scalehls-${{ runner.os }}-${{ steps.subrev.outputs.llvm }}-${{ steps.subrev.outputs.scalehls }}-${{ hashFiles('scripts/build-scalehls.sh') }}
-
-      # Sources are always needed: the cached build trees carry CMake configs
-      # that point back into the submodule source directories.
+      # Sources are always needed: the cached build tree carries CMake configs
+      # that point back into the submodule source directory.
       - name: Check out submodule sources
-        run: |
-          git submodule update --init externals/llvm-project
-          git submodule update --init externals/ScaleHLS-HIDA
+        run: git submodule update --init externals/llvm-project
 
       - name: Build LLVM
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: make llvm
-
-      - name: Build ScaleHLS
-        if: steps.cache-scalehls.outputs.cache-hit != 'true'
-        run: make scalehls
 
       - run: make build
       - run: make test

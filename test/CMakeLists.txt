@@ -8,6 +8,7 @@ configure_lit_site_cfg(
 set(SAR_DSL_TEST_DEPENDS
   FileCheck
   sar-opt
+  sar-translate
   sar_runtime
 )
 

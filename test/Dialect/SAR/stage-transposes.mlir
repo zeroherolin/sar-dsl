@@ -1,10 +1,7 @@
 // RUN: sar-opt %s --sar-stage-transposes="block-bytes=128" | FileCheck %s
 
-// A transposing nest reads one buffer along its rows and writes the other
-// along its columns, so one of the two strides by a whole row whichever loop
-// is innermost. Staging a square block makes both sides contiguous: the
-// block is filled row-wise and drained column-wise, and it is the only thing
-// left striding.
+// The staged block is filled row-wise and drained column-wise, so both
+// full-size planes sweep contiguously and only the block strides.
 
 // CHECK-LABEL: func.func @corner_turn
 // CHECK: memref.alloc() : memref<4x4xf64>
@@ -176,6 +173,70 @@ func.func @nested_match(%a: memref<8x8xf64>, %b: memref<8x8xf64>) {
         %v = affine.load %a[%k, %j] : memref<8x8xf64>
         affine.store %v, %b[%j, %k] : memref<8x8xf64>
       }
+    }
+  }
+  return
+}
+
+// -----
+
+// An induction variable flowing anywhere but a load/store index -- here
+// into arithmetic -- cannot be re-expressed by the rewrite, so the nest is
+// left alone rather than replayed with dangling references.
+
+// CHECK-LABEL: func.func @iv_used_as_value
+// CHECK-NOT: memref.alloc()
+func.func @iv_used_as_value(%in: memref<8x8xf32>, %out: memref<8x8xf32>) {
+  affine.for %i = 0 to 8 {
+    affine.for %j = 0 to 8 {
+      %v = affine.load %in[%j, %i] : memref<8x8xf32>
+      %ii = arith.index_cast %i : index to i64
+      %f = arith.sitofp %ii : i64 to f32
+      %r = arith.addf %v, %f : f32
+      affine.store %r, %out[%i, %j] : memref<8x8xf32>
+    }
+  }
+  return
+}
+
+// -----
+
+// Any nested region -- affine or not -- carries accesses the replay cannot
+// re-express, so the nest is left alone.
+
+// CHECK-LABEL: func.func @nested_scf_region
+// CHECK-NOT: memref.alloc()
+func.func @nested_scf_region(%in: memref<8x8xf32>, %out: memref<8x8xf32>,
+                             %c: i1) {
+  affine.for %i = 0 to 8 {
+    affine.for %j = 0 to 8 {
+      %v = scf.if %c -> f32 {
+        %x = affine.load %in[%j, %i] : memref<8x8xf32>
+        scf.yield %x : f32
+      } else {
+        %z = arith.constant 0.0 : f32
+        scf.yield %z : f32
+      }
+      affine.store %v, %out[%i, %j] : memref<8x8xf32>
+    }
+  }
+  return
+}
+
+// -----
+
+// Elements without an int/float bit width cannot be budgeted for a block,
+// so the nest is left alone. (The pipeline stages transposes only after
+// decomplexify, but the pass must hold up on its own.)
+
+// CHECK-LABEL: func.func @complex_elements
+// CHECK-NOT: memref.alloc()
+func.func @complex_elements(%in: memref<8x8xcomplex<f32>>,
+                            %out: memref<8x8xcomplex<f32>>) {
+  affine.for %i = 0 to 8 {
+    affine.for %j = 0 to 8 {
+      %v = affine.load %in[%j, %i] : memref<8x8xcomplex<f32>>
+      affine.store %v, %out[%i, %j] : memref<8x8xcomplex<f32>>
     }
   }
   return

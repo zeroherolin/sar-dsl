@@ -35,8 +35,8 @@ Kernels are equally light: `@sar.func` works without type annotations
 (specializing per call), numpy arrays mix freely with tensors
 (`spectrum * np.hanning(M)` lifts the window to a constant, promotes
 dtypes and broadcasts rank-1 operands along the last axis), and tensors
-carry numpy-style sugar (`abs(x)`, `x ** 2`, `x.real`, `x.conj()`,
-`x.sum(axis=0)`, `x[2:6, :]`, `axis=` everywhere).
+carry the numpy-style method, operator and slicing surface --
+[python-api.md](python-api.md) lists it in full.
 
 ## NumPy interoperability
 
@@ -90,6 +90,11 @@ Two properties worth knowing about the eager path:
 - **Semantics follow numpy**, with the deliberate exceptions documented
   on each function: `sar.round` rounds half away from zero (Matlab), and
   `sar.var` / `sar.std` normalize by N (numpy) rather than N-1.
+
+The eager path belongs to `@sar.op` operators. The thin wrappers that
+emit a single primitive (`sar.round`, `sar.where`, ...) exist only
+inside kernels: called on numpy arrays outside one, they raise
+`TraceError` rather than falling back to numpy.
 
 ## Why composition only
 

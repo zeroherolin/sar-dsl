@@ -925,4 +925,3 @@ module attributes {torch.debug_module_name = "ResNet"} {
     return
   }
 }
-
