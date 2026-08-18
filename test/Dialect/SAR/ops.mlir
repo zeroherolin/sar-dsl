@@ -190,3 +190,76 @@ func.func @iterate(%z: tensor<8x8xcomplex<f64>>, %f: tensor<8x8xcomplex<f64>>)
   }
   return %0 : tensor<8x8xcomplex<f64>>
 }
+
+// CHECK-LABEL: func.func @sort_dim1
+func.func @sort_dim1(%x: tensor<8x16xf64>) -> tensor<8x16xf64> {
+  // CHECK: sar.sort %{{.*}} {dim = 1 : i64} : tensor<8x16xf64>
+  %0 = sar.sort %x {dim = 1 : i64} : tensor<8x16xf64>
+  return %0 : tensor<8x16xf64>
+}
+
+// CHECK-LABEL: func.func @sort_dim0
+func.func @sort_dim0(%x: tensor<8x16xf32>) -> tensor<8x16xf32> {
+  // CHECK: sar.sort %{{.*}} {dim = 0 : i64} : tensor<8x16xf32>
+  %0 = sar.sort %x {dim = 0 : i64} : tensor<8x16xf32>
+  return %0 : tensor<8x16xf32>
+}
+
+// CHECK-LABEL: func.func @sort_rank1
+func.func @sort_rank1(%x: tensor<16xf64>) -> tensor<16xf64> {
+  // CHECK: sar.sort %{{.*}} {dim = 0 : i64} : tensor<16xf64>
+  %0 = sar.sort %x {dim = 0 : i64} : tensor<16xf64>
+  return %0 : tensor<16xf64>
+}
+
+// CHECK-LABEL: func.func @interp_default_boundary
+func.func @interp_default_boundary(%data: tensor<8x16xcomplex<f64>>, %pos: tensor<8x16xf64>)
+    -> tensor<8x16xcomplex<f64>> {
+  // The default boundary is "zero" but it won't print when it's the default value.
+  // CHECK: sar.interp1d
+  %0 = sar.interp1d %data, %pos
+      : (tensor<8x16xcomplex<f64>>, tensor<8x16xf64>)
+      -> (tensor<8x16xcomplex<f64>>)
+  return %0 : tensor<8x16xcomplex<f64>>
+}
+
+// CHECK-LABEL: func.func @interp_edge_boundary
+func.func @interp_edge_boundary(%data: tensor<8x16xcomplex<f64>>, %pos: tensor<8x16xf64>)
+    -> tensor<8x16xcomplex<f64>> {
+  // CHECK: sar.interp1d %{{.*}}, %{{.*}} {boundary = "edge"}
+  %0 = sar.interp1d %data, %pos {boundary = "edge"}
+      : (tensor<8x16xcomplex<f64>>, tensor<8x16xf64>)
+      -> (tensor<8x16xcomplex<f64>>)
+  return %0 : tensor<8x16xcomplex<f64>>
+}
+
+// CHECK-LABEL: func.func @interp_reflect_boundary
+func.func @interp_reflect_boundary(%data: tensor<8x16xcomplex<f64>>, %pos: tensor<8x16xf64>)
+    -> tensor<8x16xcomplex<f64>> {
+  // CHECK: sar.interp1d %{{.*}}, %{{.*}} {boundary = "reflect"}
+  %0 = sar.interp1d %data, %pos {boundary = "reflect"}
+      : (tensor<8x16xcomplex<f64>>, tensor<8x16xf64>)
+      -> (tensor<8x16xcomplex<f64>>)
+  return %0 : tensor<8x16xcomplex<f64>>
+}
+
+// CHECK-LABEL: func.func @interp_split_boundary
+func.func @interp_split_boundary(%re: tensor<4x8xf64>, %im: tensor<4x8xf64>, %pos: tensor<4x8xf64>)
+    -> (tensor<4x8xf64>, tensor<4x8xf64>) {
+  // CHECK: sar.interp1d_split %{{.*}}, %{{.*}}, %{{.*}} {boundary = "edge"}
+  %0, %1 = sar.interp1d_split %re, %im, %pos {boundary = "edge"}
+      : (tensor<4x8xf64>, tensor<4x8xf64>, tensor<4x8xf64>)
+      -> (tensor<4x8xf64>, tensor<4x8xf64>)
+  return %0, %1 : tensor<4x8xf64>, tensor<4x8xf64>
+}
+
+// CHECK-LABEL: func.func @iterate_index
+func.func @iterate_index(%z: tensor<8x8xf64>) -> tensor<8x8xf64> {
+  // CHECK: sar.iterate(%{{.*}}) {index, trips = 3 : i64}
+  %0 = sar.iterate(%z) {trips = 3 : i64, index}
+      : (tensor<8x8xf64>) -> tensor<8x8xf64> {
+  ^bb0(%i: tensor<1xi64>, %acc: tensor<8x8xf64>):
+    sar.yield %acc : tensor<8x8xf64>
+  }
+  return %0 : tensor<8x8xf64>
+}

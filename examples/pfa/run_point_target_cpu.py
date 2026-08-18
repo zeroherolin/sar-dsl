@@ -34,8 +34,7 @@ def main() -> None:
                         type=int,
                         default=512,
                         help="raster size (power of two)")
-    parser.add_argument("--output",
-                        default=str(_HERE / "assets" / "pfa_cpu.png"))
+    parser.add_argument("--output", help="PNG path (default: assets/<size>)")
     args = parser.parse_args()
 
     n = args.n
@@ -67,7 +66,8 @@ def main() -> None:
         print(f"      {name:>7}: range PSLR {cut['pslr']:6.1f} dB, "
               f"IRW {cut['irw'] / 2:.2f} cells")
 
-    output = Path(args.output).resolve()
+    output = Path(args.output
+                  or _HERE / "assets" / f"pfa_synthetic_{n}.png").resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     print(f"[3/3] Saving {output} ...")
     save_db_image(

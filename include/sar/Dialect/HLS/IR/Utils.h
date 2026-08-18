@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- Utils.h - HLS IR helpers ---------------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -17,8 +17,6 @@
 namespace mlir {
 namespace sar {
 
-using namespace hls;
-
 using AffineLoopBand = SmallVector<affine::AffineForOp, 6>;
 using AffineLoopBands = std::vector<AffineLoopBand>;
 using FactorList = SmallVector<unsigned, 8>;
@@ -27,7 +25,7 @@ using FactorList = SmallVector<unsigned, 8>;
 // HLS attribute utils
 //===----------------------------------------------------------------------===//
 
-MemoryKind getMemoryKind(MemRefType type);
+hls::MemoryKind getMemoryKind(MemRefType type);
 bool isDram(MemRefType type);
 
 //===----------------------------------------------------------------------===//
@@ -35,40 +33,41 @@ bool isDram(MemRefType type);
 //===----------------------------------------------------------------------===//
 
 /// Get the root affine loop contained by the node.
-affine::AffineForOp getNodeRootLoop(NodeOp currentNode);
+affine::AffineForOp getNodeRootLoop(hls::NodeOp currentNode);
 
 /// Get the affine loop band contained by the node.
-AffineLoopBand getNodeLoopBand(NodeOp currentNode);
+AffineLoopBand getNodeLoopBand(hls::NodeOp currentNode);
 
 /// Wrap the operations in the block with dispatch op.
-DispatchOp dispatchBlock(Block *block);
+hls::DispatchOp dispatchBlock(Block *block);
 
 /// Fuse the given operations into a new task. The new task will be created
 /// before the first operation or last operation and each operation will be
 /// inserted in order. This method always succeeds even if the resulting IR is
 /// invalid.
-TaskOp fuseOpsIntoTask(ArrayRef<Operation *> ops, PatternRewriter &rewriter,
-                       bool insertToLastOp = false);
+hls::TaskOp fuseOpsIntoTask(ArrayRef<Operation *> ops,
+                            PatternRewriter &rewriter,
+                            bool insertToLastOp = false);
 
 /// Fuse multiple nodes into a new node.
-NodeOp fuseNodeOps(ArrayRef<NodeOp> nodes, PatternRewriter &rewriter);
+hls::NodeOp fuseNodeOps(ArrayRef<hls::NodeOp> nodes, PatternRewriter &rewriter);
 
 /// Get the consumer/producer nodes of the given buffer expect the given op.
-SmallVector<NodeOp> getConsumersExcept(Value buffer, NodeOp except);
-SmallVector<NodeOp> getProducersExcept(Value buffer, NodeOp except);
-SmallVector<NodeOp> getProducers(Value buffer);
-SmallVector<NodeOp> getDependentConsumers(Value buffer, NodeOp node);
+SmallVector<hls::NodeOp> getConsumersExcept(Value buffer, hls::NodeOp except);
+SmallVector<hls::NodeOp> getProducersExcept(Value buffer, hls::NodeOp except);
+SmallVector<hls::NodeOp> getProducers(Value buffer);
+SmallVector<hls::NodeOp> getDependentConsumers(Value buffer, hls::NodeOp node);
 
 /// Get the nested consumer/producer nodes of the given buffer expect the given
 /// node. The corresponding buffer values are also returned.
-SmallVector<std::pair<NodeOp, Value>> getNestedConsumersExcept(Value buffer,
-                                                               NodeOp except);
-SmallVector<std::pair<NodeOp, Value>> getNestedProducersExcept(Value buffer,
-                                                               NodeOp except);
-SmallVector<std::pair<NodeOp, Value>> getNestedProducers(Value buffer);
+SmallVector<std::pair<hls::NodeOp, Value>>
+getNestedConsumersExcept(Value buffer, hls::NodeOp except);
+SmallVector<std::pair<hls::NodeOp, Value>>
+getNestedProducersExcept(Value buffer, hls::NodeOp except);
+SmallVector<std::pair<hls::NodeOp, Value>> getNestedProducers(Value buffer);
 
 /// Get the depth of a buffer or stream channel. Note that only if the defining
-/// operation of the buffer is not a BufferOp or stream types, the returned
+/// operation of the buffer is not a hls::BufferOp or stream types, the returned
 /// result will be 1.
 unsigned getBufferDepth(Value memref);
 
@@ -197,14 +196,15 @@ func::FuncOp getTopFunc(ModuleOp module, std::string topFuncName = "");
 /// `memOp`. `memOp`  is an operation that reads or writes to a memref. For
 /// example, if `EffectType` is MemoryEffects::Write, this method will check if
 /// there is no write to the memory between `start` and `memOp` that would
-/// change the read within `memOp`.
+/// change the read within `memOp`. `mayAlias` answers whether two values may
+/// address the same memory; anything it cannot rule out is treated as an
+/// intervening effect. This mirrors the upstream affine utility of the same
+/// name, which only exports the (Read, AffineReadOpInterface) instantiation;
+/// the copy exists for the other effect/op combinations and for a `start`
+/// that is not itself the memory op (a store hoisted out of an `affine.if`).
 template <typename EffectType>
-bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref) {
-  auto isLocallyAllocated = [](Value memref) {
-    auto *defOp = memref.getDefiningOp();
-    return defOp && hasSingleEffect<MemoryEffects::Allocate>(defOp, memref);
-  };
-
+bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref,
+                            llvm::function_ref<bool(Value, Value)> mayAlias) {
   // A boolean representing whether an intervening operation could have impacted
   // memOp.
   bool hasSideEffect = false;
@@ -224,11 +224,8 @@ bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref) {
         // If op causes EffectType on a potentially aliasing location for memOp,
         // mark as having the effect.
         if (isa<EffectType>(effect.getEffect())) {
-          // TODO: This should be replaced with a check for no aliasing.
-          // Aliasing information should be passed to this method.
           if (effect.getValue() && effect.getValue() != memref &&
-              isLocallyAllocated(memref) &&
-              isLocallyAllocated(effect.getValue()))
+              !mayAlias(effect.getValue(), memref))
             continue;
           opMayHaveEffect = true;
           break;
@@ -247,16 +244,12 @@ bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref) {
         affine::MemRefAccess srcAccess(op);
         affine::MemRefAccess destAccess(memOp);
 
-        // FIXME: This is unsafe as the two memref may be alias with each other.
-        // This is also one of the most important change from the MLIR in-tree
-        // scalar replacement.
-        if (srcAccess.memref != destAccess.memref)
-          return;
-
-        // Affine dependence analysis here is applicable only if both ops
-        // operate on the same memref and if `op`, `memOp`, and `start` are in
-        // the same AffineScope.
-        if (affine::getAffineScope(op) == affine::getAffineScope(memOp) &&
+        // Affine dependence analysis is applicable only when both ops operate
+        // on the same memref and share an AffineScope with `start`. A
+        // different memref reaching this point already failed the mayAlias
+        // screen above, so it stays an intervening effect.
+        if (srcAccess.memref == destAccess.memref &&
+            affine::getAffineScope(op) == affine::getAffineScope(memOp) &&
             affine::getAffineScope(op) == affine::getAffineScope(start)) {
           // Number of loops containing the start op and the ending operation.
           unsigned minSurroundingLoops =
@@ -291,11 +284,8 @@ bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref) {
           // No side effect was seen, simply return.
           return;
         }
-        // TODO: Check here if the memrefs alias: there is no side effect if
-        // `srcAccess.memref` and `destAccess.memref` don't alias.
       }
-      // We have an op with a memory effect and we cannot prove if it
-      // intervenes.
+      // An unclassified memory effect must be treated as intervening.
       hasSideEffect = true;
       return;
     }
@@ -316,12 +306,10 @@ bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref) {
   };
 
   // Check all paths from ancestor op `parent` to the operation `to` for the
-  // effect. It is known that `to` must be contained within `parent`.
+  // effect. It is known that `to` must be contained within `parent`. The
+  // whole parent is scanned rather than just the paths reaching `to` --
+  // conservatively correct, since extra operations can only add effects.
   auto until = [&](Operation *parent, Operation *to) {
-    // TODO check only the paths from `parent` to `to`.
-    // Currently we fallback and check the entire parent op, rather than
-    // just the paths from the parent path, stopping after reaching `to`.
-    // This is conservatively correct, but could be made more aggressive.
     assert(parent->isAncestor(to));
     checkOperation(parent);
   };

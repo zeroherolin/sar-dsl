@@ -8,7 +8,8 @@ func.func @interp(%re: tensor<8x16xf32>, %im: tensor<8x16xf32>,
   // CHECK: memref.alloc
   // CHECK: affine.for
   // CHECK: affine.for
-  // CHECK: affine.load
+  // Position inputs are scalarized at the output indices.
+  // CHECK: tensor.extract
   // 8 statically unrolled taps, each a masked (select) gather.
   // CHECK-COUNT-8: arith.select
   // CHECK: memref.load

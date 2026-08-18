@@ -101,7 +101,7 @@ The `sar-to-llvm-pipeline` (registered in `sar-opt`) does the entire descent:
    that matters for them happens on the affine path, where the same
    transforms are loop nests rather than calls.
 
-The Python launcher allocates result arrays with numpy and invokes
+The Python launcher allocates result arrays with NumPy and invokes
 `_mlir_ciface_<kernel>` via ctypes with strided memref descriptors.
 
 Binding FFT/interpolation to a runtime library mirrors how production
@@ -116,7 +116,7 @@ parallelism).
 
 The IR op set stays small and orthogonal (element-wise arithmetic,
 reductions, selection, layout, FFT/interpolation leaves); the *language*
-surface is deliberately richer. Matlab/scipy-familiar vocabulary --
+surface is deliberately richer. MATLAB/SciPy-familiar vocabulary --
 `fft2`, `matched_filter`, `dechirp`, `mag2db`, `sinc`, `circshift`,
 window constants -- decomposes into those primitives at trace time
 (`sar/language/signal.py`), and user `@sar.op` definitions extend the
@@ -145,9 +145,10 @@ class Backend(BaseBackend):
 ```
 
 Stages communicate through a shared `KernelMetadata` and a content-addressed
-on-disk cache (`~/.cache/sar-dsl/<sha256>/`), so recompilation is skipped
-for unchanged kernels. Execution backends return callables; emission
-backends (`hls`) return `HLSDesign` artifact handles.
+on-disk cache (`~/.cache/sar-dsl/<sha256>/`). Keys include the IR, options,
+backend package, and Python driver fingerprint; eviction is a bounded,
+process-safe LRU. Execution backends return callables; emission backends
+(`hls`) return self-contained `HLSDesign` artifact handles.
 
 ### 6. HLS backend
 
@@ -164,16 +165,17 @@ All kernels follow the split-complex affine path (`sar-to-affine-pipeline`):
    Cooley-Tukey: it needs no bit-reversal permutation, so every access is
    an affine function of loop indices -- which is what HLS loop analysis,
    pipelining and array partitioning require. Twiddle factors are
-   precomputed into constant memref globals; stages are statically
-   unrolled, each writing its own one-line scratch buffer so the stages
-   form a chain the HLS backend can pipeline across lines.
+   precomputed into constant memref globals. Stages are statically
+   specialized and share reusable line-sized scratch slots according to
+   the resource-derived stage grouping.
 
    Corner turns -- the transposes that carry a raster between the range and
    azimuth domains -- are staged through an on-chip block
    (`sar-stage-transposes`). A transposing nest reads one buffer along its
    rows and writes the other along its columns, so one of the two strides by
    a whole row whichever loop is innermost; a square block in between makes
-   both sides contiguous. The block is sized from the on-chip budget.
+   both sides contiguous. The block is sized from the block RAM cap,
+   split across the kernel's corner turns.
 
    Sizes that are not powers of two reduce to that same machinery through
    **Bluestein's chirp-z** algorithm: the DFT is rewritten as a
@@ -202,9 +204,10 @@ All kernels follow the split-complex affine path (`sar-to-affine-pipeline`):
 
 With that, every SAR operation lowers in the affine flow and complete
 imaging chains (omega-K, range-Doppler, chirp scaling, polar format)
-emit as single HLS designs. Correctness is checked at two levels: the identical affine
-IR is compiled to native code by `--sar-affine-to-llvm-pipeline` and
-checked against numpy (validating the lowering's arithmetic), and the
+emit as single HLS designs. Correctness is checked at two levels: the
+identical affine IR is compiled to native code by
+`--sar-affine-to-llvm-pipeline` and
+checked against NumPy (validating the lowering's arithmetic), and the
 emitted C++ itself C-simulates against a generated testbench -- all four
 imaging chains pass, matching their NumPy references to rounding
 distance (`benchmarks/README.md` tabulates the errors).
@@ -216,9 +219,7 @@ backend needs to say about a design that MLIR's own dialects cannot:
 dataflow structure (`schedule`, `node`, `buffer`, `stream`), where a
 buffer lives (`#hls.mem<dram>`, `bram_t2p`, ...), how an array is banked
 (`#hls.partition`), and what an interface looks like (`axi.bundle`,
-`axi.port`). It began as a fork of
-[ScaleHLS-HIDA](https://github.com/UIUC-ChenLab/ScaleHLS-HIDA) and is now
-maintained here; see [NOTICE](../NOTICE).
+`axi.port`).
 
 Keeping it in-tree means one LLVM build and one set of tools:
 `sar-opt` runs every pass from SAR down to scheduled HLS IR, and

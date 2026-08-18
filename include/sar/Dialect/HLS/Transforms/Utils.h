@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- Utils.h - HLS transform helpers --------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -11,8 +11,6 @@
 
 namespace mlir {
 namespace sar {
-
-using namespace hls;
 
 /// Apply loop perfection. Try to sink all operations between loop statements
 /// into the innermost loop of the input loop band.

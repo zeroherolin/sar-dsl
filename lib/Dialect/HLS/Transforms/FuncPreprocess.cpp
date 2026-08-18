@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- FuncPreprocess.cpp - func preprocess -------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -84,7 +84,9 @@ struct AllocaDemotePattern : public OpRewritePattern<memref::AllocaOp> {
   LogicalResult matchAndRewrite(memref::AllocaOp alloca,
                                 PatternRewriter &rewriter) const override {
     rewriter.setInsertionPoint(alloca);
-    rewriter.replaceOpWithNewOp<memref::AllocOp>(alloca, alloca.getType());
+    rewriter.replaceOpWithNewOp<memref::AllocOp>(
+        alloca, alloca.getType(), alloca.getDynamicSizes(),
+        alloca.getSymbolOperands(), alloca.getAlignmentAttr());
     return success();
   }
 };
@@ -155,9 +157,9 @@ struct MulIRaisePattern : public OpRewritePattern<arith::MulIOp> {
 bool sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
   auto context = func.getContext();
 
-  // We constrain functions to only contain one block.
+  // HLS preprocessing requires a single-block function.
   if (!llvm::hasSingleElement(func)) {
-    func.emitError("has more than one basic blocks.");
+    func.emitError("requires a single basic block");
     return false;
   }
 

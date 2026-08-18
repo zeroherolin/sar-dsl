@@ -5,6 +5,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(sar-dsl LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -37,6 +39,13 @@ endif()
 find_package(MLIR REQUIRED CONFIG)
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+set(_sar_default_llvm_tools "${LLVM_TOOLS_BINARY_DIR}")
+if(NOT _sar_default_llvm_tools)
+  set(_sar_default_llvm_tools "${SAR_DSL_LLVM_BUILD_DIR}/bin")
+endif()
+set(SAR_DSL_LLVM_TOOL_DIR "${_sar_default_llvm_tools}" CACHE PATH
+    "Directory containing LLVM tools used by the Python driver")
+unset(_sar_default_llvm_tools)
 
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
@@ -60,6 +69,14 @@ add_subdirectory(lib)
 add_subdirectory(runtime)
 add_subdirectory(tools)
 
+install(TARGETS sar-opt sar-translate sar-lsp-server sar_runtime
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/sar/Runtime/RuntimeEnums.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/sar/Runtime)
+install(FILES LICENSE
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/sar-dsl)
+
 option(SAR_DSL_ENABLE_TESTS "Build SAR-DSL lit tests" ON)
 if(SAR_DSL_ENABLE_TESTS)
   add_subdirectory(test)
@@ -73,10 +90,10 @@ endif()
 # ------------------------------------------------------------------------- #
 set(SAR_DSL_TOOL_DIR "${PROJECT_BINARY_DIR}/bin")
 set(SAR_DSL_RUNTIME_LIB "${PROJECT_BINARY_DIR}/lib/libsar_runtime.so")
-set(SAR_DSL_LLVM_TOOL_DIR "${SAR_DSL_LLVM_BUILD_DIR}/bin")
+file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/python/sar")
 configure_file(
   ${PROJECT_SOURCE_DIR}/cmake/_build_config.py.in
-  ${PROJECT_SOURCE_DIR}/python/sar/_build_config.py
+  ${PROJECT_BINARY_DIR}/python/sar/_build_config.py
   @ONLY)
 
 # Editor LSP servers referenced by .vscode/settings.json.

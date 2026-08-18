@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- HLS.h - the HLS dialect ----------------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -32,22 +32,12 @@ namespace hls {
 /// Kind of dataflow.node operands.
 enum class OperandKind { INPUT, OUTPUT, PARAM };
 
-/// Memory effects for dataflow.stream operations.
-namespace StreamEffects {
-struct Instantiate : public MemoryEffects::Effect::Base<Instantiate> {};
-struct Push : public MemoryEffects::Effect::Base<Push> {};
-struct Pop : public MemoryEffects::Effect::Base<Pop> {};
-} // namespace StreamEffects
-
 //===----------------------------------------------------------------------===//
 // Tile layout attribute utils.
 //===----------------------------------------------------------------------===//
 
 TileLayoutAttr getTileLayout(Operation *op);
 void setTileLayout(Operation *op, TileLayoutAttr tileLayout);
-void setTileLayout(Operation *op, ArrayRef<int64_t> tileShape,
-                   ArrayRef<int64_t> vectorShape);
-void setTileLayout(Operation *op, ArrayRef<int64_t> tileShape);
 
 TileLayoutAttr getTileLayout(Value memref);
 void setTileLayout(Value memref, TileLayoutAttr tileLayout);
@@ -56,35 +46,13 @@ void setTileLayout(Value memref, ArrayRef<int64_t> tileShape,
 void setTileLayout(Value memref, ArrayRef<int64_t> tileShape);
 
 //===----------------------------------------------------------------------===//
-// HLS resource and timing attributes
-//===----------------------------------------------------------------------===//
-
-/// Timing attribute utils.
-TimingAttr getTiming(Operation *op);
-void setTiming(Operation *op, TimingAttr timing);
-void setTiming(Operation *op, int64_t begin, int64_t end, int64_t latency,
-               int64_t interval);
-
-/// Resource attribute utils.
-ResourceAttr getResource(Operation *op);
-void setResource(Operation *op, ResourceAttr resource);
-void setResource(Operation *op, int64_t lut, int64_t dsp, int64_t bram);
-
-/// Loop information attribute utils.
-LoopInfoAttr getLoopInfo(Operation *op);
-void setLoopInfo(Operation *op, LoopInfoAttr loopInfo);
-void setLoopInfo(Operation *op, int64_t flattenTripCount, int64_t iterLatency,
-                 int64_t minII);
-
-//===----------------------------------------------------------------------===//
 // HLS directive attributes
 //===----------------------------------------------------------------------===//
 
 /// Loop directives attribute utils.
 LoopDirectiveAttr getLoopDirective(Operation *op);
 void setLoopDirective(Operation *op, LoopDirectiveAttr loopDirective);
-void setLoopDirective(Operation *op, bool pipeline, int64_t targetII,
-                      bool dataflow, bool flatten);
+void setLoopDirective(Operation *op, bool pipeline, int64_t targetII);
 
 /// Parrallel and point loop attribute utils.
 bool hasParallelAttr(Operation *op);
@@ -113,14 +81,12 @@ class NodeOp;
 namespace mlir {
 namespace OpTrait {
 
-using namespace sar::hls;
-
 template <typename ConcreteType>
 class DataflowBufferLike : public TraitBase<ConcreteType, DataflowBufferLike> {
 public:
   static LogicalResult verifyTrait(Operation *op) {
     if (op->getNumResults() != 1 ||
-        !isa<StreamType, MemRefType>(op->getResult(0).getType()))
+        !isa<sar::hls::StreamType, MemRefType>(op->getResult(0).getType()))
       return failure();
     return success();
   }

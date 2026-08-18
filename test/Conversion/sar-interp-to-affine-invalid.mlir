@@ -1,4 +1,4 @@
-// RUN: sar-opt %s --convert-sar-interp-to-affine -split-input-file -verify-diagnostics
+// RUN: sar-opt %s --convert-sar-interp-to-affine --split-input-file --verify-diagnostics
 
 // dim = 0 is normalized into transposes around the dim = 1 form by
 // canonicalization. Running this pass standalone must report that

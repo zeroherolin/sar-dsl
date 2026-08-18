@@ -43,17 +43,20 @@ def build_kernel(n: int,
     def csa(raw: sar.c64[N, N], fa: fd[N], fr: fd[N], tau: fd[N], win_r: fd[N],
             win_a: fd[N]) -> sar.f32[N, N]:
         ones = sar.constant(1.0, dtype=sar.f64, shape=(N, N))
+        fa_geometry = sar.cast(fa, sar.f64)
+        fr_geometry = sar.cast(fr, sar.f64)
+        tau_geometry = sar.cast(tau, sar.f64)
 
         # Doppler-dependent factors, broadcast along range.
-        fa2 = sar.broadcast(fa, (N, N), dim=0)
+        fa2 = sar.broadcast(fa_geometry, (N, N), dim=0)
         sin_theta = fa2 * sin_scale
         d = sar.sqrt(sar.maximum(ones - sin_theta * sin_theta, 1e-10))
         inv_d = ones / d
         coupling = (fa2 * fa2) * coupling_scale / (d * d * d)
         km = (ones * p.kr) / (ones - coupling)
 
-        tau2 = sar.broadcast(tau, (N, N), dim=1)
-        fr2 = sar.broadcast(fr, (N, N), dim=1)
+        tau2 = sar.broadcast(tau_geometry, (N, N), dim=1)
+        fr2 = sar.broadcast(fr_geometry, (N, N), dim=1)
 
         data = sar.cast(raw, dtype)
 
@@ -63,7 +66,7 @@ def build_kernel(n: int,
         # 2. Chirp scaling.
         tau_diff = tau2 - inv_d * tau_ref_scale
         phi1 = km * (inv_d - ones) * (tau_diff * tau_diff) * math.pi
-        data = data * sar.expj(phi1)
+        data = data * sar.cast(sar.expj(phi1), dtype)
 
         # 3. Range FFT.
         data = sar.fftshift(sar.fft(data, axis=1), axis=1)
@@ -71,14 +74,14 @@ def build_kernel(n: int,
         # 4. Range compression + SRC + bulk RCMC (+ range window).
         phi2 = ((fr2 * fr2) * d / km * math.pi +
                 (inv_d - ones) * fr2 * rcmc_scale)
-        data = data * sar.expj(phi2) * win_r
+        data = data * sar.cast(sar.expj(phi2), dtype) * win_r
 
         # 5. Range IFFT.
         data = sar.ifft(sar.ifftshift(data, axis=1), axis=1)
 
         # 6. Azimuth compression (+ azimuth window).
         phi3 = tau2 * (d - ones) * (az_scale * p.c / 2.0)
-        data = data * sar.expj(phi3)
+        data = data * sar.cast(sar.expj(phi3), dtype)
         data = data * sar.broadcast(win_a, (N, N), dim=0)
 
         # 7. Azimuth IFFT.

@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- HLSOps.td - HLS dialect op definitions -----------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -165,7 +165,10 @@ def ScheduleOp : HLSOp<"dataflow.schedule", [
   let hasCanonicalizer = 1;
 
   let extraClassDeclaration = [{
-    /// FIXME: Check whether the schedule is dependence free.
+    /// Whether no execution of the schedule can depend on a previous one:
+    /// true when the schedule runs once (function-level) or when every
+    /// enclosing-loop iteration is independent (parallel-marked affine
+    /// loop). Conservative -- any other position answers false.
     bool isDependenceFree();
 
     /// Update the signature of the schedule op recursively.
@@ -180,11 +183,10 @@ def NodeOp : HLSOp<"dataflow.node", [
       HasParent<"ScheduleOp">]> {
   let summary = "Represent a dataflow node";
   let description = [{
-    Node op has an isolated region to represent the ops contained by the node.
-    The node can only take buffers or streams as inputs and outputs. Meanwhile,
-    scalar values can be passed into a node as parameters, which will not be
-    considered in the dataflow. An attribute "inputTaps" is used to represent
-    the level of buffer or stream channel tap of each input.
+    A node owns an isolated region and accepts only buffers or streams as data
+    inputs and outputs. Scalar parameters may enter the region but do not
+    participate in dataflow scheduling. `inputTaps` records the hierarchy level
+    of each input buffer or stream tap.
   }];
 
   let arguments = (ins Variadic<AnyBufferOrStream>:$inputs,
@@ -341,21 +343,18 @@ def StreamWriteOp : HLSOp<"dataflow.stream_write", []> {
 
 def AxiBundleOp : HLSOp<"axi.bundle", [NoMemoryEffect,
     HasParent<"func::FuncOp">]> {
-  let summary = "Represent a bundle of axi ports";
+  let summary = "Represent a bundle of AXI ports";
 
   let arguments = (ins StrAttr:$name);
   let results = (outs BundleType:$bundle);
   let assemblyFormat = "$name attr-dict `:` type($bundle)";
 }
 
-// Deliberately not `NoMemoryEffect`: the op declares a hardware interface,
-// and its pragma must be emitted even when the design never touches the
-// port. The DRAM scratch port exists whether or not anything spilled this
-// round -- that is what keeps the top signature independent of placement
-// decisions -- and marking the op pure let DCE erase exactly that port,
-// leaving a bare argument with no interface pragma at all.
+// Deliberately not `NoMemoryEffect`: a hardware interface declaration must
+// survive DCE even when its placeholder arena is unused. Erasing it would
+// leave a bare argument without the pragma required by the interface contract.
 def AxiPortOp : HLSOp<"axi.port", [HasParent<"func::FuncOp">]> {
-  let summary = "Represent an axi port";
+  let summary = "Represent an AXI port";
 
   let arguments = (ins BundleType:$bundle, AnyAxi:$axi);
   let results = (outs AnyType:$element);
@@ -379,7 +378,7 @@ def AxiPortOp : HLSOp<"axi.port", [HasParent<"func::FuncOp">]> {
 }
 
 def AxiPackOp : HLSOp<"axi.pack", [NoMemoryEffect, HasParent<"func::FuncOp">]> {
-  let summary = "Pack a memref or scalar into an axi type";
+  let summary = "Pack a memref or scalar into an AXI type";
 
   let arguments = (ins AnyType:$element);
   let results = (outs AnyAxi:$axi);

@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
   mlir::sar::registerConversionPasses();
   mlir::sar::registerSARTransformsPasses();
   mlir::sar::registerSARPipelines();
-  mlir::sar::registerTransformsPasses(); // the HLS dialect's transforms
+  mlir::sar::registerHLSPasses();
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);

@@ -1,4 +1,4 @@
-// RUN: sar-translate -hls-emit-hlscpp -emit-vitis-directives %s | FileCheck %s
+// RUN: sar-translate --hls-emit-hlscpp -emit-vitis-directives %s | FileCheck %s
 
 // `sar.arg_names` carries the kernel's Python parameter names down to the
 // emitted top signature. Arguments past the list keep the role-based

@@ -1,9 +1,11 @@
-//===----------------------------------------------------------------------===//
+//===- AffineStoreForward.cpp - affine store forward ----------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Analysis/AliasAnalysis.h"
+#include "mlir/Analysis/AliasAnalysis/LocalAliasAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/IR/Dominance.h"
@@ -22,6 +24,7 @@ namespace sar {
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
+using namespace sar::hls;
 
 /// A helper to check whether an ifOp is valid to be replaced with select.
 bool isValid(AffineIfOp ifOp, Operation *targetOp) {
@@ -40,7 +43,8 @@ static mlir::affine::AffineReadOpInterface
 forwardStoreToLoad(mlir::affine::AffineReadOpInterface loadOp,
                    SmallVectorImpl<Operation *> &loadOpsToErase,
                    SmallPtrSetImpl<Value> &memrefsToErase,
-                   DominanceInfo &domInfo) {
+                   DominanceInfo &domInfo,
+                   llvm::function_ref<bool(Value, Value)> mayAlias) {
 
   // The store op candidate for forwarding that satisfies all conditions
   // to replace the load, if any.
@@ -81,11 +85,11 @@ forwardStoreToLoad(mlir::affine::AffineReadOpInterface loadOp,
 
     // 3. Ensure there is no intermediate operation which could replace the
     // value in memory.
-    if (!hasNoInterveningEffect<MemoryEffects::Write>(startOp, loadOp,
-                                                      loadOp.getMemRef()))
+    if (!hasNoInterveningEffect<MemoryEffects::Write>(
+            startOp, loadOp, loadOp.getMemRef(), mayAlias))
       continue;
 
-    // We now have a candidate for forwarding. Two candidates that both
+    // This is a forwarding candidate. Two candidates that both
     // dominate the load with no intervening write should be impossible; if
     // the analysis ever disagrees, forwarding either would be a guess, so
     // bail out rather than pick one.
@@ -146,7 +150,8 @@ forwardStoreToLoad(mlir::affine::AffineReadOpInterface loadOp,
 static void findUnusedStore(mlir::affine::AffineWriteOpInterface writeA,
                             SmallVectorImpl<Operation *> &opsToErase,
                             SmallPtrSetImpl<Value> &memrefsToErase,
-                            PostDominanceInfo &postDominanceInfo) {
+                            PostDominanceInfo &postDominanceInfo,
+                            llvm::function_ref<bool(Value, Value)> mayAlias) {
   auto memref = writeA.getMemRef();
   for (Operation *user : writeA.getMemRef().getUsers()) {
     // Only consider writing operations.
@@ -194,8 +199,8 @@ static void findUnusedStore(mlir::affine::AffineWriteOpInterface writeA,
 
     // There cannot be an operation which reads from memory between
     // the two writes.
-    if (!hasNoInterveningEffect<MemoryEffects::Read>(targetA, writeB,
-                                                     writeB.getMemRef()))
+    if (!hasNoInterveningEffect<MemoryEffects::Read>(
+            targetA, writeB, writeB.getMemRef(), mayAlias))
       continue;
 
     if (targetA == writeA && targetB != writeB) {
@@ -231,7 +236,8 @@ static void findUnusedStore(mlir::affine::AffineWriteOpInterface writeA,
 // 3) There is no write between loadA and loadB.
 static void loadCSE(mlir::affine::AffineReadOpInterface loadA,
                     SmallVectorImpl<Operation *> &loadOpsToErase,
-                    DominanceInfo &domInfo) {
+                    DominanceInfo &domInfo,
+                    llvm::function_ref<bool(Value, Value)> mayAlias) {
   SmallVector<mlir::affine::AffineReadOpInterface, 4> loadCandidates;
   for (auto *user : loadA.getMemRef().getUsers()) {
     auto loadB = dyn_cast<mlir::affine::AffineReadOpInterface>(user);
@@ -251,8 +257,8 @@ static void loadCSE(mlir::affine::AffineReadOpInterface loadA,
       continue;
 
     // 3. There is no write between loadA and loadB.
-    if (!hasNoInterveningEffect<MemoryEffects::Write>(loadB.getOperation(),
-                                                      loadA, loadA.getMemRef()))
+    if (!hasNoInterveningEffect<MemoryEffects::Write>(
+            loadB.getOperation(), loadA, loadA.getMemRef(), mayAlias))
       continue;
 
     // Check if two values have the same shape. This is needed for affine vector
@@ -302,17 +308,20 @@ static void loadCSE(mlir::affine::AffineReadOpInterface loadA,
 // The above conditions are simple to check, sufficient, and powerful for most
 // cases in practice - they are sufficient, but not necessary --- since they
 // don't reason about loops that are guaranteed to execute at least once or
-// multiple sources to forward from.
-//
-// TODO: more forwarding can be done when support for
-// loop/conditional live-out SSA values is available.
-// TODO: do general dead store elimination for memref's. This pass
-// currently only eliminates the stores only if no other loads/uses (other
-// than dealloc) remain.
+// multiple sources to forward from. Likewise, store elimination is not a
+// general dead-store analysis: a store dies only when no use other than a
+// dealloc remains.
 //
 static bool applyAffineStoreForward(func::FuncOp func) {
   DominanceInfo domInfo(func);
   PostDominanceInfo postDomInfo(func);
+
+  // Answers may-alias queries for the intervening-effect checks; anything
+  // the analysis cannot rule out is treated as aliasing.
+  LocalAliasAnalysis aliasAnalysis;
+  auto mayAlias = [&](Value val1, Value val2) -> bool {
+    return !aliasAnalysis.alias(val1, val2).isNo();
+  };
 
   // Load op's whose results were replaced by those forwarded from stores.
   SmallVector<Operation *, 8> opsToErase;
@@ -326,14 +335,14 @@ static bool applyAffineStoreForward(func::FuncOp func) {
     auto newLoadOp = mlir::affine::AffineReadOpInterface();
     while (1) {
       newLoadOp = forwardStoreToLoad(currentLoadOp, opsToErase, memrefsToErase,
-                                     domInfo);
+                                     domInfo, mayAlias);
       // If the current load op is erased or failed to transform, break.
       if (!newLoadOp || newLoadOp == currentLoadOp)
         break;
       currentLoadOp = newLoadOp;
     }
     if (newLoadOp)
-      loadCSE(newLoadOp, opsToErase, domInfo);
+      loadCSE(newLoadOp, opsToErase, domInfo, mayAlias);
   });
 
   // Erase all load op's whose results were replaced with store fwd'ed ones.
@@ -343,7 +352,7 @@ static bool applyAffineStoreForward(func::FuncOp func) {
 
   // Walk all store's and perform unused store elimination
   func.walk([&](mlir::affine::AffineWriteOpInterface storeOp) {
-    findUnusedStore(storeOp, opsToErase, memrefsToErase, postDomInfo);
+    findUnusedStore(storeOp, opsToErase, memrefsToErase, postDomInfo, mayAlias);
   });
   // Erase all store op's which don't impact the program
   for (auto *op : opsToErase)
@@ -354,11 +363,11 @@ static bool applyAffineStoreForward(func::FuncOp func) {
   // should be able to do this as well, but we'll do it here since we collected
   // these anyway.
   for (auto memref : memrefsToErase) {
-    // If the memref hasn't been locally alloc'ed, skip.
+    // If the memref hasn't been locally alloc'ed, skip. (A memref returned
+    // by a side-effect-free call could also qualify, but none of the
+    // pipelines produce one here.)
     Operation *defOp = memref.getDefiningOp();
     if (!defOp || !hasSingleEffect<MemoryEffects::Allocate>(defOp, memref))
-      // TODO: if the memref was returned by a 'call' operation, we
-      // could still erase it if the call had no side-effects.
       continue;
     if (llvm::any_of(memref.getUsers(), [&](Operation *ownerOp) {
           return !isa<mlir::affine::AffineWriteOpInterface>(ownerOp) &&

@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- EmitHLSCpp.h - scheduled HLS IR to Vitis HLS C++ ---------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

@@ -88,6 +88,20 @@ def SARDemoteLoopCarries
   ];
 }
 
+def SARPrivatizeOutParams
+    : Pass<"sar-privatize-out-params", "::mlir::func::FuncOp"> {
+  let summary = "Compute in local buffers, write result ports once";
+  let description = [{
+    When the working precision equals a result's precision, bufferization
+    computes through the out-parameter: several stages write and read the
+    result buffer in place. A dataflow design needs its top-level ports to
+    be one-writer channels -- a multi-writer port forfeits `#pragma HLS
+    dataflow` for the whole design. This pass moves such computation into
+    a local buffer and writes the port with one final copy.
+  }];
+  let dependentDialects = ["::mlir::memref::MemRefDialect"];
+}
+
 def SARLowerCopy : Pass<"sar-lower-copy", "::mlir::func::FuncOp"> {
   let summary = "Expand memref.copy into an affine sweep";
   let description = [{
@@ -146,6 +160,20 @@ def SARStageTransposes : Pass<"sar-stage-transposes", "::mlir::func::FuncOp"> {
   let options = [
     Option<"blockBytes", "block-bytes", "unsigned", /*default=*/"524288",
            "On-chip bytes a staged block may occupy">
+  ];
+}
+
+def SARVerifyPrecision : Pass<"sar-verify-precision", "ModuleOp"> {
+  let summary = "Verify every value against a backend precision contract";
+  let description = [{
+    Checks function signatures, operation operands/results and region block
+    arguments. `f32` rejects f64 and complex<f64>; `f64` rejects f32 and
+    complex<f32>; `native` accepts the declared mix.
+  }];
+  let options = [
+    Option<"precision", "precision", "std::string",
+           /*default=*/"\"native\"",
+           "Required floating-point component width: native, f32 or f64">
   ];
 }
 

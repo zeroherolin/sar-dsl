@@ -64,8 +64,9 @@ def build_kernel(n: int,
                    sar.broadcast(tau, (N, N), dim=1))
 
         # RCMC: positions = column index + migration shift(fa, R).
+        migration = sar.cast(fa2_tau * rcmc_scale, sar.f64)
         positions = (sar.broadcast(sar.constant(grid),
-                                   (N, N), dim=1) + fa2_tau * rcmc_scale)
+                                   (N, N), dim=1) + migration)
         data = sar.interp1d(data, positions)
 
         # Azimuth compression + window.

@@ -1,3 +1,5 @@
+"""Shared pytest fixtures and backend availability markers."""
+
 import sys
 from pathlib import Path
 
@@ -39,13 +41,15 @@ def compile_split_kernel(mlir_text: str,
                                input=mlir_text,
                                capture_output=True,
                                text=True,
-                               check=True).stdout
+                               check=True,
+                               timeout=300).stdout
     llvm_ir = subprocess.run(
         [find_tool("mlir-translate"), "--mlir-to-llvmir", "-"],
         input=llvm_mlir,
         capture_output=True,
         text=True,
-        check=True).stdout
+        check=True,
+        timeout=300).stdout
     ll = tmp_path / "kernel.ll"
     ll.write_text(llvm_ir)
     so = tmp_path / "kernel.so"
@@ -54,7 +58,8 @@ def compile_split_kernel(mlir_text: str,
         str(ll), "-o",
         str(so), "-lm", "-Wno-override-module"
     ],
-                   check=True)
+                   check=True,
+                   timeout=300)
     lib = ctypes.CDLL(str(so))
     fn = getattr(lib, f"_mlir_ciface_{name}")
     fn.restype = None
@@ -65,10 +70,10 @@ def run_split(fn, inputs, out_shapes, dtype):
     """Invokes a split-complex C interface function."""
     import numpy as np
 
-    from sar.runtime import _make_descriptor
+    from sar.runtime import make_descriptor
     import ctypes
 
     outs = [np.empty(s, dtype=dtype) for s in out_shapes]
-    descriptors = [_make_descriptor(a) for a in list(inputs) + outs]
+    descriptors = [make_descriptor(a) for a in list(inputs) + outs]
     fn(*[ctypes.byref(d) for d in descriptors])
     return outs

@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- SimplifyAffineIf.cpp - simplify affine if --------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -19,6 +19,7 @@ namespace sar {
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
+using namespace sar::hls;
 
 namespace {
 struct RemoveRedundantIf : public OpRewritePattern<mlir::affine::AffineIfOp> {
@@ -74,7 +75,7 @@ struct RemoveRedundantIf : public OpRewritePattern<mlir::affine::AffineIfOp> {
 } // namespace
 
 namespace {
-/// FIXME: More comprehensive intervening operation analysis.
+/// Merges adjacent `affine.if` ops with identical conditions.
 struct MergeSameIf : public OpRewritePattern<func::FuncOp> {
   using OpRewritePattern<func::FuncOp>::OpRewritePattern;
 
@@ -88,18 +89,7 @@ struct MergeSameIf : public OpRewritePattern<func::FuncOp> {
 
       for (auto &op : block->getOperations()) {
         if (auto ifOp = dyn_cast<AffineIfOp>(op)) {
-          // Check whether the operations between the current and the last if
-          // operation are memory stores.
-          // TODO: is this check enough?
-          bool notMemoryStore = true;
-          for (auto op : inBetweenOps)
-            if (isa<AffineWriteOpInterface, vector::TransferWriteOp>(op))
-              notMemoryStore = false;
-
-          // Only if the two if operations have identical statement while the
-          // in between operations have no memory effect, the two if
-          // operations can be merged.
-          if (checkSameIfStatement(lastIfOp, ifOp) && notMemoryStore) {
+          if (inBetweenOps.empty() && checkSameIfStatement(lastIfOp, ifOp)) {
             // Moving all operations in the last if operation to the current
             // one except the terminator.
             auto &lastIfBlock = lastIfOp.getBody()->getOperations();

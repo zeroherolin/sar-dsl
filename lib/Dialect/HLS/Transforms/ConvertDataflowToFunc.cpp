@@ -1,10 +1,11 @@
-//===----------------------------------------------------------------------===//
+//===- ConvertDataflowToFunc.cpp - convert dataflow to func ---------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Affine/LoopUtils.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
@@ -34,15 +35,14 @@ struct SplitScheduleExternalBufferAccess : public OpRewritePattern<ScheduleOp> {
 
     SmallVector<BlockArgument, 16> args(scheduleBody.getArguments());
     for (auto arg : args) {
-      // If the buffer is not an external buffer or has zero or one node users,
-      // we have nothing to do.
+      // Only external buffers shared by multiple nodes need splitting.
       auto uses = llvm::make_filter_range(arg.getUses(), [&](auto &use) {
         return isa<NodeOp>(use.getOwner());
       });
       if (!isExtBuffer(arg) || uses.empty() || llvm::hasSingleElement(uses))
         continue;
 
-      // Add a new argument and new input for each additional uses.
+      // Add an argument and input for each additional use.
       for (auto &use : llvm::make_early_inc_range(llvm::drop_begin(uses))) {
         newOperands.push_back(newOperands[arg.getArgNumber()]);
         auto newArg = scheduleBody.addArgument(arg.getType(), arg.getLoc());
@@ -153,6 +153,14 @@ struct InlineSchedule : public OpRewritePattern<ScheduleOp> {
 
   LogicalResult matchAndRewrite(ScheduleOp schedule,
                                 PatternRewriter &rewriter) const override {
+    // A schedule still sitting inside a node waits for the node to become
+    // a function: inlining it now would leave its legality nowhere to go
+    // (the dataflow directive attaches to functions), and the node keeps
+    // its hierarchy so it stays a function rather than being marked for
+    // emitter inlining.
+    if (isa<NodeOp>(schedule->getParentOp()))
+      return failure();
+
     auto &scheduleOps = schedule.getBody().front().getOperations();
     auto &parentOps = schedule->getBlock()->getOperations();
     parentOps.splice(schedule->getIterator(), scheduleOps);
@@ -165,18 +173,9 @@ struct InlineSchedule : public OpRewritePattern<ScheduleOp> {
       if (auto func = dyn_cast<func::FuncOp>(schedule->getParentOp()))
         setFuncDirective(func, /*pipeline=*/false, /*targetInterval=*/1,
                          /*dataflow=*/true);
-      else if (auto loop = dyn_cast<mlir::affine::AffineForOp>(
-                   schedule->getParentOp())) {
-        // If the schedule is located inside of a loop nest, try to coalesce
-        // them into a flattened loop.
-        AffineLoopBand band;
-        getLoopBandFromInnermost(loop, band);
-        auto dataflowLoop = loop;
-        if (isPerfectlyNested(band) && succeeded(coalesceLoops(band)))
-          dataflowLoop = band.front();
-        setLoopDirective(dataflowLoop, /*pipeline=*/false, /*targetII=*/1,
-                         /*dataflow=*/true, /*flattern=*/false);
-      }
+      // A schedule inside a loop is not marked dataflow: conditional or
+      // iterated dataflow regions violate the synthesis model and obstruct the
+      // outer loop pipeline. Their nodes retain their own directives.
     }
     rewriter.eraseOp(schedule);
     return success();
@@ -198,7 +197,11 @@ struct ConvertNodeToFunc : public OpRewritePattern<NodeOp> {
         prefix.str() + "_node" + std::to_string(nodeIdx++),
         rewriter.getFunctionType(node.getOperandTypes(), TypeRange()));
 
-    // FIXME: A better method to judge whether to inline the node.
+    // A node that is a single flat loop nest carries no dataflow region of
+    // its own, so keeping it a function call would only add call overhead
+    // in csim and another hierarchy level in the reports; mark it for the
+    // emitter to inline. Nodes with hierarchy (nested schedules) stay
+    // functions -- their region structure is what the pragma attaches to.
     if (!node.hasHierarchy() &&
         llvm::hasSingleElement(node.getOps<AffineForOp>()))
       subFunc->setAttr("inline", rewriter.getUnitAttr());
@@ -241,19 +244,37 @@ struct ConvertDataflowToFunc
       (void)applyPatternsGreedily(module, std::move(patterns));
     }
 
-    for (auto func :
-         llvm::make_early_inc_range(module.getOps<func::FuncOp>())) {
-      unsigned nodeIdx = 0;
-      mlir::RewritePatternSet patterns(context);
-      patterns.add<InlineSchedule>(context);
-      patterns.add<ConvertNodeToFunc>(context, func.getName(), nodeIdx);
-      (void)applyPatternsGreedily(func, std::move(patterns));
+    // Converting a node creates a new function holding its body, and a
+    // nested schedule waits in that body for its turn (the deferral
+    // above). One sweep over the module therefore may leave work in the
+    // functions it created; sweep until the dataflow ops are gone.
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (auto func :
+           llvm::make_early_inc_range(module.getOps<func::FuncOp>())) {
+        bool hasWork = false;
+        func.walk([&](Operation *op) {
+          if (isa<ScheduleOp, NodeOp>(op))
+            hasWork = true;
+        });
+        if (!hasWork)
+          continue;
+        unsigned nodeIdx = 0;
+        mlir::RewritePatternSet patterns(context);
+        patterns.add<InlineSchedule>(context);
+        patterns.add<ConvertNodeToFunc>(context, func.getName(), nodeIdx);
+        (void)applyPatternsGreedily(func, std::move(patterns));
+        changed = true;
+      }
     }
 
-    // Remove memref global operations.
+    // Constant buffers materialize globals inside dataflow functions. Remove
+    // only symbols with no remaining references; unrelated globals stay valid.
     for (auto global :
          llvm::make_early_inc_range(module.getOps<memref::GlobalOp>()))
-      global.erase();
+      if (SymbolTable::symbolKnownUseEmpty(global, module))
+        global.erase();
   }
 };
 } // namespace

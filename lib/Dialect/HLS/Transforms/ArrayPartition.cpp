@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- ArrayPartition.cpp - array partition -------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -50,7 +50,9 @@ static bool isViewedAnywhere(Value array, DenseSet<Value> &visited) {
 static void updateSubFuncs(func::FuncOp func, Builder builder) {
   func.walk([&](func::CallOp op) {
     auto callee = SymbolTable::lookupNearestSymbolFrom(op, op.getCalleeAttr());
-    auto subFunc = dyn_cast<func::FuncOp>(callee);
+    auto subFunc = dyn_cast_or_null<func::FuncOp>(callee);
+    if (!subFunc || subFunc.isExternal())
+      return;
 
     // Set sub-function type.
     auto subResultTypes = op.getResultTypes();
@@ -109,12 +111,13 @@ bool sar::applyArrayPartition(Value array, ArrayRef<unsigned> factors,
   LLVM_DEBUG(llvm::dbgs() << "\n";);
 
   // Calculate the actual depth of the partitioned array.
-  unsigned actualDepth = 1;
+  uint64_t actualDepth = 1;
   for (auto [factor, dimSize] : llvm::zip(factors, arrayType.getShape())) {
+    if (factor == 0)
+      continue;
     if (dimSize % factor != 0)
       return false;
-    if (factor != 0)
-      actualDepth *= dimSize / factor;
+    actualDepth *= dimSize / factor;
   }
 
   // Construct and set new array type.
@@ -131,7 +134,13 @@ bool sar::applyArrayPartition(Value array, ArrayRef<unsigned> factors,
   // them asks for more distributed RAM than the device has.
   auto elementBits = arrayType.getElementTypeBitWidth();
   uint64_t bankBits = (uint64_t)actualDepth * elementBits;
-  if (bankBits < lutramMaxBits) {
+  // Inclusive, matching the placement pass (`bytes <= lutramMax`): the
+  // threshold is one bus beat, and a bank holding exactly one beat is the
+  // canonical distributed-RAM case. With the strict compare the FFT row
+  // buffers -- 256 doubles split cyclic by 32, 512-bit banks against the
+  // 512-bit threshold -- each kept a whole BRAM primitive per bank, and a
+  // chain's worth of them asked the device for more block RAM than it has.
+  if (bankBits <= lutramMaxBits) {
     // Distributed RAM comes out of the SLICEM LUTs the datapath is built
     // from, so it is the one tier that has to be rationed against the
     // budget here as well: past it, the bank keeps whatever placement
@@ -224,7 +233,6 @@ getDimAccessMaps(Operation *op, AffineValueMap valueMap, int64_t dim) {
   auto baseMap = AffineMap::get(valueMap.getNumDims(), valueMap.getNumSymbols(),
                                 valueMap.getResult(dim));
 
-  // Get the permuation map from the transfer read/write op.
   AffineMap permuteMap;
   ArrayRef<int64_t> vectorShape;
   if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
@@ -291,23 +299,18 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
   if (funcPipeline)
     targetBlocks.push_back(&func.front());
   else {
-    // Collect all target loop bands.
     AffineLoopBands targetBands;
     getLoopBands(func.front(), targetBands);
     for (auto &band : targetBands)
       targetBlocks.push_back(band.back().getBody());
   }
 
-  // Storing the partition information of each memref. The rationale is there
-  // may exist multiple blocks/functions accessing the same memref and in
-  // different blocks/functions the best partition fashions and factors are
-  // different. To eventually determine a "best" array partition strategy,
-  // tentatively we always pick the one with the largest partition factor as the
-  // final partition strategy. This "partitionsMap" is used to hold the current
-  // partition strategy of each memref.
-  // A MapVector: the final application loop below spends the LUTRAM budget
-  // first come, first served, so iteration order has to be the program
-  // order the accesses were collected in, not pointer order.
+  // The partition choice per memref. Several blocks may access the same
+  // memref with different best fashions and factors; the largest factor
+  // wins, since a bank can be read below capacity but too few banks stall
+  // the widest loop. A MapVector: the application loop below spends the
+  // LUTRAM budget first come, first served, so iteration order has to be
+  // the program order the accesses were collected in, not pointer order.
   using Partition = std::pair<PartitionKind, int64_t>;
   llvm::MapVector<Value, SmallVector<Partition, 4>> partitionsMap;
 
@@ -343,7 +346,6 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
 
           auto dimMaps = getDimAccessMaps(accessOp, valueMap, dim);
           for (auto dimMap : dimMaps) {
-            // Construct the new valueMap.
             AffineValueMap dimValueMap(dimMap, valueMap.getOperands());
             (void)dimValueMap.canonicalize();
 
@@ -427,8 +429,11 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
         if (maxDistance == 1)
           continue;
 
-        // Determine array partition factor and kind.
-        // TODO: take storage type into consideration.
+        // Determine array partition factor and kind. The factor covers the
+        // accesses a pipelined iteration has in flight; which physical
+        // memory the banks land in is decided afterwards (placement chose a
+        // tier, and the bit-count check below may move small banks to
+        // distributed RAM).
         int64_t factor = 1;
         PartitionKind kind = PartitionKind::NONE;
         if (accessNum >= maxDistance) {
@@ -451,7 +456,7 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
           kind = PartitionKind::BLOCK;
         }
 
-        LLVM_DEBUG(llvm::dbgs() << "\nStretegy: "
+        LLVM_DEBUG(llvm::dbgs() << "\nStrategy: "
                                 << " factor=" << factor << " kind=" << kind;);
 
         // The strategies above derive the factor from the distance between
@@ -474,15 +479,17 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
             kind = PartitionKind::NONE;
         }
 
-        // TODO: For now, we always pick the partition with the largest factor.
+        // Across the loops accessing this array, keep the largest factor
+        // seen: a factor that satisfies the widest access pattern also
+        // serves the narrower ones (banks can be read below capacity, but
+        // too few banks stall the widest loop).
         if (factor > partitions[dim].second) {
           LLVM_DEBUG(llvm::dbgs() << " (update)";);
 
-          // The rationale here is if the accessing partition index cannot be
-          // determined and partition factor is more than 3, a multiplexer will
-          // be generated and the memory access operation will be wrapped into a
-          // function call, which will cause dependency problems and make the
-          // latency and II even worse.
+          // When the accessed bank cannot be determined statically and the
+          // factor exceeds 3, the tool inserts a multiplexer and wraps the
+          // access in a function call, which worsens latency and II; cap
+          // the factor at the largest divisor no greater than 3.
           if (requireMux) {
             for (auto i = 3; i > 0; --i)
               if (factor % i == 0) {
@@ -589,8 +596,10 @@ struct ArrayPartition : public sar::impl::ArrayPartitionBase<ArrayPartition> {
   void runOnOperation() override {
     auto module = getOperation();
 
-    // Get the top function.
-    // FIXME: A better solution to handle the runtime main function.
+    // Get the top function. After AXI interface creation the module holds a
+    // runtime wrapper that calls the design top; partitioning must start from
+    // the outermost caller so the partitioned types propagate through every
+    // sub-function signature, so the wrapper wins when present.
     func::FuncOp topFunc;
     for (auto func : module.getOps<func::FuncOp>()) {
       if (hasRuntimeAttr(func)) {
@@ -604,7 +613,16 @@ struct ArrayPartition : public sar::impl::ArrayPartitionBase<ArrayPartition> {
       emitError(module.getLoc(), "fail to find the top function");
       return signalPassFailure();
     }
+    // Buffer placement already spent part of the distributed-RAM cap on
+    // whole buffers; banking draws from what is left of the same cap. The
+    // figure sits on the design function, which under an AXI wrapper is
+    // not the outermost one, so every function is consulted.
     uint64_t lutramBitsUsed = 0;
+    for (auto func : module.getOps<func::FuncOp>())
+      if (auto spent = func->getAttrOfType<IntegerAttr>("lutram_spent")) {
+        lutramBitsUsed += (uint64_t)spent.getInt() * 8;
+        func->removeAttr("lutram_spent");
+      }
     applyAutoArrayPartition(topFunc, lutramMaxBits, maxFactor,
                             (uint64_t)lutramBytes * 8, &lutramBitsUsed);
   }

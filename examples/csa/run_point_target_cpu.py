@@ -28,8 +28,7 @@ def main() -> None:
                         type=int,
                         default=512,
                         help="raster size (power of two)")
-    parser.add_argument("--output",
-                        default=str(_HERE / "assets" / "csa_cpu.png"))
+    parser.add_argument("--output", help="PNG path (default: assets/<size>)")
     args = parser.parse_args()
 
     n = args.n
@@ -47,7 +46,8 @@ def main() -> None:
     print_focus_quality(image,
                         expected_peak=target_pixel(brightest, n, params))
 
-    output = Path(args.output).resolve()
+    output = Path(args.output
+                  or _HERE / "assets" / f"csa_synthetic_{n}.png").resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     print(f"[3/3] Saving {output} ...")
     save_db_image(

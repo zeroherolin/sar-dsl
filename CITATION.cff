@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use SAR-DSL in research, cite this software and the commit used."
+type: software
+title: "SAR-DSL: an MLIR compiler for synthetic aperture radar imaging"
+version: 0.1.0.dev0
+license: MIT
+repository-code: "https://github.com/zeroherolin/sar-dsl"
+authors:
+  - name: "SAR-DSL contributors"

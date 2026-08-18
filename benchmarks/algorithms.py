@@ -60,9 +60,13 @@ def _chain(name: str, kernel, raw, inputs, run_reference) -> Chain:
     """Assembles a Chain around a built (untraced) kernel: the argument
     arrays are cast to whatever the kernel declares, so one code path
     serves both precisions."""
+    values = [raw, *inputs]
+    if len(values) != len(kernel.arg_types):
+        raise ValueError(f"{name}: expected {len(kernel.arg_types)} kernel "
+                         f"arguments, got {len(values)}")
     args = [
-        np.asarray(a, dtype=t.dtype.to_numpy())
-        for a, t in zip([raw, *inputs], kernel.arg_types)
+        np.asarray(value, dtype=tensor_type.dtype.to_numpy())
+        for value, tensor_type in zip(values, kernel.arg_types)
     ]
     return Chain(name,
                  lambda backend="cpu", **opts: kernel.compile(

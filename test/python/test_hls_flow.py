@@ -80,7 +80,7 @@ func.func @ip(%d: tensor<{n}x{m}xcomplex<f64>>, %p: tensor<{n}x{m}xf64>)
 
     rng = np.random.default_rng(6)
     data = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
-    positions = rng.uniform(-2.0, m + 1.0, size=(n, m))
+    positions = rng.uniform(-3.0 * m, 4.0 * m, size=(n, m))
     re, im = np.ascontiguousarray(data.real), np.ascontiguousarray(data.imag)
 
     out_re, out_im = _run_split(fn, [re, im, positions], [(n, m), (n, m)],

@@ -8,7 +8,7 @@ package contributing an ordered set of compilation *stages*.
 ```python
 compiled = kernel.compile(backend="cpu")             # default
 design   = kernel.compile(backend="hls",
-                          options={"on_chip_budget": 8 << 20})
+                          options={"bram_bytes": 4 << 20})
 print(sar.list_backends())                           # discovery
 ```
 
@@ -26,11 +26,14 @@ Stages: `llvm` (sar-opt `--sar-to-llvm-pipeline`: runtime calls, linalg
 elementwise fusion, OpenMP parallel loops) -> `ll` (mlir-translate) ->
 `shared` (clang `-O3` + native tuning, linked against `libsar_runtime`
 and LLVM's `libomp`). The launcher is a `sar.runtime.CompiledKernel`:
-numpy arrays are marshalled as strided memref descriptors via ctypes,
+NumPy arrays are marshalled as strided memref descriptors via ctypes,
 results are allocated by the caller (destination-passing style).
 
 Options: `opt_level` (default 3), `native_codegen` (default True).
-`OMP_NUM_THREADS` controls loop parallelism at run time.
+`OMP_NUM_THREADS` controls generated OpenMP loops. FFT and interpolation
+use a process-wide reusable worker pool controlled by
+`SAR_RT_NUM_THREADS`, then `OMP_NUM_THREADS`; requests are capped by the
+process affinity and the default is at most 32 workers.
 
 ### Buffer pool
 
@@ -104,10 +107,11 @@ defaults and how to override them.
 Placement is the compiler's decision, not the user's. The backend
 measures the resident working set in the lowered kernel -- its arguments
 and results plus the full-size intermediates that survive buffer sharing
--- and keeps everything on chip while that fits `on_chip_budget`. Past
-the budget the full-size planes are streamed and only the constant
-tables (twiddles, interpolation weights) and the one-line transform
-scratch stay resident.
+-- and keeps everything on chip while that fits the tier caps
+(`bram_bytes` + `uram_bytes` + `lutram_bytes`). Past them the full-size
+planes are streamed and only the constant tables (twiddles,
+interpolation weights) and line-sized transform scratch stay
+resident.
 
 The set is measured rather than predicted because it follows the
 algorithm, not the signature: the same four-stage chain holds six live
@@ -118,28 +122,32 @@ streamed buffers reach the top function:
 
 | | top signature | use |
 |---|---|---|
-| `interface='ap_memory'` (or the deprecated `'bram'`) | the kernel's own inputs and results | csim packages: the testbench can drive every port |
-| `interface='axi'` | one AXI master port per I/O plane, plus one trailing scratch port | designs handed to Vitis |
-| `interface='stream'` | AXI4-Stream ports for the pure inputs and outputs; the scratch stays an AXI master, since a stream is unidirectional and consumed once | streaming radar front ends |
+| `interface='ap_memory'` | the kernel's own inputs and results | csim packages: the testbench can drive every port |
+| `interface='axi'` | one AXI master per I/O plane, plus compiler-managed typed scratch arenas | memory-mapped designs handed to Vitis |
+| `interface='stream'` | AXI4-Stream ports for pure inputs and outputs; scratch arenas remain AXI masters | streaming radar front ends |
 
 Internal buffers that spill to DRAM never surface as ports of their own:
-they are carved into the one trailing scratch allocation, whose extent is
-the port's own array bound -- that is the size the host must bind. The
-port exists even when nothing spilled (at a one-element placeholder), so
-the signature does not depend on what the optimizer decided this round.
+they are carved into a fixed arena for their element type. Each arena's
+array bound is the storage size the host must bind. A one-element
+placeholder preserves an arena that has no spilled buffer, so placement
+decisions do not change the interface.
 
 An imaging chain is a sequence of whole-raster passes, so a plane dies
 as soon as the next pass has read it and the ones whose lifetimes do not
 overlap share an allocation. That is what keeps the streamed set a
 property of the algorithm rather than of the chain's length: adding
 passes to a kernel does not add ports. At `16384 x 16384` the omega-K
-chain streams eight planes over two AXI bundles, roughly 13 GiB of DRAM,
-and holds only the tables and the line scratch on chip.
+chain streams its full-size working planes through typed arenas and holds
+only tables and line scratch on chip. Every port drives its own AXI master
+bundle: ports sharing a bundle serialize their bus requests, starving
+loops that read two planes concurrently.
 
-Testbench generation rejects `interface='axi'` and `interface='stream'`:
-the promoted intermediate ports have no golden data to drive them. Emit
-the csim package with `interface='ap_memory'` (the default), and compile
-with `'axi'` or `'stream'` for the design you synthesize.
+Testbench generation rejects `interface='axi'` -- the compiler-managed
+scratch allocation has no golden input data to drive it -- and
+`interface='stream'`, whose `hls::stream<>` ports need a FIFO-feeding
+harness the array testbench is not. Emit the csim package with
+`interface='ap_memory'` (the default; the numerics are identical), and
+compile with `'axi'` or `'stream'` for the design you synthesize.
 
 ### Validating a design in Vitis HLS
 
@@ -168,21 +176,29 @@ in the order failures usually appear:
    arrays and straight-line arithmetic, all synthesizable by
    construction; a failure here is a compiler bug and worth a report.
 2. **Timing.** The estimated clock in `<top>_csynth.rpt` must meet
-   `clock_ns`. The shipped 10 ns is conservative; tighten it once the
-   design closes, and treat a miss at 10 ns as a bug.
+   `clock_ns`. The shipped target is 4 ns; a miss is reported as a failed
+   constraint rather than being hidden by the emitter.
 3. **Initiation intervals.** Pipelined loops should report the II the
    pragma asked for (`II=1` throughout the element-wise and FFT nests;
    the interpolation gather may settle at II=2 on a dual-port band).
    A large II names the loop that needs attention.
 4. **Memory utilization.** BRAM/URAM usage must sit within the
-   `bram_bytes`/`uram_bytes` budgets -- placement charged whole
-   primitives, so the report should come in at or under the charge.
-   The FFT twiddle tables are file-scope `const` arrays and should map
-   to ROM: a size-N transform costs a handful of BRAM primitives for
-   its cos/sin tables, not dozens (dozens means the tool replicated
-   ROMs that ought to be shared, which is worth a report).
-5. **Interfaces.** One `m_axi` port per I/O plane plus the scratch, on
-   the bundles the design declared; burst length and outstanding
+   `bram_bytes`/`uram_bytes` caps. The caps are hard: the compiler
+   charges every dataflow buffer at twice its primitive count (Vitis
+   ping-pong double-buffers each channel), so meeting a cap at compile
+   time means meeting it in the report -- and when the working set
+   cannot fit, the backend first retries with every full-size plane
+   streamed, then fails compilation rather than emit a design that
+   cannot fit the device (the fix is raising the caps to a larger
+   part, or shrinking the kernel's resident tables).
+   The FFT twiddle tables are file-scope `const` arrays; with the stage
+   butterflies unrolled they constant-fold into the datapath and cost
+   no memory primitives at all. Only dynamically-indexed tables (the
+   axis ROMs) should appear as memories, at one or two BRAM primitives
+   per reading process -- dozens means the tool replicated ROMs that
+   ought to be shared, which is worth a report.
+5. **Interfaces.** One `m_axi` port per I/O plane plus the typed scratch
+   arenas, on the bundles the design declared; burst length and outstanding
    depths as configured (see the header comment of the emitted C++).
 
 `benchmarks/run_resources.py` estimates memory from the emitted C++
@@ -190,10 +206,10 @@ without Vitis; the synthesis report is the measured truth, and a large
 gap between the two is itself a finding worth recording.
 
 Two things csim cannot decide and only this flow can: whether the tool
-shares the twiddle ROMs (step 4), and whether `balance_dataflow=False`
--- which saves copy nodes and on-chip bytes -- is safe under hardware
-dataflow concurrency, which needs co-simulation (`cosim_design`) rather
-than the sequential csim.
+shares the twiddle ROMs (step 4), and whether the pass-pipeline option
+`balance-dataflow=false` -- which saves copy nodes and on-chip bytes --
+is safe under hardware dataflow concurrency, which needs co-simulation
+(`cosim_design`) rather than the sequential csim.
 
 ### HLS memory access patterns
 
@@ -234,10 +250,10 @@ What remains strided in the omega-K chain at `512 x 512`:
 
 ### FFT stage grouping
 
-A Stockham transform of length N is log2(N) butterfly passes. By default
-each pass writes its own scratch line, which makes the passes a chain: a
-dataflow backend can overlap one line's late stages with the next line's
-early ones. It also means log2(N)-1 live scratch buffers.
+A Stockham transform of length N is log2(N) butterfly passes. With
+`fft_stage_group=0`, each pass writes its own scratch line, which makes the
+passes a chain: a dataflow backend can overlap one line's late stages with
+the next line's early ones. It also means log2(N)-1 live scratch buffers.
 
 `fft_stage_group` trades that overlap for area. With `k > 0` the stages
 are packed into groups that share scratch, cutting the live buffers to
@@ -290,15 +306,16 @@ choice:
   DSPs of f64 ones).
 
 Consequently `c128` kernels agree across backends to f64 rounding
-(~1e-15, butterfly-ordering differences only) and `c64` kernels to
-f32 rounding (~1e-7 relative). Both satisfy the declared precision;
-use `c128` where the FFT chain itself must be reproducible bit-for-bit
-across backends. The example chains expose the choice as
-`build_kernel(..., dtype=sar.c64)`, and the cross-backend agreement at
-f32 is gated by csim in `test_hls_backend.py`.
+(~1e-15, butterfly-ordering differences only) and `c64` kernels within
+the f32 error envelope (up to ~1e-6 relative on the measured chains).
+Use `c128` where the FFT chain requires double-precision cross-backend
+agreement. The example chains expose the choice as
+`build_kernel(..., dtype=sar.c64)`. A WKA f32 C-simulation smoke test is
+gated in `test_hls_backend.py`; `benchmarks/run_accuracy.py --dtype c64`
+produces the complete four-chain matrix.
 
-Host data participates in that contract. Promotion follows numpy, so a
-float64 array -- numpy's default -- meeting an f32 tensor gives f64, and
+Host data participates in that contract. Promotion follows NumPy, so a
+float64 array -- NumPy's default -- meeting an f32 tensor gives f64, and
 every operator and buffer downstream widens with it. The trace reports
 this as `sar.PrecisionWarning`, naming the host array rather than the
 tensor it met, because the host is the side that can cheaply choose
@@ -361,6 +378,9 @@ Tools are located in this order:
 |----------|--------|
 | `SAR_DSL_TOOL_<NAME>` | Absolute path to one tool, overriding discovery |
 | `SAR_DSL_TOOL_PATH` | Extra directories to search for tools (before `PATH`, after the build tree) |
+| `SAR_DSL_TOOL_TIMEOUT_SECONDS` | Per-stage subprocess timeout (default 1800; non-positive disables it) |
+| `SAR_DSL_BUILD_CONFIG` | Explicit CMake-generated `_build_config.py` path |
+| `SAR_DSL_BUILD_DIR` | Non-default build tree containing `python/sar/_build_config.py` |
 | `SAR_DSL_RUNTIME_LIB` | Path to `libsar_runtime.so` |
 | `SAR_DSL_BACKEND_PATH` | Extra directories to search for backend packages |
 | `SAR_DSL_CACHE_DIR` | Artifact cache root (default `~/.cache/sar-dsl`) |
@@ -368,13 +388,14 @@ Tools are located in this order:
 | `SAR_DSL_CACHE_MAX_SIZE` | Cache eviction threshold in bytes (default 2 GiB) |
 | `SAR_DSL_OMP_LIB` | Path to `libomp.so` for the cpu backend |
 | `SAR_DSL_HLS_CONFIG` | HLS configuration file overriding the shipped defaults |
-| `SAR_RT_NUM_THREADS` | Runtime worker threads; falls back to `OMP_NUM_THREADS`, then the hardware concurrency |
+| `SAR_RT_NUM_THREADS` | Reusable runtime workers; falls back to `OMP_NUM_THREADS`, then min(process affinity, 32) |
 | `SAR_RT_POOL_MAX_BYTES` | Plane-pool retention bound in bytes; `0` disables pooling (see "Buffer pool") |
 
 ## HLS configuration
 
 Every knob the HLS backend hands to the passes has a default in
 `python/sar/backends/hls/hls_config.yaml`, which ships with the package.
+Configuration files are flat YAML mappings of option names to scalar values.
 Resolution order, weakest first:
 
 ```
@@ -404,29 +425,25 @@ the failure this schema exists to prevent.
 
 These are facts about the device and the deliverable. The compiler
 cannot discover them, so they are the schema the user actually sets.
-Defaults describe half a Virtex UltraScale+ VU13P: the device carries
-94.5 Mb of block RAM, 360 Mb of UltraRAM and 12288 DSP slices, and
-placement runs before synthesis, charging buffers in whole primitives.
-Half leaves room for that estimate to be wrong.
+Defaults target `xcvu13p-fhgb2104-2-i` and budget 80% of each resource,
+leaving 20% for control, interconnect and placement. Memory placement
+charges whole primitives; DSP is checked from the synthesis report because
+operator binding happens inside Vitis.
 
 | Key | Default | Controls |
 |---|---|---|
-| `bram_bytes` | `6193152` | Block RAM the design may occupy (0 = unbounded) |
-| `uram_bytes` | `23592960` | UltraRAM the design may occupy (0 = unbounded) |
-| `lutram_bytes` | `901120` | Distributed RAM the design may occupy; a quarter of the device rather than half, since this tier is carved out of the SLICEM LUTs the datapath is built from |
-| `on_chip_budget` | `null` (29.3 MiB) | Total on-chip bytes before full-scene planes are streamed; `null` sums the three tiers, `0` keeps everything resident |
-| `uram_min_bytes` | `36864` | Buffer size at or above which UltraRAM is used; a device fact (one 288 Kb URAM block), so retargeting states a different value |
-| `interface` | `ap_memory` | Protocol the top-function ports speak: `ap_memory` (plain arrays, csim-able; `bram` is a deprecated alias), `axi` (AXI4 memory-mapped masters), or `stream` (AXI4-Stream) |
+| `bram_bytes` | `9907200` | 2150 of 2688 BRAM36 primitives; hard cap |
+| `uram_bytes` | `37748736` | 1024 of 1280 UltraRAM primitives; hard cap |
+| `lutram_bytes` | `2883584` | 80% of the distributed-RAM capacity; hard cap |
+| `dsp` | `9830` | 80% DSP synthesis-report budget |
+| `interface` | `ap_memory` | Protocol the top-function ports speak: `ap_memory` (plain arrays), `axi` (AXI4 memory-mapped masters), or `stream` (AXI4-Stream) |
 | `axi_bus_bits` | `512` | Data width of the AXI masters, in bits |
 | `axi_max_burst_length` | `256` | Beats per burst at full bus width (the AXI4 maximum) |
 | `axi_max_outstanding` | `16` | Full-length bursts in flight per direction (Vitis caps it at 32) |
 | `precision` | `native` | Data path the kernel must carry: `native`, `f32` or `f64` |
-| `part` | `xcvu13p-fhgb2104-2-e` | Device part the generated Vitis scripts name; must be the device the budgets describe |
-| `clock_ns` | `10.0` | Target clock period of the generated Vitis scripts |
+| `part` | `xcvu13p-fhgb2104-2-i` | Device part the generated Vitis scripts name |
+| `clock_ns` | `4.0` | Target clock period of the generated scripts |
 | `top_func` | `null` | Name of the emitted top function; `null` takes the kernel's name |
-
-`axi_interface=True/False` predates `interface` and still selects `axi` /
-`ap_memory`; giving both a conflicting value is an error.
 
 `axi_bus_bits`, `axi_max_burst_length` and `axi_max_outstanding` are a
 buffering budget rather than a per-port setting: the emitter shapes each
@@ -435,12 +452,13 @@ run, a burst cannot outrun the row -- and a port whose bursts come out
 shorter than `axi_max_burst_length` gets proportionally more of them in
 flight, up to the Vitis cap.
 
-The tier budgets sum into `on_chip_budget` when no total is given; the
-split between them is a placement decision `-hls-pipeline` does not
-currently take an option for, so a per-tier ceiling is not yet enforced
-on its own. There is no DSP budget: Vitis binds the float operators of
-an imaging chain itself, so the emitter has no binding decision to
-ration.
+The caps are the whole constraint surface: placement charges each tier
+in whole primitives (a 36 Kb block holding one kilobyte is spent),
+overflows one block tier into the other before spilling anything, and
+fails the design when a buffer that cannot stream fits no tier. Vitis binds
+floating-point operators after emission, so the DSP budget is validated from
+`*_csynth.xml`; `precision` is the pre-synthesis lever when DSP pressure
+matters.
 
 `precision` is a gate, not a conversion: the declared dtypes *are* the
 data path (see "Precision contract"), so `precision="f32"` rejects a
@@ -466,8 +484,8 @@ marks those keys `derived`. The policy lives in
 | Derived | From |
 |---------|------|
 | `fft_stage_group` | the least grouping whose Stockham scratch fits the working share of the on-chip budget; full unroll where it fits |
-| `loop_tile_size` | bus width over element width, so a tile is a whole number of beats |
-| `lutram_max_bytes` | one bus beat: a bank that cannot fill a single transfer does not earn a block RAM primitive, so below a beat it lands in distributed RAM |
+| `loop_tile_size` | the element count in one bus beat, bounded by the pass limits |
+| `lutram_max_bytes` | one bus beat: a bank no larger than one transfer does not earn a block RAM primitive |
 | `interp_banded_gather` | on: the pass proves a bounded displacement per operation and falls back on its own when it cannot |
 | `reuse_buffer_min_elements` | a full-scene plane against what the budget can afford to keep private |
 | `recompute_min_elements` | the same measure -- storage traded for arithmetic instead of for sharing |

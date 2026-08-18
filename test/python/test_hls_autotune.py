@@ -11,9 +11,10 @@ import pytest
 from sar.backends.base import KernelMetadata
 from sar.backends.hls.autotune import (AUTO_OPTIONS, KernelFacts, derive,
                                        fft_stage_group, interp_banded_gather,
-                                       loop_tile_size, lutram_max_bytes,
-                                       measure_kernel, storage_min_elements,
-                                       _scratch_slots)
+                                       kernel_facts_from_json, loop_tile_size,
+                                       lutram_max_bytes, measure_kernel,
+                                       storage_min_elements,
+                                       transpose_block_bytes, _scratch_slots)
 from sar.backends.hls.config import HLSConfig
 
 from conftest import requires_hls
@@ -33,6 +34,13 @@ def _cfg(**opts):
     return HLSConfig.resolve(opts)
 
 
+def test_structured_kernel_facts_parser():
+    facts = kernel_facts_from_json(
+        '{"plane_elements":64,"element_bytes":4,"transposes":2,'
+        '"transforms":[[8,4]],"buffers":[[64,256]]}')
+    assert facts == KernelFacts(64, 4, ((8, 4), ), 2, ((64, 256), ))
+
+
 # ---------------------------------------------------------------------- #
 # fft_stage_group
 # ---------------------------------------------------------------------- #
@@ -43,24 +51,21 @@ class TestFftStageGroup:
     def test_no_transforms_gives_0(self):
         assert fft_stage_group(_facts(), budget=1) == 0
 
-    def test_unbounded_budget_chooses_full_unroll(self):
-        # 0 means "keep everything resident", so nothing has to be grouped.
+    def test_zero_budget_uses_the_smallest_scratch(self):
         f = _facts(transforms=((512, 8), ))
-        assert fft_stage_group(f, budget=0) == 0
+        assert fft_stage_group(f, budget=0) == 3
 
     @pytest.mark.parametrize("budget,expected", [
-        (1 << 20, 0),
-        (1 << 19, 0),
-        (1 << 18, 2),
+        (1 << 20, 3),
+        (1 << 19, 3),
+        (1 << 18, 3),
         (1 << 17, 3),
         (1 << 10, 3),
     ])
     def test_budget_picks_the_grouping(self, budget, expected):
-        """One transform of N=512 costs 64 KiB of scratch at full unroll,
-        32 KiB at k=2 and 16 KiB from k=3 on, where the pool has bottomed
-        out. An eighth of each budget is what those have to fit, and the
-        least grouping that fits is the one to take -- down to the tightest
-        available once none of them does."""
+        """Partitioned lines are charged in whole memory primitives, so this
+        budget range selects the two-slot floor rather than a logically small
+        but physically fragmented full unroll."""
         f = _facts(transforms=((512, 8), ))
         assert fft_stage_group(f, budget) == expected
 
@@ -181,14 +186,11 @@ class TestLutramMaxBytes:
         assert cfg.provenance["lutram_max_bytes"] == HLSConfig.FROM_OPTIONS
 
 
-def test_uram_min_bytes_is_a_device_fact():
-    """36864 bytes is one 288 Kb UltraRAM block. It belongs to the device
-    description, so it comes from the config file rather than a TableGen
-    constant, and it is a constraint the user states -- not strategy."""
-    assert _cfg().uram_min_bytes == 36864
-    assert "uram_min_bytes" not in AUTO_OPTIONS
-    # Retargeting to a device without URAM is stating a different fact.
-    assert _cfg(uram_min_bytes=0).uram_min_bytes == 0
+def test_dsp_budget_is_a_device_constraint():
+    assert _cfg().dsp == 9830
+    assert "dsp" not in AUTO_OPTIONS
+    # Retargeting to a smaller part is stating a different fact.
+    assert _cfg(dsp=1824).dsp == 1824
 
 
 # ---------------------------------------------------------------------- #
@@ -209,10 +211,9 @@ def test_interp_banded_gather_always_on():
 
 class TestStorageMinElements:
 
-    def test_unbounded_budget_returns_plane_size(self):
-        # Nothing has to be shared until a buffer is a full-scene plane.
+    def test_zero_budget_shares_every_buffer(self):
         f = _facts(plane_elements=65536, element_bytes=4)
-        assert storage_min_elements(f, 0) == 65536
+        assert storage_min_elements(f, 0) == 1
 
     @pytest.mark.parametrize("budget,expected", [
         (4 << 20, 65536),
@@ -280,10 +281,10 @@ class TestDerive:
         # A budget that cannot afford the full FFT scratch should push the
         # grouping above 0 (full unroll).  Budget=1 cannot afford any scratch.
         f = _facts(transforms=((512, 8), ))
-        tight = _cfg(on_chip_budget=1)
-        loose = _cfg(on_chip_budget=0)
-        g_tight = fft_stage_group(f, int(tight["on_chip_budget"]))
-        g_loose = fft_stage_group(f, int(loose["on_chip_budget"]))
+        tight = _cfg(bram_bytes=1, uram_bytes=0, lutram_bytes=0)
+        loose = _cfg()
+        g_tight = fft_stage_group(f, tight.on_chip_bytes())
+        g_loose = fft_stage_group(f, loose.on_chip_bytes())
         assert g_tight > g_loose or g_tight >= 2
 
 
@@ -292,6 +293,7 @@ class TestDerive:
 # ---------------------------------------------------------------------- #
 
 
+@requires_hls
 class TestMeasureKernel:
 
     def test_reads_plane_size_from_signature(self):
@@ -336,6 +338,7 @@ class TestMeasureKernel:
 # ---------------------------------------------------------------------- #
 
 
+@requires_hls
 class TestGenerality:
 
     def test_tiny_kernel(self):
@@ -433,8 +436,137 @@ def test_tighter_budget_moves_storage_threshold():
         return x * 2.0
 
     scale.name = "autotune_budget_threshold"
-    big = scale.compile(backend="hls", options={"on_chip_budget": 0}).config
-    small = scale.compile(backend="hls", options={"on_chip_budget": 1}).config
+    big = scale.compile(backend="hls").config
+    small = scale.compile(backend="hls",
+                          options={
+                              "bram_bytes": 65536,
+                              "uram_bytes": 0,
+                              "lutram_bytes": 0
+                          }).config
     # With a near-zero budget the threshold should be at or below the
     # full budget threshold.
     assert small.reuse_buffer_min_elements <= big.reuse_buffer_min_elements
+
+
+@requires_hls
+def test_over_budget_retries_with_streaming(monkeypatch):
+    """When the scheduled design overruns the resource caps (the
+    placement pass fails), the backend retries once with every plane
+    streamed and repins the threshold; when the retry fits, its design
+    is the one that ships."""
+    import sar.backends.hls.compiler as hls_compiler
+    from sar.errors import CompilationError
+
+    # A cache hit would skip the tools, and with them the retry under test.
+    monkeypatch.setenv("SAR_DSL_DISABLE_CACHE", "1")
+
+    n = 64
+
+    @sar.func
+    def chain(x: sar.c128[n, n], w: sar.c128[n, n]) -> sar.c128[n, n]:
+        return sar.ifft(sar.fft(x, axis=1) * w, axis=1)
+
+    chain.name = "autotune_overbudget"
+
+    calls = []
+    real_run_tool = hls_compiler.run_tool
+
+    def spy(stage, command, input_text=None):
+        if stage == "sar-hls":
+            threshold = next(c for c in command[1].split()
+                             if c.startswith("external-buffer-threshold"))
+            calls.append(int(threshold.split("=")[1]))
+            # First call: pretend placement refused the working set; the
+            # retry runs for real, so the second call decides the outcome.
+            if len(calls) == 1:
+                raise CompilationError(
+                    stage, command,
+                    "error: SAR_HLS_RETRYABLE_MEMORY_OVERFLOW: placement "
+                    "needs 999 additional bytes")
+        return real_run_tool(stage, command, input_text=input_text)
+
+    monkeypatch.setattr(hls_compiler, "run_tool", spy)
+    design = chain.compile(backend="hls")
+    assert len(calls) == 2, calls
+    assert calls[1] < calls[0]
+    assert design.config.external_buffer_threshold == calls[1]
+
+
+@requires_hls
+def test_over_budget_after_streaming_refuses_the_design(monkeypatch):
+    """The caps are hard: when even the fully-streamed design overruns
+    them, compilation fails rather than emit a design that cannot fit
+    the device."""
+    import pytest as _pytest
+
+    import sar.backends.hls.compiler as hls_compiler
+    from sar.backends.hls.config import HLSConfigError
+    from sar.errors import CompilationError
+
+    monkeypatch.setenv("SAR_DSL_DISABLE_CACHE", "1")
+
+    n = 64
+
+    @sar.func
+    def chain(x: sar.c128[n, n]) -> sar.c128[n, n]:
+        return sar.fft(chain_body(x), axis=1)
+
+    @sar.op
+    def chain_body(x):
+        return x * 2.0
+
+    chain.name = "autotune_overbudget_hard"
+
+    real_run_tool = hls_compiler.run_tool
+
+    def spy(stage, command, input_text=None):
+        if stage == "sar-hls":
+            raise CompilationError(
+                stage, command, "error: SAR_HLS_RETRYABLE_MEMORY_OVERFLOW: "
+                "on-chip working set exceeds the memory budgets")
+        return real_run_tool(stage, command, input_text=input_text)
+
+    monkeypatch.setattr(hls_compiler, "run_tool", spy)
+    with _pytest.raises(HLSConfigError, match="exceeds the resource caps"):
+        chain.compile(backend="hls")
+
+
+def test_repin_rejects_user_pinned_values():
+    """`repin` may only revise derived values; a user-pinned key is a
+    contract the compiler cannot override."""
+    import pytest as _pytest
+
+    from sar.backends.hls.config import HLSConfig
+
+    config = HLSConfig.resolve({"fft_stage_group": 2})
+    with _pytest.raises(ValueError, match="not a derived value"):
+        config.repin("fft_stage_group", 4)
+
+
+@requires_hls
+def test_axis0_interp_counts_its_hidden_transposes():
+    """`interp1d(dim=0)` canonicalizes into transposes around the row-wise
+    form; the staging budget must see those corner turns even though the
+    traced module names none."""
+    import sar
+    from sar.backends.base import KernelMetadata
+
+    n = 64
+
+    @sar.func
+    def rcmc(z: sar.c128[n, n], p: sar.f64[n, n]) -> sar.c128[n, n]:
+        return sar.interp1d(z, p, dim=0)
+
+    md = KernelMetadata("rcmc", list(rcmc.arg_types),
+                        list(rcmc.declared_result_types))
+    facts = measure_kernel(rcmc.to_mlir(), md)
+    assert facts.transposes >= 3
+    # The staging budget shrinks accordingly instead of promising each
+    # of the hidden corner turns the whole allowance.
+    whole = transpose_block_bytes(_facts(), bram_bytes=6193152)
+    split = transpose_block_bytes(facts, bram_bytes=6193152)
+    assert split < whole
+
+
+def test_zero_bram_disables_transpose_staging():
+    assert transpose_block_bytes(_facts(), bram_bytes=0) == 0

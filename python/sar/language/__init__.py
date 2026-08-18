@@ -22,10 +22,10 @@ from __future__ import annotations
 import functools
 import inspect
 import math
+import numbers
 import os
 import re
 import threading
-import warnings
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -34,6 +34,15 @@ from .. import ir
 from ..errors import TraceError
 from ..ir import (C64, C128, COMPLEX_OF, DTYPES, F32, F64, FLOAT_PRECISION_OF,
                   I32, I64, DType, TensorType)
+from .diagnostics import (DomainWarning, PrecisionWarning, _UNKNOWN_AXIS,
+                          is_double as _is_double, propagate_axes as
+                          _propagate_axes, source_location as _source_location,
+                          warn_if_host_widens as _warn_if_host_widens)
+
+
+def _is_real_scalar(value) -> bool:
+    return isinstance(value, numbers.Real)
+
 
 __all__ = [
     "f32",
@@ -99,22 +108,6 @@ __all__ = [
     "flip",
 ]
 
-
-class PrecisionWarning(UserWarning):
-    """Warns when host data widens a kernel's working precision at trace
-    time -- a float64 numpy array folded into an f32 pipeline promotes every
-    value downstream, which on an HLS target doubles the arithmetic and the
-    memory it needs. Escalate with
-    ``warnings.simplefilter("error", sar.PrecisionWarning)``."""
-
-
-class DomainWarning(UserWarning):
-    """Warns about suspicious spectral-domain usage at trace time (double
-    FFT along an axis, inverse FFT of a still-centered spectrum, mixing
-    time- and frequency-domain data). Escalate with
-    ``warnings.simplefilter("error", sar.DomainWarning)``."""
-
-
 # --------------------------------------------------------------------------- #
 # Type annotation sugar: sar.c64[512, 512]
 # --------------------------------------------------------------------------- #
@@ -168,114 +161,6 @@ def _current_function() -> ir.Function:
     return fn
 
 
-#: Directory of this package; frames inside it are DSL plumbing, not the
-#: kernel code a diagnostic should point at.
-_PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _warn_user(message: str, category: type) -> None:
-    """Warns, blaming the nearest frame outside the sar package.
-
-    A fixed `stacklevel` cannot do this: the number of DSL frames between
-    the user's line and the warning varies with how the op was reached
-    (an operator, a free function or a nested `@sar.op`). Walking the
-    stack keeps the report on the kernel line and lets
-    ``filterwarnings(..., module=...)`` match user modules.
-    """
-    depth = 2  # skip this frame and the caller inside the package
-    frame = inspect.currentframe()
-    try:
-        frame = frame.f_back if frame else None
-        while frame is not None:
-            path = os.path.abspath(frame.f_code.co_filename)
-            if not path.startswith(_PACKAGE_ROOT):
-                break
-            depth += 1
-            frame = frame.f_back
-    finally:
-        del frame
-    warnings.warn(message, category, stacklevel=depth)
-
-
-#: Per-axis spectral state: (spectral, centered), each True/False/None
-#: (None = unknown). Kernel inputs and constants start unknown, so the
-#: tracker only diagnoses states it has itself derived.
-_UNKNOWN_AXIS = (None, None)
-
-
-def _propagate_axes(op: str, operands: Sequence["Tensor"], attributes,
-                    unit_attributes, result_rank: int):
-    """Derives the per-axis spectral state of an op result and warns on
-    domain misuse. Conservative: unknown states never warn."""
-    unknown = (_UNKNOWN_AXIS, ) * result_rank
-    preserve = operands[0]._axes if operands else unknown
-
-    if op in ("fft", "ifft", "fftshift"):
-        dim = attributes["dim"]
-        axes = list(preserve)
-        spectral, centered = axes[dim]
-        if op == "fft":
-            if spectral is True:
-                _warn_user(
-                    f"sar.fft along dim {dim}: axis is already in the "
-                    "frequency domain", DomainWarning)
-            axes[dim] = (True, False)
-        elif op == "ifft":
-            if spectral is False:
-                _warn_user(
-                    f"sar.ifft along dim {dim}: axis is in the time "
-                    "domain", DomainWarning)
-            elif centered is True:
-                _warn_user(
-                    f"sar.ifft along dim {dim}: spectrum is still "
-                    "centered; apply ifftshift first", DomainWarning)
-            axes[dim] = (False, None)
-        else:
-            inverse = "inverse" in unit_attributes
-            axes[dim] = (spectral, False if inverse else True)
-        return tuple(axes)
-
-    if op == "transpose":
-        return preserve[::-1]
-    if op == "broadcast":
-        axes = [_UNKNOWN_AXIS, _UNKNOWN_AXIS]
-        axes[attributes["dim"]] = preserve[0]
-        return tuple(axes)
-    if op in ("add", "sub", "mul", "div", "complex", "atan2", "cmp", "where"):
-        merged = []
-        for dim, states in enumerate(zip(*(t._axes for t in operands))):
-            known = {s for s in states if s[0] is not None}
-            if len({s[0] for s in known}) > 1:
-                _warn_user(
-                    f"sar.{op}: operands mix time-domain and "
-                    "frequency-domain axes", DomainWarning)
-            else:
-                # Same domain on both sides, but one spectrum centered and
-                # the other not: the phase reference differs by a half-band
-                # rotation, which silently corrupts the product.
-                centered = {s[1] for s in known if s[1] is not None}
-                if len(centered) > 1:
-                    _warn_user(
-                        f"sar.{op} along dim {dim}: one operand is a "
-                        "centered spectrum and the other is not; apply "
-                        "fftshift/ifftshift to align them", DomainWarning)
-            merged.append(
-                next(iter(known)) if len(known) == 1 else _UNKNOWN_AXIS)
-        return tuple(merged)
-    if op in ("add_scalar", "mul_scalar", "sqrt", "cos", "sin", "exp", "log",
-              "abs", "cast", "conj", "real", "imag"):
-        return preserve[:result_rank]
-    # Structural ops (slice, concat, pad, reduce, interp1d, ...) change
-    # the sampling or extent; their result state is unknown.
-    return unknown
-
-
-def _is_double(dtype: DType) -> bool:
-    """Whether `dtype` carries double-precision components. `c64` is a pair
-    of f32, so the name's digits do not answer this on their own."""
-    return dtype.name in ("f64", "c128")
-
-
 def _promoted_dtype(a: DType, b: DType) -> DType:
     """NumPy-style promotion over the supported lattice: precision widens
     (32 -> 64) and float promotes to complex.
@@ -291,27 +176,6 @@ def _promoted_dtype(a: DType, b: DType) -> DType:
     if a.is_complex or b.is_complex:
         return C128 if wide else C64
     return F64 if wide else F32
-
-
-def _warn_if_host_widens(a: "Tensor", b: "Tensor", target: DType, op: str):
-    """Reports a host constant that pulls the pipeline up to double.
-
-    Promotion follows numpy, so a float64 array meeting an f32 tensor gives
-    f64 -- correct, but on an HLS target it silently doubles every operator
-    and buffer downstream. The host is the side that can cheaply choose
-    otherwise, so that is the side worth naming.
-    """
-    if not _is_double(target):
-        return
-    for wide, narrow in ((a, b), (b, a)):
-        if (getattr(wide, "_from_host", False) and _is_double(wide.dtype)
-                and not _is_double(narrow.dtype)):
-            _warn_user(
-                f"sar.{op}: host data of dtype {wide.dtype.name} widens a "
-                f"{narrow.dtype.name} pipeline to {target.name}; cast the "
-                "host array to single precision to keep it narrow",
-                PrecisionWarning)
-            return
 
 
 def _coerce_pair(a: "Tensor", b: "Tensor", op: str):
@@ -403,7 +267,7 @@ class Tensor:
               unit_attributes=()) -> "Tensor":
         fn = _current_function()
         value = fn.emit(f"sar.{op}", [t._value for t in operands], result_type,
-                        attributes, unit_attributes)
+                        attributes, unit_attributes, _source_location())
         axes = _propagate_axes(op, operands, attributes or {}, unit_attributes,
                                len(result_type.shape))
         # A value computed only from host data is still host data, so the
@@ -432,36 +296,36 @@ class Tensor:
     # -- operators ----------------------------------------------------------
 
     def __add__(self, other):
-        if isinstance(other, (int, float)):
+        if _is_real_scalar(other):
             return self._scalar("add_scalar", other)
         return self._binary("add", other)
 
     __radd__ = __add__
 
     def __sub__(self, other):
-        if isinstance(other, (int, float)):
+        if _is_real_scalar(other):
             return self._scalar("add_scalar", -float(other))
         return self._binary("sub", other)
 
     def __rsub__(self, other):
-        if isinstance(other, (int, float)):
+        if _is_real_scalar(other):
             return (-self)._scalar("add_scalar", float(other))
         return self._binary("sub", other, reflected=True)
 
     def __mul__(self, other):
-        if isinstance(other, (int, float)):
+        if _is_real_scalar(other):
             return self._scalar("mul_scalar", other)
         return self._binary("mul", other)
 
     __rmul__ = __mul__
 
     def __truediv__(self, other):
-        if isinstance(other, (int, float)):
+        if _is_real_scalar(other):
             return self._scalar("mul_scalar", 1.0 / float(other))
         return self._binary("div", other)
 
     def __rtruediv__(self, other):
-        if isinstance(other, (int, float)):
+        if _is_real_scalar(other):
             other = np.full(self.shape, other, dtype=self.dtype.to_numpy())
         return self._binary("div", other, reflected=True)
 
@@ -678,11 +542,20 @@ def constant(value,
              dtype: Optional[_DTypeSpec] = None,
              shape: Optional[Sequence[int]] = None) -> Tensor:
     """Materializes a constant tensor from a numpy array or a scalar."""
-    if isinstance(value, (int, float, complex)):
+    if isinstance(value, (int, float, complex, np.generic)):
         if shape is None:
             raise TraceError("scalar constants require an explicit shape")
         if dtype is None:
-            dtype = c64 if isinstance(value, complex) else f64
+            if isinstance(value, np.generic):
+                np_name = value.dtype.name
+                matches = [d for d in DTYPES.values() if d.np_dtype == np_name]
+                if not matches:
+                    raise TraceError(
+                        f"unsupported constant dtype {np_name}; supported: "
+                        f"{sorted(d.np_dtype for d in DTYPES.values())}")
+                dtype = _SPEC_BY_DTYPE[matches[0]]
+            else:
+                dtype = c64 if isinstance(value, complex) else f64
         array = np.full(tuple(shape), value, dtype=dtype.dtype.to_numpy())
     else:
         array = np.asarray(value)
@@ -699,7 +572,9 @@ def constant(value,
     ttype = TensorType(tuple(array.shape), dtype.dtype)
     attr = ir.DenseAttr.from_array(array, ttype)
     fn = _current_function()
-    value_ = fn.emit("sar.constant", [], ttype, {"value": attr})
+    value_ = fn.emit("sar.constant", [],
+                     ttype, {"value": attr},
+                     location=_source_location())
     return Tensor(value_, from_host=True)
 
 
@@ -886,7 +761,8 @@ def maximum(x: Tensor, scalar: float) -> Tensor:
     x = _require_tensor(x, "sar.maximum")
     if not x.dtype.is_float:
         raise TraceError("sar.maximum expects a float tensor")
-    return where(x > scalar, x, scalar)
+    selected = where(x > scalar, x, scalar)
+    return where(x != x, x, selected)
 
 
 def minimum(x: Tensor, scalar: float) -> Tensor:
@@ -894,7 +770,8 @@ def minimum(x: Tensor, scalar: float) -> Tensor:
     x = _require_tensor(x, "sar.minimum")
     if not x.dtype.is_float:
         raise TraceError("sar.minimum expects a float tensor")
-    return where(x < scalar, x, scalar)
+    selected = where(x < scalar, x, scalar)
+    return where(x != x, x, selected)
 
 
 def clip(x: Tensor, lo: float, hi: float) -> Tensor:
@@ -1218,7 +1095,8 @@ def fft(x: Tensor,
         norm: Optional[str] = None) -> Tensor:
     """Forward DFT along `dim`/`axis` (numpy/Matlab convention:
     unscaled); `norm` selects "backward" (default), "ortho" or
-    "forward". Any size >= 2 on cpu; powers of two on the HLS path."""
+    "forward". Any size >= 2 on both backends (non-powers of two go
+    through Bluestein's chirp-z reduction on the HLS path)."""
     dim = _resolve_axis("fft", dim, axis)
     return _fft_norm(_fft("fft", x, dim), dim, norm, inverse=False)
 
@@ -1341,8 +1219,7 @@ def cumsum(x: Tensor,
            axis: Optional[int] = None) -> Tensor:
     """Inclusive prefix sum along `dim`/`axis` (numpy `cumsum`).
 
-    Rank-2 float or complex tensors; rank-1 tensors are normalized to
-    `1 x n` and scanned along the data axis. Unlike numpy, an omitted
+    Rank-1 or rank-2 float or complex tensors. Unlike numpy, an omitted
     axis does not flatten -- it defaults to the last one.
     """
     dim = _resolve_axis("cumsum", dim, axis, required=False)
@@ -1352,9 +1229,7 @@ def cumsum(x: Tensor,
     if x.rank == 1:
         if dim not in (None, 0):
             raise TraceError(f"sar.cumsum: dim {dim} out of range for rank 1")
-        row = broadcast(x, (1, x.shape[0]), dim=1)
-        scanned = row._emit("cumsum", [row], row._value.type, {"dim": 1})
-        return scanned[0, :]
+        return x._emit("cumsum", [x], x._value.type, {"dim": 0})
     if x.rank != 2:
         raise TraceError("sar.cumsum expects a rank-1 or rank-2 tensor")
     dim = 1 if dim is None else dim
@@ -1391,13 +1266,11 @@ def rank_filter(x: Tensor,
         if dim not in (None, 0):
             raise TraceError(
                 f"sar.rank_filter: dim {dim} out of range for rank 1")
-        row = broadcast(x, (1, x.shape[0]), dim=1)
-        filtered = row._emit("rank_filter", [row], row._value.type, {
+        return x._emit("rank_filter", [x], x._value.type, {
             "window": window,
             "rank": rank,
-            "dim": 1
+            "dim": 0
         })
-        return filtered[0, :]
     if x.rank != 2:
         raise TraceError("sar.rank_filter expects a rank-1 or rank-2 tensor")
     dim = 1 if dim is None else dim
@@ -1425,8 +1298,8 @@ def sort(x: Tensor,
     """Sorts each line along `dim`/`axis` into ascending order
     (numpy `sort`).
 
-    Float tensors only -- ordering is undefined for complex. Rank-1
-    tensors are normalized to `1 x n` and sorted along the data axis.
+    Rank-1 or rank-2 float tensors only -- ordering is undefined for
+    complex.
     """
     dim = _resolve_axis("sort", dim, axis, required=False)
     x = _require_tensor(x, "sar.sort")
@@ -1435,9 +1308,7 @@ def sort(x: Tensor,
     if x.rank == 1:
         if dim not in (None, 0):
             raise TraceError(f"sar.sort: dim {dim} out of range for rank 1")
-        row = broadcast(x, (1, x.shape[0]), dim=1)
-        sorted_row = row._emit("sort", [row], row._value.type, {"dim": 1})
-        return sorted_row[0, :]
+        return x._emit("sort", [x], x._value.type, {"dim": 0})
     if x.rank != 2:
         raise TraceError("sar.sort expects a rank-1 or rank-2 tensor")
     dim = 1 if dim is None else dim
@@ -1446,7 +1317,7 @@ def sort(x: Tensor,
     return x._emit("sort", [x], x._value.type, {"dim": dim})
 
 
-def iterate(trips: int, body: Callable, *carries: Tensor):
+def iterate(trips: int, body: Callable, *carries: Tensor, index: bool = False):
     """Compiled counted loop with tensor-carried state: applies `body`
     `trips` times, feeding each iteration's results to the next.
 
@@ -1458,9 +1329,13 @@ def iterate(trips: int, body: Callable, *carries: Tensor):
 
         smoothed = sar.iterate(steps, lambda x: x - mu * grad(x), x0)
 
-    The trip count is a compile-time constant, and the body cannot read
-    the iteration index: per-iteration addressing (sub-aperture slicing)
-    is host-orchestrated for now (see docs/roadmap.md).
+    With ``index=True`` the body receives the iteration index first, as
+    an ``i64[1]`` tensor (0-based, not a carry), so per-iteration terms
+    can be computed in the kernel::
+
+        out = sar.iterate(n, lambda i, acc: acc * phase(i), x0, index=True)
+
+    The trip count is a compile-time constant.
     """
     fn = _current_function()
     if isinstance(trips, bool) or not isinstance(trips, (int, np.integer)):
@@ -1472,7 +1347,10 @@ def iterate(trips: int, body: Callable, *carries: Tensor):
     if not carried:
         raise TraceError("sar.iterate needs at least one carried tensor")
 
-    args = fn.push_region([c._value.type for c in carried])
+    arg_types = [c._value.type for c in carried]
+    if index:
+        arg_types = [TensorType((1, ), I64)] + arg_types
+    args = fn.push_region(arg_types)
     try:
         returned = body(*[Tensor(a) for a in args])
         results = returned if isinstance(returned, tuple) else (returned, )
@@ -1495,7 +1373,8 @@ def iterate(trips: int, body: Callable, *carries: Tensor):
     region = fn.pop_region([r._value for r in results])
     values = fn.emit_region_op("sar.iterate", [c._value for c in carried],
                                [c._value.type for c in carried], region,
-                               {"trips": trips})
+                               {"trips": trips}, ("index", ) if index else (),
+                               _source_location())
     tensors = tuple(Tensor(v) for v in values)
     return tensors[0] if len(tensors) == 1 else tensors
 
@@ -1567,6 +1446,7 @@ def op(fn=None, *, const=()):
     signature = inspect.signature(fn)
     #: One GenericKernel per (tensor parameters, constant values).
     variants: Dict[tuple, GenericKernel] = {}
+    variants_lock = threading.RLock()
 
     def eager(args, kwargs):
         bound = signature.bind(*args, **kwargs)
@@ -1591,20 +1471,21 @@ def op(fn=None, *, const=()):
                tuple(
                    sorted(
                        (k, _freeze_for_key(v)) for k, v in constants.items())))
-        generic = variants.get(key)
-        if generic is None:
+        with variants_lock:
+            generic = variants.get(key)
+            if generic is None:
 
-            def bound_fn(*tensors,
-                         _names=tuple(tensor_names),
-                         _consts=dict(constants)):
-                call = dict(_consts)
-                call.update(zip(_names, tensors))
-                return fn(**call)
+                def bound_fn(*tensors,
+                             _names=tuple(tensor_names),
+                             _consts=dict(constants)):
+                    call = dict(_consts)
+                    call.update(zip(_names, tensors))
+                    return fn(**call)
 
-            bound_fn.__name__ = fn.__name__
-            bound_fn.__doc__ = fn.__doc__
-            generic = GenericKernel(bound_fn)
-            variants[key] = generic
+                bound_fn.__name__ = fn.__name__
+                bound_fn.__doc__ = fn.__doc__
+                generic = GenericKernel(bound_fn)
+                variants[key] = generic
         return generic(*[bound.arguments[n] for n in tensor_names])
 
     @functools.wraps(fn)
@@ -1616,6 +1497,7 @@ def op(fn=None, *, const=()):
     #: Handle for emission backends:
     #: ``f.func.specialize(sar.c64[512, 512], ...)``.
     wrapper.func = GenericKernel(fn)
+    wrapper.specialize = wrapper.func.specialize
     return wrapper
 
 
@@ -1654,7 +1536,8 @@ class Kernel:
                  fn: Callable,
                  arg_types: Optional[Sequence[TensorType]] = None):
         self._fn = fn
-        self.name = _validated_kernel_name(fn.__name__)
+        self._lock = threading.RLock()
+        self._name = _validated_kernel_name(fn.__name__)
         functools.update_wrapper(self, fn)
         if arg_types is None:
             self.arg_types, self.declared_result_types = \
@@ -1665,6 +1548,20 @@ class Kernel:
         self.param_names = self._parse_param_names(fn, len(self.arg_types))
         self._module_text: Optional[str] = None
         self._compiled = {}
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @name.setter
+    def name(self, value: str) -> None:
+        value = _validated_kernel_name(value)
+        with self._lock:
+            if value == self._name:
+                return
+            self._name = value
+            self._module_text = None
+            self._compiled.clear()
 
     @staticmethod
     def _resolve_annotation(annotation, fn: Callable):
@@ -1735,47 +1632,49 @@ class Kernel:
 
     def trace(self) -> str:
         """Traces the Python function and returns the MLIR module text."""
+        with self._lock:
+            fn_ir = ir.Function(self.name, self.arg_types, self.param_names)
+            prev = getattr(_state, "function", None)
+            _state.function = fn_ir
+            try:
+                result = self._fn(*[Tensor(a) for a in fn_ir.arguments])
+            finally:
+                _state.function = prev
 
-        fn_ir = ir.Function(self.name, self.arg_types, self.param_names)
-        prev = getattr(_state, "function", None)
-        _state.function = fn_ir
-        try:
-            result = self._fn(*[Tensor(a) for a in fn_ir.arguments])
-        finally:
-            _state.function = prev
-
-        results = result if isinstance(result, tuple) else (result, )
-        for i, value in enumerate(results):
-            if not isinstance(value, Tensor):
-                raise TraceError(
-                    f"kernel '{self.name}' result #{i} is not a SAR tensor")
-        if self.declared_result_types is None:
-            # Annotation-free kernels infer their result types.
-            self.declared_result_types = [v._value.type for v in results]
-        else:
-            if len(results) != len(self.declared_result_types):
-                raise TraceError(
-                    f"kernel '{self.name}' returned {len(results)} values "
-                    f"but declares {len(self.declared_result_types)}")
-            for i, (value, declared) in enumerate(
-                    zip(results, self.declared_result_types)):
-                if value._value.type != declared:
+            results = result if isinstance(result, tuple) else (result, )
+            for i, value in enumerate(results):
+                if not isinstance(value, Tensor):
                     raise TraceError(
-                        f"kernel '{self.name}' result #{i} has type "
-                        f"{value._value.type.mlir} but declares "
-                        f"{declared.mlir}")
+                        f"kernel '{self.name}' result #{i} is not a SAR tensor"
+                    )
+            if self.declared_result_types is None:
+                self.declared_result_types = [v._value.type for v in results]
+            else:
+                if len(results) != len(self.declared_result_types):
+                    raise TraceError(
+                        f"kernel '{self.name}' returned {len(results)} values "
+                        f"but declares {len(self.declared_result_types)}")
+                for i, (value, declared) in enumerate(
+                        zip(results, self.declared_result_types)):
+                    if value._value.type != declared:
+                        raise TraceError(
+                            f"kernel '{self.name}' result #{i} has type "
+                            f"{value._value.type.mlir} but declares "
+                            f"{declared.mlir}")
 
-        fn_ir.set_return([v._value for v in results])
-        self._module_text = ir.Module([fn_ir]).render()
-        return self._module_text
+            fn_ir.set_return([v._value for v in results])
+            self._module_text = ir.Module([fn_ir]).render()
+            self._compiled.clear()
+            return self._module_text
 
     def to_mlir(self) -> str:
         """The kernel's MLIR module text, traced on first use and reused
         after that (the trace depends only on the function and the
         argument types, both fixed per kernel)."""
-        if self._module_text is None:
-            return self.trace()
-        return self._module_text
+        with self._lock:
+            if self._module_text is None:
+                return self.trace()
+            return self._module_text
 
     def compile(self, backend: str = "cpu", options: Optional[dict] = None):
         """Compiles the kernel for `backend` and returns the launcher.
@@ -1784,26 +1683,27 @@ class Kernel:
         launcher. Option sets that cannot serve as a memo key skip the
         memo and compile directly (the on-disk artifact cache still
         applies): a `config` entry points at a file whose contents can
-        change between calls, and an unhashable value cannot be looked
-        up at all.
+        change between calls, an environment-named config file can change
+        the same way, and an unhashable value cannot be looked up at all.
         """
+
         from ..compiler import compile as _compile
         key = None
-        if not (options or {}).get("config"):
+        env_config = os.environ.get("SAR_DSL_HLS_CONFIG")
+        if not (options or {}).get("config") and not env_config:
             try:
                 key = (backend, tuple(sorted((options or {}).items())))
                 hash(key)
             except TypeError:
                 key = None
-        if key is None:
-            return _compile(self, backend=backend, options=options)
-        if key not in self._compiled:
-            # `_compile` traces the kernel itself; tracing here as well
-            # would do the work twice.
-            self._compiled[key] = _compile(self,
-                                           backend=backend,
-                                           options=options)
-        return self._compiled[key]
+        with self._lock:
+            if key is None:
+                return _compile(self, backend=backend, options=options)
+            if key not in self._compiled:
+                self._compiled[key] = _compile(self,
+                                               backend=backend,
+                                               options=options)
+            return self._compiled[key]
 
     def __call__(self, *arrays):
         """JIT-compiles for the CPU backend and executes."""
@@ -1832,14 +1732,16 @@ class GenericKernel:
         self._fn = fn
         functools.update_wrapper(self, fn)
         self._variants: Dict[tuple, Kernel] = {}
+        self._lock = threading.RLock()
 
     def specialize(self, *arg_types: TensorType) -> Kernel:
         """Returns the kernel instance for explicit argument types
         (`sar.c64[512, 512]`, ...); useful for emission backends."""
         key = tuple(arg_types)
-        if key not in self._variants:
-            self._variants[key] = Kernel(self._fn, arg_types=key)
-        return self._variants[key]
+        with self._lock:
+            if key not in self._variants:
+                self._variants[key] = Kernel(self._fn, arg_types=key)
+            return self._variants[key]
 
     def __call__(self, *arrays):
         return self.specialize(*[_type_of_array(a) for a in arrays])(*arrays)

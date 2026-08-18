@@ -1,4 +1,4 @@
-// RUN: sar-translate -hls-emit-hlscpp -emit-vitis-directives %s | FileCheck %s
+// RUN: sar-translate --hls-emit-hlscpp -emit-vitis-directives %s | FileCheck %s
 
 // The emitted file has to read like something a human would hand to Vitis:
 // a header saying where it came from, the top function up front, and every

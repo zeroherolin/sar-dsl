@@ -22,7 +22,19 @@ from conftest import requires_cpu
 
 pytestmark = requires_cpu
 
-_ITERS = int(os.environ.get("SAR_FUZZ_ITERS", "25"))
+
+def _fuzz_iterations() -> int:
+    raw = os.environ.get("SAR_FUZZ_ITERS", "25")
+    try:
+        iterations = int(raw)
+    except ValueError as err:
+        raise ValueError("SAR_FUZZ_ITERS must be a positive integer") from err
+    if iterations < 1:
+        raise ValueError("SAR_FUZZ_ITERS must be a positive integer")
+    return iterations
+
+
+_ITERS = _fuzz_iterations()
 
 
 class _Program:
@@ -35,7 +47,6 @@ class _Program:
         # Working precision per program keeps casts deliberate.
         self.float_dtype = rng.choice([F32, F64])
         self.complex_dtype = C64 if self.float_dtype == F32 else C128
-        self.steps = []  # (op, args) mirrored in trace and numpy
         self.num_inputs = rng.randint(1, 3)
         self.input_kinds = [
             rng.choice(["float", "complex", "int"])

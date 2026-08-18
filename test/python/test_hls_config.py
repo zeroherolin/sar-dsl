@@ -54,20 +54,17 @@ def test_pinning_a_derived_option_still_wins():
     assert config.provenance["fft_stage_group"] == HLSConfig.FROM_OPTIONS
 
 
-def test_defaults_describe_a_vu13p_half():
-    """Half of the device (2688 x 36 Kb block RAM, 1280 x 288 Kb UltraRAM,
-    12288 DSP slices), which is the headroom a pre-synthesis estimate
-    needs."""
+def test_defaults_budget_eighty_percent_of_vu13p():
     config = HLSConfig.resolve()
-    assert config.bram_bytes == 2688 * 36 * 1024 // 8 // 2
-    assert config.uram_bytes == 1280 * 288 * 1024 // 8 // 2
-    # Distributed RAM is rationed harder than the dedicated tiers: it comes
-    # out of the SLICEM LUTs the datapath itself is built from, so a quarter
-    # of the device's 27.5 Mb rather than a half.
-    assert config.lutram_bytes == int(27.5 * 1024 * 1024 / 8 / 4)
-    # A null total is the sum of the tiers.
-    assert config.on_chip_budget == (config.bram_bytes + config.uram_bytes +
-                                     config.lutram_bytes)
+    assert config.bram_bytes == int(2688 * 0.8) * 36 * 1024 // 8
+    assert config.uram_bytes == int(1280 * 0.8) * 288 * 1024 // 8
+    assert config.lutram_bytes == int(27.5 * 1024 * 1024 / 8 * 0.8)
+    assert config.dsp == int(12288 * 0.8)
+    assert config.part == "xcvu13p-fhgb2104-2-i"
+    assert config.clock_ns == 4.0
+    # The aggregate the streaming decisions reason against is the tier sum.
+    assert config.on_chip_bytes() == (config.bram_bytes + config.uram_bytes +
+                                      config.lutram_bytes)
 
 
 def test_resolved_config_reads_as_a_mapping():
@@ -85,7 +82,7 @@ def test_resolved_config_reads_as_a_mapping():
 
 def test_option_overrides_the_file():
     assert HLSConfig.resolve({"loop_tile_size": 32}).loop_tile_size == 32
-    assert HLSConfig.resolve({"on_chip_budget": 0}).on_chip_budget == 0
+    assert HLSConfig.resolve({"bram_bytes": 0}).bram_bytes == 0
 
 
 def test_config_file_overrides_the_shipped_defaults(tmp_path):
@@ -98,7 +95,7 @@ def test_config_file_overrides_the_shipped_defaults(tmp_path):
     assert config.bram_bytes == 1024
     assert config.axi_bus_bits == 128
     # Keys the file leaves out keep the shipped default.
-    assert config.uram_bytes == 23592960
+    assert config.uram_bytes == 37748736
     assert str(path) in config.sources
 
 
@@ -127,22 +124,6 @@ def test_missing_config_file_names_where_it_came_from(tmp_path):
         HLSConfig.resolve({"config": str(tmp_path / "absent.yaml")})
 
 
-def test_axi_interface_flag_still_selects_the_interface():
-    """`axi_interface` predates `interface` and is what the examples and
-    benchmarks pass."""
-    assert HLSConfig.resolve({"axi_interface": True}).interface == "axi"
-    # False selects the memory protocol, stored under its canonical name.
-    assert HLSConfig.resolve({"axi_interface": False}).interface == "ap_memory"
-    with pytest.raises(HLSConfigError, match="conflicting interface"):
-        HLSConfig.resolve({"axi_interface": True, "interface": "bram"})
-    # `bram` is the deprecated spelling of `ap_memory`, so pairing it with
-    # axi_interface=False agrees rather than conflicts.
-    assert HLSConfig.resolve({
-        "axi_interface": False,
-        "interface": "bram"
-    }).interface == "ap_memory"
-
-
 # --------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------- #
@@ -150,10 +131,10 @@ def test_axi_interface_flag_still_selects_the_interface():
 
 def test_unknown_option_lists_the_valid_ones():
     with pytest.raises(HLSConfigError) as excinfo:
-        HLSConfig.resolve({"on_chip_bugdet": 1024})
+        HLSConfig.resolve({"bram_byts": 1024})
     message = str(excinfo.value)
-    assert "unknown HLS option 'on_chip_bugdet'" in message
-    assert "did you mean 'on_chip_budget'?" in message
+    assert "unknown HLS option 'bram_byts'" in message
+    assert "did you mean 'bram_bytes'?" in message
     # The whole schema, so the error is also the documentation.
     for name in OPTIONS:
         assert name in message
@@ -189,7 +170,7 @@ def test_unknown_key_in_a_config_file_names_the_file(tmp_path):
         "fft_stage_group": -1
     }, "must be at least 0"),
     ({
-        "on_chip_budget": 2**40
+        "uram_bytes": 2**40
     }, "must be at most"),
     ({
         "bram_bytes": -1
@@ -205,7 +186,7 @@ def test_out_of_range_values_are_rejected(options, expected):
 
 @pytest.mark.parametrize("options,expected", [
     ({
-        "on_chip_budget": "8 MiB"
+        "bram_bytes": "8 MiB"
     }, "expected an integer"),
     ({
         "loop_tile_size": True
@@ -231,35 +212,19 @@ def test_out_of_range_values_are_rejected(options, expected):
     ({
         "clock_ns": "fast"
     }, "expected a number"),
+    ({
+        "clock_ns": float("nan")
+    }, "must be finite"),
 ])
 def test_ill_typed_values_are_rejected(options, expected):
     with pytest.raises(HLSConfigError, match=expected):
         HLSConfig.resolve(options)
 
 
-def test_bram_is_accepted_as_a_deprecated_alias():
-    """`bram` was the old name for the memory protocol. Existing configs
-    and benchmarks still say it, so it keeps working -- and normalizes to
-    the canonical name so nothing downstream sees two spellings."""
-    assert HLSConfig.resolve({"interface": "bram"}).interface == "ap_memory"
-    assert HLSConfig.resolve({
-        "interface": "ap_memory"
-    }).interface == "ap_memory"
-
-
-def test_bram_alias_works_from_a_config_file(tmp_path):
-    """The alias has to survive the YAML path too, not just compile
-    options: that is where a retargeting project states it."""
-    path = tmp_path / "legacy.yaml"
-    path.write_text("interface: bram\n")
-    assert HLSConfig.resolve({"config": str(path)}).interface == "ap_memory"
-
-
 def test_stream_interface_is_accepted():
     """AXI4-Stream is a top-level port protocol a streaming radar front
-    end asks for; it used to be rejected on the grounds that streams are
-    the compiler's call, which is true only of internal dataflow
-    channels."""
+    end asks for -- a user constraint, unlike the internal dataflow
+    channels that stay the compiler's call."""
     assert HLSConfig.resolve({"interface": "stream"}).interface == "stream"
 
 
@@ -329,8 +294,11 @@ def test_precision_policy_rejects_the_other_width():
     def wide(x: sar.c128[n, n]) -> sar.c128[n, n]:
         return x * 2.0
 
+    from sar.backends.hls.config import check_precision
+
+    config = HLSConfig.resolve({"precision": "f32"})
     with pytest.raises(HLSConfigError, match="whose data path is f64"):
-        wide.compile(backend="hls", options={"precision": "f32"})
+        check_precision(config, wide.arg_types, wide.declared_result_types)
 
 
 def test_precision_policy_accepts_a_matching_kernel():
@@ -340,6 +308,18 @@ def test_precision_policy_accepts_a_matching_kernel():
     config = HLSConfig.resolve({"precision": "f32"})
     check_precision(config, [TensorType((4, 4), C64)],
                     [TensorType((4, ), F32)])
+
+
+@requires_hls
+def test_precision_policy_rejects_internal_widening():
+
+    @sar.func
+    def internally_wide(x: sar.f32[4]) -> sar.f32[4]:
+        wide = sar.cast(x, sar.f64) * 1.25
+        return sar.cast(wide, sar.f32)
+
+    with pytest.raises(sar.CompilationError, match="violates precision=f32"):
+        internally_wide.compile(backend="hls", options={"precision": "f32"})
 
 
 # --------------------------------------------------------------------- #
@@ -361,9 +341,9 @@ def recorded_commands(monkeypatch):
     commands = []
     real = module.run_tool
 
-    def spy(stage, command, input_text=None):
+    def spy(stage, command, input_text=None, **kwargs):
         commands.append(" ".join(str(c) for c in command))
-        return real(stage, command, input_text=input_text)
+        return real(stage, command, input_text=input_text, **kwargs)
 
     monkeypatch.setattr(module, "run_tool", spy)
     return commands
@@ -397,20 +377,20 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
     assert "recompute-min-elements=9" in lower
     assert "interp-enable-banded-gather=false" in lower
     assert "fft-stage-group=2" in lower
-    # The tiers with no total sum to one, and an eighth of it is what a
-    # staged transpose block may occupy.
-    assert "transpose-block-bytes=768" in lower
+    # No corner turn in the kernel, so a quarter of the block RAM cap
+    # is offered to a staging block -- floored at one 4 KiB burst.
+    assert "transpose-block-bytes=4096" in lower
 
     assert "top-func=renamed_top" in hls
     assert "loop-tile-size=4" in hls
-    assert "on-chip-bytes=6144" in hls
+    assert "bram-bytes=2048" in hls
+    assert "uram-bytes=4096" in hls
+    assert "lutram-bytes=0" in hls
     assert "axi-interface=false" in hls
     assert "external-buffer-threshold=11" in hls
-    # Both tier thresholds are derived rather than frozen as pass
-    # defaults, and both have to arrive in bytes: `lutram-max-bytes` is
-    # one bus beat (512/8), `uram-min-bytes` is one physical URAM block.
+    # The LUT-bank threshold is derived rather than frozen as a pass
+    # default, and arrives in bytes: one bus beat (512/8).
     assert "lutram-max-bytes=64" in hls
-    assert "uram-min-bytes=36864" in hls
 
     assert "-axi-bus-bits=512" in emit
     # Buffering is both directions' worth of full-length bursts.
@@ -473,7 +453,8 @@ def test_configured_bus_width_reaches_the_pragmas(bus_bits):
     source = scale.compile(backend="hls",
                            options={
                                "interface": "axi",
-                               "on_chip_budget": 1,
+                               "bram_bytes": 65536,
+                               "uram_bytes": 0,
                                "axi_bus_bits": bus_bits
                            }).source()
     widen, burst, _ = _axi_shape(source)
@@ -499,7 +480,8 @@ def test_configured_buffering_bounds_the_outstanding_bursts():
         source = scale.compile(backend="hls",
                                options={
                                    "interface": "axi",
-                                   "on_chip_budget": 1,
+                                   "bram_bytes": 65536,
+                                   "uram_bytes": 0,
                                    **options
                                }).source()
         return max(_axi_shape(source)[2])
@@ -525,7 +507,8 @@ def test_env_var_config_reaches_the_emitted_design(tmp_path, monkeypatch):
         return scale.compile(backend="hls",
                              options={
                                  "interface": "axi",
-                                 "on_chip_budget": 1
+                                 "bram_bytes": 65536,
+                                 "uram_bytes": 0
                              }).source()
 
     assert _axi_shape(emit())[0] == {512}
@@ -555,9 +538,12 @@ def test_tier_budgets_steer_placement():
                                     options={
                                         **common, "uram_bytes": 23592960
                                     }).source()
+    # Starving URAM must demote its buffers, not refuse the design, so
+    # the block RAM cap is raised to hold what URAM no longer may.
     starved = corner_turn.compile(backend="hls",
                                   options={
-                                      **common, "uram_bytes": 1
+                                      **common, "uram_bytes": 0,
+                                      "bram_bytes": 1 << 26
                                   }).source()
 
     import re

@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- CreateMemrefSubview.cpp - create memref subview --------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -40,7 +40,7 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
   b.setInsertionPoint(band.front());
 
   band.back().walk([&](Operation *op) {
-    // We only consider affine read/write for now.
+    // Subviews are derived only from affine reads and writes.
     SmallVector<Value, 4> operands;
     AffineMap map;
     Value memref;
@@ -63,8 +63,7 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
     for (auto operand : operands) {
       auto loop = getForInductionVarOwner(operand);
 
-      // We only need to consider point loops here and We assume all point
-      // loops are normalized and have constant bounds.
+      // Point-loop dimensions must be normalized with constant bounds.
       if (loop && llvm::find(band, loop) != band.end()) {
         if (!loop.hasConstantLowerBound() || !loop.hasConstantUpperBound() ||
             loop.getConstantLowerBound() != 0 ||
@@ -86,7 +85,7 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
     SmallVector<int64_t> tileShape;
 
     // Traverse the memory access index of each dimension to construct the
-    // sizes, offsets, and strids of the memref subview. Also, construct the
+    // sizes, offsets, and strides of the memref subview. Also, construct the
     // new memory access indices.
     for (auto expr : map.getResults()) {
       if (!expr.isPureAffine())
@@ -95,7 +94,9 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
       // Get the flattened form of the expr, which is a sum of products in an
       // order of [dims, symbols, locals, constant].
       SimpleAffineExprFlattener flattener(numDims, numSymbols);
-      flattener.walkPostOrder(expr);
+      if (failed(flattener.walkPostOrder(expr)) ||
+          flattener.operandExprStack.empty())
+        return WalkResult::advance();
       auto flattenedExpr = flattener.operandExprStack.back();
 
       // The last coefficient is the constant offset.
@@ -153,7 +154,6 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
       auto divisor = std::max((int64_t)1, sizeExpr.getLargestKnownDivisor());
       bufStrides.push_back(b.getI64IntegerAttr(divisor));
 
-      // Now we need to determine the size of the resulting memref.
       sizeExpr = sizeExpr.floorDiv(divisor);
       accessExprs.push_back(sizeExpr);
       AffineValueMap sizeMap(AffineMap::get(numDims, numSymbols, sizeExpr),
@@ -167,11 +167,8 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
         return WalkResult::advance();
       bufSizes.push_back(b.getI64IntegerAttr(bounds.value().second + 1));
 
-      // Record the tile shape.
       tileShape.push_back(divisor * (bounds.value().second + 1));
 
-      // Now we can construct the affine apply for the offset of the current
-      // memory dimension.
       AffineValueMap offsetMap(AffineMap::get(numDims, numSymbols, offsetExpr),
                                operands);
       (void)offsetMap.canonicalize();
@@ -204,8 +201,9 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
         AffineMap::get(numDims, numSymbols, accessExprs, map.getContext());
     op->setAttr("map", AffineMapAttr::get(accessMap));
 
-    // If necessary, annotate the memref with tile layout attribute.
-    // TODO: For now, we only support tile layout without static offset.
+    // If necessary, annotate the memref with tile layout attribute. A tile
+    // view at a static offset covers only part of the buffer, so the layout
+    // would misdescribe the rest; leave those unannotated.
     if (tileLayout) {
       if (hasStaticOffset)
         return WalkResult::advance();
@@ -222,7 +220,6 @@ static void createSubviewBeforeLoopBand(AffineLoopBand band,
 void CreateMemrefSubview::runOnOperation() {
   auto func = getOperation();
 
-  // Collect all target loop bands.
   AffineLoopBands targetBands;
   getLoopBands(func.front(), targetBands, /*allowHavingChilds=*/true);
 

@@ -10,11 +10,11 @@ export PYTHONPATH=$PWD/python:$PYTHONPATH
 make test        # lit + pytest, everything must pass
 ```
 
-`make build` writes `python/sar/_build_config.py`, which points the Python
-package at `build/bin`. If the tools move, or you want to run against a
-different build tree, add its tool directory to `SAR_DSL_TOOL_PATH`, or
-pin a single tool with `SAR_DSL_TOOL_<NAME>` (e.g. `SAR_DSL_TOOL_SAR_OPT`);
-see [docs/backends.md](docs/backends.md) for the discovery order.
+`make build` writes `build/python/sar/_build_config.py`, which points the
+Python package at the active build. For a non-default build directory set
+`SAR_DSL_BUILD_DIR`; individual tools can be overridden with
+`SAR_DSL_TOOL_<NAME>`. See [docs/backends.md](docs/backends.md) for the
+discovery order.
 
 ## Editor setup
 
@@ -33,12 +33,12 @@ clang-format (LLVM style) for C++, yapf + ruff (pep8, 79 columns) for
 Python, plus whitespace/file hygiene hooks.
 
 ```bash
-pip install pre-commit
+python -m pip install pre-commit
 pre-commit install         # run on every commit
 pre-commit run --all-files # run manually
 ```
 
-CI runs the same hooks on every push.
+CI runs the same hooks on pull requests and the main branch.
 
 ## Repository conventions
 
@@ -48,11 +48,11 @@ CI runs the same hooks on every push.
   dialect transforms in `include/sar/Dialect/SAR/Transforms/Passes.td` --
   and registered in `sar-opt`.
 - **Python** is PEP 8 with 79-column lines (enforced by yapf + ruff);
-  keep the frontend dependency-free beyond numpy.
+  keep the frontend dependency-free beyond NumPy.
 - **Tests are mandatory.** Dialect/lowering changes need lit coverage under
   `test/Dialect` / `test/Conversion`; user-visible behavior needs pytest
   coverage under `test/python`. Numerical kernels are validated against
-  numpy references with explicit tolerances. Changes to the Stockham or
+  NumPy references with explicit tolerances. Changes to the Stockham or
   Bluestein lowering must also be checked numerically on CPU through
   `--sar-affine-to-llvm-pipeline` (see `test/python/test_hls_flow.py`),
   since that path is what the HLS backend emits from.
@@ -61,8 +61,8 @@ CI runs the same hooks on every push.
   is the gate.
 - **Folds must be bit-exact.** Rewrites that can change floating-point
   results (even by one ULP) do not belong in canonicalization.
-- **User-visible changes get a [CHANGELOG](CHANGELOG.md) entry** under
-  `Unreleased`.
+- **Keep the [CHANGELOG](CHANGELOG.md) accurate** when user-visible behavior
+  changes.
 
 ## Adding functionality
 
@@ -78,5 +78,3 @@ CI runs the same hooks on every push.
 The `hls` dialect and its passes (`include/sar/Dialect/HLS`,
 `lib/Dialect/HLS`, `lib/Target/HLS`) are ordinary in-tree code: change
 them like any other pass, and `test/Dialect/HLS/*.mlir` covers them.
-They derive from ScaleHLS-HIDA; the attribution lives in
-[NOTICE](NOTICE) and must stay intact.

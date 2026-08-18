@@ -6,12 +6,16 @@ figure helpers are exercised through `tmp_path`, so nothing lands in
 `benchmarks/assets/`.
 """
 
+import json
 import os
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
+import sar
+from sar.backends.hls import HLSConfig
 from conftest import REPO_ROOT, requires_cpu, requires_hls
 
 sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
@@ -22,14 +26,66 @@ import run_performance  # noqa: E402
 import run_precision  # noqa: E402
 import run_quality  # noqa: E402
 import run_resources  # noqa: E402
+import provenance  # noqa: E402
+import metrics  # noqa: E402
+from hls_reports import parse_csynth_xml, validate_constraints  # noqa: E402
 from algorithms import ALL, STRIPMAP, load  # noqa: E402
 
 N = 32
 
 
+def test_provenance_handles_missing_git(monkeypatch):
+
+    def unavailable(*args, **kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(provenance.subprocess, "run", unavailable)
+    data = provenance.environment()
+    assert data["git_commit"] is None
+    assert data["git_dirty"] is None
+
+
+def test_accuracy_rejects_result_count_mismatch():
+    with pytest.raises(ValueError, match="result count mismatch"):
+        run_accuracy._max_abs((object(), ), ())
+
+
+def test_quality_metrics_reject_degenerate_inputs():
+    with pytest.raises(ValueError, match="finite nonzero"):
+        metrics.measure_cut(np.zeros(8))
+    with pytest.raises(ValueError, match="non-empty 2-D"):
+        metrics.measure_image(np.zeros(8))
+    with pytest.raises(ValueError, match="at least tile"):
+        metrics.urban_contrast(np.ones((8, 8)), tile=16)
+
+
+def test_checked_in_hls_results_are_self_consistent():
+    paths = sorted((REPO_ROOT / "benchmarks" / "results").glob("*.json"))
+    assert paths
+    for path in paths:
+        data = json.loads(path.read_text())
+        assert data["schema_version"] == 1
+        constraints = data["constraints"]
+        if "report" in data:
+            report = data["report"]
+            assert report["timing_constraint_met"] == (
+                report["estimated_clock_ns"] <= constraints["clock_ns"])
+            assert report["bram18k"] <= constraints["bram18k_budget"]
+            assert report["uram"] <= constraints["uram_budget"]
+            assert report["dsp"] <= constraints["dsp_budget"]
+            assert len(report["report_sha256"]) == 64
+        else:
+            assert len(data["designs"]) == len(ALL)
+            for design in data["designs"]:
+                assert design["estimated_clock_ns"] <= constraints["clock_ns"]
+                assert design["vitis_csim_passed"]
+                assert len(design["report_sha256"]) == 64
+
+
 def test_runner_modules_expose_main():
     """Every runner imports cleanly and exposes a `main` entry point."""
-    for module in (run_accuracy, run_quality, run_figures):
+    for module in (run_accuracy, run_quality, run_figures, run_performance,
+                   run_precision, run_resources):
         assert callable(module.main), module.__name__
 
 
@@ -37,6 +93,9 @@ def test_runner_modules_expose_main():
     ("run_accuracy.py", "--algs"),
     ("run_quality.py", "--algs"),
     ("run_figures.py", "--sva-n"),
+    ("run_performance.py", "--sizes"),
+    ("run_precision.py", "--algs"),
+    ("run_resources.py", "--budget-sweep"),
 ])
 def test_runner_cli_help(script, flag):
     """argparse smoke: `--help` must exit 0 and document the script's
@@ -71,8 +130,7 @@ def test_chain_exposes_its_kernel_arguments(name):
     """
     chain = load(name, N)
     assert chain.args is not None
-    kernel = chain.compile_kernel()
-    assert len(chain.args) == len(kernel.arg_types)
+    assert len(chain.args) == len(chain.kernel.arg_types)
 
 
 def test_throughput_figure_writes_to_tmp(tmp_path):
@@ -98,24 +156,73 @@ def test_throughput_figure_handles_skipped_points(tmp_path):
 def test_resource_measure_reports_ports():
     chain = load("wka", N)
     design = chain.compile_kernel(backend="hls",
-                                  axi_interface=True,
-                                  on_chip_budget=1 << 20)
+                                  interface="axi",
+                                  bram_bytes=1 << 22,
+                                  uram_bytes=1 << 22,
+                                  lutram_bytes=0)
     stats = run_resources.measure(design.source(), design.name)
     assert stats["lines"] > 0
-    assert stats["dram_mib"] >= 0.0
+    assert stats["external_footprint_mib"] >= 0.0
+
+
+def test_resource_measure_rejects_format_drift():
+    with pytest.raises(ValueError, match="cannot parse top function"):
+        run_resources.measure("void other() {}", "expected")
+    malformed = "void top(\n  int unsupported\n) {\n}\n"
+    with pytest.raises(ValueError, match="top-level declaration"):
+        run_resources.measure(malformed, "top")
+
+
+def test_vitis_report_parser_checks_constraints(tmp_path):
+    report = tmp_path / "probe_csynth.xml"
+    report.write_text("""\
+<profile>
+  <ReportVersion><Version>2022.2</Version></ReportVersion>
+  <UserAssignments>
+    <Part>xcvu13p-fhgb2104-2-i</Part>
+    <TopModelName>probe</TopModelName>
+    <TargetClockPeriod>4.00</TargetClockPeriod>
+  </UserAssignments>
+  <PerformanceEstimates>
+    <SummaryOfTimingAnalysis>
+      <EstimatedClockPeriod>3.10</EstimatedClockPeriod>
+    </SummaryOfTimingAnalysis>
+    <SummaryOfOverallLatency>
+      <Worst-caseLatency>100</Worst-caseLatency>
+      <Interval-max>20</Interval-max>
+    </SummaryOfOverallLatency>
+  </PerformanceEstimates>
+  <AreaEstimates>
+    <Resources>
+      <BRAM_18K>10</BRAM_18K><DSP>20</DSP><FF>30</FF>
+      <LUT>40</LUT><URAM>1</URAM>
+    </Resources>
+    <AvailableResources>
+      <BRAM_18K>5376</BRAM_18K><DSP>12288</DSP><FF>3456000</FF>
+      <LUT>1728000</LUT><URAM>1280</URAM>
+    </AvailableResources>
+  </AreaEstimates>
+</profile>
+""")
+    parsed = parse_csynth_xml(report)
+    assert parsed["estimated_clock_ns"] == 3.1
+    assert not validate_constraints(parsed, HLSConfig.resolve())
 
 
 @requires_hls
 def test_budget_sweep_and_figure(tmp_path):
     results = run_resources.sweep(["wka"], N, steps=2)
-    assert len(results) == 3
-    # The ladder must start at all-DRAM and end at the full working set.
-    assert results[0]["budget"] == 0
-    assert results[-1]["budget"] == results[-1]["full"]
+    assert len(results) >= 2
+    assert len({row["budget"] for row in results}) == len(results)
+    # The ladder starts no lower than the primitive floor and ends at the
+    # full working set. Infeasible and duplicate points are omitted.
+    assert results[0]["budget"] == 8 * 36864
+    assert results[-1]["budget"] >= results[-1]["full"]
     run_resources.budget_figure(results, N, out_dir=tmp_path)
     assert (tmp_path / "budget_sweep.png").exists()
 
 
+@requires_hls
 @pytest.mark.parametrize("name", ALL)
 def test_f32_build_parses_as_valid_ir(name):
     """Every chain built with `dtype=sar.c64` must produce IR the C++
@@ -147,7 +254,6 @@ def test_dtype_must_be_a_complex_spec():
     """`build_kernel` rejects anything but sar.c128/sar.c64 up front."""
     import importlib
 
-    import sar
     from common.params import synthetic_params
 
     algorithm = importlib.import_module("wka.algorithm")
@@ -162,7 +268,7 @@ def test_narrowed_ir_carries_single_precision_planes(name):
     Counts 2-D complex plane types in the narrowed IR; at least one must
     have come out as c64, otherwise the build parsed but bought nothing.
     """
-    counts = run_precision.residual_double_planes(
+    counts = run_precision.complex_type_references(
         run_precision.narrow_ir(name))
     assert counts["complex<f32>"] > 0
 
@@ -174,5 +280,5 @@ def test_pfa_keeps_its_interpolation_axes_double():
     still f64."""
     kernel, mode = run_precision._build("pfa", 64, single=True)
     assert mode == "c64 only"
-    counts = run_precision.residual_double_planes(kernel.to_mlir())
+    counts = run_precision.complex_type_references(kernel.to_mlir())
     assert counts["f64"] > 0  # the interpolation position planes

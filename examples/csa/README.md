@@ -9,6 +9,7 @@ exercises the pure phase-multiply path of the compiler on both backends.
 |------|---------|
 | `algorithm.py` | The CSA chain in the DSL (`build_kernel`, `make_inputs`) |
 | `reference.py` | NumPy reference implementation (`CSAProcessor`) |
+| `assets/` | Reference imagery |
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
 | `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 | `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset |
@@ -67,14 +68,14 @@ python examples/csa/run_alos_cpu.py
 python examples/csa/run_alos_hls.py
 ```
 
-The full 16384x16384 scene focuses in 3.0 s on a 240-core machine,
-reaching an urban-area contrast of 0.809.
+The runner reports wall time and urban-area contrast. Real-data output is
+not tracked because the source product is not redistributed.
 
 `run_alos_hls.py` writes `hls_project/csa_alos/`: `csa_alos_axi.cpp` is
 the 16384x16384 design with AXI ports for synthesis, and
 `csa_alos.cpp` plus its testbench, golden data, csim/csynth scripts
-and stubs form a C-simulation package at `--csim-n` (default 1024) with the same
-radar parameters -- why two designs are needed is covered in
+and stubs form a C-simulation package at `--csim-n` (default 1024) with
+the same radar parameters. The artifact split is described in
 [examples/README.md](../README.md#real-data-alos-1). At 1024x1024 the
 package csim-matches the reference to 3.7e-09 over 1048576 samples.
 

@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- Utils.cpp - HLS dialect utilities ----------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -603,8 +603,7 @@ std::pair<bool, bool> sar::ifAlwaysTrueOrFalse(mlir::affine::AffineIfOp ifOp) {
   ifOp.setIntegerSet(set);
   ifOp->setOperands(operands);
 
-  // Construct the constraints of the if statement. For now, we only add the
-  // loop induction constraints and integer set constraint.
+  // Combine loop induction domains with the affine-if integer set.
   FlatAffineValueConstraints constrs;
   constrs.addAffineIfOpDomain(ifOp);
   for (auto operand : operands)
@@ -658,7 +657,8 @@ bool sar::checkSameIfStatement(AffineIfOp lhsOp, AffineIfOp rhsOp) {
   auto lhsSet = lhsOp.getIntegerSet();
   auto rhsSet = rhsOp.getIntegerSet();
 
-  // TODO: support if statement with return values.
+  // Two ifs are "the same" only when both are statements (no results):
+  // yielded values would make the merged op's results ambiguous.
   if (lhsOp.getNumResults() != 0 || rhsOp.getNumResults() != 0 ||
       lhsOp.getOperands() != rhsOp.getOperands() ||
       lhsSet.getConstraints() != rhsSet.getConstraints() ||
@@ -768,9 +768,29 @@ sar::getBoundOfAffineMap(AffineMap map, ValueRange operands) {
     return std::pair<int64_t, int64_t>(constBound, constBound);
   }
 
-  // For now, we can only handle one result value map.
+  // Bounds are defined only for single-result maps.
   if (map.getNumResults() != 1)
     return std::optional<std::pair<int64_t, int64_t>>();
+  if (operands.size() != map.getNumInputs())
+    return std::nullopt;
+
+  bool hasNonLinearExpr = false;
+  map.getResult(0).walk([&](AffineExpr expr) {
+    auto binary = dyn_cast<AffineBinaryOpExpr>(expr);
+    if (!binary)
+      return;
+    switch (binary.getKind()) {
+    case AffineExprKind::Mod:
+    case AffineExprKind::FloorDiv:
+    case AffineExprKind::CeilDiv:
+      hasNonLinearExpr = true;
+      break;
+    default:
+      break;
+    }
+  });
+  if (hasNonLinearExpr)
+    return std::nullopt;
 
   auto context = map.getContext();
   SmallVector<int64_t, 4> lbs;
@@ -795,10 +815,15 @@ sar::getBoundOfAffineMap(AffineMap map, ValueRange operands) {
     ubs.push_back(ub - 1 - (ub - 1 - lb) % step);
   }
 
-  // TODO: maybe a more efficient algorithm.
+  // Exhaustive corner enumeration: 2^n map evaluations for n operands.
+  // Operands are the enclosing loop ivs the bound map reads, so n is the
+  // nesting depth in practice and the box stays small.
   auto operandNum = operands.size();
+  if (operandNum > 16)
+    return std::nullopt;
+  uint64_t cornerCount = uint64_t{1} << operandNum;
   SmallVector<int64_t, 16> results;
-  for (unsigned i = 0, e = pow(2, operandNum); i < e; ++i) {
+  for (uint64_t i = 0; i < cornerCount; ++i) {
     SmallVector<AffineExpr, 4> replacements;
     for (unsigned pos = 0; pos < operandNum; ++pos) {
       // Bit `pos` of `i` selects the lower or upper bound for this operand,
@@ -808,7 +833,11 @@ sar::getBoundOfAffineMap(AffineMap map, ValueRange operands) {
       else
         replacements.push_back(getAffineConstantExpr(ubs[pos], context));
     }
-    auto newExpr = map.getResult(0).replaceDimsAndSymbols(replacements, {});
+    ArrayRef<AffineExpr> allReplacements(replacements);
+    auto dimReplacements = allReplacements.take_front(map.getNumDims());
+    auto symbolReplacements = allReplacements.drop_front(map.getNumDims());
+    auto newExpr = map.getResult(0).replaceDimsAndSymbols(dimReplacements,
+                                                          symbolReplacements);
 
     if (auto constExpr = dyn_cast<AffineConstantExpr>(newExpr))
       results.push_back(constExpr.getValue());
@@ -986,9 +1015,10 @@ std::optional<unsigned> sar::getAverageTripCount(AffineForOp forOp) {
   if (auto optionalTripCount = getConstantTripCount(forOp))
     return optionalTripCount.value();
   else {
-    // TODO: A temporary approach to estimate the trip count. For now, we take
-    // the average of the upper bound and lower bound of trip count as the
-    // estimated trip count.
+    // Without a constant trip count, estimate from the bound maps: the
+    // midpoint of the smallest and largest possible trip counts. Only
+    // consumers that rank candidates (loop order, parallelization) read
+    // this, so a bounded estimate beats refusing to answer.
     auto lowerBound = getBoundOfAffineMap(forOp.getLowerBoundMap(),
                                           forOp.getLowerBoundOperands());
     auto upperBound = getBoundOfAffineMap(forOp.getUpperBoundMap(),

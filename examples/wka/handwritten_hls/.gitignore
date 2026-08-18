@@ -1,0 +1,11 @@
+work/
+generated/wka_luts.h
+*.log
+__pycache__/
+*.pyc
+reports/*.bin
+reports/*.bmp
+reports/hls_summary.csv
+reports/hls_summary.json
+data/*.bin
+data/ALPSRP*/

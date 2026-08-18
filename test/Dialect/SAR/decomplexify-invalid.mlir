@@ -1,4 +1,4 @@
-// RUN: sar-opt %s --sar-decomplexify -verify-diagnostics
+// RUN: sar-opt %s --sar-decomplexify --verify-diagnostics
 
 // The rewrite walks one straight-line body; branch successors would need
 // their block arguments remapped, so anything but a single block is

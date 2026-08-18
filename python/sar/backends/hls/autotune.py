@@ -12,28 +12,31 @@ left at null.
 
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from .config import OPTIONS
+from ...compiler.toolchain import find_tool, run_tool
+
 __all__ = [
-    "AUTO_OPTIONS", "KernelFacts", "derive", "lutram_max_bytes",
-    "measure_kernel"
+    "AUTO_OPTIONS", "KernelFacts", "buffer_extents", "derive",
+    "external_buffer_threshold", "fft_stage_group", "interp_banded_gather",
+    "kernel_facts_from_json", "loop_tile_size", "lutram_max_bytes",
+    "measure_kernel", "storage_min_elements", "streaming_threshold",
+    "transpose_block_bytes"
 ]
 
-#: The options this module decides. Everything else in the schema is a
-#: constraint the user has to state.
-AUTO_OPTIONS = ("fft_stage_group", "loop_tile_size", "interp_banded_gather",
-                "reuse_buffer_min_elements", "recompute_min_elements",
-                "external_buffer_threshold", "lutram_max_bytes")
+#: The options this module decides -- exactly the schema's `advanced`
+#: keys, so a new derived key cannot be forgotten here. Everything else
+#: is a constraint the user has to state.
+AUTO_OPTIONS = tuple(key for key, spec in OPTIONS.items() if spec.advanced)
 
-#: Share of the on-chip budget one working buffer may claim. `-hls-pipeline`
-#: already rations a staged transpose block this way (`getStagingBudget`),
-#: and transform scratch and private dataflow channels are the same kind of
-#: per-region working set: several are in flight while the planes they serve
-#: still need the rest of the budget.
+#: Share of the on-chip budget one working buffer may claim: several are
+#: in flight while the planes they serve still need the rest. The same
+#: eighth rations the loop-tiling staging blocks inside `-hls-pipeline`.
 _WORKING_SHARE = 8
 
 #: Threshold that leaves every buffer resident (no buffer has this many
@@ -46,20 +49,10 @@ KEEP_ON_CHIP = 2**32 - 1
 #: resident would be the worst of both.
 _PLANE_TOLERANCE = 4
 
-#: Byte width of the element types the affine flow emits. A complex tensor
-#: is decomplexified into planes of its component float, so the data path
-#: only ever sees these two.
-_ELEMENT_BYTES = {"f32": 4, "f64": 8}
-
 #: Tiling is off at 1, so a tile is at least a pair; past 64 elements a
 #: side the per-band local buffer has stopped being a bank and become a
 #: plane, which is what `external_buffer_threshold` is for.
 _MIN_TILE, _MAX_TILE = 2, 64
-
-#: Element width assumed when a kernel names no float plane at all: the
-#: widest, which keeps the derived tile the shortest one that still fills
-#: a beat.
-_WIDEST_ELEMENT = 8
 
 # ---------------------------------------------------------------------- #
 # What the compiler can measure about a kernel
@@ -83,59 +76,35 @@ class KernelFacts:
     element_bytes: int
     #: (transform length, element bytes) per FFT the kernel performs.
     transforms: Tuple[Tuple[int, int], ...]
+    #: Corner turns (`sar.transpose`) the kernel performs. Each staged
+    #: transpose holds a block resident, so the staging budget is split
+    #: between them.
+    transposes: int = 0
+    #: (elements, bytes) for every explicit allocation in lowered IR.
+    buffers: Tuple[Tuple[int, int], ...] = ()
 
 
-_TENSOR_RE = re.compile(r"tensor<([0-9x]*?)((?:complex<)?[a-z]\w*>?)>")
-_FFT_RE = re.compile(r"sar\.(?:i?fft|fft_split)\b")
-_DIM_RE = re.compile(r"dim = (\d+)")
-
-
-def _element_bytes(element: str) -> Optional[int]:
-    """Bytes one plane element takes, or None for a type the data path
-    never carries."""
-    for name, width in _ELEMENT_BYTES.items():
-        if name in element:
-            return width
-    return None
-
-
-def _tensors(text: str):
-    """(shape, element bytes or None) of every static tensor named."""
-    for match in _TENSOR_RE.finditer(text):
-        dims = [int(d) for d in match.group(1).split("x") if d]
-        yield dims, _element_bytes(match.group(2))
-
-
-def _transforms(module_text: str):
-    """(length, element bytes) of every FFT the module performs.
-
-    The length is the extent the transform runs along, so a corner-turned
-    chain and a straight one are told apart by the axis they name rather
-    than by how the planes happen to be laid out.
-    """
-    for line in module_text.splitlines():
-        if not _FFT_RE.search(line):
-            continue
-        dim = _DIM_RE.search(line)
-        shapes = [(d, w) for d, w in _tensors(line) if w is not None and d]
-        if dim is None or not shapes:
-            continue
-        dims, width = max(shapes, key=lambda s: len(s[0]))
-        axis = int(dim.group(1))
-        if 0 <= axis < len(dims):
-            yield dims[axis], width
-
-
-def measure_kernel(module_text: str, metadata) -> KernelFacts:
-    """Reads the strategy inputs out of a traced kernel."""
-    planes = [(list(t.shape), t.dtype.to_numpy().itemsize)
-              for t in list(metadata.arg_types) + list(metadata.result_types)]
-    tensors = list(_tensors(module_text)) + planes
-    widths = [width for _, width in tensors if width]
+def kernel_facts_from_json(text: str) -> KernelFacts:
+    """Builds immutable strategy facts from `sar-translate` JSON."""
+    values = json.loads(text)
     return KernelFacts(
-        plane_elements=max([int(np.prod(dims)) for dims, _ in tensors] + [0]),
-        element_bytes=min(widths) if widths else _WIDEST_ELEMENT,
-        transforms=tuple(_transforms(module_text)))
+        plane_elements=int(values["plane_elements"]),
+        element_bytes=int(values["element_bytes"]),
+        transforms=tuple((int(length), int(width))
+                         for length, width in values["transforms"]),
+        transposes=int(values["transposes"]),
+        buffers=tuple((int(elements), int(size))
+                      for elements, size in values["buffers"]),
+    )
+
+
+def measure_kernel(module_text: str, metadata=None) -> KernelFacts:
+    """Parses MLIR with the compiler and returns structured strategy facts."""
+    output = run_tool(
+        "sar-kernel-facts",
+        [find_tool("sar-translate"), "--sar-emit-kernel-facts", "-"],
+        input_text=module_text)
+    return kernel_facts_from_json(output)
 
 
 # ---------------------------------------------------------------------- #
@@ -144,26 +113,20 @@ def measure_kernel(module_text: str, metadata) -> KernelFacts:
 
 
 def buffer_extents(lowered: str):
-    """(elements, bytes) of every buffer the lowered kernel allocates."""
-    for match in re.finditer(r"memref\.alloc\(\)[^:]*: memref<([^>]+)>",
-                             lowered):
-        parts = match.group(1).split("x")
-        width = _ELEMENT_BYTES.get(parts[-1])
-        if width is None:
-            continue
-        elements = int(np.prod([int(d) for d in parts[:-1]]))
-        yield elements, elements * width
+    """(elements, bytes) of every explicit allocation in lowered IR."""
+    return iter(measure_kernel(lowered).buffers)
 
 
-def _plane_elements(metadata, lowered: str) -> int:
+def _plane_elements(metadata, lowered_facts: KernelFacts) -> int:
     """Element count above which a buffer counts as a full-scene plane."""
     planes = list(metadata.arg_types) + list(metadata.result_types)
     largest = max([int(np.prod(t.shape)) for t in planes] +
-                  [elements for elements, _ in buffer_extents(lowered)])
+                  [elements for elements, _ in lowered_facts.buffers])
     return largest // _PLANE_TOLERANCE
 
 
-def _resident_bytes(metadata, lowered: str, min_elements: int) -> int:
+def _resident_bytes(metadata, lowered_facts: KernelFacts,
+                    min_elements: int) -> int:
     """On-chip memory the lowered kernel would need for its full-size planes.
 
     The kernel's own planes come from the signature; the intermediates are
@@ -176,7 +139,7 @@ def _resident_bytes(metadata, lowered: str, min_elements: int) -> int:
     planes = list(metadata.arg_types) + list(metadata.result_types)
     total = sum(
         int(np.prod(t.shape)) * t.dtype.to_numpy().itemsize for t in planes)
-    total += sum(size for elements, size in buffer_extents(lowered)
+    total += sum(size for elements, size in lowered_facts.buffers
                  if elements >= min_elements)
     return total
 
@@ -213,18 +176,28 @@ def _transform_stages(length: int) -> Tuple[int, int, bool]:
 
 
 def _fft_scratch_bytes(transforms, group: int) -> int:
-    """On-chip bytes the transforms' scratch lines hold live at `group`."""
+    """Primitive-aware bytes for transform scratch at `group`.
+
+    Stockham accesses induce cyclic banking. Each bank occupies at least one
+    BRAM/URAM primitive, so logical payload bytes alone understate large
+    partitioned designs by an order of magnitude.
+    """
     total = 0
     for length, width in transforms:
         stages, line, bluestein = _transform_stages(length)
         slots = _scratch_slots(stages, group)
+        payload = line * width
+        banks = min(32, line)
+        bank_bytes = -(-payload // banks)
+        primitive = 36864 if payload >= 36864 else 4608
+        physical_line = banks * (-(-bank_bytes // primitive)) * primitive
         if bluestein:
             # Chirp-z runs two transforms over shared stage/spectrum/
             # product/convolution lines, so eight lines stand whatever the
             # grouping and each transform draws its own slots.
-            total += (8 + 4 * slots) * line * width
+            total += (8 + 4 * slots) * physical_line
         else:
-            total += slots * 2 * line * width
+            total += slots * 2 * physical_line
     return total
 
 
@@ -247,10 +220,11 @@ def fft_stage_group(facts: KernelFacts, budget: int) -> int:
     area back with pipeline depth."""
     if not facts.transforms:
         return 0
-    if budget <= 0:  # an unbounded budget can afford the full unroll
-        return 0
-    share = max(1, budget // _WORKING_SHARE)
     groups = _fft_groups(facts.transforms)
+    if budget <= 0:
+        return min(groups,
+                   key=lambda g: _fft_scratch_bytes(facts.transforms, g))
+    share = max(1, budget // _WORKING_SHARE)
     for group in groups:
         if _fft_scratch_bytes(facts.transforms, group) <= share:
             return group
@@ -268,12 +242,8 @@ def loop_tile_size(facts: KernelFacts, axi_bus_bits: int) -> int:
 
 def lutram_max_bytes(axi_bus_bits: int) -> int:
     """Bank size below which distributed RAM is the right tier: one bus
-    beat.
-
-    A bank holding less than a beat cannot fill one transfer, so spending
-    a dedicated block RAM primitive on it wastes the primitive; such a
-    bank belongs in the SLICEM LUTs it can be built from directly.
-    """
+    beat, since a bank that cannot fill one transfer is not worth a
+    dedicated block RAM primitive."""
     return max(1, axi_bus_bits // 8)
 
 
@@ -290,23 +260,52 @@ def storage_min_elements(facts: KernelFacts, budget: int) -> int:
     kept as a private channel would cost its own bytes on chip; a tighter
     budget pulls the line down to one working buffer's share."""
     if budget <= 0:
-        return max(1, facts.plane_elements)
+        return 1
     share = max(1, budget // _WORKING_SHARE)
     return max(1, min(facts.plane_elements, share // facts.element_bytes))
 
 
+def transpose_block_bytes(facts: KernelFacts, bram_bytes: int) -> int:
+    """Bytes one transpose staging block may occupy.
+
+    The blocks live in block RAM, every corner turn holds one per plane
+    (a complex transpose stages re and im), and Vitis ping-pong doubles
+    each -- so the block RAM cap is split across all of them, with half
+    of the tier left for everything else. The 4 KiB floor keeps a block
+    at least one burst long on any budget.
+    """
+    if bram_bytes <= 0:
+        return 0
+    slots = max(1, 2 * facts.transposes)
+    return max(4096, bram_bytes // (4 * slots))
+
+
 def external_buffer_threshold(facts: KernelFacts, budget: int, metadata,
-                              lowered: str) -> int:
+                              lowered_facts: KernelFacts) -> int:
     """Element count above which a buffer is moved off chip: planes stay
     resident while the whole set fits the budget and stream once it does
     not, because full-scene planes dominate the working set and streaming
-    them is what lets scene size grow past the device."""
-    elements = _plane_elements(metadata, lowered)
-    if budget <= 0 or not elements:
+    them is what lets scene size grow past the device.
+
+    The resident set is charged at twice its single-instance size, since
+    Vitis ping-pong double-buffers every dataflow channel.
+    """
+    elements = _plane_elements(metadata, lowered_facts)
+    if not elements:
         return KEEP_ON_CHIP
-    if _resident_bytes(metadata, lowered, elements) <= budget:
+    if budget <= 0:
+        return elements
+    if 2 * _resident_bytes(metadata, lowered_facts, elements) <= budget:
         return KEEP_ON_CHIP
     return elements
+
+
+def streaming_threshold(facts: KernelFacts) -> int:
+    """The threshold that streams every full-size plane: what the resident
+    decision falls back to when the placed design still overruns the
+    budgets (the fork/balance copies are not visible to the resident
+    estimate, so the first answer can be too optimistic)."""
+    return max(1, facts.plane_elements // _PLANE_TOLERANCE)
 
 
 # ---------------------------------------------------------------------- #
@@ -317,16 +316,17 @@ def external_buffer_threshold(facts: KernelFacts, budget: int, metadata,
 def derive(config,
            facts: KernelFacts,
            metadata=None,
-           lowered: Optional[str] = None) -> Dict[str, object]:
+           lowered_facts: Optional[KernelFacts] = None) -> Dict[str, object]:
     """Every strategy value the constraints and the kernel imply.
 
     Called twice: once on the traced module, where everything but the
     placement threshold is decidable, and again once the kernel is lowered
     and its buffers can be counted. Keys the user pinned are still
-    returned -- `HLSConfig.derive` keeps the pinned value and reports this
-    one as the road not taken.
+    returned; `HLSConfig.adopt` keeps the pinned value.
     """
-    budget = int(config.on_chip_budget)
+    assert (metadata is None) == (lowered_facts is None), \
+        "the placement decision needs the metadata and the lowered IR together"
+    budget = config.on_chip_bytes()
     values = {
         "fft_stage_group": fft_stage_group(facts, budget),
         "loop_tile_size": loop_tile_size(facts, int(config.axi_bus_bits)),
@@ -335,7 +335,7 @@ def derive(config,
         "recompute_min_elements": storage_min_elements(facts, budget),
         "lutram_max_bytes": lutram_max_bytes(int(config.axi_bus_bits)),
     }
-    if lowered is not None:
+    if lowered_facts is not None:
         values["external_buffer_threshold"] = external_buffer_threshold(
-            facts, budget, metadata, lowered)
+            facts, budget, metadata, lowered_facts)
     return values

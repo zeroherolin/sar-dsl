@@ -2,43 +2,33 @@
 #
 # Target device: AMD (Xilinx) Virtex UltraScale+ VU13P (XCVU13P).
 # Device capacity per DS890 / XMP103: 94.5 Mb block RAM (2688 x 36 Kb),
-# 360 Mb UltraRAM (1280 x 288 Kb), 12288 DSP48E2 slices.
+# 360 Mb UltraRAM (1280 x 288 Kb), 27.5 Mb distributed RAM,
+# 12288 DSP48E2 slices.
 #
-# The on-chip budgets are half of what the device holds. Placement runs
-# before synthesis and charges a buffer in whole primitives, so what the
-# device is finally asked for is always more than what was counted here;
-# half leaves room for that error and for the logic's own memory.
+# Memory budgets are hard compiler caps. DSP is a synthesis-report budget:
+# Vitis binds floating-point operators after emission, so the compiler records
+# the target but cannot honestly enforce it before synthesis.
+#
+# The defaults reserve 20% of each resource for control, interconnect and
+# placement. Dedicated-memory budgets are rounded down to whole primitives.
 #
 # Every key below is also a `kernel.compile(backend="hls", options={...})`
 # key, and an option beats this file. Point $SAR_DSL_HLS_CONFIG (or
 # options={"config": "..."}) at a copy to retarget a whole project.
 
-# --- On-chip memory ---------------------------------------------------
+# --- On-chip resource caps --------------------------------------------
 
-# Block RAM the design may occupy, in bytes: half of 94.5 Mb.
-bram_bytes: 6193152
+# 2150 of 2688 BRAM36 primitives.
+bram_bytes: 9907200
 
-# UltraRAM the design may occupy, in bytes: half of 360 Mb.
-uram_bytes: 23592960
+# 1024 of 1280 UltraRAM primitives.
+uram_bytes: 37748736
 
-# Distributed RAM, in bytes: a quarter of the device's 27.5 Mb -- not
-# half like the other tiers, because this RAM is carved out of the same
-# SLICEM LUTs the datapath is built from; a quarter leaves the fabric its
-# own shift registers and small FIFOs.
-lutram_bytes: 901120
+# 80% of the device's 27.5 Mb distributed-RAM capacity.
+lutram_bytes: 2883584
 
-# On-chip bytes the working set may occupy before full-scene planes are
-# streamed from DRAM; null sums the tiers above (29.3 MiB). 0 pins
-# everything on chip whatever the scene size.
-on_chip_budget: null
-
-# --- Device thresholds ------------------------------------------------
-
-# Physical size of one UltraRAM block on the VU13P, in bytes (288 Kb).
-# Buffers at or above this size are placed in URAM because one primitive
-# already holds them without waste. The value is a device fact: the
-# number must agree with the UltraRAM geometry, not with the workload.
-uram_min_bytes: 36864
+# 80% synthesis-report budget (9830 of 12288 DSP48E2 slices).
+dsp: 9830
 
 # --- Interfaces -------------------------------------------------------
 
@@ -46,8 +36,7 @@ uram_min_bytes: 36864
 # kernel's own arrays, the signature the generated csim testbench can
 # drive; `axi` wraps each streamed buffer in an AXI master, which is the
 # design handed to Vitis; `stream` emits AXI-Stream (axis) pragmas on
-# the top-level stream ports. `bram` is a deprecated alias for
-# `ap_memory` and is still accepted.
+# the top-level stream ports.
 interface: ap_memory
 
 # Data width of the AXI masters, in bits. A beat narrower than the bus
@@ -66,14 +55,12 @@ axi_max_outstanding: 16
 # --- Vitis scripts ----------------------------------------------------
 
 # Device part the generated csim/csynth scripts name. It must be the
-# device the memory budgets above describe; retargeting a project means
+# device the resource caps above describe; retargeting a project means
 # changing both together.
-part: xcvu13p-fhgb2104-2-e
+part: xcvu13p-fhgb2104-2-i
 
-# Target clock period of the generated scripts, in ns. 10 ns (100 MHz)
-# is a conservative starting point; tighten it once the design meets
-# timing there.
-clock_ns: 10.0
+# Target clock period of the generated scripts, in ns (250 MHz).
+clock_ns: 4.0
 
 # --- Precision --------------------------------------------------------
 
@@ -88,7 +75,7 @@ top_func: null
 # --- Not configured here ----------------------------------------------
 #
 # Optimization strategy (FFT stage grouping, loop tiling, banded gathers,
-# the buffer-sharing and off-chip thresholds) is derived by the compiler;
-# `design.config.provenance` marks those keys `derived`, and the policy
-# lives in `autotune.py`. Pinning one as a compile option is a diagnostic
-# act -- see docs/backends.md.
+# the buffer-sharing and off-chip thresholds) is derived by the compiler
+# from the caps above; `design.config.provenance` marks those keys
+# `derived`, and the policy lives in `autotune.py`. Pinning one as a
+# compile option is a diagnostic act -- see docs/backends.md.

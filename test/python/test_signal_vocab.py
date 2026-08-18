@@ -135,7 +135,7 @@ def test_vocabulary_decomposes_to_primitives():
 
 
 def test_std_var_match_numpy():
-    """std / var (numpy convention: normalized by N)."""
+    """std / var use numpy's population convention."""
     rng = np.random.default_rng(31)
     a = rng.uniform(0.5, 4.0, (N, M))
 
@@ -148,6 +148,30 @@ def test_std_var_match_numpy():
     np.testing.assert_allclose(s_all, [np.std(a)], rtol=1e-10)
     np.testing.assert_allclose(v_r, np.var(a, axis=1), rtol=1e-10)
     np.testing.assert_allclose(s_a, np.std(a, axis=0), rtol=1e-10)
+
+
+def test_std_var_are_stable_and_support_complex():
+    rng = np.random.default_rng(310)
+    real = 1.0e12 + rng.standard_normal((N, M))
+    complex_data = (real + 1j * (2.0e12 + rng.standard_normal(
+        (N, M)))).astype(np.complex128)
+
+    @sar.func
+    def real_stats(x):
+        return sar.var(x), sar.std(x, axis=1)
+
+    @sar.func
+    def complex_stats(x):
+        return sar.var(x), sar.std(x, axis=0)
+
+    real_var, real_std = real_stats(real)
+    complex_var, complex_std = complex_stats(complex_data)
+    np.testing.assert_allclose(real_var, [np.var(real)], rtol=1e-7)
+    np.testing.assert_allclose(real_std, np.std(real, axis=1), rtol=1e-7)
+    np.testing.assert_allclose(complex_var, [np.var(complex_data)], rtol=1e-7)
+    np.testing.assert_allclose(complex_std,
+                               np.std(complex_data, axis=0),
+                               rtol=1e-7)
 
 
 def test_db_conversions_roundtrip():
@@ -168,11 +192,7 @@ def test_db_conversions_roundtrip():
 
 def test_vocabulary_is_uniformly_callable_on_arrays():
     """Every name in the vocabulary works outside a kernel, on numpy
-    arrays, exactly like the scipy/Matlab function it mirrors.
-
-    The split used to be arbitrary -- `sar.sinc(arr)` worked while
-    `sar.mean(arr)` raised -- because only some entries carried @sar.op.
-    """
+    arrays, exactly like the scipy/Matlab function it mirrors."""
     rng = np.random.default_rng(5)
     vec = rng.standard_normal(8)
     mat = rng.standard_normal((2, 4))
@@ -242,7 +262,7 @@ def test_operator_keywords_specialize_independently():
 
 
 def test_whole_vocabulary_carries_the_op_decorator():
-    """Every public name in the vocabulary is spelled `@sar.op`.
+    """Every public name in the vocabulary is spelled `@op` (`sar.op`).
 
     The uniformity is the point: users should not have to learn which
     entries are "real" operators and which are helpers. Constructors
@@ -261,6 +281,6 @@ def test_whole_vocabulary_carries_the_op_decorator():
         if not match or match.group(1).startswith("_"):
             continue
         window = source[max(0, i - 3):i]
-        if not any(w.lstrip().startswith("@sar.op") for w in window):
+        if not any(w.lstrip().startswith("@op") for w in window):
             undecorated.append(match.group(1))
-    assert not undecorated, f"missing @sar.op: {undecorated}"
+    assert not undecorated, f"missing @op: {undecorated}"

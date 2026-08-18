@@ -8,16 +8,16 @@ add_mlir_library(HLSTransforms
   BufferConversion.cpp
   CollapseMemrefUnitDims.cpp
   ConvertDataflowToFunc.cpp
-  CreateMemrefSubview.cpp
-  LoopUnrolling.cpp
   CreateAxiInterface.cpp
   CreateDataflowFromAffine.cpp
+  CreateMemrefSubview.cpp
   CreateTokenStream.cpp
   EliminateMultiConsumer.cpp
   EliminateMultiProducer.cpp
   FuncPreprocess.cpp
   LegalizeDataflow.cpp
   LoopPipelining.cpp
+  LoopUnrolling.cpp
   LowerCopyToAffine.cpp
   LowerDataflow.cpp
   ParallelizeDataflowNode.cpp

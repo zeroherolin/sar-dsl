@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "design": {
+    "top": "wka_sar_top",
+    "shape": [16384, 16384],
+    "dtype": "complex64",
+    "fft_parallel_rows": 16,
+    "corner_tile_size": 256
+  },
+  "constraints": {
+    "part": "xcvu13p-fhgb2104-2-i",
+    "clock_ns": 4.0,
+    "clock_uncertainty_ns": 0.5,
+    "axi_bus_bits": 512
+  },
+  "tool": {
+    "name": "Vitis HLS",
+    "version": "2022.2",
+    "flow_target": "vivado",
+    "csynth_elapsed_s": 201.24
+  },
+  "report": {
+    "estimated_clock_ns": 3.5,
+    "latency_min_cycles": 940925067,
+    "latency_average_cycles": 1487151207,
+    "latency_max_cycles": 2033373247,
+    "interval_min_cycles": 940925068,
+    "interval_max_cycles": 2033373248,
+    "bram18k": 384,
+    "uram": 296,
+    "dsp": 1135,
+    "ff": 210325,
+    "lut": 373962,
+    "timing_constraint_met": true
+  }
+}

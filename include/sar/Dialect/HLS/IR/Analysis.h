@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- Analysis.h - dataflow analyses ---------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -13,26 +13,26 @@
 namespace mlir {
 namespace sar {
 
-using namespace hls;
-
 /// Node and Schedule complexity analysis.
 class ComplexityAnalysis {
 public:
   ComplexityAnalysis(func::FuncOp func);
 
-  std::optional<unsigned long> getScheduleComplexity(ScheduleOp schedule) const;
-  std::optional<unsigned long> getNodeComplexity(NodeOp node) const;
+  std::optional<unsigned long>
+  getScheduleComplexity(hls::ScheduleOp schedule) const;
+  std::optional<unsigned long> getNodeComplexity(hls::NodeOp node) const;
 
 private:
   std::optional<unsigned long> calculateBlockComplexity(Block *block) const;
-  llvm::SmallDenseMap<NodeOp, unsigned long> nodeComplexityMap;
+  llvm::SmallDenseMap<hls::NodeOp, unsigned long> nodeComplexityMap;
 };
 
-/// TODO: Support dataflow node with multiple loops.
-/// Record a pair of correlated node.
+/// Record a pair of correlated nodes. The analysis reads one loop band per
+/// node -- the node structure the dataflow passes build; a node with several
+/// bands contributes only its first (see CorrelationAnalysis).
 class Correlation {
 public:
-  Correlation(NodeOp sourceNode, NodeOp targetNode,
+  Correlation(hls::NodeOp sourceNode, hls::NodeOp targetNode,
               hls::BufferLikeInterface sharedBuffer, Value sourceBuffer,
               Value targetBuffer, SmallVector<float> sourceScaleFactors,
               SmallVector<float> targetScaleFactors,
@@ -83,25 +83,25 @@ public:
   hls::BufferLikeInterface getBuffer() const { return sharedBuffer; }
 
   /// Check whether a node is source node.
-  bool isSourceNode(NodeOp currentNode) const {
+  bool isSourceNode(hls::NodeOp currentNode) const {
     assert((currentNode == sourceNode || currentNode == targetNode) &&
            "invalid input node");
     return currentNode == sourceNode;
   }
 
   // Get the correlated node of the current node.
-  NodeOp getCorrelatedNode(NodeOp currentNode) const {
+  hls::NodeOp getCorrelatedNode(hls::NodeOp currentNode) const {
     return isSourceNode(currentNode) ? targetNode : sourceNode;
   }
 
-  SmallVector<int64_t> getCorrelateMap(NodeOp currentNode) const {
+  SmallVector<int64_t> getCorrelateMap(hls::NodeOp currentNode) const {
     if (isSourceNode(currentNode))
       return sourceToTargetMap;
     else
       return targetToSourceMap;
   }
 
-  SmallVector<float> getScaleFactors(NodeOp currentNode) const {
+  SmallVector<float> getScaleFactors(hls::NodeOp currentNode) const {
     if (isSourceNode(currentNode))
       return sourceScaleFactors;
     else
@@ -111,7 +111,7 @@ public:
   // Permute factors of the current node to the correlated node. If any of the
   // scaled factors is less than 1 and rounded to 1, return true.
   std::pair<FactorList, bool>
-  permuteAndScaleFactors(NodeOp currentNode, const FactorList &factors) {
+  permuteAndScaleFactors(hls::NodeOp currentNode, const FactorList &factors) {
     assert(factors.size() == getNodeLoopBand(currentNode).size() &&
            "invalid permutation factors");
     auto correlateMap = getCorrelateMap(currentNode);
@@ -156,8 +156,8 @@ private:
     return permutedFactors;
   }
 
-  NodeOp sourceNode;
-  NodeOp targetNode;
+  hls::NodeOp sourceNode;
+  hls::NodeOp targetNode;
   hls::BufferLikeInterface sharedBuffer;
   Value sourceBuffer;
   Value targetBuffer;
@@ -174,7 +174,7 @@ class CorrelationAnalysis {
 public:
   CorrelationAnalysis(func::FuncOp func);
 
-  CorrelationList getCorrelations(NodeOp node) const {
+  CorrelationList getCorrelations(hls::NodeOp node) const {
     return nodeCorrelationMap.lookup(node);
   }
 
@@ -184,7 +184,7 @@ public:
 private:
   /// A MapVector: consumers build worklists by iterating this map, and the
   /// order has to be the walk order, not pointer order.
-  llvm::MapVector<NodeOp, CorrelationList> nodeCorrelationMap;
+  llvm::MapVector<hls::NodeOp, CorrelationList> nodeCorrelationMap;
 };
 
 } // namespace sar

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ..backends import KernelMetadata, get_backend
+from ..backends import KernelMetadata, backend_fingerprint, get_backend
 from .cache import KernelCache
 
 __all__ = ["compile"]
@@ -35,7 +35,8 @@ def compile(kernel, backend: str = "cpu", options: Optional[dict] = None):
     # may rewrite them into their fully resolved form (the HLS backend
     # folds in its config files), and it is the resolved set that
     # identifies the artifacts.
-    cache = KernelCache(module_text, backend, metadata.options)
+    cache = KernelCache(module_text, backend, metadata.options,
+                        backend_fingerprint(backend_cls))
     artifact = module_text
     for stage_fn in stages.values():
         artifact = stage_fn(artifact, metadata, cache)

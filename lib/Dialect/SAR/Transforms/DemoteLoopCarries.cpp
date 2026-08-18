@@ -50,12 +50,25 @@ static LogicalResult demote(scf::ForOp loop) {
       return loop.emitOpError(
           "swapped buffer carries are not supported; copy through a "
           "scratch buffer inside the loop instead");
+    // A function argument is a top-level port of the design, and the HLS
+    // dataflow checker forbids a node that both reads and writes a port
+    // ("cannot read as well as write over function parameter"). Iterate
+    // in a local buffer primed from the port instead; an internal alloc
+    // carries no such restriction and stays the zero-copy path.
+    Value buffer = init;
+    if (isa<BlockArgument>(init)) {
+      OpBuilder prologue(loop);
+      buffer = memref::AllocOp::create(prologue, loop.getLoc(),
+                                       cast<MemRefType>(init.getType()));
+      memref::CopyOp::create(prologue, loop.getLoc(), init, buffer);
+    }
     if (yielded != arg)
-      memref::CopyOp::create(builder, yield.getLoc(), yielded, init);
-    // The body iterates in the init buffer itself; making the yield a
-    // pass-through lets canonicalization erase the now-dead carry.
-    arg.replaceAllUsesWith(init);
-    result.replaceAllUsesWith(init);
+      memref::CopyOp::create(builder, yield.getLoc(), yielded, buffer);
+    // The body iterates in the (possibly localized) init buffer itself;
+    // making the yield a pass-through lets canonicalization erase the
+    // now-dead carry.
+    arg.replaceAllUsesWith(buffer);
+    result.replaceAllUsesWith(buffer);
     yield.setOperand(index, arg);
   }
   return success();

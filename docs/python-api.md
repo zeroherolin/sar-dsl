@@ -1,30 +1,34 @@
 # Python API reference
 
-The public surface of the `sar` package, one line per name. Semantics
-follow numpy unless a note says otherwise; every function's docstring
-carries the details, and the exact IR-level semantics live in
+This is a compact map of the public `sar` package. Semantics follow NumPy
+unless a note says otherwise; function docstrings carry the details, and
+the exact IR-level semantics live in
 [dialect.md](dialect.md). `dim=` and `axis=` are interchangeable
-everywhere; indexing is 0-based ([matlab-users.md](matlab-users.md)).
+everywhere; indexing is 0-based ([MATLAB guide](matlab-users.md)).
 
 ## Types
 
 `sar.f32`, `sar.f64`, `sar.i32`, `sar.i64`, `sar.c64`, `sar.c128` --
 element dtypes; indexing builds a tensor type annotation
-(`sar.c64[512, 512]`). `c64` is a pair of f32 (numpy `complex64`),
+(`sar.c64[512, 512]`). `c64` is a pair of f32 (NumPy `complex64`),
 `c128` a pair of f64.
+
+`sar.Tensor` is the traced tensor value used inside kernels.
+`sar.__version__` reports the installed package version.
 
 ## Defining kernels and operators
 
 | Name | Meaning |
 |------|---------|
 | `@sar.func` | traces a Python function into a compiled kernel; annotation-free kernels specialize per call signature |
-| `@sar.op` | defines an operator as a composition: inlines into kernels, runs eagerly on numpy arrays ([defining-ops.md](defining-ops.md)) |
+| `@sar.op` | defines an operator as a composition: inlines into kernels, runs eagerly on NumPy arrays ([defining-ops.md](defining-ops.md)) |
+| `sar.Kernel`, `sar.GenericKernel` | traced kernel handles for fixed and call-specialized signatures |
 | `Kernel.compile(backend=, options=)` | compiles for a backend; returns a callable (cpu) or a design handle (hls) |
 | `Kernel.specialize(*types)` | pins an annotation-free kernel to explicit types |
 | `Kernel.to_mlir()` | the traced MLIR module text |
-| `sar.constant(value, dtype=, shape=)` | materializes a numpy array or scalar as a tensor constant |
+| `sar.constant(value, dtype=, shape=)` | materializes a NumPy array or scalar as a tensor constant |
 
-Inside a kernel, tensors carry numpy-style sugar: operators (`+`, `*`,
+Inside a kernel, tensors carry NumPy-style sugar: operators (`+`, `*`,
 comparisons building masks), `abs(x)`, `x ** 2`, `x.T` /
 `x.transpose()`, `x.real`, `x.conj()` / `x.conjugate()`, reduction and
 scan methods (`x.sum(axis=)`, `x.mean()`, `x.std()`, `x.var()`,
@@ -34,9 +38,9 @@ slicing `x[2:6, ::2]`, and introspection (`x.shape`, `x.dtype`,
 
 ## Element-wise operations
 
-`sqrt`, `cos`, `sin`, `exp`, `log`, `log2`, `log10`, `atan2` (numpy
+`sqrt`, `cos`, `sin`, `exp`, `log`, `log2`, `log10`, `atan2` (NumPy
 argument order), `hypot`, `sinc`, `absolute`/`abs`, `sign`, `floor`,
-`ceil`, `round` (half away from zero -- Matlab, not numpy), `maximum`,
+`ceil`, `round` (half away from zero -- MATLAB, not NumPy), `maximum`,
 `minimum`, `clip`, `cast`, `where` (exact selection by a mask).
 
 Complex access: `conj` (alias `conjugate`), `real`, `imag`, `angle`,
@@ -44,7 +48,7 @@ Complex access: `conj` (alias `conjugate`), `real`, `imag`, `angle`,
 
 ## Reductions, scans, order statistics
 
-`sum`, `max`, `min`, `mean`, `std`, `var` (N-normalized, numpy
+`sum`, `max`, `min`, `mean`, `std`, `var` (N-normalized, NumPy
 convention), `argmax`, `argmin` (i64 indices, first occurrence on
 ties), `cumsum` (inclusive prefix sum), `sort`, `rank_filter`,
 `median_filter`.
@@ -58,7 +62,7 @@ ties), `cumsum` (inclusive prefix sum), `sort`, `rank_filter`,
 
 | Name | Meaning |
 |------|---------|
-| `fft`, `ifft` | DFT along one axis; unscaled forward, 1/N inverse; `norm=` follows numpy; any size >= 2 on both backends |
+| `fft`, `ifft` | DFT along one axis; unscaled forward, 1/N inverse; `norm=` follows NumPy; any size >= 2 on both backends |
 | `fft2`, `ifft2` | both axes |
 | `fftshift`, `ifftshift` | center / uncenter a spectrum; all axes when `dim` is omitted |
 | `interp1d` | resampling at fractional positions; `kernel=` nearest/linear/cubic/sinc, `boundary=` zero/edge/reflect |

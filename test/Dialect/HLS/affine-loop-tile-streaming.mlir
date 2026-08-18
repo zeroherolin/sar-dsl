@@ -1,4 +1,4 @@
-// RUN: sar-opt -hls-affine-loop-tile="tile-size=8 tile-buffer-bytes=2048" %s | FileCheck %s
+// RUN: sar-opt %s --hls-affine-loop-tile="tile-size=8 tile-buffer-bytes=2048" | FileCheck %s
 
 // A pass that streams DRAM contiguously keeps its sweep whole: tiling the
 // dimension every access agrees on would turn one long AXI burst per row

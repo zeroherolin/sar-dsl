@@ -12,7 +12,7 @@ line prefix to recover:
 Byte offsets follow the ALOS PALSAR CEOS format description and were
 verified against sample products. The effective radar velocity Vr is not
 recoverable from these records; configure it explicitly in the imaging
-parameters (e.g. Vr = 7155.0 for the San Francisco scene).
+parameters (the calibrated San Francisco example uses Vr = 7072.0).
 """
 
 import glob
@@ -71,8 +71,8 @@ def parse_ceos_leader(led_filepath):
     r0 = None
     rank = 0
     img_pattern = os.path.basename(led_filepath).replace("LED-", "IMG-??-")
-    img_files = glob.glob(
-        os.path.join(os.path.dirname(led_filepath), img_pattern))
+    img_files = sorted(
+        glob.glob(os.path.join(os.path.dirname(led_filepath), img_pattern)))
     if img_files and prf:
         with open(img_files[0], "rb") as f:
             f.seek(720)

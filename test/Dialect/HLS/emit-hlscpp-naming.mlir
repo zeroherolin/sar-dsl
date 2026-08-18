@@ -1,4 +1,4 @@
-// RUN: sar-translate -hls-emit-hlscpp -emit-vitis-directives %s | FileCheck %s
+// RUN: sar-translate --hls-emit-hlscpp -emit-vitis-directives %s | FileCheck %s
 
 // Ports and identifiers carry their role. Nothing in the emitted C++ should
 // be named after a counter that ran across the whole design.
@@ -22,6 +22,7 @@
 // CHECK:        named_s00(kAxis0_4,
 
 // CHECK:      void named_s00(
+// CHECK:        = (int64_t)
 // CHECK:        for (int i0 = 0
 // CHECK:          for (int i1 = 0
 
@@ -33,6 +34,8 @@ module {
                          %arg1: memref<4x4xf64, #hls.mem<bram_t2p>>,
                          %arg2: memref<4x4xf64, #hls.mem<bram_t2p>>)
       attributes {inline} {
+    %c1 = arith.constant 1.5 : f64
+    %unused_index = arith.fptosi %c1 : f64 to i64
     affine.for %i = 0 to 4 {
       affine.for %j = 0 to 4 {
         %t = affine.load %arg0[%j] : memref<4xf64, #hls.mem<bram_t2p>>

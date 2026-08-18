@@ -7,8 +7,8 @@ reports the image-quality metrics side by side. Declared dtypes fix the
 data path on every backend, so this is the number that says whether a
 design can halve its memory and its arithmetic without losing
 resolution. What narrows, and why geometry stays double, is described in
-benchmarks/README.md ("Precision"); the `c128/c64 planes` column reports
-the re-widening that promotion causes inside the kernel.
+benchmarks/README.md ("Precision"); the `c128/c64 refs` column reports
+textual 2-D complex-type references in the traced IR.
 
 Usage:
     python benchmarks/run_precision.py [--n 512] [--algs wka rda csa pfa]
@@ -64,23 +64,22 @@ def _build(name: str, n: int, single: bool):
     return kernel, "c64+f32" if narrowed else "c64 only"
 
 
-def residual_double_planes(ir: str) -> dict:
-    """Counts 2-D plane types left at double precision in narrowed IR.
+def complex_type_references(ir: str) -> dict:
+    """Counts textual 2-D complex-type references in narrowed IR.
 
-    Reports what the narrowing actually achieved rather than what it
-    intended.  Annotations narrow the kernel's *boundary*; inside the
-    body an op mixing a c64 plane with an f64 geometry plane promotes
-    the result back to c128, so a chain can be narrowed at the interface
-    and still carry a double-precision data path.
+    Geometry may deliberately compute a c128 phase factor and cast it to
+    c64 before touching the data. This is a composition indicator, not a
+    count of distinct allocations; cross-backend accuracy decides whether
+    the resulting data path meets its precision contract.
     """
     planes = re.findall(r"tensor<\d+x\d+x(complex<f64>|complex<f32>|f64|f32)>",
                         ir)
     return collections.Counter(planes)
 
 
-def narrow_ir(name: str) -> str:
+def narrow_ir(name: str, n: int = 64) -> str:
     """MLIR text of the narrowed (f32) kernel, before backend lowering."""
-    kernel, _ = _build(name, 64, single=True)
+    kernel, _ = _build(name, n, single=True)
     return kernel.to_mlir()
 
 
@@ -122,7 +121,7 @@ def main() -> None:
     args = parser.parse_args()
 
     print(f"{'chain':<14} {'precision':>15} {'IRW':>7} {'PSLR/dB':>9} "
-          f"{'ISLR/dB':>9} {'rel. err':>10} {'c64/c128 planes':>17}")
+          f"{'ISLR/dB':>9} {'rel. err':>10} {'c64/c128 refs':>17}")
     print("-" * 86)
     for name in args.algs:
         reference = None
@@ -136,7 +135,7 @@ def main() -> None:
             else:
                 peak = reference.max()
                 error = float(np.abs(image - reference).max() / peak)
-                counts = residual_double_planes(narrow_ir(name))
+                counts = complex_type_references(narrow_ir(name, args.n))
                 planes = (f"{counts['complex<f32>']} / "
                           f"{counts['complex<f64>']}")
             label = f"f32 ({mode})" if single else "f64"
@@ -144,10 +143,10 @@ def main() -> None:
                   f"{metrics['irw']:>7.2f} {metrics['pslr']:>9.2f} "
                   f"{metrics['islr']:>9.2f} {error:>10.2e} {planes:>17}")
 
-    print("\nc64/c128 planes: 2-D complex plane types in the narrowed IR. "
-          "A nonzero\nc128 count means the data path re-widens inside the "
-          "kernel where it meets\nan f64 geometry plane -- the narrowing "
-          "reaches the boundary, not the core.")
+    print("\nc64/c128 refs: textual 2-D complex-type references in the "
+          "narrowed IR,\nnot distinct allocations. A c128 phase may be cast "
+          "before it multiplies\nc64 data; use the accuracy columns to judge "
+          "the data path.")
 
 
 if __name__ == "__main__":

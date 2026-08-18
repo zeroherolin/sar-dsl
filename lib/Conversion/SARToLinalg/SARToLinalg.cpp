@@ -28,6 +28,9 @@
 #include "sar/Dialect/SAR/IR/SARDialect.h"
 #include "sar/Dialect/SAR/IR/SAROps.h"
 
+#include <tuple>
+#include <utility>
+
 namespace mlir {
 namespace sar {
 #define GEN_PASS_DEF_CONVERTSARTOLINALG
@@ -260,7 +263,7 @@ struct CmpOpLowering : OpRewritePattern<CmpOp> {
     auto predicate = llvm::StringSwitch<std::optional<arith::CmpFPredicate>>(
                          op.getPredicate())
                          .Case("eq", arith::CmpFPredicate::OEQ)
-                         .Case("ne", arith::CmpFPredicate::ONE)
+                         .Case("ne", arith::CmpFPredicate::UNE)
                          .Case("lt", arith::CmpFPredicate::OLT)
                          .Case("le", arith::CmpFPredicate::OLE)
                          .Case("gt", arith::CmpFPredicate::OGT)
@@ -354,7 +357,7 @@ struct ComplexPartOpLowering : OpRewritePattern<SarOpTy> {
     Value result = buildElementwiseGeneric(
         rewriter, op.getLoc(), resultType, ValueRange{op.getInput()},
         [&](OpBuilder &b, Location loc, ValueRange args) {
-          return b.template create<ComplexOpTy>(loc, args[0]).getResult();
+          return ComplexOpTy::create(b, loc, args[0]).getResult();
         });
     rewriter.replaceOp(op, result);
     return success();
@@ -447,12 +450,18 @@ struct ReduceOpLowering : OpRewritePattern<ReduceOp> {
       auto predicate =
           kind == "max" ? arith::CmpFPredicate::OGT : arith::CmpFPredicate::OLT;
       Value wins = arith::CmpFOp::create(b, nested, predicate, lhs, rhs);
-      return arith::SelectOp::create(b, nested, wins, lhs, rhs);
+      Value selected = arith::SelectOp::create(b, nested, wins, lhs, rhs);
+      Value lhsNan =
+          arith::CmpFOp::create(b, nested, arith::CmpFPredicate::UNE, lhs, lhs);
+      Value rhsNan =
+          arith::CmpFOp::create(b, nested, arith::CmpFPredicate::UNE, rhs, rhs);
+      selected = arith::SelectOp::create(b, nested, rhsNan, rhs, selected);
+      return arith::SelectOp::create(b, nested, lhsNan, lhs, selected);
     };
 
     auto reduce = linalg::ReduceOp::create(
         rewriter, loc, ValueRange{op.getInput()}, ValueRange{filled},
-        ArrayRef<int64_t>{op.getDim()},
+        ArrayRef<int64_t>{static_cast<int64_t>(op.getDim())},
         [&](OpBuilder &b, Location nested, ValueRange args) {
           linalg::YieldOp::create(b, nested,
                                   combine(b, nested, args[0], args[1]));
@@ -511,8 +520,25 @@ struct ArgMaxOpLowering : OpRewritePattern<ArgMaxOp> {
           Value position = linalg::IndexOp::create(b, nested, dim);
           position = arith::IndexCastOp::create(
               b, nested, resultType.getElementType(), position);
-          Value better = arith::CmpFOp::create(
+          Value numericBetter = arith::CmpFOp::create(
               b, nested, arith::CmpFPredicate::OGT, candidate, best);
+          Value candidateNan = arith::CmpFOp::create(
+              b, nested, arith::CmpFPredicate::UNE, candidate, candidate);
+          Value bestNan = arith::CmpFOp::create(
+              b, nested, arith::CmpFPredicate::UNE, best, best);
+          Value falseValue =
+              arith::ConstantOp::create(b, nested, b.getBoolAttr(false));
+          Value candidateFinite = arith::CmpIOp::create(
+              b, nested, arith::CmpIPredicate::eq, candidateNan, falseValue);
+          Value bestFinite = arith::CmpIOp::create(
+              b, nested, arith::CmpIPredicate::eq, bestNan, falseValue);
+          Value nanWins =
+              arith::AndIOp::create(b, nested, candidateNan, bestFinite);
+          Value finiteWins = arith::AndIOp::create(
+              b, nested,
+              arith::AndIOp::create(b, nested, candidateFinite, bestFinite),
+              numericBetter);
+          Value better = arith::OrIOp::create(b, nested, nanWins, finiteWins);
           Value newBest =
               arith::SelectOp::create(b, nested, better, candidate, best);
           Value newIndex =
@@ -1009,9 +1035,10 @@ struct CumsumOpLowering : OpRewritePattern<CumsumOp> {
     Location loc = op.getLoc();
     auto resultType = cast<RankedTensorType>(op.getType());
     Type elementType = resultType.getElementType();
+    int64_t rank = resultType.getRank();
     int64_t dim = op.getDim();
     int64_t scanLen = resultType.getDimSize(dim);
-    int64_t lineLen = resultType.getDimSize(1 - dim);
+    int64_t lineLen = rank == 1 ? 1 : resultType.getDimSize(1 - dim);
 
     // A scan is sequential along `dim`, so it cannot be a linalg.generic:
     // the lines are swept in parallel, each carrying a running sum.
@@ -1026,8 +1053,11 @@ struct CumsumOpLowering : OpRewritePattern<CumsumOp> {
     Value init = tensor::EmptyOp::create(rewriter, loc, resultType.getShape(),
                                          elementType);
 
-    // Map a (line, position-along-dim) pair onto tensor indices.
+    // Map a (line, position-along-dim) pair onto tensor indices; a rank-1
+    // tensor is a single line, so only the scan position indexes it.
     auto indicesFor = [&](Value line, Value scan) {
+      if (rank == 1)
+        return SmallVector<Value>{scan};
       SmallVector<Value> indices(2);
       indices[dim] = scan;
       indices[1 - dim] = line;
@@ -1063,14 +1093,26 @@ struct CumsumOpLowering : OpRewritePattern<CumsumOp> {
   }
 };
 
+static std::pair<Value, Value>
+orderedFloatPair(OpBuilder &builder, Location loc, Value lhs, Value rhs) {
+  Value rhsIsNaN =
+      arith::CmpFOp::create(builder, loc, arith::CmpFPredicate::UNE, rhs, rhs);
+  Value orderedLE =
+      arith::CmpFOp::create(builder, loc, arith::CmpFPredicate::OLE, lhs, rhs);
+  Value lhsFirst = arith::OrIOp::create(builder, loc, rhsIsNaN, orderedLE);
+  return {arith::SelectOp::create(builder, loc, lhsFirst, lhs, rhs),
+          arith::SelectOp::create(builder, loc, lhsFirst, rhs, lhs)};
+}
+
 struct RankFilterOpLowering : OpRewritePattern<RankFilterOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(RankFilterOp op,
                                 PatternRewriter &rewriter) const override {
     auto resultType = cast<RankedTensorType>(op.getType());
+    int64_t rank = resultType.getRank();
     int64_t dim = op.getDim();
     int64_t window = op.getWindow();
-    int64_t rank = op.getRank();
+    int64_t orderRank = op.getRank();
     int64_t half = window / 2;
     int64_t extent = resultType.getDimSize(dim);
 
@@ -1080,7 +1122,8 @@ struct RankFilterOpLowering : OpRewritePattern<RankFilterOp> {
         rewriter, op.getLoc(), resultType, ValueRange{},
         [&](OpBuilder &b, Location loc, ValueRange) -> Value {
           Value position = linalg::IndexOp::create(b, loc, dim);
-          Value line = linalg::IndexOp::create(b, loc, 1 - dim);
+          Value line =
+              rank == 1 ? Value() : linalg::IndexOp::create(b, loc, 1 - dim);
           Value low = arith::ConstantIndexOp::create(b, loc, 0);
           Value high = arith::ConstantIndexOp::create(b, loc, extent - 1);
 
@@ -1092,9 +1135,10 @@ struct RankFilterOpLowering : OpRewritePattern<RankFilterOp> {
             Value raw = arith::AddIOp::create(b, loc, position, offset);
             Value clamped = arith::MinSIOp::create(
                 b, loc, arith::MaxSIOp::create(b, loc, raw, low), high);
-            SmallVector<Value> indices(2);
+            SmallVector<Value> indices(rank);
             indices[dim] = clamped;
-            indices[1 - dim] = line;
+            if (rank == 2)
+              indices[1 - dim] = line;
             taps.push_back(
                 tensor::ExtractOp::create(b, loc, op.getInput(), indices));
           }
@@ -1105,10 +1149,10 @@ struct RankFilterOpLowering : OpRewritePattern<RankFilterOp> {
           for (int64_t i = 0; i + 1 < window; ++i)
             for (int64_t j = 0; j + 1 < window - i; ++j) {
               Value lhs = taps[j], rhs = taps[j + 1];
-              taps[j] = arith::MinimumFOp::create(b, loc, lhs, rhs);
-              taps[j + 1] = arith::MaximumFOp::create(b, loc, lhs, rhs);
+              std::tie(taps[j], taps[j + 1]) =
+                  orderedFloatPair(b, loc, lhs, rhs);
             }
-          return taps[rank];
+          return taps[orderRank];
         });
     rewriter.replaceOp(op, result);
     return success();
@@ -1121,9 +1165,10 @@ struct SortOpLowering : OpRewritePattern<SortOp> {
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     auto resultType = cast<RankedTensorType>(op.getType());
+    int64_t rank = resultType.getRank();
     int64_t dim = op.getDim();
     int64_t extent = resultType.getDimSize(dim);
-    int64_t lineLen = resultType.getDimSize(1 - dim);
+    int64_t lineLen = rank == 1 ? 1 : resultType.getDimSize(1 - dim);
 
     // A full sort is kept as a loop nest rather than a fully unrolled
     // network: unrolling costs O(extent^2) compare-exchanges of IR, which is
@@ -1140,6 +1185,8 @@ struct SortOpLowering : OpRewritePattern<SortOp> {
     Value passBound = arith::ConstantIndexOp::create(rewriter, loc, extent - 1);
 
     auto indicesFor = [&](Value line, Value pos) {
+      if (rank == 1)
+        return SmallVector<Value>{pos};
       SmallVector<Value> indices(2);
       indices[dim] = pos;
       indices[1 - dim] = line;
@@ -1162,8 +1209,7 @@ struct SortOpLowering : OpRewritePattern<SortOp> {
                           sb, sloc, sit[0], indicesFor(line, j));
                       Value rhs = tensor::ExtractOp::create(
                           sb, sloc, sit[0], indicesFor(line, next));
-                      Value lo = arith::MinimumFOp::create(sb, sloc, lhs, rhs);
-                      Value hi = arith::MaximumFOp::create(sb, sloc, lhs, rhs);
+                      auto [lo, hi] = orderedFloatPair(sb, sloc, lhs, rhs);
                       Value stored = tensor::InsertOp::create(
                           sb, sloc, lo, sit[0], indicesFor(line, j));
                       stored = tensor::InsertOp::create(sb, sloc, hi, stored,
@@ -1181,7 +1227,8 @@ struct SortOpLowering : OpRewritePattern<SortOp> {
 
 /// `sar.iterate` becomes `scf.for` over tensors: the carried values map
 /// onto `iter_args`, which one-shot bufferization already understands on
-/// both pipelines.
+/// both pipelines. The optional index argument materializes from the
+/// loop counter as a one-element tensor.
 struct IterateOpLowering : OpRewritePattern<IterateOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(IterateOp op,
@@ -1196,8 +1243,24 @@ struct IterateOpLowering : OpRewritePattern<IterateOp> {
     Block *body = forOp.getBody();
     Block &src = op.getBody().front();
     auto yield = cast<sar::YieldOp>(src.getTerminator());
-    rewriter.inlineBlockBefore(&src, body, body->end(),
-                               forOp.getRegionIterArgs());
+
+    SmallVector<Value> replacements;
+    if (op.getIndex()) {
+      // tensor.from_elements would be shorter but bufferizes to its own
+      // allocation each iteration; insert-into-empty folds to a store
+      // into one stack slot on both pipelines.
+      rewriter.setInsertionPointToStart(body);
+      Value counter = arith::IndexCastOp::create(
+          rewriter, loc, rewriter.getI64Type(), forOp.getInductionVar());
+      Value empty = tensor::EmptyOp::create(rewriter, loc, ArrayRef<int64_t>{1},
+                                            rewriter.getI64Type());
+      Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+      replacements.push_back(tensor::InsertOp::create(rewriter, loc, counter,
+                                                      empty, ValueRange{zero}));
+    }
+    llvm::append_range(replacements, forOp.getRegionIterArgs());
+
+    rewriter.inlineBlockBefore(&src, body, body->end(), replacements);
     rewriter.setInsertionPointToEnd(body);
     scf::YieldOp::create(rewriter, yield.getLoc(), yield.getResults());
     rewriter.eraseOp(yield);

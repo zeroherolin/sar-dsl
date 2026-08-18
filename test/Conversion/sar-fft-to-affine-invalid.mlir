@@ -1,4 +1,4 @@
-// RUN: sar-opt %s --convert-sar-fft-to-affine -split-input-file -verify-diagnostics
+// RUN: sar-opt %s --convert-sar-fft-to-affine --split-input-file --verify-diagnostics
 
 // Non-power-of-two sizes are legal (Bluestein handles them); what the op
 // rejects is a shape the transform cannot be defined on at all. These are

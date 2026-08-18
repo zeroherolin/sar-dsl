@@ -17,8 +17,10 @@ from conftest import requires_hls
 
 pytestmark = requires_hls
 
-#: A bank smaller than this many bits belongs in distributed RAM; anything
-#: larger asks for more LUTs than a device can spare.
+#: A bank of at most this many bits belongs in distributed RAM; anything
+#: larger asks for more LUTs than a device can spare. One bus beat at the
+#: widest supported AXI bus, matching the inclusive banking threshold in
+#: `hls-array-partition`.
 _LUTRAM_MAX_BITS = 1024
 
 _ELEMENT_BITS = {"float": 32, "double": 64}
@@ -32,14 +34,15 @@ def _worst_lutram_bank_bits(source: str) -> int:
         name = match.group(1)
         decl = re.search(rf"(float|double) {name}((?:\[\d+\])+);", source)
         if not decl:
-            continue
+            raise AssertionError(f"missing declaration for LUTRAM bank {name}")
         factor = re.search(
             rf"array_partition variable={name} \w+ factor=(\d+)", source)
         elements = 1
         for dim in re.findall(r"\[(\d+)\]", decl.group(2)):
             elements *= int(dim)
         banks = int(factor.group(1)) if factor else 1
-        worst = max(worst, elements // banks * _ELEMENT_BITS[decl.group(1)])
+        bank_elements = (elements + banks - 1) // banks
+        worst = max(worst, bank_elements * _ELEMENT_BITS[decl.group(1)])
     return worst
 
 
@@ -52,8 +55,10 @@ def _emit(name, spec, body):
     kernel.name = name
     return kernel.specialize(spec).compile(backend="hls",
                                            options={
-                                               "axi_interface": True,
-                                               "on_chip_budget": 8192
+                                               "interface": "axi",
+                                               "bram_bytes": 1 << 22,
+                                               "uram_bytes": 1 << 22,
+                                               "lutram_bytes": 0
                                            }).source()
 
 
@@ -77,7 +82,7 @@ def _shapes(n):
 @pytest.mark.parametrize("dtype,spec", [("f32", sar.f32), ("f64", sar.f64),
                                         ("c64", sar.c64), ("c128", sar.c128)])
 @pytest.mark.parametrize("n", [8, 64, 300, 512])
-def test_every_shape_synthesizes(dtype, spec, n):
+def test_every_shape_emits(dtype, spec, n):
     """Any precision, any scale, any operator shape: the design must emit
     and must not ask distributed RAM to hold a block RAM's worth of bits."""
     shapes = list(_shapes(n))
@@ -88,7 +93,7 @@ def test_every_shape_synthesizes(dtype, spec, n):
         source = _emit(f"gen_{name}_{dtype}_{n}", spec[n, n], body)
         assert "#pragma HLS" in source, name
         bits = _worst_lutram_bank_bits(source)
-        assert bits < _LUTRAM_MAX_BITS, (name, bits)
+        assert bits <= _LUTRAM_MAX_BITS, (name, bits)
 
 
 @pytest.mark.parametrize("n", [64, 512])
@@ -122,8 +127,10 @@ def test_port_count_does_not_track_chain_length(n):
         kernel.name = f"len_{n}_{passes}"
         return kernel.compile(backend="hls",
                               options={
-                                  "axi_interface": True,
-                                  "on_chip_budget": 1
+                                  "interface": "axi",
+                                  "bram_bytes": 1 << 22,
+                                  "uram_bytes": 0,
+                                  "lutram_bytes": 0
                               }).source().count("m_axi")
 
     assert ports(1) == ports(4)
@@ -142,7 +149,7 @@ def test_oversampled_grid_is_streamed(n):
     """
     import re
 
-    budget = 64 * 1024
+    budget = 256 * 1024
 
     @sar.func
     def upsample(x: sar.c64[n, n]) -> sar.c64[2 * n, 2 * n]:
@@ -152,8 +159,10 @@ def test_oversampled_grid_is_streamed(n):
     upsample.name = f"oversampled_{n}"
     source = upsample.compile(backend="hls",
                               options={
-                                  "axi_interface": True,
-                                  "on_chip_budget": budget
+                                  "interface": "axi",
+                                  "bram_bytes": budget,
+                                  "uram_bytes": 0,
+                                  "lutram_bytes": 0
                               }).source()
 
     on_chip = 0

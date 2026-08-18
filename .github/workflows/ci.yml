@@ -4,14 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
-    # `labeled` lets the full-build job below be requested on a PR by
-    # attaching the `full-ci` label; the other types are the defaults.
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
   schedule:
-    # Nightly full build: the toolchain-dependent suites (lit, e2e imaging
-    # chains, HLS emission) never run on the per-push job.
+    # Nightly run in addition to the pull-request and main-branch gates.
     - cron: "0 2 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   # Frontend tests are pure Python: tracing, IR emission, error reporting
@@ -21,19 +21,27 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install numpy pytest pre-commit
+      - run: pip install build numpy pytest pre-commit
       - name: Lint and format checks
         run: pre-commit run --all-files --show-diff-on-failure
       - name: Frontend tests
         run: |
           set -o pipefail
           PYTHONPATH=python python -m pytest test/python -q | tee pytest.out
+      - name: Build Python package
+        run: |
+          python -m build --wheel --sdist --outdir /tmp/sar-dist
+          python -m venv /tmp/sar-venv
+          /tmp/sar-venv/bin/pip install /tmp/sar-dist/*.whl
+          cd /tmp
+          /tmp/sar-venv/bin/python -c \
+            "import sar; assert sar.__version__; print(sar.list_backends())"
       # Most of the suite self-skips here (no toolchain), so a green run says
       # little on its own. Pin the floor of tests that must actually execute:
       # it only ever grows, and it fails loudly if a toolchain-free test is
@@ -42,7 +50,7 @@ jobs:
         run: |
           PASSED=$(grep -oE '[0-9]+ passed' pytest.out | tail -1 | cut -d' ' -f1)
           PASSED=${PASSED:-0}
-          FLOOR=26
+          FLOOR=189
           echo "$PASSED toolchain-free tests ran (floor: $FLOOR)"
           if [ "$PASSED" -lt "$FLOOR" ]; then
             echo "::error::only $PASSED tests ran, expected at least $FLOOR;"\
@@ -50,15 +58,10 @@ jobs:
             exit 1
           fi
 
-  # The full build (LLVM + sar-opt + lit + e2e) takes hours from scratch, so
-  # it runs nightly, on demand, and on PRs labeled `full-ci`, with the
-  # toolchain tree cached between runs.
+  # Compiler and backend correctness is a merge gate. The LLVM tree is
+  # cached by submodule revision; a cache miss is expensive but must not let
+  # C++ or lowering regressions merge unchecked.
   full-build:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'schedule' ||
-      (github.event_name == 'pull_request' &&
-       contains(github.event.pull_request.labels.*.name, 'full-ci'))
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
@@ -97,3 +100,21 @@ jobs:
 
       - run: make build
       - run: make test
+      - name: Runtime ASan and UBSan
+        run: |
+          cmake -S . -B build-sanitize \
+            -DSAR_DSL_ENABLE_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake --build build-sanitize --target sar_runtime
+          LD_PRELOAD="$(gcc -print-file-name=libasan.so)" \
+          ASAN_OPTIONS="detect_leaks=0:halt_on_error=1" \
+          UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+          SAR_DSL_RUNTIME_LIB="$PWD/build-sanitize/lib/libsar_runtime.so" \
+          PYTHONPATH=python \
+            python -m pytest test/python/test_runtime_direct.py -q
+      - name: Test installed compiler prefix
+        run: |
+          cmake --install build --prefix /tmp/sar-install
+          /tmp/sar-install/bin/sar-opt --version
+          /tmp/sar-install/bin/sar-translate --help >/dev/null

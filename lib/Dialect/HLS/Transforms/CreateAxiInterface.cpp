@@ -1,4 +1,4 @@
-//===- CreateAxiInterface.cpp - Shape the top function's AXI ports --------===//
+//===- CreateAxiInterface.cpp - create axi interface ----------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -10,6 +10,8 @@
 #include "mlir/IR/SymbolTable.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
+
+#include "llvm/ADT/SetVector.h"
 
 namespace mlir {
 namespace sar {
@@ -27,20 +29,16 @@ using namespace hls;
 // Internal DRAM scratch
 //
 // The top function's signature is the design's contract with its caller, so it
-// is fixed: the kernel's declared arguments, its declared results, and one
-// scratch pointer. Buffers the compiler decides to keep off chip are internal,
-// so they may not appear as ports of their own -- a host would otherwise have
-// to bind a different number of interfaces every time a budget, a scene size
-// or a fusion decision moved a buffer across the line. They are carved out of
-// the single scratch allocation instead, at offsets fixed at compile time; the
-// size the caller must allocate is recorded on the top function
-// (`scratch_bytes`) and is the extent of the scratch port. The port is emitted
-// whether or not anything currently spills, so the signature follows the
-// algorithm alone.
+// is fixed: the kernel's declared arguments/results and one scratch arena per
+// scalar element type in the lowered design. Buffers the compiler decides to
+// keep off chip are internal, so they may not appear as ports of their own.
+// Each is carved into its typed arena at a compile-time offset. Placeholder
+// arenas remain in the signature when their type has no spill, so placement
+// decisions change extents but never the number or order of ports.
 //
-// Serialization is not a new cost: ports of one element type already share a
-// single AXI bundle, and a bundle serializes its accesses whether or not each
-// buffer has a port of its own.
+// Serialization within one scratch port is not a new cost: the carved
+// buffers already take turns on the port's data bus, whether or not each
+// of them had a port of its own.
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -75,10 +73,6 @@ static SmallVector<int64_t> rowMajorStrides(MemRefType type) {
   for (int i = (int)shape.size() - 2; i >= 0; --i)
     strides[i] = strides[i + 1] * shape[i + 1];
   return strides;
-}
-
-static uint64_t elementBytes(MemRefType type) {
-  return (type.getElementTypeBitWidth() + 7) / 8;
 }
 
 /// A buffer can be carved when it is a plain contiguous array: the offset
@@ -207,8 +201,9 @@ static void redirectToScratch(const ScratchUses &uses, Value buffer,
 /// Replaces the top function's internal DRAM buffers with slices of a single
 /// scratch buffer, and returns that buffer for the caller to turn into the one
 /// extra port.
-static Value createScratchBuffer(func::FuncOp func, ModuleOp module,
-                                 OpBuilder &builder) {
+static FailureOr<Value> createScratchBuffer(func::FuncOp func, ModuleOp module,
+                                            OpBuilder &builder,
+                                            Type elementType) {
   DenseMap<StringRef, unsigned> callerCounts;
   module.walk([&](func::CallOp call) { ++callerCounts[call.getCallee()]; });
 
@@ -216,33 +211,11 @@ static Value createScratchBuffer(func::FuncOp func, ModuleOp module,
   // scratch: it keeps its own storage and its initializer.
   SmallVector<hls::BufferLikeInterface> candidates;
   for (auto buffer : func.getOps<hls::BufferLikeInterface>())
-    if (isExtBuffer(buffer.getMemref()) && !isa<ConstBufferOp>(*buffer))
+    if (isExtBuffer(buffer.getMemref()) && !isa<ConstBufferOp>(*buffer) &&
+        buffer.getMemrefType().getElementType() == elementType)
       candidates.push_back(buffer);
 
-  // One flat array cannot hold two element widths -- the emitted C++ has no
-  // way to reinterpret it -- so the scratch takes the widest element among
-  // the buffers to be carved. Whatever else the design allocates decides the
-  // type when nothing spills, so the port's type still follows the algorithm.
-  Type elementType;
-  unsigned widest = 0;
-  auto widen = [&](MemRefType type) {
-    if (type.getElementTypeBitWidth() > widest) {
-      widest = type.getElementTypeBitWidth();
-      elementType = type.getElementType();
-    }
-  };
-  if (candidates.empty()) {
-    for (auto buffer : func.getOps<hls::BufferLikeInterface>())
-      widen(buffer.getMemrefType());
-    for (auto arg : func.getArguments())
-      if (auto type = dyn_cast<MemRefType>(arg.getType()))
-        widen(type);
-  } else {
-    for (auto buffer : candidates)
-      widen(buffer.getMemrefType());
-  }
-  if (!elementType)
-    elementType = builder.getF64Type();
+  unsigned widest = elementType.getIntOrFloatBitWidth();
 
   // A buffer may ask to start at a value. One allocation carries one such
   // value, so the scratch adopts it -- initializing a buffer that asked for
@@ -252,8 +225,7 @@ static Value createScratchBuffer(func::FuncOp func, ModuleOp module,
   for (auto buffer : candidates)
     if (auto buf = dyn_cast<BufferOp>(*buffer))
       if (auto init = buf.getInitValueAttr()) {
-        if (!initValue)
-          initValue = init;
+        initValue = init;
         break;
       }
 
@@ -271,8 +243,7 @@ static Value createScratchBuffer(func::FuncOp func, ModuleOp module,
     auto init = buf ? buf.getInitValueAttr() : TypedAttr();
     ScratchUses uses;
     DenseSet<Value> visited;
-    if (!isCarvable(type) || type.getElementType() != elementType ||
-        (init && init != initValue) ||
+    if (!isCarvable(type) || (init && init != initValue) ||
         failed(collectScratchUses(buffer.getMemref(), module, callerCounts,
                                   uses, visited))) {
       skipped.push_back(buffer);
@@ -282,6 +253,14 @@ static Value createScratchBuffer(func::FuncOp func, ModuleOp module,
     slots.push_back({buffer, elements});
     slotUses.push_back(std::move(uses));
     elements += ((int64_t)type.getNumElements() + align - 1) / align * align;
+  }
+
+  if (!skipped.empty()) {
+    for (auto buffer : skipped)
+      buffer->emitError("internal DRAM buffer cannot be carved into the "
+                        "scratch allocation; a stable AXI interface cannot "
+                        "expose optimizer-created buffers as ports");
+    return failure();
   }
 
   // The port exists even when nothing spills, so a caller binds the same
@@ -300,17 +279,6 @@ static Value createScratchBuffer(func::FuncOp func, ModuleOp module,
     slot.buffer->erase();
   }
 
-  // Anything left keeps a port of its own, which is exactly the behaviour the
-  // fixed signature exists to prevent -- so say so rather than quietly
-  // growing the interface.
-  for (auto buffer : skipped)
-    buffer->emitWarning("internal DRAM buffer cannot be carved into the "
-                        "scratch allocation and becomes a top-level port; "
-                        "the design's port count no longer follows its I/O");
-
-  func->setAttr(
-      "scratch_bytes",
-      builder.getI64IntegerAttr((int64_t)elements * elementBytes(scratchType)));
   return scratch;
 }
 } // namespace
@@ -347,16 +315,39 @@ struct CreateAxiInterface
     if (streamInterface)
       func->setAttr("stream_interface", builder.getUnitAttr());
 
-    // Fold the internal DRAM buffers into one scratch allocation before any
-    // port is made, so exactly one of them reaches the signature.
-    createScratchBuffer(func, module, builder);
+    // Fold internal DRAM buffers into stable typed arenas before ports are
+    // created. Scan all non-constant buffers, not only current spills, so a
+    // budget change cannot add or remove an arena type from the signature.
+    llvm::SetVector<Type> scratchTypes;
+    for (auto buffer : func.getOps<hls::BufferLikeInterface>())
+      if (!isa<ConstBufferOp>(*buffer))
+        if (Type elementType = buffer.getMemrefType().getElementType();
+            elementType.isIntOrFloat())
+          scratchTypes.insert(elementType);
+    if (scratchTypes.empty())
+      scratchTypes.insert(builder.getF64Type());
+    for (Type elementType : scratchTypes)
+      if (failed(createScratchBuffer(func, module, builder, elementType)))
+        return signalPassFailure();
 
-    // The wrapper takes the fixed name "main"; a module that already claims
-    // that symbol -- including a kernel named "main" itself -- would end up
-    // with two functions under one name.
+    // Preserve `main` for the interface wrapper when the implementation itself
+    // uses the pipeline's default top-function name.
+    if (func.getName() == "main") {
+      SymbolTable symbols(module);
+      std::string name = "main_impl";
+      for (unsigned suffix = 0; symbols.lookup(name); ++suffix)
+        name = "main_impl_" + std::to_string(suffix);
+      StringAttr implementationName = builder.getStringAttr(name);
+      if (failed(symbols.rename(func, implementationName))) {
+        func.emitError("failed to rename the AXI implementation");
+        return signalPassFailure();
+      }
+    }
+
+    // An unrelated `main` would collide with the fixed wrapper symbol.
     if (module.lookupSymbol("main")) {
       func.emitError("module already contains a symbol named 'main', which "
-                     "the AXI wrapper function needs; rename the kernel");
+                     "the AXI wrapper function needs");
       return signalPassFailure();
     }
 
@@ -420,19 +411,15 @@ struct CreateAxiInterface
     };
 
     // Convert collected buffers to AXI ports and collect them in "funcPorts".
-    // Ports of the same element type share one AXI master: a design then
-    // presents a handful of interfaces, which is what a device can wire up
-    // and a host can bind.
+    // Every port gets its own AXI master bundle so concurrent plane accesses
+    // are not serialized by bundle arbitration. The system interconnect may
+    // still concentrate those masters onto fewer memory controllers.
     unsigned bundleIndex = 0;
-    llvm::DenseMap<BundleType, AxiBundleOp> bundles;
     for (auto buffer : buffers) {
       auto bundleType = getBundleType(buffer);
-      auto &bundle = bundles[bundleType];
-      if (!bundle) {
-        builder.setInsertionPointToStart(&func.front());
-        bundle = AxiBundleOp::create(builder, loc, bundleType,
-                                     "axi_" + std::to_string(bundleIndex++));
-      }
+      builder.setInsertionPointToStart(&func.front());
+      auto bundle = AxiBundleOp::create(builder, loc, bundleType,
+                                        "axi_" + std::to_string(bundleIndex++));
       // Ports go after every bundle, so a reused bundle still dominates the
       // port that refers to it.
       builder.setInsertionPointAfter(bundle);

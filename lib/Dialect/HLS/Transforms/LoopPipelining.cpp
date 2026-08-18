@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- LoopPipelining.cpp - loop pipelining -------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -25,10 +25,6 @@ bool sar::applyLoopPipelining(AffineLoopBand &band, unsigned pipelineLoc,
                               unsigned targetII) {
   auto targetLoop = band[pipelineLoc];
 
-  if (auto directive = getLoopDirective(targetLoop))
-    if (directive.getDataflow())
-      return false;
-
   if (!targetLoop.getOps<func::CallOp>().empty())
     return false;
 
@@ -39,24 +35,26 @@ bool sar::applyLoopPipelining(AffineLoopBand &band, unsigned pipelineLoc,
   // Erase all loops in loop band that are inside of the pipelined loop.
   band.resize(pipelineLoc + 1);
 
-  setLoopDirective(targetLoop, true, targetII, false, false);
+  setLoopDirective(targetLoop, true, targetII);
 
-  // All outer loops that perfect nest the pipelined loop can be flattened.
+  // Outer loops that perfectly nest the pipelined loop also get a directive:
+  // its presence is what makes the emitter give them `#pragma HLS dependence
+  // false`. Vitis flattens such nests into the pipelined loop on its own.
   auto currentLoop = targetLoop;
   while (true) {
     if (auto outerLoop = currentLoop->getParentOfType<AffineForOp>()) {
-      // Only if the current loop is the only child loop of the outer loop, the
-      // outer loop can be flattened into the current loop.
-      bool canFlatten = true;
+      // Only if the current loop is the only child loop of the outer loop
+      // does the nest stay perfect.
+      bool perfectNest = true;
       for (auto &op : outerLoop)
         if (&op != currentLoop && !isa<AffineApplyOp, AffineYieldOp>(op)) {
-          canFlatten = false;
+          perfectNest = false;
           break;
         }
 
-      if (canFlatten) {
+      if (perfectNest) {
         currentLoop = outerLoop;
-        setLoopDirective(outerLoop, false, 1, false, true);
+        setLoopDirective(outerLoop, false, 1);
         continue;
       }
     }
@@ -69,7 +67,6 @@ bool sar::applyLoopPipelining(AffineLoopBand &band, unsigned pipelineLoc,
 namespace {
 struct LoopPipelining : public sar::impl::LoopPipeliningBase<LoopPipelining> {
   void runOnOperation() override {
-    // Collect all target loop bands.
     AffineLoopBands targetBands;
     getLoopBands(getOperation().front(), targetBands);
 

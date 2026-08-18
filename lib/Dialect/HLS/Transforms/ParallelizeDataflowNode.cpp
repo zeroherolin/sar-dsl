@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- ParallelizeDataflowNode.cpp - parallelize dataflow node ------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -13,6 +13,9 @@
 #include "sar/Dialect/HLS/Transforms/Utils.h"
 #include "llvm/Support/Debug.h"
 
+#include <algorithm>
+#include <cstdint>
+
 namespace mlir {
 namespace sar {
 #define GEN_PASS_DEF_PARALLELIZEDATAFLOWNODE
@@ -25,6 +28,7 @@ namespace sar {
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
+using namespace sar::hls;
 
 /// Apply loop vectorization to the loop band.
 namespace {
@@ -36,18 +40,18 @@ struct GenerateBufferLayout
   LogicalResult matchAndRewrite(VectorTransferOpInterface transferOp,
                                 PatternRewriter &rewriter) const override {
     auto vectorType = transferOp.getVectorType();
-    // TODO: For now, we demand the vector rank to be the same as memref rank.
+    // A transfer whose vector rank differs from the memref rank implies a
+    // broadcast or rank-reducing map, which the tile-shape logic below
+    // does not model; leave those transfers unvectorized.
     if (vectorType.getRank() != transferOp.getShapedType().getRank())
       return failure();
 
-    // The default tile shape is as same as the memref shape.
+    // The default tile shape matches the memref shape.
     auto tileShape = transferOp.getShapedType().getShape();
 
     // If the source has a tile layout, use it as the tile shape.
     if (auto layout = getTileLayout(transferOp.getBase())) {
-      // If the layout is already vectorized, check if it's vector shape is
-      // compatible with the existing one. If not, it means that different
-      // transfer ops are using different vector shapes, which is not allowed.
+      // A vectorized layout must agree with every transfer using it.
       if (layout.isVectorized()) {
         if (vectorType.getShape() != layout.getVectorShape())
           return transferOp->emitOpError("incompatible vector shape");
@@ -57,7 +61,6 @@ struct GenerateBufferLayout
       tileShape = layout.getTileShape();
     }
 
-    // Set the tile layout the calculated tile shape and vector shape.
     setTileLayout(transferOp.getBase(), tileShape, vectorType.getShape());
     return success();
   }
@@ -78,11 +81,11 @@ struct ParallelizeDataflowNode
 
   /// Try to calculate the unroll factors of the nodes contained in each
   /// dataflow schedule.
-  void getNodeParallelFactorMap(func::FuncOp func) {
+  LogicalResult getNodeParallelFactorMap(func::FuncOp func) {
     auto compAnal = ComplexityAnalysis(func);
     nodeParallelFactorMap.clear();
 
-    func.walk<WalkOrder::PreOrder>([&](ScheduleOp schedule) {
+    auto result = func.walk<WalkOrder::PreOrder>([&](ScheduleOp schedule) {
       unsigned long scheduleUnrollFactor = maxUnrollFactor.getValue();
       if (auto parentNode = schedule->getParentOfType<NodeOp>()) {
         if (!nodeParallelFactorMap.count(parentNode)) {
@@ -104,9 +107,14 @@ struct ParallelizeDataflowNode
           node.emitOpError("failed to get node complexity");
           return WalkResult::interrupt();
         }
-        auto nodeUnrollFactor = 1 + scheduleUnrollFactor *
-                                        nodeComplexity.value() /
-                                        scheduleComplexity.value();
+        uint64_t factorLimit = std::max<unsigned long>(1, scheduleUnrollFactor);
+        uint64_t nodeCost = std::max<uint64_t>(1, nodeComplexity.value());
+        uint64_t scheduleCost =
+            std::max<uint64_t>(1, scheduleComplexity.value());
+        uint64_t proportional =
+            (factorLimit * nodeCost + scheduleCost - 1) / scheduleCost;
+        auto nodeUnrollFactor = static_cast<unsigned long>(
+            std::clamp<uint64_t>(proportional, 1, factorLimit));
         nodeParallelFactorMap.insert({node, nodeUnrollFactor});
 
         LLVM_DEBUG(
@@ -121,6 +129,7 @@ struct ParallelizeDataflowNode
       }
       return WalkResult::advance();
     });
+    return success(!result.wasInterrupted());
   }
 
   /// Unroll dataflow node with the given parallel factor. If the pass is not
@@ -130,7 +139,6 @@ struct ParallelizeDataflowNode
     if (!complexityAware)
       unrollFactor = maxUnrollFactor.getValue();
 
-    // Collect all loop bands to be unrolled.
     AffineLoopBands bands;
     node.walk([&](AffineForOp loop) {
       if (loop->getParentOfType<NodeOp>() == node &&
@@ -143,9 +151,10 @@ struct ParallelizeDataflowNode
     });
 
     for (auto &band : bands) {
-      // For loop band that has effect on external buffers, we should directly
-      // unroll them without considering whether it's point loop.
-      // FIXME: Need a better solution on handling external buffers.
+      // A band touching an external (DRAM) buffer is unrolled whole rather
+      // than at its point loops: tiling widened the external access into
+      // the tile loops, so restricting the unroll to point loops would
+      // leave the external port at its unwidened rate.
       if (pointLoopOnly && !hasEffectOnExternalBuffer(band.front())) {
         AffineLoopBand tileBand;
         AffineLoopBand pointBand;
@@ -169,9 +178,8 @@ struct ParallelizeDataflowNode
   void applyCorrelationAwareUnroll(func::FuncOp func) {
     auto corrAnal = CorrelationAnalysis(func);
 
-    // We first sort all nodes in a decending order of their associated number
-    // of correlations. The rationale is nodes that have more correlations
-    // should be optimized first.
+    // Nodes with more correlations are optimized first: their factors
+    // constrain more of the graph, so they get first claim on the budget.
     SmallVector<std::pair<NodeOp, unsigned>> worklist;
     for (auto &nodeAndList : corrAnal)
       worklist.push_back({nodeAndList.first, nodeAndList.second.size()});
@@ -191,7 +199,6 @@ struct ParallelizeDataflowNode
       if (corrList.empty())
         continue;
 
-      // Get the parallel factor and loop band associated with the current node.
       // Also initialize the unroll factors as one.
       auto parallelFactor = maxUnrollFactor.getValue();
       if (complexityAware && nodeParallelFactorMap.count(node))
@@ -289,7 +296,10 @@ struct ParallelizeDataflowNode
   void runOnOperation() override {
     auto func = getOperation();
     auto context = func.getContext();
-    getNodeParallelFactorMap(func);
+    if (failed(getNodeParallelFactorMap(func))) {
+      signalPassFailure();
+      return;
+    }
     if (correlationAware)
       applyCorrelationAwareUnroll(func);
     else {

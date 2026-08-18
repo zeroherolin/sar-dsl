@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- PlaceDataflowBuffer.cpp - place dataflow buffer --------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -21,14 +21,14 @@ using namespace sar;
 using namespace hls;
 
 namespace {
-/// On-chip tier capacities and the size thresholds that steer a buffer to
-/// one of them. A budget of 0 means the tier is unbounded.
+/// On-chip tier capacities: hard caps the placed design never exceeds. A
+/// budget of 0 forbids the tier. `lutramMax` steers small buffers to
+/// distributed RAM; the URAM floor is the physical block size below.
 struct TierBudget {
   uint64_t bram = 0;
   uint64_t uram = 0;
   uint64_t lutram = 0;
   uint64_t lutramMax = 256;
-  uint64_t uramMin = 36864;
 };
 
 /// Running occupancy, charged in whole primitives: a 36Kb block holding one
@@ -51,8 +51,8 @@ static uint64_t roundUpTo(uint64_t bytes, uint64_t grain) {
 /// same decisions until the iteration limit.
 class Placer {
 public:
-  Placer(unsigned threshold, TierBudget budget)
-      : threshold(threshold), budget(budget) {}
+  Placer(unsigned threshold, TierBudget budget, bool rebalanceOnly)
+      : threshold(threshold), budget(budget), rebalanceOnly(rebalanceOnly) {}
 
   LogicalResult run(func::FuncOp func) {
     // A declaration has no entry block to read arguments or a terminator
@@ -87,10 +87,18 @@ public:
           arg.setType(getPlacedType(type, /*isConstBuffer=*/false, use));
 
     func.walk([&](hls::BufferLikeInterface buffer) {
-      if (isPlaceable(buffer.getMemrefType()))
-        buffer.getMemref().setType(
-            getPlacedType(buffer.getMemrefType(),
-                          isa<ConstBufferOp>(buffer.getOperation()), use));
+      if (!isPlaceable(buffer.getMemrefType()))
+        return;
+      // A buffer allocated inside a compiled loop lives for one
+      // iteration: DRAM placement would promise it an AXI port or a
+      // scratch slot, neither of which can be carved through an
+      // `scf.for` region -- and a one-iteration working buffer belongs
+      // on chip in any case. Treating it like a constant buffer keeps
+      // the threshold rule off it while the tier budgets still apply.
+      bool perIteration = buffer->getParentOfType<scf::ForOp>() != nullptr;
+      buffer.getMemref().setType(getPlacedType(
+          buffer.getMemrefType(),
+          isa<ConstBufferOp>(buffer.getOperation()) || perIteration, use));
     });
 
     // A compiled loop (`scf.for` from `sar.iterate`) threads one buffer
@@ -124,9 +132,8 @@ public:
     if (carried.wasInterrupted())
       return failure();
 
-    // Buffer placement rewrites the memory kind in place, so any subview
-    // taken before this point still carries the old (space-less) result
-    // type. Re-infer those so the view keeps agreeing with its source.
+    // Buffer placement rewrites memory kinds in place. Re-infer subviews so
+    // their result types retain the source memory space.
     func.walk([](memref::SubViewOp subview) {
       auto sourceType = subview.getSourceType();
       auto resultType =
@@ -148,10 +155,16 @@ public:
         std::get<0>(t).setType(std::get<1>(t));
     });
 
+    // Re-placement after forking or balancing must propagate updated types
+    // through isolated schedule and node regions.
+    for (auto schedule : func.getOps<ScheduleOp>())
+      schedule.updateSignatureRecursively();
+
     auto builder = Builder(func.getContext());
     func.setType(builder.getFunctionType(
         func.front().getArgumentTypes(),
         func.front().getTerminator()->getOperandTypes()));
+    lastUse = use;
     return success();
   }
 
@@ -176,32 +189,50 @@ private:
   /// to distributed RAM where they do not consume a block, planes large
   /// enough to fill ultra RAM go there, everything else to block RAM.
   /// Spilling to DRAM is the last resort, once no tier has room.
-  MemoryKind chooseTier(uint64_t bytes, TierUse &use) const {
+  ///
+  /// A dataflow channel is charged at twice its primitive count: Vitis
+  /// double-buffers every channel (ping-pong), so the synthesized design
+  /// holds two copies of each. Constant buffers are ROMs and are read in
+  /// place -- they stay at one copy. Charging the doubling here is what
+  /// keeps the budgets honest: a budget set to a device fraction limits the
+  /// synthesized channels to that fraction.
+  MemoryKind chooseTier(MemRefType type, uint64_t bytes, TierUse &use,
+                        bool isConst) const {
     auto fits = [](uint64_t budget, uint64_t used, uint64_t need) {
-      return budget == 0 || used + need <= budget;
+      return used + need <= budget;
     };
+    uint64_t copies = isConst ? 1 : 2;
+    uint64_t banks = std::max<int64_t>(1, getPartitionFactors(type));
+    uint64_t bankBytes = (bytes + banks - 1) / banks;
 
-    if (bytes <= budget.lutramMax && fits(budget.lutram, use.lutram, bytes)) {
-      use.lutram += bytes;
+    if (bytes <= budget.lutramMax &&
+        fits(budget.lutram, use.lutram, copies * bytes)) {
+      use.lutram += copies * bytes;
       return MemoryKind::LUTRAM_S2P;
     }
-    if (bytes >= budget.uramMin) {
-      uint64_t need = roundUpTo(bytes, kUramBlockBytes);
-      if (fits(budget.uram, use.uram, need)) {
-        use.uram += need;
-        return MemoryKind::URAM_T2P;
-      }
+    uint64_t uramNeed = copies * banks * roundUpTo(bankBytes, kUramBlockBytes);
+    if (bytes >= kUramBlockBytes && fits(budget.uram, use.uram, uramNeed)) {
+      use.uram += uramNeed;
+      return MemoryKind::URAM_T2P;
     }
-    uint64_t need = roundUpTo(bytes, kBramBlockBytes);
+    uint64_t need = copies * banks * roundUpTo(bankBytes, kBramBlockBytes);
     if (fits(budget.bram, use.bram, need)) {
       use.bram += need;
       return MemoryKind::BRAM_T2P;
     }
+    // Block RAM is exhausted. A buffer below the URAM block size now takes
+    // a URAM block anyway when one is free: it wastes part of the block,
+    // but overflowing the device's block RAM would waste the whole design
+    // -- this is what soaks up the mid-size working set (row buffers,
+    // banded gather tables) of large-scene designs.
+    if (bytes < kUramBlockBytes && fits(budget.uram, use.uram, uramNeed)) {
+      use.uram += uramNeed;
+      return MemoryKind::URAM_T2P;
+    }
     return MemoryKind::DRAM;
   }
 
-  MemRefType getPlacedType(MemRefType type, bool isConstBuffer,
-                           TierUse &use) const {
+  MemRefType getPlacedType(MemRefType type, bool isConstBuffer, TierUse &use) {
     // Two independent decisions, in order. The threshold answers whether a
     // buffer belongs on chip at all -- it is what lets scene size grow past
     // the device -- and the tiers only choose where among the on-chip
@@ -213,12 +244,39 @@ private:
     // needs on entry, and `CreateAxiInterface` deliberately keeps them out
     // of the DRAM scratch -- a streamed one would grow the port count past
     // the algorithm's own I/O.
-    if (!isConstBuffer && type.getNumElements() >= threshold)
+    //
+    // A rebalance keeps DRAM placements as they are and never adds new
+    // ones: this late the graph is scheduled and the external set is
+    // already carved into ports.
+    if (rebalanceOnly) {
+      if (getMemoryKind(type) == MemoryKind::DRAM)
+        return type;
+    } else if (!isConstBuffer && type.getNumElements() >= threshold) {
       return withKind(type, MemoryKind::DRAM);
+    }
 
     auto kind = MemoryKind::BRAM_T2P;
-    if (uint64_t bytes = byteSize(type))
-      kind = chooseTier(bytes, use);
+    if (uint64_t bytes = byteSize(type)) {
+      kind = chooseTier(type, bytes, use, isConstBuffer);
+      if (rebalanceOnly && kind == MemoryKind::DRAM) {
+        // No tier has budget left and nothing may newly stream this late.
+        // Keep the placement the buffer already carries and record the
+        // overflow; the driver turns it into a hard failure.
+        auto placed = getMemoryKind(type);
+        kind = placed == MemoryKind::UNKNOWN ? MemoryKind::BRAM_T2P : placed;
+        uint64_t banks = std::max<int64_t>(1, getPartitionFactors(type));
+        uint64_t bankBytes = (bytes + banks - 1) / banks;
+        overflowBytes += (isConstBuffer ? 1 : 2) * banks *
+                         roundUpTo(bankBytes, kBramBlockBytes);
+      } else if (kind == MemoryKind::DRAM && isConstBuffer) {
+        // A constant table or per-iteration scratch cannot stream; a tier
+        // set that cannot hold it cannot hold the design.
+        uint64_t banks = std::max<int64_t>(1, getPartitionFactors(type));
+        uint64_t bankBytes = (bytes + banks - 1) / banks;
+        constOverflowBytes += banks * roundUpTo(bankBytes, kBramBlockBytes);
+        kind = MemoryKind::BRAM_T2P;
+      }
+    }
     return withKind(type, kind);
   }
 
@@ -230,6 +288,20 @@ private:
 
   unsigned threshold;
   TierBudget budget;
+  bool rebalanceOnly;
+
+public:
+  /// Bytes a rebalance could not fit into any tier budget and left at the
+  /// buffers' original placement (charged in whole primitives, ping-pong
+  /// included).
+  uint64_t overflowBytesUsed() const { return overflowBytes; }
+  uint64_t constOverflowBytesUsed() const { return constOverflowBytes; }
+  uint64_t lutramBytesUsed() const { return lastUse.lutram; }
+
+private:
+  TierUse lastUse;
+  uint64_t overflowBytes = 0;
+  uint64_t constOverflowBytes = 0;
 };
 } // namespace
 
@@ -263,21 +335,50 @@ struct PlaceDataflowBuffer
   PlaceDataflowBuffer() = default;
   PlaceDataflowBuffer(unsigned argThreshold, unsigned argBramBytes,
                       unsigned argUramBytes, unsigned argLutramBytes,
-                      unsigned argLutramMaxBytes, unsigned argUramMinBytes) {
+                      unsigned argLutramMaxBytes, bool argRebalanceOnly) {
     threshold = argThreshold;
     bramBytes = argBramBytes;
     uramBytes = argUramBytes;
     lutramBytes = argLutramBytes;
     lutramMaxBytes = argLutramMaxBytes;
-    uramMinBytes = argUramMinBytes;
+    rebalanceOnly = argRebalanceOnly;
   }
 
   void runOnOperation() override {
     auto func = getOperation();
-    TierBudget budget{bramBytes, uramBytes, lutramBytes, lutramMaxBytes,
-                      uramMinBytes};
-    if (failed(Placer(threshold, budget).run(func)))
+    TierBudget budget{bramBytes, uramBytes, lutramBytes, lutramMaxBytes};
+    Placer placer(threshold, budget, rebalanceOnly);
+    if (failed(placer.run(func)))
       return signalPassFailure();
+
+    // The banking pass later spends distributed RAM from the same cap, so
+    // what placement consumed travels with the function; the second
+    // (rebalance) run overwrites the first with the final figure.
+    func->setAttr("lutram_spent",
+                  IntegerAttr::get(IntegerType::get(func.getContext(), 64),
+                                   placer.lutramBytesUsed()));
+
+    // The budgets are hard caps: a working set the tiers cannot hold is a
+    // design that will not fit the device, and emitting it anyway would
+    // hand the user a permanently invalid design. Fail here; the backend
+    // reacts by streaming more planes and retrying.
+    if (placer.constOverflowBytesUsed()) {
+      func.emitError()
+          << "constant tables and per-iteration buffers need "
+          << placer.constOverflowBytesUsed()
+          << " bytes more on-chip memory than the tier budgets allow; they "
+             "cannot stream -- raise the budgets or shrink the tables";
+      return signalPassFailure();
+    }
+    if (rebalanceOnly && placer.overflowBytesUsed()) {
+      func.emitError()
+          << "SAR_HLS_RETRYABLE_MEMORY_OVERFLOW: on-chip working set "
+             "exceeds the memory budgets by "
+          << placer.overflowBytesUsed()
+          << " bytes (ping-pong buffering included); stream more planes or "
+             "raise the tier budgets";
+      return signalPassFailure();
+    }
 
     mlir::RewritePatternSet patterns(func.getContext());
     patterns.add<HoistDramBuffer>(func.getContext());
@@ -288,8 +389,8 @@ struct PlaceDataflowBuffer
 
 std::unique_ptr<Pass> sar::createPlaceDataflowBufferPass(
     unsigned threshold, unsigned bramBytes, unsigned uramBytes,
-    unsigned lutramBytes, unsigned lutramMaxBytes, unsigned uramMinBytes) {
+    unsigned lutramBytes, unsigned lutramMaxBytes, bool rebalanceOnly) {
   return std::make_unique<PlaceDataflowBuffer>(threshold, bramBytes, uramBytes,
                                                lutramBytes, lutramMaxBytes,
-                                               uramMinBytes);
+                                               rebalanceOnly);
 }

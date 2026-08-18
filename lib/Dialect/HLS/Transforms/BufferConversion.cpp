@@ -1,4 +1,4 @@
-//===- BufferConversion.cpp - memref allocations to dataflow buffers ------===//
+//===- BufferConversion.cpp - buffer conversion ---------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -28,6 +28,8 @@ struct ConvertAllocToBufferWithInitValue : public OpRewritePattern<OpType> {
 
   LogicalResult matchAndRewrite(OpType op,
                                 PatternRewriter &rewriter) const override {
+    if (!op.getDynamicSizes().empty() || !op.getSymbolOperands().empty())
+      return failure();
     DominanceInfo DT;
     SmallVector<Operation *> users(op->user_begin(), op->user_end());
     if (users.empty())
@@ -59,6 +61,8 @@ struct ConvertAllocToBuffer : public OpRewritePattern<OpType> {
 
   LogicalResult matchAndRewrite(OpType op,
                                 PatternRewriter &rewriter) const override {
+    if (!op.getDynamicSizes().empty() || !op.getSymbolOperands().empty())
+      return failure();
     rewriter.replaceOpWithNewOp<BufferOp>(op, op.getType());
     return success();
   }

@@ -1,4 +1,4 @@
-// RUN: sar-translate -hls-emit-hlscpp %s | FileCheck %s
+// RUN: sar-translate --hls-emit-hlscpp %s | FileCheck %s
 
 // Loop-carried values (`iter_args`) compile to ordinary variables: declared
 // and initialized ahead of the loop, reassigned by the yield, read as the

@@ -17,6 +17,7 @@ two pieces that go beyond straight op chaining:
 | `algorithm.py` | The PFA + SVA chain as Python-defined operators (`build_kernel`, `make_inputs`) |
 | `geometry.py` | Polar collection grid, inscribed target grid, phase-history simulation |
 | `reference.py` | NumPy reference implementation (`PFAProcessor`) |
+| `assets/` | Reference imagery |
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, measure, save a PNG |
 | `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 

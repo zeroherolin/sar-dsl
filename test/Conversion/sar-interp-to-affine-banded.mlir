@@ -47,6 +47,42 @@ func.func @interp_banded(%re: tensor<8x32xf64>, %im: tensor<8x32xf64>)
 
 // -----
 
+// sqrt(x*x + q) preserves a positive coordinate ramp: its residual over x is
+// bounded even when q selects at runtime between bounded constant planes.
+// The unknown mask prevents whole-plane constant folding.
+
+// CHECK-LABEL: func.func @sqrt_residual_banded
+// CHECK: memref.alloc() : memref<16xf64>
+// CHECK: memref.alloc() : memref<16xf64>
+// CHECK-NOT: sar.interp1d_split
+func.func @sqrt_residual_banded(
+    %re: tensor<8x32xf64>, %im: tensor<8x32xf64>,
+    %mask: tensor<8x32xf64>) -> (tensor<8x32xf64>, tensor<8x32xf64>) {
+  %axis = sar.constant dense<[
+      100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0,
+      108.0, 109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0,
+      116.0, 117.0, 118.0, 119.0, 120.0, 121.0, 122.0, 123.0,
+      124.0, 125.0, 126.0, 127.0, 128.0, 129.0, 130.0, 131.0
+    ]> : tensor<32xf64>
+  %x = sar.broadcast %axis {dim = 1 : i64}
+      : tensor<32xf64> -> tensor<8x32xf64>
+  %x2 = sar.mul %x, %x : tensor<8x32xf64>
+  %q0 = sar.constant dense<4.0> : tensor<8x32xf64>
+  %q1 = sar.constant dense<16.0> : tensor<8x32xf64>
+  %q = sar.where %mask, %q0, %q1
+      : (tensor<8x32xf64>, tensor<8x32xf64>, tensor<8x32xf64>)
+      -> tensor<8x32xf64>
+  %sum = sar.add %x2, %q : tensor<8x32xf64>
+  %root = sar.sqrt %sum : tensor<8x32xf64>
+  %positions = sar.add_scalar %root, -100.0 : tensor<8x32xf64>
+  %or, %oi = sar.interp1d_split %re, %im, %positions
+      : (tensor<8x32xf64>, tensor<8x32xf64>, tensor<8x32xf64>)
+      -> (tensor<8x32xf64>, tensor<8x32xf64>)
+  return %or, %oi : tensor<8x32xf64>, tensor<8x32xf64>
+}
+
+// -----
+
 // A ramp reached through add_scalar / mul_scalar and a row-varying (dim = 0)
 // perturbation still resolves: the row term contributes only to the interval,
 // leaving the ramp coefficient at 1.

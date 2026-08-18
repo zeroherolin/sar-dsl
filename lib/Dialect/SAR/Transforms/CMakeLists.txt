@@ -1,11 +1,13 @@
 add_mlir_library(SARTransforms
   Decomplexify.cpp
+  DemoteLoopCarries.cpp
+  EmitCInterface.cpp
   FuseElementwise.cpp
   LowerCopy.cpp
-  EmitCInterface.cpp
-  DemoteLoopCarries.cpp
+  PrivatizeOutParams.cpp
   ReuseBuffers.cpp
   StageTransposes.cpp
+  VerifyPrecision.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/sar/Dialect/SAR/Transforms
@@ -16,6 +18,7 @@ add_mlir_library(SARTransforms
   LINK_LIBS PUBLIC
   SARDialect
   MLIRFuncDialect
+  MLIRFunctionInterfaces
   MLIRAffineDialect
   MLIRLinalgDialect
   MLIRLinalgTransforms

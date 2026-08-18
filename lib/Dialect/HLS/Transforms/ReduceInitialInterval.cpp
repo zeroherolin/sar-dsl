@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- ReduceInitialInterval.cpp - reduce initial interval ----------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -23,6 +23,7 @@ namespace sar {
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
+using namespace sar::hls;
 
 /// Find a chain of commutative operators starting from "headOps" and ended with
 /// the "store". "headOps" is a list of single-use operations starting with "op"
@@ -58,7 +59,7 @@ static bool findCommutativeChain(Operation *op, AffineWriteOpInterface store,
   return false;
 }
 
-/// The rationale here is we transform the chain from this:
+/// The transform reshapes the reduction chain from this:
 /// dst  1
 ///   \ /
 ///    +   2
@@ -82,8 +83,9 @@ static bool findCommutativeChain(Operation *op, AffineWriteOpInterface store,
 ///
 /// In this way, the distance between the source store and destination
 /// load is effectively reduced, such that potentially the initial
-/// interval can be reduced as well.
-/// TODO: It's possible to reshape the chain to a tree here.
+/// interval can be reduced as well. (Reshaping the chain into a balanced
+/// tree would shorten it further, at the cost of changing the summation
+/// order -- out of bounds for a pass that must keep results bit-exact.)
 
 /// "opsToMove" contains the operations to be moved along the "chain".
 static bool optimizeCommutativeChain(SmallVectorImpl<Operation *> &headOps,
@@ -100,9 +102,9 @@ static bool optimizeCommutativeChain(SmallVectorImpl<Operation *> &headOps,
           : firstOp->getOpOperand(0);
 
   // Get the target operator the chain before which we can optimize.
-  Operation *targetOp;
+  Operation *targetOp = chainOps.back();
   for (auto op : chainOps)
-    if (op == *std::prev(chainOps.end()) || !op->getResult(0).hasOneUse()) {
+    if (!op->getResult(0).hasOneUse()) {
       targetOp = op;
       break;
     }
@@ -164,11 +166,11 @@ struct ReduceInitialIntervalPattern : public OpRewritePattern<AffineForOp> {
           SmallVector<Operation *, 4> headOps({dstLoad});
           if (findCommutativeChain(dstLoad, srcStore, headOps, chainOps))
             if (optimizeCommutativeChain(headOps, chainOps, rewriter)) {
-              LLVM_DEBUG(llvm::dbgs() << "Optimize succeeded\n");
+              LLVM_DEBUG(llvm::dbgs() << "Optimization succeeded\n");
               hasChanged = true;
             }
 
-          // We only consider the first dominated store op.
+          // Only the first dominated store can start this chain.
           break;
         }
       }
@@ -176,7 +178,7 @@ struct ReduceInitialIntervalPattern : public OpRewritePattern<AffineForOp> {
     return success(hasChanged);
   }
 };
-} //  namespace
+} // namespace
 
 namespace {
 struct ReduceInitialInterval

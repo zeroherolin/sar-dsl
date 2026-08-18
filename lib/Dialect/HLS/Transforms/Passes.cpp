@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- Passes.cpp - HLS pipeline and pass registration --------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -16,14 +16,15 @@
 
 using namespace mlir;
 using namespace sar;
+using namespace sar::hls;
 
 namespace {
 #define GEN_PASS_REGISTRATION
 #include "sar/Dialect/HLS/Transforms/Passes.h.inc"
 } // namespace
 
-void sar::addCreateSubviewPasses(OpPassManager &pm, CreateSubviewMode mode) {
-  pm.addPass(sar::createCreateMemrefSubviewPass(mode));
+void sar::addCreateSubviewPasses(OpPassManager &pm) {
+  pm.addPass(sar::createCreateMemrefSubviewPass());
   pm.addPass(mlir::createCSEPass());
   pm.addPass(mlir::createCanonicalizerPass());
 }
@@ -44,37 +45,25 @@ struct HLSPipelineOptions : public PassPipelineOptions<HLSPipelineOptions> {
       *this, "loop-tile-size", llvm::cl::init(2),
       llvm::cl::desc("The tile size of each loop (must larger equal to 1)")};
 
-  Option<unsigned> onChipBytes{
-      *this, "on-chip-bytes", llvm::cl::init(4 * 1024 * 1024),
-      llvm::cl::desc("On-chip memory the design may occupy. Decisions that "
-                     "spend it -- staging blocks for transposes, the bank "
-                     "size below which distributed RAM is used -- follow "
-                     "from this one number")};
-
   Option<unsigned> bramBytes{
-      *this, "bram-bytes", llvm::cl::init(0),
-      llvm::cl::desc("Block RAM the design may occupy, in bytes (0 is "
-                     "unbounded, which keeps the aggregate on-chip rule)")};
+      *this, "bram-bytes", llvm::cl::init(9907200),
+      llvm::cl::desc("Block RAM the design may occupy, in bytes (hard cap; "
+                     "0 forbids the tier)")};
 
   Option<unsigned> uramBytes{
-      *this, "uram-bytes", llvm::cl::init(0),
-      llvm::cl::desc("Ultra RAM the design may occupy, in bytes (0 is "
-                     "unbounded)")};
+      *this, "uram-bytes", llvm::cl::init(37748736),
+      llvm::cl::desc("Ultra RAM the design may occupy, in bytes (hard cap; "
+                     "0 forbids the tier)")};
 
   Option<unsigned> lutramBytes{
-      *this, "lutram-bytes", llvm::cl::init(0),
-      llvm::cl::desc("Distributed RAM the design may occupy, in bytes (0 is "
-                     "unbounded)")};
+      *this, "lutram-bytes", llvm::cl::init(2883584),
+      llvm::cl::desc("Distributed RAM the design may occupy, in bytes (hard "
+                     "cap; 0 forbids the tier)")};
 
   Option<unsigned> lutramMaxBytes{
       *this, "lutram-max-bytes", llvm::cl::init(64),
       llvm::cl::desc("Bank size at or below which distributed RAM is used, "
                      "in bytes (one bus beat at the default 512-bit bus)")};
-
-  Option<unsigned> uramMinBytes{
-      *this, "uram-min-bytes", llvm::cl::init(36864),
-      llvm::cl::desc("Buffer size at or above which ultra RAM is preferred, "
-                     "in bytes")};
 
   Option<unsigned> loopUnrollFactor{
       *this, "loop-unroll-factor", llvm::cl::init(0),
@@ -109,27 +98,21 @@ struct HLSPipelineOptions : public PassPipelineOptions<HLSPipelineOptions> {
 };
 } // namespace
 
-/// On-chip bytes one staging block may occupy.
-///
-/// A band that stages a block also touches the buffers it streams, and the
-/// backend may keep several bands in flight, so a block gets a bounded share
-/// of the budget rather than all of it. The share is what decides a
-/// transpose's tile edge, and through it how long each side's AXI burst
-/// runs.
-static unsigned getStagingBudget(unsigned onChipBytes) {
-  return std::max(1u, onChipBytes / 8);
+/// On-chip bytes one loop-tiling staging block may occupy: an eighth of
+/// the total tier allowance, so staged blocks do not compete with the
+/// working set they serve when several bands are in flight.
+static unsigned getStagingBudget(const HLSPipelineOptions &opts) {
+  uint64_t total = uint64_t(opts.bramBytes) + opts.uramBytes + opts.lutramBytes;
+  return std::max<uint64_t>(1, total / 8);
 }
 
 void sar::registerHLSPipeline() {
   PassPipelineRegistration<HLSPipelineOptions>(
       "hls-pipeline", "Compile SAR affine IR to scheduled HLS IR",
       [](OpPassManager &pm, const HLSPipelineOptions &opts) {
-        // Loop preparation. Note there is no affine fusion here: the fusion
-        // pass this pipeline inherited only worked inside dataflow tasks,
-        // which do not exist until CreateDataflowFromAffine runs further
-        // down, and has been removed as dead code. Introducing fusion means
-        // running it inside the tasks -- a scheduling change that needs its
-        // own validation.
+        // Upstream affine fusion cannot model the data-dependent memref loads
+        // in interpolation gathers and may reorder stores across them. Fusion
+        // here requires gather-aware dependence analysis.
         pm.addPass(sar::createFuncPreprocessPass(opts.hlsTopFunc));
         sar::addSimplifyAffineLoopPasses(pm);
         sar::addCreateSubviewPasses(pm);
@@ -142,7 +125,7 @@ void sar::registerHLSPipeline() {
         // Place dataflow buffers.
         pm.addPass(sar::createPlaceDataflowBufferPass(
             opts.externalBufferThreshold, opts.bramBytes, opts.uramBytes,
-            opts.lutramBytes, opts.lutramMaxBytes, opts.uramMinBytes));
+            opts.lutramBytes, opts.lutramMaxBytes));
 
         // Affine loop tiling.
         pm.addPass(sar::createFuncPreprocessPass(opts.hlsTopFunc));
@@ -150,8 +133,8 @@ void sar::registerHLSPipeline() {
         pm.addPass(sar::createRemoveVariableBoundPass());
         pm.addPass(sar::createAffineLoopOrderOptPass());
         if (opts.loopTileSize != 1)
-          pm.addPass(sar::createAffineLoopTilePass(
-              opts.loopTileSize, getStagingBudget(opts.onChipBytes)));
+          pm.addPass(sar::createAffineLoopTilePass(opts.loopTileSize,
+                                                   getStagingBudget(opts)));
         pm.addPass(affine::createSimplifyAffineStructuresPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
@@ -162,7 +145,7 @@ void sar::registerHLSPipeline() {
         // (sar-stage-transposes for corner turns, the banded gather for
         // interpolation), where the access pattern is known.
 
-        // Affine loop dataflowing.
+        // Form dataflow tasks from affine loops.
         pm.addPass(sar::createCollapseMemrefUnitDimsPass());
         pm.addPass(sar::createAffineStoreForwardPass());
         pm.addPass(sar::createCreateDataflowFromAffinePass());
@@ -180,13 +163,19 @@ void sar::registerHLSPipeline() {
         pm.addPass(sar::createAffineStoreForwardPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // Parallelize dataflow.
+        // Parallelize dataflow nodes.
         if (opts.loopUnrollFactor) {
           pm.addPass(sar::createParallelizeDataflowNodePass(
               opts.loopUnrollFactor, /*unrollPointLoopOnly=*/true,
               opts.complexityAware, opts.correlationAware));
           pm.addPass(affine::createSimplifyAffineStructuresPass());
           pm.addPass(mlir::createCanonicalizerPass());
+          // Splitting a consumer widens its buffer's fan-out past what a
+          // dual-port memory can serve; the multi-consumer forks ran
+          // before the split, so run them again on the widened graph and
+          // re-schedule the nodes that were inserted.
+          pm.addPass(sar::createEliminateMultiConsumerPass());
+          pm.addPass(sar::createScheduleDataflowNodePass());
         }
 
         // Mark schedules whose nodes are all scheduled as legal, which is
@@ -196,13 +185,21 @@ void sar::registerHLSPipeline() {
         pm.addPass(sar::createLegalizeDataflowPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
+        // Forking and balancing create buffer copies after initial placement.
+        // Recharge the tiers, including ping-pong storage, and demote URAM
+        // overflow without changing the established DRAM interface.
+        pm.addPass(sar::createPlaceDataflowBufferPass(
+            opts.externalBufferThreshold, opts.bramBytes, opts.uramBytes,
+            opts.lutramBytes, opts.lutramMaxBytes,
+            /*rebalanceOnly=*/true));
+
         // Memory optimization.
         pm.addPass(sar::createSimplifyAffineIfPass());
         pm.addPass(sar::createAffineStoreForwardPass());
         pm.addPass(sar::createReduceInitialIntervalPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // Convert dataflow to func.
+        // Outline dataflow nodes as functions.
         pm.addPass(sar::createCreateTokenStreamPass());
         pm.addPass(sar::createConvertDataflowToFuncPass());
         pm.addPass(mlir::createCanonicalizerPass());
@@ -222,7 +219,7 @@ void sar::registerHLSPipeline() {
       });
 }
 
-void sar::registerTransformsPasses() {
+void sar::registerHLSPasses() {
   registerHLSPipeline();
-  registerHLSTransformsPasses();
+  registerHLSTransformsPasses(); // TableGen'd per-pass registrations
 }

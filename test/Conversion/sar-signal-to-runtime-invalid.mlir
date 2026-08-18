@@ -1,4 +1,4 @@
-// RUN: sar-opt %s --convert-sar-signal-to-runtime -split-input-file -verify-diagnostics
+// RUN: sar-opt %s --convert-sar-signal-to-runtime --split-input-file --verify-diagnostics
 
 // The runtime lowering only implements the dim = 1 form; dim = 0 is
 // rewritten into transposes by canonicalization, which every pipeline runs

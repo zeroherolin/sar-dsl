@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- AffineLoopPerfection.cpp - affine loop perfection ------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -18,6 +18,7 @@ namespace sar {
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
+using namespace sar::hls;
 
 /// Apply loop perfection. Try to sink all operations between loop statements
 /// into the innermost loop of the input loop band.
@@ -28,7 +29,6 @@ bool sar::applyAffineLoopPerfection(AffineLoopBand &band) {
   auto builder = OpBuilder(innermostLoop);
 
   for (unsigned i = band.size() - 1; i > 0; --i) {
-    // Get the current loop and the child loop.
     auto loop = band[i - 1];
     auto childLoop = band[i];
 
@@ -67,9 +67,9 @@ bool sar::applyAffineLoopPerfection(AffineLoopBand &band) {
     SmallVector<Operation *, 4> suffixOps;
     bool isPrefix = true;
     for (auto &op : loop.getOps()) {
-      // TODO: For now, any operations that allocate memrefs should have been
-      // hoisted. Otherwise, the perfection cannot be done. Call ops are always
-      // not be perfectized as well.
+      // Allocations must have been hoisted by now: sinking one into the
+      // child loop would re-allocate per iteration. A call is opaque to the
+      // sinking below. Either one leaves the band imperfect.
       if (hasEffect<MemoryEffects::Allocate>(&op) || isa<func::CallOp>(op))
         return false;
 
@@ -85,7 +85,6 @@ bool sar::applyAffineLoopPerfection(AffineLoopBand &band) {
 
     // Handle prefix operations.
     if (!prefixOps.empty()) {
-      // Construct the condition of the if statement.
       SmallVector<AffineExpr, 4> ifExprs;
       SmallVector<bool, 4> ifEqFlags;
       SmallVector<Value, 4> ifOperands;
@@ -130,7 +129,6 @@ bool sar::applyAffineLoopPerfection(AffineLoopBand &band) {
 
     // Handle suffix operations.
     if (!suffixOps.empty()) {
-      // Construct the condition of the if statement.
       SmallVector<AffineExpr, 4> ifExprs;
       SmallVector<bool, 4> ifEqFlags;
       SmallVector<Value, 4> ifOperands;
@@ -180,7 +178,6 @@ namespace {
 struct AffineLoopPerfection
     : public sar::impl::AffineLoopPerfectionBase<AffineLoopPerfection> {
   void runOnOperation() override {
-    // Collect all target loop bands.
     AffineLoopBands targetBands;
     getLoopBands(getOperation().front(), targetBands);
 

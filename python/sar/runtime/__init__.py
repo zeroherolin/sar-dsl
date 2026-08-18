@@ -19,7 +19,7 @@ import numpy as np
 from ..errors import LaunchError
 from ..ir import TensorType
 
-__all__ = ["CompiledKernel"]
+__all__ = ["CompiledKernel", "make_descriptor"]
 
 _descriptor_cache = {}
 
@@ -41,7 +41,10 @@ def _descriptor_type(rank: int):
     return _descriptor_cache[rank]
 
 
-def _make_descriptor(array: np.ndarray):
+def make_descriptor(array: np.ndarray):
+    """Builds the MLIR C-interface memref descriptor for `array`
+    (strides in elements). The array must stay alive while the
+    descriptor is in use."""
     rank = array.ndim
     desc = _descriptor_type(rank)()
     address = array.ctypes.data
@@ -81,8 +84,19 @@ class CompiledKernel:
         self.name = name
         self.arg_types = list(arg_types)
         self.result_types = list(result_types)
-        self._library = ctypes.CDLL(self.library_path)
-        self._fn = getattr(self._library, f"_mlir_ciface_{name}")
+        try:
+            self._library = ctypes.CDLL(self.library_path)
+        except OSError as exc:
+            raise LaunchError(
+                f"cannot load compiled kernel library {self.library_path}: "
+                f"{exc}") from exc
+        symbol = f"_mlir_ciface_{name}"
+        try:
+            self._fn = getattr(self._library, symbol)
+        except AttributeError as exc:
+            raise LaunchError(
+                f"compiled kernel library {self.library_path} does not export "
+                f"{symbol}") from exc
         self._fn.restype = None
         # One descriptor pointer per tensor, inputs then results. Declaring
         # them lets ctypes reject an arity mismatch instead of corrupting
@@ -114,7 +128,7 @@ class CompiledKernel:
             for t in self.result_types
         ]
 
-        descriptors = [_make_descriptor(a) for a in inputs + outputs]
+        descriptors = [make_descriptor(a) for a in inputs + outputs]
         self._fn(*[ctypes.byref(d) for d in descriptors])
 
         return outputs[0] if len(outputs) == 1 else tuple(outputs)

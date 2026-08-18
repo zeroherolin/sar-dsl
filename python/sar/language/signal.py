@@ -13,11 +13,10 @@ from typing import Optional
 
 import numpy as np
 
-import sar
-
 from . import (Tensor, TraceError, _require_tensor, _resolve_axis, _tracing,
-               broadcast, cast, concatenate, conj, constant, exp, expj, fft,
-               ifft, interp1d, log, maximum, sin, sqrt, where)
+               absolute, broadcast, cast, concatenate, conj, constant, exp,
+               expj, f32, fft, ifft, interp1d, log, maximum, op, sin, sqrt,
+               where)
 from . import sum as _sum
 
 __all__ = [
@@ -53,19 +52,19 @@ __all__ = [
 # --------------------------------------------------------------------- #
 
 
-@sar.op
+@op
 def fft2(x):
     """2-D forward FFT (Matlab `fft2`): both axes, rows then columns."""
     return fft(fft(x, axis=1), axis=0)
 
 
-@sar.op
+@op
 def ifft2(x):
     """2-D inverse FFT (Matlab `ifft2`)."""
     return ifft(ifft(x, axis=1), axis=0)
 
 
-@sar.op
+@op
 def circshift(x: Tensor,
               shift: int,
               dim: Optional[int] = None,
@@ -96,7 +95,7 @@ def circshift(x: Tensor,
     return rolled
 
 
-@sar.op
+@op
 def mean(x: Tensor,
          dim: Optional[int] = None,
          axis: Optional[int] = None) -> Tensor:
@@ -108,18 +107,44 @@ def mean(x: Tensor,
     return _sum(x, dim=d) / count
 
 
-@sar.op
+def _repeat_vector(x: Tensor, size: int) -> Tensor:
+    """Repeats a length-one reduction result without adding an IR primitive."""
+    result = x
+    while result.shape[0] < size:
+        take = min(result.shape[0], size - result.shape[0])
+        result = concatenate((result, result[:take]), dim=0)
+    return result
+
+
+def _broadcast_mean(mu: Tensor, x: Tensor, dim: Optional[int]) -> Tensor:
+    if x.rank == 1:
+        return _repeat_vector(mu, x.shape[0])
+    if dim == 0:
+        return broadcast(mu, x.shape, dim=1)
+    if dim == 1:
+        return broadcast(mu, x.shape, dim=0)
+    row = _repeat_vector(mu, x.shape[1])
+    return broadcast(row, x.shape, dim=1)
+
+
+@op
 def var(x: Tensor,
         dim: Optional[int] = None,
         axis: Optional[int] = None) -> Tensor:
-    """Variance `mean(x^2) - mean(x)^2` (numpy convention: normalized
-    by N; Matlab `var` divides by N-1)."""
+    """Two-pass population variance, normalized by N like numpy.
+
+    Complex inputs use squared magnitude deviations and therefore return
+    a real tensor, matching numpy.
+    """
     d = _resolve_axis("var", dim, axis, required=False)
     mu = mean(x, dim=d)
-    return mean(x * x, dim=d) - mu * mu
+    centered = x - _broadcast_mean(mu, x, d)
+    if centered.dtype.is_complex:
+        centered = absolute(centered)
+    return mean(centered * centered, dim=d)
 
 
-@sar.op
+@op
 def std(x: Tensor,
         dim: Optional[int] = None,
         axis: Optional[int] = None) -> Tensor:
@@ -135,25 +160,25 @@ _LN2 = float(np.log(2.0))
 _LN10 = float(np.log(10.0))
 
 
-@sar.op
+@op
 def log2(x):
     """Base-2 logarithm of a float tensor."""
     return log(x) * (1.0 / _LN2)
 
 
-@sar.op
+@op
 def log10(x):
     """Base-10 logarithm of a float tensor."""
     return log(x) * (1.0 / _LN10)
 
 
-@sar.op
+@op
 def mag2db(x):
     """Magnitude to decibels, `20 log10(x)` (Matlab `mag2db`)."""
     return log(x) * (20.0 / _LN10)
 
 
-@sar.op
+@op
 def pow2db(x):
     """Power to decibels, `10 log10(x)` (Matlab `pow2db`)."""
     return log(x) * (10.0 / _LN10)
@@ -163,19 +188,19 @@ def pow2db(x):
 db = mag2db
 
 
-@sar.op
+@op
 def db2mag(x):
     """Decibels to magnitude, `10^(x/20)` (Matlab `db2mag`)."""
     return exp(x * (_LN10 / 20.0))
 
 
-@sar.op
+@op
 def db2pow(x):
     """Decibels to power, `10^(x/10)` (Matlab `db2pow`)."""
     return exp(x * (_LN10 / 10.0))
 
 
-@sar.op
+@op
 def sinc(x):
     """Normalized sinc, `sin(pi x) / (pi x)` with `sinc(0) = 1` (numpy
     convention, like Matlab `sinc`)."""
@@ -183,13 +208,13 @@ def sinc(x):
     return where(x == 0.0, 1.0, sin(safe * np.pi) / (safe * np.pi))
 
 
-@sar.op
+@op
 def hypot(a, b):
     """`sqrt(a^2 + b^2)` element-wise (Matlab/numpy `hypot`)."""
     return sqrt(a * a + b * b)
 
 
-@sar.op
+@op
 def multilook(x: Tensor, factors) -> Tensor:
     """Non-overlapping box average over `factors = (azimuth, range)`
     blocks (multilook speckle reduction): the mean of the strided
@@ -211,7 +236,7 @@ def multilook(x: Tensor, factors) -> Tensor:
     return acc * (1.0 / (fa * fr))
 
 
-@sar.op(const=("fa", "fr"))
+@op(const=("fa", "fr"))
 def stolt_interp(data: Tensor,
                  fa: np.ndarray,
                  fr: np.ndarray,
@@ -262,7 +287,7 @@ def stolt_interp(data: Tensor,
     # Positions stay f64 above (interp1d's contract). The ramps multiply the
     # data, so building them at f64 would promote a c64 pipeline to c128 and
     # double the arithmetic downstream; keep them at the data's precision.
-    ramp_axis = fr2 if data.dtype.name == "c128" else cast(fr2, sar.f32)
+    ramp_axis = fr2 if data.dtype.name == "c128" else cast(fr2, f32)
     ramp = expj(ramp_axis * (2.0 * np.pi * t_shift))
     deramp = expj(ramp_axis * (-2.0 * np.pi * t_shift))
     return deramp * interp1d(data * ramp,
@@ -279,7 +304,7 @@ def stolt_interp(data: Tensor,
 # --------------------------------------------------------------------- #
 
 
-@sar.op
+@op
 def dechirp(x: Tensor, ref: Tensor) -> Tensor:
     """Dechirp-on-receive: mixes each pulse with the conjugated
     reference (Matlab `dechirp`). `ref` is a fast-time vector (or a full
@@ -291,7 +316,7 @@ def dechirp(x: Tensor, ref: Tensor) -> Tensor:
     return x * conj(ref)
 
 
-@sar.op
+@op
 def matched_filter(data: Tensor,
                    replica,
                    dim: Optional[int] = None,
@@ -345,7 +370,7 @@ _WINDOWS = {
 }
 
 
-@sar.op
+@op
 def window(kind: str, n: int, **params) -> Tensor:
     """A length-`n` window: `window("taylor", 512, sll=-35)`; kinds:
     hanning, hamming, blackman, kaiser, taylor, rect.
@@ -362,31 +387,31 @@ def window(kind: str, n: int, **params) -> Tensor:
     return constant(samples) if _tracing() else samples
 
 
-@sar.op
+@op
 def hanning(n: int) -> Tensor:
     """Length-`n` Hann window constant (Matlab/numpy `hanning`)."""
     return window("hanning", n)
 
 
-@sar.op
+@op
 def hamming(n: int) -> Tensor:
     """Length-`n` Hamming window constant."""
     return window("hamming", n)
 
 
-@sar.op
+@op
 def blackman(n: int) -> Tensor:
     """Length-`n` Blackman window constant."""
     return window("blackman", n)
 
 
-@sar.op
+@op
 def kaiser(n: int, beta: float = 6.0) -> Tensor:
     """Length-`n` Kaiser window constant with shape parameter `beta`."""
     return window("kaiser", n, beta=beta)
 
 
-@sar.op
+@op
 def taylorwin(n: int, nbar: int = 4, sll: float = -30.0) -> Tensor:
     """Length-`n` Taylor window constant (Matlab `taylorwin`): `nbar - 1`
     near-in sidelobes held at `sll` dB."""

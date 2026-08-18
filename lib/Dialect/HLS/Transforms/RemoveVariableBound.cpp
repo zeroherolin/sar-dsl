@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- RemoveVariableBound.cpp - remove variable bound --------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -19,6 +19,7 @@ namespace sar {
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
+using namespace sar::hls;
 
 /// Apply remove variable bound to all inner loops of the input loop.
 bool sar::applyRemoveVariableBound(AffineLoopBand &band) {
@@ -30,8 +31,9 @@ bool sar::applyRemoveVariableBound(AffineLoopBand &band) {
   // Remove all vairable loop bound if possible.
   for (auto loop : band) {
     if (!loop.hasConstantUpperBound()) {
-      // TODO: support variable upper bound with more than one result in the
-      // getBoundOfAffineValueMap() method.
+      // A single-result bound map is what the affine path produces; a
+      // multi-result (min/max) bound has no one expression to hoist into
+      // the guard, so the loop keeps its variable bound.
       if (auto bound = getBoundOfAffineMap(loop.getUpperBoundMap(),
                                            loop.getUpperBoundOperands())) {
         // Collect all components for creating AffineIf operation.
@@ -64,8 +66,7 @@ bool sar::applyRemoveVariableBound(AffineLoopBand &band) {
     }
 
     if (!loop.hasConstantLowerBound()) {
-      // TODO: support variable lower bound with more than one result in the
-      // getBoundOfAffineValueMap() method.
+      // Same single-result restriction as the upper bound above.
       if (auto bound = getBoundOfAffineMap(loop.getLowerBoundMap(),
                                            loop.getLowerBoundOperands())) {
         // Collect all components for creating AffineIf operation.
@@ -104,7 +105,6 @@ namespace {
 struct RemoveVariableBound
     : public sar::impl::RemoveVariableBoundBase<RemoveVariableBound> {
   void runOnOperation() override {
-    // Collect all target loop bands.
     AffineLoopBands targetBands;
     getLoopBands(getOperation().front(), targetBands);
 

@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- AffineLoopOrderOpt.cpp - affine loop order opt ---------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -23,8 +23,7 @@ namespace sar {
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
-
-/// TODO: support to pass in permutation map.
+using namespace sar::hls;
 
 /// Optimize loop order. Loops associated with memory access dependencies are
 /// moved to an as outer as possible location of the input loop band. If
@@ -134,7 +133,6 @@ namespace {
 struct AffineLoopOrderOpt
     : public sar::impl::AffineLoopOrderOptBase<AffineLoopOrderOpt> {
   void runOnOperation() override {
-    // Collect all target loop bands.
     AffineLoopBands targetBands;
     getLoopBands(getOperation().front(), targetBands);
 

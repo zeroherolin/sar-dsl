@@ -1,4 +1,4 @@
-// RUN: sar-opt %s --hls-place-dataflow-buffer -verify-diagnostics
+// RUN: sar-opt %s --hls-place-dataflow-buffer --verify-diagnostics
 
 // Placement retypes values in place; the only view it can re-infer is
 // memref.subview. Any other view-like op is rejected by name instead of

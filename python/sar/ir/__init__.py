@@ -12,6 +12,7 @@ which is stable regardless of custom assembly formats.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -137,7 +138,7 @@ def _format_attr(value) -> str:
 
 
 #: Above this element count, non-splat float/complex constants are emitted
-#: as raw hex blobs (compact and exact; same layout numpy uses in memory).
+#: as raw hex blobs (compact and exact).
 _HEX_DENSE_THRESHOLD = 64
 
 
@@ -166,10 +167,10 @@ class DenseAttr:
             body = render(flat[0])  # splat
         elif (flat.size > _HEX_DENSE_THRESHOLD
               and (type.dtype.is_float or type.dtype.is_complex)):
-            # MLIR hex blobs store elements in little-endian byte order,
-            # which matches numpy's contiguous layout exactly.
-            data = np.ascontiguousarray(
-                array.astype(type.dtype.to_numpy(), copy=False))
+            # MLIR hex blobs are little-endian regardless of the host.
+            little_endian = np.dtype(type.dtype.to_numpy()).newbyteorder("<")
+            data = np.ascontiguousarray(array.astype(little_endian,
+                                                     copy=False))
             body = '"0x' + data.tobytes().hex().upper() + '"'
         else:
 
@@ -214,6 +215,7 @@ class Operation:
     unit_attributes: Tuple[str, ...] = ()
     results: List[Value] = field(default_factory=list)
     region: Optional[Region] = None
+    location: Optional[Tuple[str, int, int]] = None
 
     def render(self, indent: str = "  ") -> str:
         # Several results print as one group (`%3:2 = ...`), which later
@@ -237,9 +239,13 @@ class Operation:
         operand_types = ", ".join(v.type.mlir for v in self.operands)
         result_types = ", ".join(t.mlir for t in self.result_types)
         signature = f"({operand_types}) -> ({result_types})"
+        loc = ""
+        if self.location is not None:
+            path, line, column = self.location
+            loc = f" loc({json.dumps(path)}:{line}:{column})"
 
         return (f'{prefix}"{self.op_name}"({operands}){props}{region}'
-                f" : {signature}")
+                f" : {signature}{loc}")
 
 
 class Function:
@@ -276,11 +282,15 @@ class Function:
         operands: Sequence[Value],
         result_type: TensorType,
         attributes: Optional[Dict[str, object]] = None,
-        unit_attributes: Sequence[str] = ()
+        unit_attributes: Sequence[str] = (),
+        location: Optional[Tuple[str, int, int]] = None,
     ) -> Value:
         """Appends an operation with a single result and returns its value."""
-        op = Operation(op_name, list(operands), [result_type],
-                       dict(attributes or {}), tuple(unit_attributes))
+        op = Operation(op_name,
+                       list(operands), [result_type],
+                       dict(attributes or {}),
+                       tuple(unit_attributes),
+                       location=location)
         op.results = [self._new_value(result_type)]
         self._frames[-1].append(op)
         return op.results[0]
@@ -314,10 +324,16 @@ class Function:
         result_types: Sequence[TensorType],
         region: Region,
         attributes: Optional[Dict[str, object]] = None,
+        unit_attributes: Sequence[str] = (),
+        location: Optional[Tuple[str, int, int]] = None,
     ) -> List[Value]:
         """Appends an operation holding `region`, with one result group."""
-        op = Operation(op_name, list(operands), list(result_types),
-                       dict(attributes or {}))
+        op = Operation(op_name,
+                       list(operands),
+                       list(result_types),
+                       dict(attributes or {}),
+                       tuple(unit_attributes),
+                       location=location)
         op.region = region
         base = self._next_id
         self._next_id += 1

@@ -1,4 +1,4 @@
-// RUN: sar-opt -hls-legalize-dataflow %s | FileCheck %s
+// RUN: sar-opt %s --hls-legalize-dataflow | FileCheck %s
 
 // Two nodes that share an input sit at the same level and are candidates for
 // fusion, but a consumer of the first one's output sits between them. Fusion

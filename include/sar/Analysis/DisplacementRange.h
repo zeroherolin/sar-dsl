@@ -1,4 +1,4 @@
-//===- DisplacementRange.h - Bounds on resampling displacement ----*- C++-*-===//
+//===- DisplacementRange.h - Resampling displacement bounds -----*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

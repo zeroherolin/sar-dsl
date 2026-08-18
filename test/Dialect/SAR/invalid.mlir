@@ -1,4 +1,4 @@
-// RUN: sar-opt %s -split-input-file -verify-diagnostics
+// RUN: sar-opt %s --split-input-file --verify-diagnostics
 // Verifier coverage for ill-formed SAR operations.
 
 func.func @fft_too_small(%x: tensor<4x1xcomplex<f32>>) -> tensor<4x1xcomplex<f32>> {
@@ -155,6 +155,32 @@ func.func @interp_odd_taps(%z: tensor<4x8xcomplex<f64>>, %p: tensor<4x8xf64>)
 
 // -----
 
+func.func @interp_bad_window(%z: tensor<4x8xcomplex<f64>>,
+                             %p: tensor<4x8xf64>)
+    -> tensor<4x8xcomplex<f64>> {
+  // expected-error @+1 {{window must be one of: rect, hann, hamming, kaiser}}
+  %0 = sar.interp1d %z, %p {kernel = "nearest", window = "triangle"}
+      : (tensor<4x8xcomplex<f64>>, tensor<4x8xf64>)
+      -> (tensor<4x8xcomplex<f64>>)
+  return %0 : tensor<4x8xcomplex<f64>>
+}
+
+// -----
+
+func.func @interp_nonfinite_beta(%z: tensor<4x8xcomplex<f64>>,
+                                 %p: tensor<4x8xf64>)
+    -> tensor<4x8xcomplex<f64>> {
+  // expected-error @+1 {{beta must be finite and in (0, 12]}}
+  %0 = sar.interp1d %z, %p
+      {kernel = "nearest", window = "kaiser",
+       beta = 0x7FF8000000000000 : f64}
+      : (tensor<4x8xcomplex<f64>>, tensor<4x8xf64>)
+      -> (tensor<4x8xcomplex<f64>>)
+  return %0 : tensor<4x8xcomplex<f64>>
+}
+
+// -----
+
 func.func @cast_int_to_complex(%x: tensor<4xi64>)
     -> tensor<4xcomplex<f64>> {
   // expected-error @+1 {{cannot cast an integer tensor directly to complex}}
@@ -165,7 +191,7 @@ func.func @cast_int_to_complex(%x: tensor<4xi64>)
 // -----
 
 func.func @cumsum_rank3(%x: tensor<2x4x8xf32>) -> tensor<2x4x8xf32> {
-  // expected-error @+1 {{expects a rank-2 input}}
+  // expected-error @+1 {{expects a rank-1 or rank-2 input}}
   %0 = sar.cumsum %x {dim = 0 : i64} : tensor<2x4x8xf32>
   return %0 : tensor<2x4x8xf32>
 }
@@ -173,7 +199,7 @@ func.func @cumsum_rank3(%x: tensor<2x4x8xf32>) -> tensor<2x4x8xf32> {
 // -----
 
 func.func @cumsum_bad_dim(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
-  // expected-error @+1 {{dim must be 0 or 1}}
+  // expected-error @+1 {{dim is out of range for the input rank}}
   %0 = sar.cumsum %x {dim = 2 : i64} : tensor<4x8xf32>
   return %0 : tensor<4x8xf32>
 }
@@ -206,7 +232,7 @@ func.func @rank_filter_rank_oob(%x: tensor<8x16xf32>) -> tensor<8x16xf32> {
 // -----
 
 func.func @rank_filter_bad_dim(%x: tensor<8x16xf32>) -> tensor<8x16xf32> {
-  // expected-error @+1 {{dim must be 0 or 1}}
+  // expected-error @+1 {{dim is out of range for the input rank}}
   %0 = sar.rank_filter %x {window = 3 : i64, rank = 1 : i64, dim = 2 : i64} : tensor<8x16xf32>
   return %0 : tensor<8x16xf32>
 }
@@ -231,7 +257,7 @@ func.func @sort_complex(%x: tensor<8x16xcomplex<f64>>) -> tensor<8x16xcomplex<f6
 // -----
 
 func.func @sort_bad_dim(%x: tensor<8x16xf32>) -> tensor<8x16xf32> {
-  // expected-error @+1 {{dim must be 0 or 1}}
+  // expected-error @+1 {{dim is out of range for the input rank}}
   %0 = sar.sort %x {dim = 2 : i64} : tensor<8x16xf32>
   return %0 : tensor<8x16xf32>
 }
@@ -293,4 +319,45 @@ func.func @iterate_type_drift(%z: tensor<4x4xf64>, %w: tensor<4x4xf32>)
     sar.yield %1 : tensor<4x4xf64>
   }
   return %0 : tensor<4x4xf64>
+}
+
+// -----
+
+func.func @iterate_bad_index_type(%z: tensor<4x4xf64>) -> tensor<4x4xf64> {
+  // expected-error @+1 {{the index block argument must be tensor<1xi64>}}
+  %0 = sar.iterate(%z) {trips = 2 : i64, index}
+      : (tensor<4x4xf64>) -> tensor<4x4xf64> {
+  ^bb0(%i: tensor<1xf64>, %acc: tensor<4x4xf64>):
+    sar.yield %acc : tensor<4x4xf64>
+  }
+  return %0 : tensor<4x4xf64>
+}
+
+// -----
+
+func.func @cumsum_empty(%x: tensor<0xf32>) -> tensor<0xf32> {
+  // expected-error @+1 {{input must have static positive extents}}
+  %0 = sar.cumsum %x {dim = 0 : i64} : tensor<0xf32>
+  return %0 : tensor<0xf32>
+}
+
+// -----
+
+func.func @interp_empty(%data: tensor<1x0xcomplex<f64>>,
+                        %pos: tensor<1x0xf64>)
+    -> tensor<1x0xcomplex<f64>> {
+  // expected-error @+1 {{data must have static positive extents}}
+  %0 = sar.interp1d %data, %pos
+      : (tensor<1x0xcomplex<f64>>, tensor<1x0xf64>)
+      -> (tensor<1x0xcomplex<f64>>)
+  return %0 : tensor<1x0xcomplex<f64>>
+}
+
+// -----
+
+func.func @pad_empty(%x: tensor<0xf32>) -> tensor<2xf32> {
+  // expected-error @+1 {{input must have static positive extents}}
+  %0 = sar.pad %x {low = array<i64: 1>, high = array<i64: 1>, value = 0.0}
+      : tensor<0xf32> -> tensor<2xf32>
+  return %0 : tensor<2xf32>
 }

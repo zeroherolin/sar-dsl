@@ -6,8 +6,8 @@ previous artifact, starting from the serialized `sar` dialect module.
 The final artifact is wrapped into a launcher by `make_launcher`.
 
 New hardware targets drop a package with a ``Backend`` subclass into
-``third_party/<name>/backend`` (development) or ``sar/backends/<name>``
-(installed) -- no changes to the core are needed.
+``sar/backends/<name>`` or any directory on ``$SAR_DSL_BACKEND_PATH`` --
+no changes to the core are needed (see docs/backends.md).
 """
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ from ..ir import TensorType
 
 __all__ = ["BaseBackend", "KernelMetadata", "Stage", "cached_stage"]
 
-Stage = Callable  # (artifact, metadata: KernelMetadata, cache) -> artifact
+#: One compilation stage: ``(artifact, metadata, cache) -> artifact``.
+Stage = Callable[[object, "KernelMetadata", object], object]
 
 
 def cached_stage(cache, filename: str, build: Callable[[], str]) -> str:

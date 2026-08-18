@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- StreamDataflowTask.cpp - stream dataflow task ----------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -44,7 +44,7 @@ struct StreamTaskIOs : public OpRewritePattern<TaskOp> {
       auto stream = ToStreamOp::create(rewriter, loc, streamType, output.get());
       output.set(stream);
 
-      // Create to_value op at the begining of every task user.
+      // Create a to_value op at the beginning of every task user.
       llvm::SmallDenseSet<TaskOp, 4> taskUsers;
       for (auto user : result.getUsers())
         if (auto taskUser = user->getParentOfType<TaskOp>())

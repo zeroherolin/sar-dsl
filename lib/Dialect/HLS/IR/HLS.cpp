@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- HLS.cpp - the HLS dialect ------------------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -242,11 +242,13 @@ struct SimplifyScheduleOperands : public OpRewritePattern<ScheduleOp> {
     schedule.getBody().front().eraseArguments(
         [&](BlockArgument arg) { return unusedArgs.count(arg); });
 
-    // Construct new schedule.
+    // Preserve all schedule attributes, including the `isLegal` dataflow
+    // marker, when rebuilding the operation.
     if (hasUnusedPort) {
       rewriter.setInsertionPoint(schedule);
       auto newSchedule =
           ScheduleOp::create(rewriter, schedule.getLoc(), usedOperands);
+      newSchedule->setAttrs(schedule->getAttrDictionary());
       rewriter.inlineRegionBefore(schedule.getBody(), newSchedule.getBody(),
                                   newSchedule.getBody().end());
       rewriter.eraseOp(schedule);
@@ -319,7 +321,10 @@ void ScheduleOp::getEffects(
     }
 }
 
-/// FIXME: Check whether the schedule is dependence free.
+/// Whether no execution of the schedule can depend on a previous one. A
+/// function-level schedule runs once; a schedule inside an affine loop is
+/// independent across iterations only if the loop is marked parallel.
+/// Conservative: any other parent answers false.
 bool ScheduleOp::isDependenceFree() {
   if (auto loop = dyn_cast<mlir::affine::AffineForOp>((*this)->getParentOp()))
     return hasParallelAttr(loop);
@@ -557,7 +562,8 @@ void NodeOp::updateSignatureRecursively() {
       if (auto schedule = dyn_cast<ScheduleOp>(user))
         schedules.insert(schedule);
   }
-  // TODO: How to traverse all schedule ops?
+  // Recurse into the schedules that consume the updated arguments; other
+  // schedules in the body see no type change and need no visit.
   for (auto schedule : schedules)
     schedule.updateSignatureRecursively();
 }
@@ -696,6 +702,9 @@ void BufferOp::getCanonicalizationPatterns(RewritePatternSet &results,
 }
 
 LogicalResult BufferOp::verify() {
+  if (getDepth() <= 0)
+    return emitOpError("buffer depth must be positive");
+
   if (auto initValue = getInitValue())
     if (initValue.value().getType() != getType().getElementType())
       return emitOpError("initial value's type doesn't align with memref type");
@@ -753,7 +762,16 @@ void ConstBufferOp::getEffects(
 // StreamOp, StreamReadOp, and StreamWriteOp
 //===----------------------------------------------------------------------===//
 
+LogicalResult StreamType::verify(function_ref<InFlightDiagnostic()> emitError,
+                                 Type elementType, unsigned depth) {
+  if (depth == 0)
+    return emitError() << "stream depth must be positive";
+  return success();
+}
+
 LogicalResult StreamOp::verify() {
+  if (getDepth() <= 0)
+    return emitOpError("stream depth must be positive");
   if (getDepth() != cast<StreamType>(getChannel().getType()).getDepth())
     return emitOpError("stream channel depth is not aligned");
   return success();
@@ -788,7 +806,8 @@ LogicalResult StreamWriteOp::verify() {
 
 LogicalResult AxiType::verify(function_ref<InFlightDiagnostic()> emitError,
                               Type elementType) {
-  // TODO: Support AxiLite type for scalar values.
+  // Scalars ride in the AXI-lite control bundle the emitter already
+  // generates, not in their own AXI port, so only bulk carriers qualify.
   if (!isa<MemRefType, StreamType>(elementType))
     return emitError() << "AXI element type must be a memref or stream";
   return success();
@@ -805,14 +824,16 @@ Type AxiType::getDataType() {
 }
 
 LogicalResult AxiPortOp::verify() {
+  if (!getBundle().getDefiningOp<AxiBundleOp>())
+    return emitOpError("bundle must be defined by hls.axi.bundle");
   if (!isa<BlockArgument>(getAxi()))
-    return emitOpError("axi must be block arguments");
+    return emitOpError("AXI value must be a block argument");
 
   if (getAxiType().getElementType() != getElement().getType())
-    return emitOpError("axi type doesn't align with element type");
+    return emitOpError("AXI type doesn't align with element type");
 
   if (getAxiType().getDataType() != getBundleType().getDataType())
-    return emitOpError("axi type doesn't align with bundle type");
+    return emitOpError("AXI type doesn't align with bundle type");
 
   return TypeSwitch<Type, LogicalResult>(getAxiType().getElementType())
       .Case<MemRefType>([&](auto type) -> LogicalResult {
@@ -830,7 +851,20 @@ LogicalResult AxiPortOp::verify() {
       });
 }
 
-LogicalResult AxiPackOp::verify() { return success(); }
+LogicalResult AxiPackOp::verify() {
+  auto axiType = cast<AxiType>(getAxi().getType());
+  Type sourceType = getElement().getType();
+  Type interfaceType = axiType.getElementType();
+  bool compatible = sourceType == interfaceType;
+  if (auto sourceMemref = dyn_cast<MemRefType>(sourceType))
+    if (auto interfaceMemref = dyn_cast<MemRefType>(interfaceType))
+      compatible =
+          sourceMemref.getShape() == interfaceMemref.getShape() &&
+          sourceMemref.getElementType() == interfaceMemref.getElementType();
+  if (!compatible)
+    return emitOpError("source type doesn't align with AXI element type");
+  return success();
+}
 
 //===----------------------------------------------------------------------===//
 // Affine SelectOp
@@ -925,8 +959,9 @@ OpFoldResult AffineSelectOp::fold(FoldAdaptor) {
 }
 
 LogicalResult AffineSelectOp::verify() {
-  // Verify that we have a condition attribute.
-  // FIXME: This should be specified in the arguments list in ODS.
+  // The condition lives in a discardable attribute rather than the ODS
+  // argument list, mirroring upstream `affine.if`, whose custom builders
+  // and parser this op reuses the shape of.
   auto conditionAttr =
       (*this)->getAttrOfType<IntegerSetAttr>(getConditionAttrStrName());
   if (!conditionAttr)
@@ -1169,11 +1204,14 @@ LogicalResult TileLayoutAttr::verifyLayout(
     function_ref<InFlightDiagnostic()> emitError) const {
   if (shape.size() != getTileShape().size())
     return emitError() << "number of memref dimensions must be equal to number "
-                          "of vector shape dimensions";
-  for (auto [size, tileSize] : llvm::zip(shape, getTileShape()))
+                          "of tile shape dimensions";
+  for (auto [size, tileSize] : llvm::zip(shape, getTileShape())) {
+    if (size <= 0 || tileSize <= 0)
+      return emitError() << "memref and tile dimensions must be positive";
     if (size % tileSize != 0)
       return emitError() << "memref dimension size must be a multiple of "
-                            "vector shape dimension size";
+                            "tile shape dimension size";
+  }
   return success();
 }
 
@@ -1184,10 +1222,13 @@ TileLayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   if (tileShape.size() != vectorShape.size())
     return emitError() << "number of dimensions in affine map must be equal to "
                           "number of vector shape dimensions";
-  for (auto [tileSize, vectorSize] : llvm::zip(tileShape, vectorShape))
+  for (auto [tileSize, vectorSize] : llvm::zip(tileShape, vectorShape)) {
+    if (tileSize <= 0 || vectorSize <= 0)
+      return emitError() << "tile and vector dimensions must be positive";
     if (tileSize % vectorSize != 0)
       return emitError() << "tile shape dimension size must be a multiple of "
                             "vector shape dimension size";
+  }
   return success();
 }
 
@@ -1201,17 +1242,8 @@ TileLayoutAttr hls::getTileLayout(Operation *op) {
 void hls::setTileLayout(Operation *op, TileLayoutAttr tileLayout) {
   op->setAttr("tile_layout", tileLayout);
 }
-void hls::setTileLayout(Operation *op, ArrayRef<int64_t> tileShape,
-                        ArrayRef<int64_t> vectorShape) {
-  auto tileLayout =
-      TileLayoutAttr::get(op->getContext(), tileShape, vectorShape);
-  setTileLayout(op, tileLayout);
-}
-void hls::setTileLayout(Operation *op, ArrayRef<int64_t> tileShape) {
-  auto tileLayout = TileLayoutAttr::get(op->getContext(), tileShape);
-  setTileLayout(op, tileLayout);
-}
-
+TileLayoutAttr getTileLayout(Operation *op);
+void setTileLayout(Operation *op, TileLayoutAttr tileLayout);
 TileLayoutAttr hls::getTileLayout(Value memref) {
   if (auto buffer = findBuffer(memref)) {
     if (auto bufferArg = dyn_cast<BlockArgument>(buffer)) {
@@ -1247,50 +1279,6 @@ void hls::setTileLayout(Value memref, ArrayRef<int64_t> tileShape) {
 }
 
 //===----------------------------------------------------------------------===//
-// HLS resource and timing attributes
-//===----------------------------------------------------------------------===//
-
-/// Timing attribute utils.
-TimingAttr hls::getTiming(Operation *op) {
-  return op->getAttrOfType<TimingAttr>("timing");
-}
-void hls::setTiming(Operation *op, TimingAttr timing) {
-  assert(timing.getBegin() <= timing.getEnd() && "invalid timing attribute");
-  op->setAttr("timing", timing);
-}
-void hls::setTiming(Operation *op, int64_t begin, int64_t end, int64_t latency,
-                    int64_t minII) {
-  auto timing = TimingAttr::get(op->getContext(), begin, end, latency, minII);
-  setTiming(op, timing);
-}
-
-/// Resource attribute utils.
-ResourceAttr hls::getResource(Operation *op) {
-  return op->getAttrOfType<ResourceAttr>("resource");
-}
-void hls::setResource(Operation *op, ResourceAttr resource) {
-  op->setAttr("resource", resource);
-}
-void hls::setResource(Operation *op, int64_t lut, int64_t dsp, int64_t bram) {
-  auto resource = ResourceAttr::get(op->getContext(), lut, dsp, bram);
-  setResource(op, resource);
-}
-
-/// Loop information attribute utils.
-LoopInfoAttr hls::getLoopInfo(Operation *op) {
-  return op->getAttrOfType<LoopInfoAttr>("loop_info");
-}
-void hls::setLoopInfo(Operation *op, LoopInfoAttr loopInfo) {
-  op->setAttr("loop_info", loopInfo);
-}
-void hls::setLoopInfo(Operation *op, int64_t flattenTripCount,
-                      int64_t iterLatency, int64_t minII) {
-  auto loopInfo =
-      LoopInfoAttr::get(op->getContext(), flattenTripCount, iterLatency, minII);
-  setLoopInfo(op, loopInfo);
-}
-
-//===----------------------------------------------------------------------===//
 // HLS directive attributes
 //===----------------------------------------------------------------------===//
 
@@ -1301,10 +1289,9 @@ LoopDirectiveAttr hls::getLoopDirective(Operation *op) {
 void hls::setLoopDirective(Operation *op, LoopDirectiveAttr loopDirective) {
   op->setAttr("loop_directive", loopDirective);
 }
-void hls::setLoopDirective(Operation *op, bool pipeline, int64_t targetII,
-                           bool dataflow, bool flatten) {
-  auto loopDirective = LoopDirectiveAttr::get(op->getContext(), pipeline,
-                                              targetII, dataflow, flatten);
+void hls::setLoopDirective(Operation *op, bool pipeline, int64_t targetII) {
+  auto loopDirective =
+      LoopDirectiveAttr::get(op->getContext(), pipeline, targetII);
   setLoopDirective(op, loopDirective);
 }
 

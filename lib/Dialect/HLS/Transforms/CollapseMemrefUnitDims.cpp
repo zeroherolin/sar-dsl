@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- CollapseMemrefUnitDims.cpp - collapse memref unit dims -------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -25,13 +25,16 @@ static LogicalResult collapseMemref(Value memref) {
   if (!type)
     return failure();
 
-  // TODO: Support non-identity buffers.
+  // Only identity-layout buffers with a unit dim qualify: a non-identity
+  // layout (partitioned or tiled) encodes banking whose meaning would
+  // change if a dimension vanished from under it.
   if (!type.getLayout().getAffineMap().isIdentity() ||
       !llvm::any_of(type.getShape(),
                     [](int64_t dimSize) { return dimSize == 1; }))
     return failure();
 
-  // TODO: Support non-affine read/write interfaces.
+  // Every user's access map must be rewritable; only the affine
+  // read/write interfaces expose one.
   if (llvm::any_of(memref.getUsers(), [](Operation *op) {
         return !isa<AffineReadOpInterface, AffineWriteOpInterface>(op);
       }))
@@ -45,6 +48,10 @@ static LogicalResult collapseMemref(Value memref) {
       newShape.push_back(dimSize.value());
       remainDims.push_back(dimSize.index());
     }
+  // A rank-0 memref emits as a scalar C++ value. Dataflow extraction may
+  // later pass it to a helper by value, losing writes to the channel.
+  if (newShape.empty())
+    return failure();
 
   // Set the buffer to a new type.
   auto newType = MemRefType::get(newShape, type.getElementType(), AffineMap(),
@@ -91,10 +98,6 @@ struct CollapseFuncMemref : public OpRewritePattern<func::FuncOp> {
   LogicalResult matchAndRewrite(func::FuncOp func,
                                 PatternRewriter &rewriter) const override {
     bool hasChanged = false;
-    for (auto arg : func.getArguments())
-      if (succeeded(collapseMemref(arg)))
-        hasChanged = true;
-
     func.walk([&](hls::BufferLikeInterface buffer) {
       if (succeeded(collapseMemref(buffer.getMemref()))) {
         hasChanged = true;

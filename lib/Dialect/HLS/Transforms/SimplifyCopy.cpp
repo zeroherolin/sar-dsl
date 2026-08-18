@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- SimplifyCopy.cpp - simplify copy -----------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -134,7 +134,7 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
         (hasWriteUsers(targetPostDomUsers) && !sourcePostDomUsers.empty()))
       return failure();
 
-    // If the source buffer has writer users dominating the copy and the target
+    // If the source buffer has writers dominating the copy and the target
     // buffer has users dominating the copy, the copy cannot be eliminated.
     // Meanwhile, as long as the target buffer has users dominating the copy,
     // return failure.
@@ -146,12 +146,10 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
     // (which should both be read only), the init value must be the same.
     if (!sourceDomUsers.empty() && !targetDomUsers.empty())
       if ((!sourceBuf || !targetBuf) ||
-          (sourceBuf.getInitValue() && targetBuf.getInitValue() &&
-           sourceBuf.getInitValue().value() !=
-               targetBuf.getInitValue().value()))
+          sourceBuf.getInitValue() != targetBuf.getInitValue())
         return failure();
 
-    LLVM_DEBUG(llvm::dbgs() << "Dominances are valid\n");
+    LLVM_DEBUG(llvm::dbgs() << "Dominance is valid\n");
 
     auto sourceView = copy.getSource().getDefiningOp();
     auto targetView = copy.getTarget().getDefiningOp();
@@ -159,15 +157,15 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
 
     // To replace the target buffer, the buffer must be directly defined by a
     // BufferOp without view. Meanwhile, the source view should either be a
-    // block argument or dominate all users of the target buffer.
-    // TODO: The second condition is quite conservative and could be improved by
-    // analyzing whether the source view can be replaced to the location of the
-    // target buffer.
+    // block argument or dominate all users of the target buffer -- a
+    // conservative dominance screen; moving the source view down to the
+    // target buffer could legalize more cases at the cost of a placement
+    // analysis.
     if (targetBuf && targetBuf == targetView &&
         (!sourceView || llvm::all_of(targetUsers, [&](Operation *user) {
           return domInfo.dominates(sourceView, user);
         }))) {
-      LLVM_DEBUG(llvm::dbgs() << "Target and copy is erased\n");
+      LLVM_DEBUG(llvm::dbgs() << "Target and copy are erased\n");
 
       rewriter.replaceOp(targetBuf, copy.getSource());
       rewriter.eraseOp(copy);
@@ -175,6 +173,20 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
     }
 
     // Similarly, we need the same conditions to replace the source buffer.
+    // One more screen first: when the target is a top-function port,
+    // replacing a source that several operations write would hand the
+    // port several writing processes -- exactly the multi-writer port
+    // that forfeits `#pragma HLS dataflow` for the whole design (and what
+    // sar-privatize-out-params exists to prevent). A single-writer source
+    // may still merge; the port stays a one-writer channel.
+    if (isa<BlockArgument>(target)) {
+      unsigned writers = 0;
+      for (auto user : sourceUsers)
+        if (user != copy && hasEffect<MemoryEffects::Write>(user))
+          ++writers;
+      if (writers >= 2)
+        return failure();
+    }
     if (sourceBuf && sourceBuf == sourceView &&
         (!targetView || llvm::all_of(sourceUsers, [&](Operation *user) {
           return domInfo.dominates(targetView, user);

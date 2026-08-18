@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- HLSTypes.td - HLS dialect type definitions -------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -22,6 +22,7 @@ def StreamType : HLSType<"Stream"> {
 
   let parameters = (ins "mlir::Type":$elementType, "unsigned":$depth);
   let assemblyFormat = "`<` qualified($elementType) `,` $depth `>`";
+  let genVerifyDecl = 1;
 }
 
 def AxiType : HLSType<"Axi"> {

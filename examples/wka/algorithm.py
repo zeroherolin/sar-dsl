@@ -53,8 +53,8 @@ def build_kernel(n: int,
         # Bulk compression:
         #   phase = (4 pi R0 / c) * (sqrt((fc + fr)^2 - (c fa / 2 vr)^2)
         #           - (fc + fr)) + pi fr^2 / Kr
-        fa2 = sar.broadcast(fa, (N, N), dim=0)  # varies along azimuth rows
-        fr2 = sar.broadcast(fr, (N, N), dim=1)  # varies along range cols
+        fa2 = sar.broadcast(fa, (N, N), dim=0)
+        fr2 = sar.broadcast(fr, (N, N), dim=1)
         fr_shifted = fr2 + p.fc
         term1 = fr_shifted * fr_shifted
         fa_scaled = fa2 * (p.c / (2.0 * p.vr))
@@ -62,7 +62,7 @@ def build_kernel(n: int,
         root = sar.sqrt(sar.maximum(term1 - term2, 1e-10))
         phase = ((root - fr_shifted) * (4.0 * math.pi * p.r0 / p.c) +
                  (fr2 * fr2) * (math.pi / p.kr))
-        data = data * sar.expj(phase)
+        data = data * sar.cast(sar.expj(phase), dtype)
 
         data = sar.stolt_interp(data,
                                 fa,

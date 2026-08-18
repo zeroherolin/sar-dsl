@@ -22,6 +22,7 @@ reports as `HLSDesign.config`.
 from __future__ import annotations
 
 import difflib
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -29,11 +30,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
-from sar.errors import SARError
+from ...errors import SARError
 
 __all__ = [
     "CONFIG_ENV_VAR", "HLSConfig", "HLSConfigError", "OPTIONS",
-    "shipped_config_path"
+    "check_precision", "shipped_config_path"
 ]
 
 #: Names a YAML file replacing the shipped defaults for a whole project.
@@ -62,15 +63,9 @@ class _Spec:
     minimum: Optional[int] = None
     maximum: Optional[int] = None
     choices: Tuple[str, ...] = ()
-    #: Deprecated spellings of a choice, mapped to the canonical one. An
-    #: alias is accepted wherever the choice is and stored normalized, so
-    #: everything downstream sees exactly one name per value.
-    aliases: Optional[Dict[str, str]] = None
     power_of_two: bool = False
     #: None is accepted and means "the backend decides".
     nullable: bool = False
-    #: Values that parse but cannot be honoured, mapped to the reason.
-    rejected: Optional[Dict[str, str]] = None
     #: Optimization strategy rather than a constraint. The compiler derives
     #: these, so they carry no default in the shipped file and are not part
     #: of the surface a user configures; pinning one is a diagnostic act.
@@ -78,32 +73,27 @@ class _Spec:
 
 
 #: The complete option schema; the shipped YAML carries a default for
-#: every key, and the docs table is generated from these one-liners.
+#: every key; the table in docs/backends.md mirrors these one-liners
+#: and is maintained alongside them.
 OPTIONS: Dict[str, _Spec] = {
     "bram_bytes":
-    _Spec("int",
-          "Block RAM the design may occupy, in bytes (0 = unbounded)",
+    _Spec("int", "Block RAM the design may occupy, in bytes (hard cap; "
+          "0 forbids the tier)",
           minimum=0,
           maximum=_UINT32_MAX),
     "uram_bytes":
-    _Spec("int",
-          "UltraRAM the design may occupy, in bytes (0 = unbounded)",
+    _Spec("int", "UltraRAM the design may occupy, in bytes (hard cap; "
+          "0 forbids the tier)",
           minimum=0,
           maximum=_UINT32_MAX),
     "lutram_bytes":
-    _Spec("int",
-          "Distributed RAM the design may occupy, in bytes (0 = unbounded)",
+    _Spec("int", "Distributed RAM the design may occupy, in bytes (hard cap; "
+          "0 forbids the tier)",
           minimum=0,
           maximum=_UINT32_MAX),
-    "on_chip_budget":
-    _Spec("int", "Total on-chip bytes before planes are streamed "
-          "(null = sum of the tiers, 0 = keep everything resident)",
-          minimum=0,
-          maximum=_UINT32_MAX,
-          nullable=True),
-    "uram_min_bytes":
-    _Spec("int", "Buffer size, in bytes, at or above which ultra RAM is used "
-          "(device fact: 36864 = one 288 Kb UltraRAM block on VU13P)",
+    "dsp":
+    _Spec("int", "DSP slice budget checked against synthesis reports "
+          "(`precision` is the pre-synthesis lever)",
           minimum=0,
           maximum=_UINT32_MAX),
     "interface":
@@ -111,8 +101,7 @@ OPTIONS: Dict[str, _Spec] = {
           "Protocol the top function's ports speak: 'ap_memory' (plain "
           "arrays behind the Vitis ap_memory handshake), 'axi' (AXI4 "
           "masters) or 'stream' (AXI4-Stream)",
-          choices=("ap_memory", "axi", "stream"),
-          aliases={"bram": "ap_memory"}),
+          choices=("ap_memory", "axi", "stream")),
     "axi_bus_bits":
     _Spec("int",
           "Data width of the AXI masters, in bits",
@@ -187,8 +176,8 @@ OPTIONS: Dict[str, _Spec] = {
           nullable=True,
           advanced=True),
     "lutram_max_bytes":
-    _Spec("int", "Bank size, in bytes, below which distributed RAM is used "
-          "(null = the compiler decides)",
+    _Spec("int", "Bank size, in bytes, at or below which distributed RAM is "
+          "used (null = the compiler decides)",
           minimum=0,
           maximum=_UINT32_MAX,
           nullable=True,
@@ -197,16 +186,6 @@ OPTIONS: Dict[str, _Spec] = {
     _Spec("identifier",
           "Name of the emitted top function (null = the kernel's name)",
           nullable=True),
-}
-
-#: Deprecated boolean spellings accepted alongside the schema keys:
-#: alias -> (target key, value per flag). The single source for both the
-#: rewriting in `_apply_aliases` and the unknown-option suggestions.
-_ALIASES: Dict[str, Tuple[str, Dict[bool, str]]] = {
-    "axi_interface": ("interface", {
-        True: "axi",
-        False: "bram"
-    }),
 }
 
 #: Not a setting but a pointer to one more file of them.
@@ -322,7 +301,7 @@ def _known_options() -> str:
 
 
 def _unknown_option(key: str, origin: str) -> HLSConfigError:
-    close = difflib.get_close_matches(key, list(OPTIONS) + list(_ALIASES), 1)
+    close = difflib.get_close_matches(key, list(OPTIONS), 1)
     hint = f" (did you mean {close[0]!r}?)" if close else ""
     return HLSConfigError(f"unknown HLS option {key!r} in {origin}{hint}. "
                           f"Valid options are:\n{_known_options()}")
@@ -350,13 +329,6 @@ def _validate(key: str, value, origin: str):
         return value
 
     if spec.kind == "choice":
-        rejected = spec.rejected or {}
-        if isinstance(value, str) and value in rejected:
-            raise _bad_value(key, origin, rejected[value], value)
-        # A deprecated spelling is accepted and stored canonically, so the
-        # rest of the backend only ever sees one name per value.
-        if isinstance(value, str) and value in (spec.aliases or {}):
-            value = spec.aliases[value]
         if value not in spec.choices:
             raise _bad_value(key, origin,
                              f"expected one of {list(spec.choices)}", value)
@@ -373,7 +345,7 @@ def _validate(key: str, value, origin: str):
         if not isinstance(value, str) or not _PART_RE.fullmatch(value):
             raise _bad_value(
                 key, origin, "expected a Vitis part name such as "
-                "'xcvu13p-fhgb2104-2-e' (the name goes into a Tcl "
+                "'xcvu13p-fhgb2104-2-i' (the name goes into a Tcl "
                 "set_part command)", value)
         return value
 
@@ -381,6 +353,8 @@ def _validate(key: str, value, origin: str):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise _bad_value(key, origin, "expected a number", value)
         value = float(value)
+        if not math.isfinite(value):
+            raise _bad_value(key, origin, "must be finite", value)
         if spec.minimum is not None and value < spec.minimum:
             raise _bad_value(key, origin, f"must be at least {spec.minimum}",
                              value)
@@ -430,27 +404,6 @@ def _user_config(options: Dict[str, object]) -> Tuple[Optional[Path], str]:
     return None, ""
 
 
-def _apply_aliases(options: Dict[str, object]) -> None:
-    for alias, (target, by_flag) in _ALIASES.items():
-        if alias not in options:
-            continue
-        flag = options.pop(alias)
-        if not isinstance(flag, bool):
-            raise _bad_value(alias, "compile options",
-                             "expected true or false", flag)
-        kind = by_flag[flag]
-        existing = options.setdefault(target, kind)
-        # After alias normalisation `bram` and `ap_memory` are the same
-        # interface, so compare the canonical forms rather than the raw
-        # strings a user might have written in either spelling.
-        canonical = OPTIONS[target].aliases or {}
-        if (canonical.get(str(existing), str(existing))
-                != canonical.get(kind, kind)):
-            raise HLSConfigError(
-                f"conflicting interface options: {alias}={flag} says "
-                f"{kind!r} but {target}={existing!r} was also given")
-
-
 # ---------------------------------------------------------------------- #
 # The resolved configuration
 # ---------------------------------------------------------------------- #
@@ -485,7 +438,6 @@ class HLSConfig(Mapping):
     def resolve(cls, options=None) -> "HLSConfig":
         options = dict(options or {})
         path, origin = _user_config(options)
-        _apply_aliases(options)
 
         shipped = shipped_config_path()
         values = _read_file(shipped, "shipped defaults")
@@ -515,12 +467,6 @@ class HLSConfig(Mapping):
             provenance[key] = cls.FROM_OPTIONS
         if options:
             sources.append(cls.FROM_OPTIONS)
-
-        if values["on_chip_budget"] is None:
-            values["on_chip_budget"] = (values["bram_bytes"] +
-                                        values["uram_bytes"] +
-                                        values["lutram_bytes"])
-            provenance["on_chip_budget"] = cls.DERIVED
         return cls(values, sources, provenance)
 
     # -- Derived values ------------------------------------------------ #
@@ -541,11 +487,31 @@ class HLSConfig(Mapping):
             if self.DERIVED not in self.sources:
                 self.sources = self.sources + (self.DERIVED, )
 
+    def repin(self, key: str, value) -> None:
+        """Replaces a derived value with a revised one (still `derived`).
+
+        Only the compiler calls this, when a first decision turned out
+        wrong against measured feedback -- e.g. the placement threshold
+        after the scheduled design overran the memory budgets. A value the
+        user pinned is never revised; that is `adopt`'s contract too.
+        """
+        if self._provenance.get(key) != self.DERIVED:
+            raise HLSConfigError(f"cannot repin {key!r}: not a derived value")
+        self._values[key] = _validate(key, value, self.DERIVED)
+
     @property
     def provenance(self) -> Dict[str, str]:
         """Where each value came from: a config path, `compile options`
         or `derived`."""
         return dict(self._provenance)
+
+    def on_chip_bytes(self) -> int:
+        """Total on-chip memory the tier caps allow, in bytes. Strategy
+        decisions that trade residency against streaming reason against
+        this aggregate; placement itself charges each tier separately."""
+        return (int(self._values["bram_bytes"]) +
+                int(self._values["uram_bytes"]) +
+                int(self._values["lutram_bytes"]))
 
     # -- Mapping ------------------------------------------------------- #
 

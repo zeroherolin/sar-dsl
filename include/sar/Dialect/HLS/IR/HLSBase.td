@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- HLSBase.td - HLS dialect base definitions --------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -11,11 +11,10 @@ include "mlir/IR/OpBase.td"
 
 def HLSDialect : Dialect {
   let name = "hls";
-  let summary = "An HLS out-of-tree MLIR dialect";
+  let summary = "The in-tree SAR-DSL HLS dialect";
   let description = [{
-    This dialect contains dedicated operations, types, and attributes designed
-    for representing HLS-specific structures and components in MLIR, while
-    enabling comprehensive optimization for both performance and area.
+    Operations, types, and attributes for dataflow structure, memory placement,
+    interfaces, and synthesis directives.
   }];
   let useDefaultTypePrinterParser = 1;
   let useDefaultAttributePrinterParser = 1;

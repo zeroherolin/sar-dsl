@@ -15,7 +15,7 @@ import textwrap
 import numpy as np
 import pytest
 
-from conftest import requires_cpu
+from conftest import REPO_ROOT, requires_cpu
 
 pytestmark = requires_cpu
 
@@ -30,8 +30,30 @@ def runtime_lib():
 @pytest.fixture(scope="module")
 def descriptor():
     """Factory building strided memref descriptors for numpy arrays."""
-    from sar.runtime import _make_descriptor
-    return _make_descriptor
+    from sar.runtime import make_descriptor
+    return make_descriptor
+
+
+def test_compiled_kernel_wraps_library_load_errors(tmp_path):
+    from sar.errors import LaunchError
+    from sar.runtime import CompiledKernel
+
+    invalid = tmp_path / "not-a-library.so"
+    invalid.write_text("not an ELF library")
+    with pytest.raises(LaunchError,
+                       match="cannot load compiled kernel") as err:
+        CompiledKernel(str(invalid), "missing", [], [])
+    assert isinstance(err.value.__cause__, OSError)
+
+
+def test_compiled_kernel_wraps_missing_symbols():
+    from sar.compiler.toolchain import find_runtime_library
+    from sar.errors import LaunchError
+    from sar.runtime import CompiledKernel
+
+    with pytest.raises(LaunchError, match="_mlir_ciface_missing") as err:
+        CompiledKernel(find_runtime_library(), "missing", [], [])
+    assert isinstance(err.value.__cause__, AttributeError)
 
 
 def _call_fft(runtime_lib, descriptor, x, dim, inverse, symbol):
@@ -148,17 +170,17 @@ def _call_interp(runtime_lib,
     return out
 
 
-@pytest.mark.parametrize("kernel,taps", [
-    ("nearest", 1),
-    ("linear", 2),
-    ("cubic", 4),
-    ("sinc", 8),
-    ("sinc", 16),
+@pytest.mark.parametrize("kernel,taps,seed", [
+    ("nearest", 1, 101),
+    ("linear", 2, 102),
+    ("cubic", 4, 103),
+    ("sinc", 8, 104),
+    ("sinc", 16, 105),
 ])
 def test_interp1d_identity_at_integer_positions(runtime_lib, descriptor,
-                                                kernel, taps):
+                                                kernel, taps, seed):
     """Every kernel reproduces the input when sampled on the grid."""
-    rng = np.random.default_rng(hash(kernel) % 1000 + taps)
+    rng = np.random.default_rng(seed)
     shape = (4, 16)
     data = _random_complex(rng, shape, np.complex128)
     positions = np.tile(np.arange(shape[1], dtype=np.float64), (shape[0], 1))
@@ -232,9 +254,9 @@ def test_interp1d_edge_boundary_at_runtime(runtime_lib, descriptor):
 
 
 def test_interp1d_reflect_boundary_at_runtime(runtime_lib, descriptor):
-    """Reflect boundary policy mirrors out-of-range taps back inside."""
+    """Reflect repeats for positions arbitrarily far beyond either edge."""
     data = np.arange(8, dtype=np.complex128).reshape(1, 8)
-    positions = np.array([[-1.0, -2.0, 8.0, 9.0, 3.0, 4.0, 5.0, 6.0]])
+    positions = np.array([[-1.0, -2.0, -5.0, -8.0, 8.0, 9.0, 14.0, 16.0]])
 
     out = _call_interp(runtime_lib,
                        descriptor,
@@ -243,10 +265,31 @@ def test_interp1d_reflect_boundary_at_runtime(runtime_lib, descriptor):
                        "nearest",
                        1,
                        boundary="reflect")
-    # nearest rounds to -1, -2, 8, 9; mirrored to 0, 1, 7, 6.
-    np.testing.assert_allclose(out, [[0, 1, 7, 6, 3, 4, 5, 6]],
+    np.testing.assert_allclose(out, [[0, 1, 4, 7, 7, 6, 1, 0]],
                                rtol=1e-12,
                                atol=1e-12)
+
+
+def test_runtime_rejects_negative_allocations():
+    script = textwrap.dedent("""
+        import ctypes
+        from sar.compiler.toolchain import find_runtime_library
+
+        lib = ctypes.CDLL(find_runtime_library())
+        alloc = lib._mlir_memref_to_llvm_alloc
+        alloc.argtypes = [ctypes.c_int64]
+        alloc.restype = ctypes.c_void_p
+        alloc(-1)
+    """)
+    import os
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "python"))
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True,
+                          text=True,
+                          env=env,
+                          timeout=30)
+    assert proc.returncode < 0
+    assert "allocation size must be non-negative" in proc.stderr
 
 
 # --------------------------------------------------------------------------- #
@@ -265,7 +308,7 @@ def test_runtime_thread_env_is_honoured(env_var):
         import ctypes
         import numpy as np
         from sar.compiler.toolchain import find_runtime_library
-        from sar.runtime import _make_descriptor
+        from sar.runtime import make_descriptor
 
         lib = ctypes.CDLL(find_runtime_library())
         rng = np.random.default_rng(0)
@@ -274,17 +317,86 @@ def test_runtime_thread_env_is_honoured(env_var):
         out = np.empty_like(x)
         fn = lib._mlir_ciface_sar_rt_fft_2d_c128
         fn.restype = None
-        a, b = _make_descriptor(x), _make_descriptor(out)
+        a, b = make_descriptor(x), make_descriptor(out)
         fn(ctypes.byref(a), ctypes.byref(b),
            ctypes.c_int64(1), ctypes.c_bool(False))
         assert np.allclose(out, np.fft.fft(x, axis=1), rtol=1e-12, atol=1e-12)
         print("OK")
     """)
     import os
-    env = dict(os.environ, PYTHONPATH="python", **{env_var: "2"})
+    env = dict(os.environ,
+               PYTHONPATH=str(REPO_ROOT / "python"),
+               **{env_var: "2"})
     proc = subprocess.run([sys.executable, "-c", script],
                           capture_output=True,
                           text=True,
-                          env=env)
+                          env=env,
+                          timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+
+
+def test_runtime_thread_pool_is_reused_and_concurrent_calls_are_safe():
+    script = textwrap.dedent("""
+        import ctypes
+        from concurrent.futures import ThreadPoolExecutor
+        import numpy as np
+        from sar.compiler.toolchain import find_runtime_library
+        from sar.runtime import make_descriptor
+
+        lib = ctypes.CDLL(find_runtime_library())
+        fn = lib._mlir_ciface_sar_rt_fft_2d_c128
+        fn.restype = None
+        rng = np.random.default_rng(17)
+        inputs = [
+            (rng.standard_normal((32, 32))
+             + 1j * rng.standard_normal((32, 32))).astype(np.complex128)
+            for _ in range(2)
+        ]
+
+        def threads():
+            with open("/proc/self/status") as handle:
+                line = next(line for line in handle
+                            if line.startswith("Threads:"))
+            return int(line.split()[1])
+
+        np.fft.fft(inputs[0], axis=1)
+        baseline = threads()
+        def run(index):
+            for _ in range(20):
+                out = np.empty_like(inputs[index])
+                a, b = make_descriptor(inputs[index]), make_descriptor(out)
+                fn(ctypes.byref(a), ctypes.byref(b),
+                   ctypes.c_int64(1), ctypes.c_bool(False))
+                assert np.allclose(out, np.fft.fft(inputs[index], axis=1),
+                                   rtol=1e-12, atol=1e-12)
+
+        first = np.empty_like(inputs[0])
+        a, b = make_descriptor(inputs[0]), make_descriptor(first)
+        fn(ctypes.byref(a), ctypes.byref(b),
+           ctypes.c_int64(1), ctypes.c_bool(False))
+        pooled = threads()
+        def concurrent_batch():
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(run, index) for index in range(2)]
+                for future in futures:
+                    future.result()
+
+        concurrent_batch()
+        after_first = threads()
+        concurrent_batch()
+        assert threads() <= after_first + 1
+        assert pooled >= baseline
+        print("OK")
+    """)
+    import os
+    env = dict(os.environ,
+               PYTHONPATH=str(REPO_ROOT / "python"),
+               SAR_RT_NUM_THREADS="4")
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True,
+                          text=True,
+                          env=env,
+                          timeout=30)
     assert proc.returncode == 0, proc.stderr
     assert "OK" in proc.stdout

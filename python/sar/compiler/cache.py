@@ -22,6 +22,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - SAR-DSL currently targets Linux
+    fcntl = None
+
 __all__ = ["KernelCache"]
 
 #: Marker file recording the last use of an entry (LRU ordering).
@@ -31,15 +36,25 @@ _ACCESS_MARKER = ".accessed"
 #: usually means another process is compiling into the entry right now.
 _PRUNE_GRACE_SECONDS = 600
 
-#: Cache roots already pruned in this process (pruning is a full scan).
-_pruned_roots = set()
+#: Last prune time per root; a full directory scan is throttled.
+_pruned_roots = {}
+_PRUNE_INTERVAL_SECONDS = 30
 
 
 def _max_cache_size() -> int:
     """Eviction threshold in bytes (0 disables pruning); read per cache
     construction rather than at import, so the environment can change it
     in a running process."""
-    return int(os.environ.get("SAR_DSL_CACHE_MAX_SIZE", str(2 * 1024**3)))
+    raw = os.environ.get("SAR_DSL_CACHE_MAX_SIZE", str(2 * 1024**3))
+    try:
+        value = int(raw)
+    except ValueError as err:
+        raise ValueError(
+            "SAR_DSL_CACHE_MAX_SIZE must be a non-negative integer") from err
+    if value < 0:
+        raise ValueError(
+            "SAR_DSL_CACHE_MAX_SIZE must be a non-negative integer")
+    return value
 
 
 def _default_cache_root() -> Path:
@@ -55,6 +70,23 @@ def _default_cache_root() -> Path:
 #: `clang` and `mlir-translate` produce the CPU backend's final object, and
 #: libsar_runtime is linked into it, so all three belong here too.
 _FINGERPRINTED_TOOLS = ("sar-opt", "sar-translate", "mlir-translate", "clang")
+
+
+def _driver_fingerprint() -> str:
+    """Content identity of the Python code that orchestrates compilation."""
+    package = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*")):
+        if not path.is_file() or path.name == "_build_config.py":
+            continue
+        if path.suffix != ".py" and path.name != "hls_config.yaml":
+            continue
+        digest.update(str(path.relative_to(package)).encode())
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"unreadable")
+    return digest.hexdigest()[:16]
 
 
 def _cpu_identity() -> str:
@@ -138,9 +170,13 @@ def _entry_size(path: Path) -> int:
 
 def _prune_lru(root: Path, max_size: int) -> None:
     """Evicts least-recently-used entries until the cache fits `max_size`."""
-    if max_size <= 0 or not root.is_dir() or root in _pruned_roots:
+    if max_size <= 0 or not root.is_dir():
         return
-    _pruned_roots.add(root)
+    now = time.monotonic()
+    last = _pruned_roots.get(root)
+    if last is not None and now - last < _PRUNE_INTERVAL_SECONDS:
+        return
+    _pruned_roots[root] = now
 
     entries = []
     total = 0
@@ -166,23 +202,35 @@ def _prune_lru(root: Path, max_size: int) -> None:
     fresh = time.time() - _PRUNE_GRACE_SECONDS
     entries.sort(key=lambda item: item[0])  # oldest first
     for used, size, entry in entries:
-        if total <= max_size or used > fresh:
-            # Recently used entries are likely being compiled into or read
-            # by a concurrent process; sorted oldest-first, everything past
-            # the first fresh one is fresh too.
+        if total <= max_size:
             break
+        if used > fresh:
+            break
+        lock = None
         try:
+            if fcntl is not None:
+                lock = (entry / ".lock").open("a+")
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             shutil.rmtree(entry)
             total -= size
-        except OSError:  # pragma: no cover - racing eviction
+        except (BlockingIOError, OSError):  # pragma: no cover - racing use
             pass
+        finally:
+            if lock is not None:
+                lock.close()
 
 
 class KernelCache:
 
-    def __init__(self, module_text: str, backend: str, options: dict):
+    def __init__(self,
+                 module_text: str,
+                 backend: str,
+                 options: dict,
+                 backend_fingerprint: str = ""):
         digest = hashlib.sha256()
         digest.update(_toolchain_fingerprint().encode())
+        digest.update(_driver_fingerprint().encode())
+        digest.update(backend_fingerprint.encode())
         digest.update(module_text.encode())
         digest.update(backend.encode())
         digest.update(repr(sorted(options.items())).encode())
@@ -193,9 +241,13 @@ class KernelCache:
         # Artifacts are written even when lookups are disabled, so the
         # directory always has to exist.
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._lock = (self.dir / ".lock").open("a+")
+        if fcntl is not None:
+            fcntl.flock(self._lock, fcntl.LOCK_SH)
         if self.enabled:
             _prune_lru(root, _max_cache_size())
             self._touch()
+        self._root = root
 
     def _touch(self) -> None:
         """Records this entry as most recently used."""
@@ -239,6 +291,8 @@ class KernelCache:
             # A failed write or rename must not litter the entry with .tmp
             # files; after a successful rename there is nothing to unlink.
             tmp.unlink(missing_ok=True)
+        if self.enabled:
+            _prune_lru(self._root, _max_cache_size())
         return p
 
     def scratch_path(self, filename: str) -> Path:
@@ -249,4 +303,6 @@ class KernelCache:
     def publish(self, scratch: Path, filename: str) -> Path:
         p = self.path(filename)
         os.replace(scratch, p)
+        if self.enabled:
+            _prune_lru(self._root, _max_cache_size())
         return p

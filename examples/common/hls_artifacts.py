@@ -6,13 +6,11 @@ runner stays a short script.
 
 Two designs come out of one geometry because no single design can be
 both. At the full 16384 x 16384 raster the planes have to stream from
-DRAM, which means `axi_interface=True`: every streamed buffer becomes
-its own AXI master port, and a testbench has no data to drive the
-promoted intermediates with -- golden data exists for the kernel's own
-inputs and results, not for its scratch. That design is therefore
-emitted for synthesis and not simulated. Simulation happens on a second
-design at a raster small enough to keep every plane on chip, so the top
-function is the kernel's own signature and the testbench can drive it.
+DRAM, which means `interface="axi"`: kernel I/O becomes AXI masters and
+internal spilled planes share a scratch port. A golden testbench has no
+input data for compiler-managed scratch, so that design is emitted for
+synthesis. Simulation uses a smaller `ap_memory` design whose complete
+signature the testbench can drive.
 
 The reduced design is not a different radar: `alos_params` keeps `fc`,
 `fs`, PRF, `Vr`, `R0`, `Kr` and `Tp`, and the frequency axes span
@@ -36,43 +34,27 @@ from .simulate import demo_scene
 __all__ = ["emit_alos_artifacts"]
 
 
-def _axi_summary(source: str):
-    """(ports, bundles) of the m_axi interfaces the design presents."""
-    ports = source.count("m_axi")
-    bundles = {
-        line.split("bundle=")[1].split()[0]
-        for line in source.splitlines()
-        if "m_axi" in line and "bundle=" in line
-    }
-    return ports, len(bundles)
+def _axi_ports(source: str) -> int:
+    """m_axi ports the design presents (each on its own bundle)."""
+    return source.count("m_axi")
 
 
-def _annotate_csim_script(path: Path, algorithm: str, csim_n: int, n: int,
-                          uses_streams: bool) -> None:
+def _annotate_csim_script(path: Path, algorithm: str, csim_n: int,
+                          n: int) -> None:
     """Records in the csim script which raster it simulates and why."""
-    if uses_streams:
-        fallback = (
-            "# This design uses hls::stream for its dataflow handshakes, so\n"
-            "# it needs the real Vitis headers: the `stubs/` stand-ins cover\n"
-            "# ap_int and the math headers but not hls::stream. Run the csim\n"
-            "# through vitis_hls, or shrink --csim-n until the dataflow\n"
-            "# regions disappear if you want the plain-C++ fallback.\n")
-    else:
-        fallback = (
-            "# Without Vitis HLS the same package runs through any C++\n"
-            "# compiler:\n"
-            f"#   c++ -O2 -I stubs {algorithm}_alos.cpp "
-            f"{algorithm}_alos_tb.cpp \\\n"
-            "#       -o csim -pthread && ./csim\n")
+    fallback = (
+        "# Without Vitis HLS the package runs through any C++ compiler:\n"
+        f"#   c++ -O2 -I stubs {algorithm}_alos.cpp "
+        f"{algorithm}_alos_tb.cpp \\\n"
+        "#       -o csim -pthread && ./csim\n")
     header = (
         f"# C simulation of the {algorithm.upper()} chain at ALOS-1 radar\n"
         f"# parameters on a {csim_n} x {csim_n} raster.\n"
         "#\n"
         f"# The design emitted for the {n} x {n} scene is\n"
         f"# {algorithm}_alos_axi.cpp, and it is not this one: it compiles\n"
-        "# with axi_interface=True, where every buffer the compiler moves\n"
-        "# off chip becomes its own AXI master port. Those promoted ports\n"
-        "# are kernel scratch, and no golden data exists for scratch, so\n"
+        "# with interface='axi', where internal off-chip buffers share a\n"
+        "# compiler-managed scratch port. No golden input exists for it, so\n"
         "# that design is synthesized rather than simulated. This raster\n"
         "# keeps the planes on chip, so the top function is the kernel's\n"
         "# own signature and the testbench can drive every port. The radar\n"
@@ -112,16 +94,15 @@ def emit_alos_artifacts(algorithm: str,
     print(f"[1/3] Emitting the {n}x{n} {algorithm.upper()} design "
           "(AXI, for synthesis) ...")
     started = time.time()
-    axi = build_kernel(n, alos_params(n), name=f"{top}_axi").compile(
-        backend="hls", options={"axi_interface": True})
+    axi = build_kernel(n, alos_params(n),
+                       name=f"{top}_axi").compile(backend="hls",
+                                                  options={"interface": "axi"})
     source = axi.source()
     axi.write_synthesis_script(out)  # writes {top}_axi.cpp + its csynth.tcl
-    ports, bundles = _axi_summary(source)
-    result.update(axi_lines=source.count("\n"),
-                  axi_ports=ports,
-                  axi_bundles=bundles)
-    print(f"      {source.count(chr(10))} lines, {ports} AXI ports on "
-          f"{bundles} bundle(s), {time.time() - started:.1f} s")
+    ports = _axi_ports(source)
+    result.update(axi_lines=source.count("\n"), axi_ports=ports)
+    print(f"      {source.count(chr(10))} lines, {ports} AXI master "
+          f"ports, {time.time() - started:.1f} s")
 
     print(f"[2/3] Emitting the {csim_n}x{csim_n} {algorithm.upper()} design "
           "(csim package) ...")
@@ -141,15 +122,11 @@ def emit_alos_artifacts(algorithm: str,
     golden = processor(csim_n, params).process(raw)
     design.write_testbench([raw, *make_inputs(csim_n, params)], [golden], out)
     uses_streams = "hls::stream" in source
-    _annotate_csim_script(out / f"{top}_csim.tcl", algorithm, csim_n, n,
-                          uses_streams)
+    _annotate_csim_script(out / f"{top}_csim.tcl", algorithm, csim_n, n)
     result.update(targets=len(targets),
                   golden_peak=float(golden.max()),
                   uses_streams=uses_streams)
     print(f"      {len(targets)} point targets, golden peak "
           f"{golden.max():.1f}, {np.count_nonzero(golden):d} nonzero samples")
-    if uses_streams:
-        print("      note: the design uses hls::stream, so csim needs the "
-              "real Vitis headers")
     print(f"      saved {out}")
     return result

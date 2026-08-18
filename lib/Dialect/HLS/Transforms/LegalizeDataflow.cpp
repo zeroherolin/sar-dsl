@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- LegalizeDataflow.cpp - legalize dataflow ---------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

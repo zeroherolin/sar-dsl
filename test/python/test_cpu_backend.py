@@ -140,6 +140,29 @@ def test_reductions():
     np.testing.assert_array_equal(am_full, [a.sum(axis=0).argmax()])
 
 
+def test_nan_comparison_selection_and_reduction_match_numpy():
+
+    @sar.func
+    def kernel(
+        x: sar.f64[4]
+    ) -> (sar.f64[4], sar.f64[4], sar.f64[4], sar.f64[4], sar.f64[1],
+          sar.f64[1], sar.i64[1], sar.i64[1]):
+        return (x != 0.0, sar.maximum(x, 1.0), sar.minimum(x, 1.0),
+                sar.clip(x, -1.0, 1.0), sar.max(x), sar.min(x), sar.argmax(x),
+                sar.argmin(x))
+
+    x = np.array([0.0, np.nan, 2.0, -2.0])
+    ne, maximum, minimum, clipped, high, low, arg_high, arg_low = kernel(x)
+    np.testing.assert_array_equal(ne, (x != 0.0).astype(np.float64))
+    np.testing.assert_array_equal(maximum, np.maximum(x, 1.0))
+    np.testing.assert_array_equal(minimum, np.minimum(x, 1.0))
+    np.testing.assert_array_equal(clipped, np.clip(x, -1.0, 1.0))
+    np.testing.assert_array_equal(high, [np.max(x)])
+    np.testing.assert_array_equal(low, [np.min(x)])
+    np.testing.assert_array_equal(arg_high, [np.argmax(x)])
+    np.testing.assert_array_equal(arg_low, [np.argmin(x)])
+
+
 def test_complex_sum():
     N, M = 4, 8
 
@@ -485,6 +508,24 @@ def test_cumsum_non_square():
     np.testing.assert_allclose(k(x), np.cumsum(x, axis=0), rtol=1e-10)
 
 
+def test_cumsum_rank1():
+    """A rank-1 scan runs along the only axis, complex included."""
+    N = 17
+
+    @sar.func
+    def k(x: sar.f64[N]) -> sar.f64[N]:
+        return sar.cumsum(x)
+
+    @sar.func
+    def kc(x: sar.c128[N]) -> sar.c128[N]:
+        return sar.cumsum(x)
+
+    x = _f64(N)
+    np.testing.assert_allclose(k(x), np.cumsum(x), rtol=1e-10)
+    xc = _f64(N) + 1j * _f64(N)
+    np.testing.assert_allclose(kc(xc), np.cumsum(xc), rtol=1e-10)
+
+
 # ---- rank_filter / median_filter -------------------------------------------
 
 
@@ -554,6 +595,32 @@ def test_median_filter_window3_known_values():
     x = np.array([[1.0, 3.0, 2.0, 4.0]])
     expected = np.array([[1.0, 2.0, 3.0, 4.0]])
     np.testing.assert_allclose(k(x), expected, rtol=1e-10)
+
+
+def test_rank_filter_rank1():
+    """rank_filter and median_filter accept rank-1 tensors directly."""
+    N = 15
+
+    @sar.func
+    def kmin(x: sar.f64[N]) -> sar.f64[N]:
+        return sar.rank_filter(x, window=3, rank=0)
+
+    @sar.func
+    def kmed(x: sar.f64[N]) -> sar.f64[N]:
+        return sar.median_filter(x, window=5)
+
+    x = _f64(N)
+
+    def reference(data, window, rank):
+        half = window // 2
+        out = np.empty_like(data)
+        for i in range(len(data)):
+            idx = np.clip(np.arange(i - half, i + half + 1), 0, len(data) - 1)
+            out[i] = np.sort(data[idx])[rank]
+        return out
+
+    np.testing.assert_allclose(kmin(x), reference(x, 3, 0), rtol=1e-12)
+    np.testing.assert_allclose(kmed(x), reference(x, 5, 2), rtol=1e-12)
 
 
 def test_rank_filter_median_matches_numpy_sort():

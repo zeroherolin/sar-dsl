@@ -21,13 +21,14 @@ from conftest import run_split as _run_split
 pytestmark = requires_cpu
 
 
+def _lit(v):
+    s = f"{float(v):.17g}"
+    return s if any(c in s for c in ".eEn") else s + ".0"
+
+
 def _dense(values):
     # MLIR needs a decimal point to read a literal as floating point.
-    def lit(v):
-        s = f"{float(v):.17g}"
-        return s if any(c in s for c in ".eEn") else s + ".0"
-
-    return "[" + ", ".join(lit(v) for v in values) + "]"
+    return "[" + ", ".join(_lit(v) for v in values) + "]"
 
 
 def _module(n, m, positions_1d, boundary=None):
@@ -82,14 +83,11 @@ def _oracle(data, positions, taps=8, boundary="zero"):
     return out
 
 
-def _run(mlir, name, tmp_path, banded):
+def _run(mlir, name, tmp_path, banded, top="ip"):
     pipeline = "--sar-affine-to-llvm-pipeline"
     if not banded:
         pipeline += "=interp-enable-banded-gather=0"
-    return _compile_split_kernel(mlir,
-                                 "ip",
-                                 tmp_path / name,
-                                 pipeline=pipeline)
+    return _compile_split_kernel(mlir, top, tmp_path / name, pipeline=pipeline)
 
 
 @pytest.mark.parametrize(
@@ -206,3 +204,53 @@ def test_banded_honours_boundary_policy(tmp_path, boundary, shift):
                                ref,
                                rtol=1e-11,
                                atol=1e-11)
+
+
+def _gather2d_module(n, row_shift):
+    """A gather2d whose row coordinate is the output row plus a constant
+    shift (provably bounded) and whose column coordinate is arbitrary."""
+    iota = _dense(np.arange(n, dtype=np.float64))
+    return f"""
+module {{
+  func.func @g2d(%re: tensor<{n}x{n}xf64>, %im: tensor<{n}x{n}xf64>)
+      -> (tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>) {{
+    %iota = sar.constant dense<{iota}> : tensor<{n}xf64>
+    %rows0 = sar.broadcast %iota {{dim = 0 : i64}}
+        : tensor<{n}xf64> -> tensor<{n}x{n}xf64>
+    %rows = sar.add_scalar %rows0, {_lit(row_shift)} : tensor<{n}x{n}xf64>
+    %cols = sar.broadcast %iota {{dim = 1 : i64}}
+        : tensor<{n}xf64> -> tensor<{n}x{n}xf64>
+    %or, %oi = sar.gather2d_split %re, %im, %rows, %cols
+        : (tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>,
+           tensor<{n}x{n}xf64>)
+        -> (tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>)
+    return %or, %oi : tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>
+  }}
+}}
+"""
+
+
+@pytest.mark.parametrize("row_shift", [0.0, 1.5, -2.25])
+def test_banded_gather2d_matches_full_plane(tmp_path, row_shift):
+    """The row-band gather2d and the full-plane path perform identical
+    arithmetic, so the results must agree bit for bit -- including at the
+    row edges the staging clamp covers."""
+    n = 16
+    mlir = _gather2d_module(n, row_shift)
+
+    (tmp_path / "b").mkdir()
+    (tmp_path / "f").mkdir()
+    _, fn_banded = _run(mlir, "b", tmp_path, banded=True, top="g2d")
+    _, fn_full = _run(mlir, "f", tmp_path, banded=False, top="g2d")
+
+    rng = np.random.default_rng(7)
+    data = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    re = np.ascontiguousarray(data.real)
+    im = np.ascontiguousarray(data.imag)
+
+    got_re, got_im = _run_split(fn_banded, [re, im], [(n, n), (n, n)],
+                                np.float64)
+    want_re, want_im = _run_split(fn_full, [re, im], [(n, n), (n, n)],
+                                  np.float64)
+    np.testing.assert_array_equal(got_re, want_re)
+    np.testing.assert_array_equal(got_im, want_im)

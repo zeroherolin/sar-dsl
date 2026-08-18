@@ -23,6 +23,7 @@ on each backend rather than backend disagreement alone.
 """
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -35,6 +36,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from algorithms import ALL, LABELS, load  # noqa: E402
+from provenance import environment  # noqa: E402
 
 import sar  # noqa: E402
 
@@ -49,6 +51,9 @@ def _as_tuple(x):
 
 
 def _max_abs(a, b) -> float:
+    if not a or len(a) != len(b):
+        raise ValueError(
+            f"result count mismatch: got {len(a)}, expected {len(b)}")
     return float(max(np.abs(x - y).max() for x, y in zip(a, b)))
 
 
@@ -81,7 +86,11 @@ def csim_error(chain, name: str, reference, work: Path, single: bool):
 
     design = chain.compile_kernel(backend="hls")
     # The golden files must carry the kernel's declared result dtypes; the
-    # reference itself is f64 numpy whatever the build precision.
+    # reference itself is f64 NumPy whatever the build precision.
+    if len(reference) != len(chain.kernel.declared_result_types):
+        raise ValueError(
+            f"{name}: expected {len(chain.kernel.declared_result_types)} "
+            f"results, got {len(reference)}")
     golden = [
         np.asarray(r, dtype=t.dtype.to_numpy())
         for r, t in zip(reference, chain.kernel.declared_result_types)
@@ -107,7 +116,10 @@ def csim_error(chain, name: str, reference, work: Path, single: bool):
         str(binary),
         "-pthread",
     ]
-    built = subprocess.run(compile_cmd, capture_output=True, text=True)
+    built = subprocess.run(compile_cmd,
+                           capture_output=True,
+                           text=True,
+                           timeout=300)
     if built.returncode != 0:
         raise RuntimeError(f"csim build failed for {name}:\n{built.stderr}")
 
@@ -115,8 +127,12 @@ def csim_error(chain, name: str, reference, work: Path, single: bool):
     run = subprocess.run(
         [str(binary), str(out / f"{top}_tb_data")],
         capture_output=True,
-        text=True)
+        text=True,
+        timeout=300)
     elapsed = time.perf_counter() - t0
+    if run.returncode != 0:
+        raise RuntimeError(f"csim failed for {name}:\n"
+                           f"{run.stdout}\n{run.stderr}")
     errors = [
         float(m)
         for m in re.findall(r"max \|err\| = ([0-9.eE+-]+)", run.stdout)
@@ -124,7 +140,8 @@ def csim_error(chain, name: str, reference, work: Path, single: bool):
     if not errors:
         raise RuntimeError(f"csim produced no error lines for {name}:\n"
                            f"{run.stdout}\n{run.stderr}")
-    return max(errors), elapsed, "PASS" in run.stdout
+    return max(errors), elapsed, re.search(r"(?m)^PASS$",
+                                           run.stdout) is not None
 
 
 def main() -> None:
@@ -138,6 +155,7 @@ def main() -> None:
     parser.add_argument("--keep-dir",
                         help="write csim packages here instead of a "
                         "temporary directory")
+    parser.add_argument("--json", help="write machine-readable results here")
     args = parser.parse_args()
     dtype = sar.c128 if args.dtype == "c128" else sar.c64
 
@@ -156,6 +174,8 @@ def main() -> None:
           f"{'csim s*':>9} {'csim':>6}")
     print("-" * 92)
 
+    results = []
+    failed = False
     for name in args.algs:
         chain = load(name, args.n, dtype=dtype)
 
@@ -167,12 +187,32 @@ def main() -> None:
             sim_rel = f"{sim_err / peak:10.2e}"
             sim_s_txt = f"{sim_s:9.2f}"
             verdict = "PASS" if passed else "FAIL"
+            failed |= not passed
+            result = {
+                "name": name,
+                "cpu_abs_error": cpu_err,
+                "cpu_relative_error": cpu_err / peak,
+                "csim_abs_error": sim_err,
+                "csim_relative_error": sim_err / peak,
+                "cpu_warm_s": cpu_s,
+                "csim_s": sim_s,
+                "csim_passed": passed,
+            }
         except Exception as exc:  # noqa: BLE001
             sim_txt = f"{'n/a':>12}"
             sim_rel = f"{'n/a':>10}"
             sim_s_txt = f"{'n/a':>9}"
             verdict = "ERR"
+            failed = True
+            result = {
+                "name": name,
+                "cpu_abs_error": cpu_err,
+                "cpu_relative_error": cpu_err / peak,
+                "csim_passed": False,
+                "error": str(exc),
+            }
             print(f"  ! {name}: {exc}", file=sys.stderr)
+        results.append(result)
 
         print(f"{LABELS[name]:<14} {cpu_err:12.3e} {cpu_err / peak:10.2e} "
               f"{sim_txt} {sim_rel} {cpu_s:11.3f} {sim_s_txt} {verdict:>6}")
@@ -182,6 +222,17 @@ def main() -> None:
           "NOT an FPGA figure.")
     if ctx is not None:
         ctx.cleanup()
+    if args.json:
+        payload = {
+            "environment": environment(),
+            "benchmark": "cross_backend_accuracy",
+            "scene_size": args.n,
+            "dtype": args.dtype,
+            "results": results,
+        }
+        Path(args.json).write_text(json.dumps(payload, indent=2) + "\n")
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

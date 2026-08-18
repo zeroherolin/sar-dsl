@@ -19,8 +19,11 @@ def _resolve(idx, cols, boundary):
         return None
     if boundary == "edge":
         return int(np.clip(idx, 0, cols - 1))
-    mirrored = -idx - 1 if idx < 0 else 2 * cols - idx - 1
-    return int(np.clip(mirrored, 0, cols - 1))
+    if cols == 1:
+        return 0
+    period = 2 * cols
+    folded = idx % period
+    return folded if folded < cols else period - folded - 1
 
 
 def _window(window, t, beta):
@@ -170,16 +173,15 @@ def test_interp1d_edge_clamps_to_endpoint():
 
 
 def test_interp1d_reflect_mirrors_about_boundary():
-    """Hand-checked: `reflect` mirrors an out-of-range tap back inside."""
-    data = np.array([[1, 2, 3, 4]], dtype=np.complex128)
-    positions = np.array([[-1.0, -0.5, 4.0, 4.5]])
+    """Reflect periodically folds indices at both boundaries."""
+    data = np.arange(1, 9, dtype=np.complex128).reshape(1, 8)
+    positions = np.array([[-17.0, -10.0, -1.0, 0.0, 8.0, 9.0, 15.0, 18.0]])
 
     @sar.func
-    def k(d: sar.c128[1, 4], p: sar.f64[1, 4]) -> sar.c128[1, 4]:
+    def k(d: sar.c128[1, 8], p: sar.f64[1, 8]) -> sar.c128[1, 8]:
         return sar.interp1d(d, p, kernel="nearest", boundary="reflect")
 
-    # round(pos) = -1, 0, 4, 5 -> mirrored to 0, 0, 3, 2.
-    np.testing.assert_allclose(k(data, positions), [[1, 1, 4, 3]],
+    np.testing.assert_allclose(k(data, positions), [[1, 7, 1, 1, 8, 7, 1, 3]],
                                rtol=1e-12,
                                atol=1e-12)
 

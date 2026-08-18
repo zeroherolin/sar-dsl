@@ -33,4 +33,7 @@ class CompilationError(SARError):
 
 
 class LaunchError(SARError):
-    """A compiled kernel was invoked with invalid arguments."""
+    """A compiled artifact was used in a way it does not support: a
+    kernel invoked with invalid arguments, a design that cannot be
+    executed directly, or a testbench request the interface cannot
+    serve."""

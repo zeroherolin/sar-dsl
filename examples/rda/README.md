@@ -9,6 +9,7 @@ arithmetic.
 |------|---------|
 | `algorithm.py` | The RDA chain in the DSL (`build_kernel`, `make_inputs`) |
 | `reference.py` | NumPy reference implementation (`RDAProcessor`) |
+| `assets/` | Reference imagery |
 | `run_point_target_cpu.py` | Full cpu-backend flow: simulate, focus, save a PNG |
 | `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 | `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset |
@@ -69,17 +70,18 @@ python examples/rda/run_alos_cpu.py
 python examples/rda/run_alos_hls.py
 ```
 
-The full 16384x16384 scene focuses in 3.5 s on a 240-core machine,
-reaching an urban-area contrast of 0.808.
+The runner reports wall time and urban-area contrast. Real-data output is
+not tracked because the source product is not redistributed.
 
 `run_alos_hls.py` writes `hls_project/rda_alos/`: `rda_alos_axi.cpp` is
 the 16384x16384 design with AXI ports for synthesis, and
 `rda_alos.cpp` plus its testbench, golden data, csim/csynth scripts
-and stubs form a C-simulation package at `--csim-n` (default 1024) with the same
-radar parameters -- why two designs are needed is covered in
+and stubs form a C-simulation package at `--csim-n` (default 1024) with
+the same radar parameters. The artifact split is described in
 [examples/README.md](../README.md#real-data-alos-1). At 1024x1024 the
 package csim-matches the reference to 1.9e-09 over 1048576 samples.
 
 Tests (`test/python/test_rda.py`) check numerical equivalence with the
-reference, point-target focusing, and cross-algorithm agreement: RDA and
-omega-K must place the same scatterer on the same pixel.
+reference, point-target focusing, HLS C++ emission, and cross-algorithm
+agreement: RDA and omega-K must place the same scatterer on the same
+pixel.

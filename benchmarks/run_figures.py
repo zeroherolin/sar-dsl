@@ -2,8 +2,8 @@
 """Publication figures, written to `benchmarks/assets/`.
 
     point_target_response.png   range/azimuth impulse-response cuts of the
-                                three stripmap chains, with the Hann
-                                sidelobe bound
+                                three stripmap chains, with the ideal Hann
+                                reference level
     sva_response.png            PFA range cut, uniform weighting vs SVA
 
 Usage:
@@ -60,7 +60,7 @@ def point_target_response(n: int, span: float = 14.0) -> None:
     ax_r.set_ylabel("Normalized magnitude (dB)")
     ax_r.text(-13.4,
               -30.3,
-              "Hann first sidelobe (-31.5 dB)",
+              "ideal Hann reference (-31.5 dB)",
               fontsize=8,
               color="0.35")
     ax_a.legend(loc="upper right", fontsize=8.5)

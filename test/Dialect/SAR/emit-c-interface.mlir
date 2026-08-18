@@ -1,4 +1,4 @@
-// RUN: sar-opt --sar-emit-c-interface %s | FileCheck %s
+// RUN: sar-opt %s --sar-emit-c-interface | FileCheck %s
 
 // Only public functions (kernel entry points) get llvm.emit_c_interface.
 

@@ -40,9 +40,10 @@ BASELINE_CROSS_ROW = 10
 #: a quarter of a plane, which is what separates the two.
 _PLANE_ELEMENTS = N * N // 4
 
-#: Bytes a staged transpose block may occupy, mirroring the backend's
-#: `transpose-block-bytes` (an eighth of the on-chip budget).
-_BLOCK_BUDGET = (4 << 20) // 8
+#: Bytes a staged transpose block may occupy: exactly what the fixture
+#: passes as `transpose-block-bytes` below, so the assertion checks the
+#: configured cap rather than a historic default.
+_BLOCK_BUDGET = (N * N * 8) // 8
 
 #: Multi-dimensional reads that stay on the non-affine `memref` path. All
 #: of them belong to the Stolt band gather, whose address is clamped
@@ -118,8 +119,8 @@ def test_wka_non_affine_accesses_do_not_grow(wka_affine):
 
     `fftshift` folds its rotation into the indexing map; computing it with
     `arith.remui` instead leaves a `memref.load` that neither the HLS flow
-    nor the corner-turn rewrite can see through -- which is what used to
-    leave whole planes on the strided side.
+    nor the corner-turn rewrite can see through, forcing whole planes onto
+    the strided path.
 
     The ones that remain are the Stolt interpolation's band gather, whose
     address is clamped (`maxsi`/`minsi`) against the raster edge. Clamping

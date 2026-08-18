@@ -1,5 +1,7 @@
 # Build and packaging
 build/
+build-*/
+.pybuild/
 dist/
 *.egg-info/
 python/sar/_build_config.py
@@ -23,5 +25,5 @@ __pycache__/
 # Example outputs and datasets
 examples/data/ALPSRP*
 examples/data/*.bin
-*_cpu.png
+examples/*/assets/*_synthetic_*.png
 hls_project/

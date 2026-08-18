@@ -11,13 +11,14 @@ one backend can reach. Both are bugs.
 """
 
 import warnings
+import re
 
 import numpy as np
 import pytest
 
 import sar
 
-from conftest import requires_cpu, requires_hls
+from conftest import REPO_ROOT, requires_cpu, requires_hls
 
 N = 16
 
@@ -26,7 +27,7 @@ N = 16
 #: that only accept floats get a real value derived from it.
 CONSTRUCTS = {
     "arith":
-    lambda x: x * 2.0 + 1.0 - x / 3.0,
+    lambda x: x * 2.0 + 1.0 - x / (x + 3.0),
     "sqrt":
     lambda x: sar.sqrt(sar.absolute(x) + 1.0),
     "trig":
@@ -90,6 +91,39 @@ CONSTRUCTS = {
 }
 
 
+def _declared_sar_ops():
+    lines = (REPO_ROOT /
+             "include/sar/Dialect/SAR/IR/SAROps.td").read_text().splitlines()
+    result = set()
+    for index, line in enumerate(lines):
+        if not re.match(r"\s*def SAR_\w+Op\b", line):
+            continue
+        declaration = " ".join(lines[index:index + 5])
+        match = re.search(r'<"([^"]+)"', declaration)
+        assert match is not None, line
+        result.add(match.group(1))
+    return result
+
+
+def test_construct_matrix_covers_every_sar_operation():
+    traced = set()
+    for name, body in CONSTRUCTS.items():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
+            @sar.func
+            def kernel(x):
+                return body(x)
+
+            module = kernel.specialize(sar.c128[N, N]).to_mlir()
+        traced.update(re.findall(r'"sar\.([^"]+)"', module))
+
+    internal = {"fft_split", "interp1d_split", "gather2d_split"}
+    missing = _declared_sar_ops() - internal - traced
+    assert not missing, (
+        f"SAR operations absent from symmetry matrix: {missing}")
+
+
 def _compile(name, body, backend, spec=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -135,3 +169,22 @@ def test_non_power_of_two_fft_lowers_on_hls():
              lambda x: sar.fft(x, axis=1),
              "hls",
              spec=sar.c128[12, 12])
+
+
+# Rank-1 is a distinct code path for the ops that sweep lines (there is
+# no line dimension to sweep), so the symmetry gate covers it explicitly.
+
+
+def _rank1_body(x):
+    magnitude = sar.absolute(sar.fft(x, axis=0))
+    return sar.cumsum(sar.sort(sar.median_filter(magnitude, window=3)))
+
+
+@requires_cpu
+def test_rank1_constructs_lower_on_cpu():
+    _compile("rank1", _rank1_body, "cpu", spec=sar.c128[N])
+
+
+@requires_hls
+def test_rank1_constructs_lower_on_hls():
+    _compile("rank1", _rank1_body, "hls", spec=sar.c128[N])

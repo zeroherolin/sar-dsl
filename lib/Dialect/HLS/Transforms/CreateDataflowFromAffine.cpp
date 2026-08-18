@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- CreateDataflowFromAffine.cpp - create dataflow from affine ---------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -33,20 +33,25 @@ struct TaskPartition : public OpRewritePattern<DispatchOp> {
         }))
       return failure();
     auto &block = dispatch.getRegion().front();
+    if (llvm::none_of(block, [](Operation &op) {
+          return isa<AffineForOp, scf::ForOp>(op);
+        }))
+      return failure();
 
-    // Fuse operations into dataflow tasks. TODO: We need more case study to
-    // figure out any other operations need to be separately handled. For
-    // example, how to handle AffineIfOp?
+    // Fuse operations into dataflow tasks: each loop seeds a task and takes
+    // the non-loop operations collected before it (anything else, including
+    // a block-level `affine.if`, rides along into the adjacent task rather
+    // than forming one of its own).
     SmallVector<Operation *, 4> opsToFuse;
     unsigned taskIdx = 0;
     for (auto &op : llvm::make_early_inc_range(block)) {
       if (hasEffect<MemoryEffects::Allocate>(&op)) {
-        // Memory allocs are moved to the begining and skipped.
+        // Allocations stay outside tasks at the beginning of the block.
         op.moveBefore(&block, block.begin());
 
       } else if (isa<AffineForOp, scf::ForOp>(op)) {
-        // We always take loop as root operation and fuse all the collected
-        // operations so far.
+        // Each loop roots a task together with the operations collected before
+        // it.
         opsToFuse.push_back(&op);
         fuseOpsIntoTask(opsToFuse, rewriter);
         opsToFuse.clear();
@@ -85,7 +90,8 @@ struct CreateDataflowFromAffine
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<TaskPartition>(context);
-    (void)applyPatternsGreedily(func, std::move(patterns));
+    if (failed(applyPatternsGreedily(func, std::move(patterns))))
+      signalPassFailure();
   }
 };
 } // namespace

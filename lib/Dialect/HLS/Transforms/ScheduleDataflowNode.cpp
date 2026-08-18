@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- ScheduleDataflowNode.cpp - schedule dataflow node ------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

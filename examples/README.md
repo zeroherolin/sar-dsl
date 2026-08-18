@@ -13,8 +13,8 @@ examples/
 │   ├── hls_artifacts.py  artifact set of the ALOS-scale HLS runners
 │   ├── plot.py        dB-scale image saving
 │   └── alos.py        ALOS-1 raw loading and scene post-processing
-├── data/              shared dataset: CEOS extraction tooling + ALOS product
-├── wka/               omega-K (wavenumber domain)
+├── data/              CEOS extraction tooling; local ALOS products are ignored
+├── wka/               omega-K, plus a standalone hand-written HLS reference
 ├── rda/               Range-Doppler
 ├── csa/               Chirp Scaling (interpolation-free)
 └── pfa/               Polar Format built from Python-defined operators
@@ -31,6 +31,9 @@ Every algorithm directory contains:
 | `run_point_target_hls.py` | **full flow on the hls backend**: emit a Vitis HLS C++ design plus its C-simulation package |
 
 `pfa` additionally carries `geometry.py` (polar-grid setup).
+`wka/handwritten_hls/` is deliberately separate from this common layout: it is
+a self-contained Vitis HLS implementation used to document hardware
+optimization patterns, not another SAR-DSL backend or compiler dependency.
 
 Runner scripts are named `run_<scene>_<backend>.py`: the scene is either
 `point_target` (a synthetic scene generated on the spot) or `alos` (the
@@ -75,36 +78,46 @@ uniformly weighted, 2x-oversampled image (PSLR -13.3 dB -> -23.3 dB with
 no mainlobe broadening).
 
 Each `assets/<algo>_synthetic_512.png` regenerates with its chain's CPU
-runner, e.g. `python examples/wka/run_point_target_cpu.py --n 512
---output examples/wka/assets/wka_synthetic_512.png`.
+runner, e.g. `python examples/wka/run_point_target_cpu.py --n 512`.
 
 ## Real data (ALOS-1)
 
 The three stripmap algorithms also process the real ALOS-1 San Francisco
 dataset (16384 x 16384 raw echoes, extracted once via
 `data/extract_alos.py`; original data © JAXA/METI, obtained from JAXA --
-the product itself is not part of this repository). Measured on a
-240-core machine, urban-area image contrast from
-`benchmarks/metrics.py:urban_contrast` (higher is sharper):
+the product itself is not part of this repository). The runners report
+wall time and `benchmarks/metrics.py:urban_contrast`; machine-specific
+real-data measurements are not kept as reference numbers.
 
-| | focus time | urban contrast |
-|---|---|---|
-| omega-K | 4.6 s | 0.810 |
-| Chirp Scaling | 3.0 s | 0.809 |
-| Range-Doppler | 3.5 s | 0.808 |
+<div align="center">
+<table>
+<tr>
+<td><img src="wka/assets/san_francisco_wka.png"
+         alt="ALOS-1 scene focused by omega-K"/></td>
+<td><img src="csa/assets/san_francisco_csa.png"
+         alt="ALOS-1 scene focused by Chirp Scaling"/></td>
+<td><img src="rda/assets/san_francisco_rda.png"
+         alt="ALOS-1 scene focused by Range-Doppler"/></td>
+</tr>
+<tr>
+<td align="center">omega-K</td>
+<td align="center">Chirp Scaling</td>
+<td align="center">Range-Doppler</td>
+</tr>
+</table>
+</div>
 
 Each also has a `run_alos_hls.py`, which emits **two** designs into
-`hls_project/<algo>_alos/`, because no single design can be both
-synthesizable at scene size and simulatable:
+`hls_project/<algo>_alos/`, separating the production geometry from a
+manageable C-simulation package:
 
 - `<algo>_alos_axi.cpp` -- the 16384 x 16384 design, compiled with
-  `axi_interface=True`. Every full-size buffer, including the FFT
-  scratch planes, sits behind an AXI master backed by DRAM and only the
+  `interface="axi"`. Kernel I/O uses AXI masters; internal full-size
+  planes share the compiler-managed DRAM scratch allocation, while
   constant tables stay on chip; see
   [docs/backends.md](../docs/backends.md) for how that placement is
-  decided. It is emitted for synthesis and not simulated: the promoted
-  ports are kernel scratch, and golden data exists only for the kernel's
-  own inputs and results.
+  decided. It is emitted for synthesis and not simulated because a
+  golden testbench has no input data for compiler-managed scratch.
 - `<algo>_alos.cpp` with `<algo>_alos_tb.cpp`, the csim/csynth scripts,
   `<algo>_alos_tb_data/` and `stubs/` -- a C-simulation package at
   `--csim-n` (default 1024), small enough to keep every plane on chip so
@@ -116,7 +129,8 @@ checklist for reading the reports is in
 
 The reduced package is the same radar: `common.params.alos_params`
 changes only `t_shift`, where R0 sits in the sampled window, because a
-window shorter than 4800 samples would not contain the echo at all.
+window shorter than 5232 samples (R0 at sample 4800 plus the trailing
+half-chirp) would not contain the echo at all.
 `fc`, `Fs`, PRF, `Vr`, `R0`, `Kr` and `Tp` are the acquisition's at
 every size, and the frequency axes span +/- Fs/2 and +/- PRF/2
 regardless of raster, so the Stolt map and the migration corrections are

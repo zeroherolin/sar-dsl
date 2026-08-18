@@ -14,6 +14,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 #include "sar/Dialect/SAR/IR/SARDialect.h"
@@ -118,7 +119,32 @@ FailureOr<func::FuncOp> FunctionDecomplexifier::run() {
   auto replacement =
       func::FuncOp::create(builder, original.getLoc(), original.getName(),
                            builder.getFunctionType(inputTypes, resultTypes));
-  replacement.setVisibility(original.getVisibility());
+  replacement->setAttrs(original->getAttrDictionary());
+  replacement.setName(original.getName());
+  replacement.setType(builder.getFunctionType(inputTypes, resultTypes));
+
+  if (original.getAllArgAttrs()) {
+    SmallVector<DictionaryAttr> attrs;
+    for (auto [index, type] :
+         llvm::enumerate(original.getFunctionType().getInputs())) {
+      DictionaryAttr attr = original.getArgAttrDict(index);
+      attrs.push_back(attr);
+      if (isComplexTensor(type))
+        attrs.push_back(attr);
+    }
+    replacement.setAllArgAttrs(attrs);
+  }
+  if (original.getAllResultAttrs()) {
+    SmallVector<DictionaryAttr> attrs;
+    for (auto [index, type] :
+         llvm::enumerate(original.getFunctionType().getResults())) {
+      DictionaryAttr attr = original.getResultAttrDict(index);
+      attrs.push_back(attr);
+      if (isComplexTensor(type))
+        attrs.push_back(attr);
+    }
+    replacement.setAllResultAttrs(attrs);
+  }
 
   // The frontend names arguments after the kernel's Python parameters
   // (`sar.arg_names`); a split complex argument keeps the name on both of
@@ -200,6 +226,50 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
           }
         }
         func::ReturnOp::create(builder, loc, operands);
+        return success();
+      })
+      .Case<func::CallOp>([&](func::CallOp call) -> LogicalResult {
+        auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+            call, call.getCalleeAttr());
+        if (!callee || callee.isExternal()) {
+          call.emitOpError(
+              "complex calls require a defined callee in the same module");
+          return failure();
+        }
+
+        SmallVector<Value> operands;
+        for (Value value : call.getOperands()) {
+          if (isComplexTensor(value.getType())) {
+            auto [re, im] = getSplit(value);
+            operands.push_back(re);
+            operands.push_back(im);
+          } else {
+            operands.push_back(getReal(value));
+          }
+        }
+        SmallVector<Type> resultTypes;
+        for (Type type : call.getResultTypes()) {
+          resultTypes.push_back(isComplexTensor(type) ? getPlaneType(type)
+                                                      : type);
+          if (isComplexTensor(type))
+            resultTypes.push_back(getPlaneType(type));
+        }
+        auto replacement = func::CallOp::create(builder, loc, call.getCallee(),
+                                                resultTypes, operands);
+        for (NamedAttribute attr : call->getAttrs())
+          if (attr.getName() != call.getCalleeAttrName())
+            replacement->setAttr(attr.getName(), attr.getValue());
+
+        unsigned resultIndex = 0;
+        for (Value result : call.getResults()) {
+          if (isComplexTensor(result.getType())) {
+            splitValues[result] = {replacement.getResult(resultIndex),
+                                   replacement.getResult(resultIndex + 1)};
+            resultIndex += 2;
+          } else {
+            realValues.map(result, replacement.getResult(resultIndex++));
+          }
+        }
         return success();
       })
       .Case<ConstantOp>([&](ConstantOp cst) -> LogicalResult {
@@ -434,14 +504,31 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
 
         auto newLoop = IterateOp::create(builder, loc, carryTypes, inits,
                                          loop.getTripsAttr());
+        if (loop.getIndex())
+          newLoop.setIndex(true);
         {
           // createBlock moves the insertion point into the new block; the
           // guard restores it so the ops after the loop land after it.
           OpBuilder::InsertionGuard guard(builder);
-          Block *block =
-              builder.createBlock(&newLoop.getBody(), {}, carryTypes, argLocs);
+          // The index argument (integer, never complex) precedes the
+          // carries in both the old and the new block.
+          SmallVector<Type> blockTypes;
+          SmallVector<Location> blockLocs;
+          Block &oldBlock = loop.getBody().front();
+          if (loop.getIndex()) {
+            blockTypes.push_back(oldBlock.getArgument(0).getType());
+            blockLocs.push_back(oldBlock.getArgument(0).getLoc());
+          }
+          blockTypes.append(carryTypes);
+          blockLocs.append(argLocs);
+          Block *block = builder.createBlock(&newLoop.getBody(), {}, blockTypes,
+                                             blockLocs);
           unsigned argIndex = 0;
-          for (BlockArgument arg : loop.getBody().front().getArguments()) {
+          if (loop.getIndex())
+            realValues.map(oldBlock.getArgument(0),
+                           block->getArgument(argIndex++));
+          for (BlockArgument arg :
+               oldBlock.getArguments().drop_front(loop.getIndex() ? 1 : 0)) {
             if (isComplexTensor(arg.getType())) {
               splitValues[arg] = {block->getArgument(argIndex),
                                   block->getArgument(argIndex + 1)};
@@ -545,9 +632,12 @@ struct SARDecomplexifyPass
       builder.setInsertionPoint(func);
       FunctionDecomplexifier rewriter(func, builder);
       std::string name = func.getName().str();
-      // Rename the original out of the way so the replacement can take its
-      // symbol name; the original is erased once the rewrite succeeds.
-      func.setName(name + "__complex_orig");
+      std::string temporaryName = name + "__complex_orig";
+      for (unsigned suffix = 0; module.lookupSymbol(temporaryName); ++suffix)
+        temporaryName = name + "__complex_orig_" + std::to_string(suffix);
+      // Calls keep the public symbol name and resolve to the replacement once
+      // the temporary implementation is erased.
+      func.setName(temporaryName);
       FailureOr<func::FuncOp> replacement = rewriter.run();
       if (failed(replacement)) {
         signalPassFailure();

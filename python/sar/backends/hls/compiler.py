@@ -26,18 +26,21 @@ the resolved set, with where each value came from, is reported by
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
 import numpy as np
 
-from sar.backends.base import BaseBackend, KernelMetadata, cached_stage
-from sar.backends.hls import autotune
-from sar.backends.hls.config import HLSConfig, check_precision
-from sar.compiler.toolchain import find_tool, run_tool
-from sar.errors import LaunchError, ToolchainError
+from ..base import BaseBackend, KernelMetadata, cached_stage
+from . import autotune
+from .config import HLSConfig, HLSConfigError, check_precision
+from .design import HLSDesign
+from ...compiler.toolchain import find_tool, run_tool
+from ...errors import CompilationError, LaunchError, ToolchainError
 
 _C_TYPES = {"f32": "float", "f64": "double"}
+_RETRYABLE_MEMORY_OVERFLOW = "SAR_HLS_RETRYABLE_MEMORY_OVERFLOW"
 
 
 def _top_func(config, metadata: KernelMetadata) -> str:
@@ -63,116 +66,6 @@ def _split_planes(kind: str, types) -> list:
         else:
             ports.append((f"{kind}{i}", t.shape, t.dtype.name))
     return ports
-
-
-class HLSDesign:
-    """Handle to an emitted HLS C++ design."""
-
-    def __init__(self, cpp_path: str, name: str, metadata=None, config=None):
-        self.cpp_path = str(cpp_path)
-        self.name = name
-        #: The `HLSConfig` the design was compiled with: shipped defaults,
-        #: the user's config file and the compile options, resolved.
-        self.config = config
-        self._metadata = metadata
-
-    def source(self) -> str:
-        return Path(self.cpp_path).read_text()
-
-    def write_testbench(self,
-                        inputs,
-                        expected,
-                        output_dir=None,
-                        rtol: float = 1e-4,
-                        atol: float = 1e-5) -> Path:
-        """Writes a self-contained C-simulation package into `output_dir`:
-        the design, a testbench comparing against golden data, the data
-        files, and a Vitis HLS csim script.
-
-        `inputs` / `expected` are numpy arrays matching the kernel's
-        original argument/result types (complex arrays for complex
-        tensors); golden outputs typically come from the NumPy reference
-        or the cpu backend. `output_dir` defaults to
-        `hls_project/<top>`. Returns the testbench path.
-        """
-        meta = self._metadata
-        if self.config is not None and self.config.interface == "axi":
-            raise LaunchError(
-                "testbench generation needs the plain-array top signature: "
-                "with interface='axi' every DRAM buffer is promoted to its "
-                "own AXI port, which the testbench has no data to drive. "
-                "Emit the csim package with the default "
-                "interface='ap_memory', and hand the interface='axi' "
-                "design to Vitis.")
-        if self.config is not None and self.config.interface == "stream":
-            raise LaunchError(
-                "testbench generation does not support interface='stream' "
-                "yet: an AXI4-Stream design takes hls::stream<> ports, and "
-                "driving them needs a FIFO-feeding harness the array "
-                "testbench is not. Emit the csim package with "
-                "interface='ap_memory' (the numerics are identical), and "
-                "hand the interface='stream' design to Vitis.")
-        for t in list(meta.arg_types) + list(meta.result_types):
-            if t.dtype.is_int:
-                raise LaunchError(
-                    "testbench generation does not support integer "
-                    "kernel arguments/results yet")
-
-        in_ports = _split_planes("in", meta.arg_types)
-        out_ports = _split_planes("out", meta.result_types)
-        arrays = (list(_plane_data(inputs, meta.arg_types)) +
-                  list(_plane_data(expected, meta.result_types)))
-
-        out = Path(
-            output_dir if output_dir is not None else Path("hls_project") /
-            self.name)
-        data_dir = out / f"{self.name}_tb_data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        for (port, _, _), values in zip(in_ports + out_ports, arrays):
-            np.savetxt(data_dir / f"{port}.dat",
-                       values.reshape(-1),
-                       fmt="%.17g")
-
-        (out / f"{self.name}.cpp").write_text(self.source())
-        tb = out / f"{self.name}_tb.cpp"
-        tb.write_text(
-            _testbench_source(self.name, in_ports, out_ports, rtol, atol))
-        part, clock = _part_and_clock(self.config)
-        (out / f"{self.name}_csim.tcl").write_text(
-            _csim_script(self.name, part, clock))
-        (out / f"{self.name}_csynth.tcl").write_text(
-            _csynth_script(self.name, part, clock))
-        _write_header_stubs(out / "stubs")
-        return tb
-
-    def write_synthesis_script(self, output_dir=None) -> Path:
-        """Writes the design and a Vitis HLS synthesis script into
-        `output_dir` (default `hls_project/<top>`), returning the script
-        path.
-
-        Unlike `write_testbench` this works for every interface: synthesis
-        needs no golden data, so the AXI designs that cannot be csim'd are
-        exactly the ones this exists for. Run with
-        `vitis_hls -f <top>_csynth.tcl`; see docs/backends.md for what to
-        check in the reports.
-        """
-        out = Path(
-            output_dir if output_dir is not None else Path("hls_project") /
-            self.name)
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"{self.name}.cpp").write_text(self.source())
-        part, clock = _part_and_clock(self.config)
-        script = out / f"{self.name}_csynth.tcl"
-        script.write_text(_csynth_script(self.name, part, clock))
-        return script
-
-    def __call__(self, *args, **kwargs):
-        raise RuntimeError(
-            "HLS designs are emitted as C++ for Vitis HLS synthesis and "
-            f"cannot be executed directly; see {self.cpp_path}")
-
-    def __repr__(self) -> str:
-        return f"HLSDesign({self.name} @ {self.cpp_path})"
 
 
 def _plane_data(arrays, types):
@@ -232,7 +125,9 @@ def _testbench_source(top, in_ports, out_ports, rtol, atol) -> str:
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <pthread.h>
 #include <string>
 
@@ -257,11 +152,21 @@ bool load(const std::string &dir, const std::string &name, T *dst,
                  name.c_str(), name.c_str());
     return false;
   }}
-  for (long i = 0; i < count; ++i)
-    if (!(f >> dst[i])) {{
+  for (long i = 0; i < count; ++i) {{
+    std::string token;
+    if (!(f >> token)) {{
       std::fprintf(stderr, "short read in %s\\n", path.c_str());
       return false;
     }}
+    char *end = nullptr;
+    double value = std::strtod(token.c_str(), &end);
+    if (!end || *end != '\\0') {{
+      std::fprintf(stderr, "invalid number in %s: %s\\n", path.c_str(),
+                   token.c_str());
+      return false;
+    }}
+    dst[i] = static_cast<T>(value);
+  }}
   return true;
 }}
 
@@ -274,7 +179,24 @@ int check(const std::string &dir, const std::string &name, const char *port,
   double max_err = 0.0;
   long bad = 0;
   for (long i = 0; i < count; ++i) {{
-    double err = std::abs(double(got[i]) - gold[i]);
+    double actual = double(got[i]);
+    bool actual_nan = std::isnan(actual);
+    bool gold_nan = std::isnan(gold[i]);
+    if (actual_nan || gold_nan) {{
+      if (actual_nan != gold_nan) {{
+        ++bad;
+        max_err = std::numeric_limits<double>::infinity();
+      }}
+      continue;
+    }}
+    if (std::isinf(actual) || std::isinf(gold[i])) {{
+      if (actual != gold[i]) {{
+        ++bad;
+        max_err = std::numeric_limits<double>::infinity();
+      }}
+      continue;
+    }}
+    double err = std::abs(actual - gold[i]);
     max_err = std::fmax(max_err, err);
     if (err > {atol} + {rtol} * std::abs(gold[i]))
       ++bad;
@@ -402,7 +324,7 @@ def _write_header_stubs(stub_dir: Path) -> None:
 def _part_and_clock(config) -> tuple:
     """(part, clock period) the generated Vitis scripts name."""
     if config is None:
-        return "xcvu13p-fhgb2104-2-e", 10.0
+        return "xcvu13p-fhgb2104-2-i", 4.0
     return config.part, float(config.clock_ns)
 
 
@@ -495,18 +417,23 @@ class Backend(BaseBackend):
             # finds nothing.
             renamed = _rename_symbol(module_text, metadata.name,
                                      _top_func(config, metadata))
-            budget = max(1, int(config.on_chip_budget))
+            staging = autotune.transpose_block_bytes(facts,
+                                                     int(config.bram_bytes))
             banded = "true" if config.interp_banded_gather else "false"
             pipeline = ("--sar-to-affine-pipeline="
                         f"reuse-buffer-min-elements="
                         f"{int(config.reuse_buffer_min_elements)} "
                         f"recompute-min-elements="
                         f"{int(config.recompute_min_elements)} "
-                        f"transpose-block-bytes={budget // 8} "
+                        f"transpose-block-bytes={staging} "
                         f"interp-enable-banded-gather={banded} "
                         f"fft-stage-group={int(config.fft_stage_group)}")
-            return run_tool("sar-lower", [find_tool("sar-opt"), pipeline, "-"],
-                            input_text=renamed)
+            command = [find_tool("sar-opt")]
+            if config.precision != "native":
+                command.append(
+                    f"--sar-verify-precision=precision={config.precision}")
+            command.extend([pipeline, "-"])
+            return run_tool("sar-lower", command, input_text=renamed)
 
         return cached_stage(cache, "kernel.affine.mlir", build)
 
@@ -516,13 +443,13 @@ class Backend(BaseBackend):
         # Placement is the one decision that needs the lowered buffers, so
         # it is derived here rather than with the rest -- and, like them,
         # before the cache short-circuits the stage.
+        lowered_facts = autotune.measure_kernel(lowered)
         config.adopt(
             autotune.derive(config, metadata.extra["hls_facts"], metadata,
-                            lowered))
+                            lowered_facts))
 
         def build() -> str:
             top_func = _top_func(config, metadata)
-            budget = max(1, int(config.on_chip_budget))
 
             # `interface` decides how off-chip buffers reach the top
             # function: as AXI master ports (SoC integration), AXI-Stream
@@ -538,29 +465,75 @@ class Backend(BaseBackend):
                                       "false")
             stream_flag = ("stream-interface=true"
                            if iface == "stream" else "")
-            # Per-tier budgets steer placement between BRAM, URAM and
-            # distributed RAM; 0 means the tier is unbounded and the
-            # aggregate `on-chip-bytes` rule applies on its own.
-            # `lutram-max-bytes` and `uram-min-bytes` are derived from the
-            # config (one bus beat and one physical URAM block).
+            # The tier caps are the hard resource contract; placement
+            # charges each tier in whole primitives and fails the design
+            # rather than exceed one. `lutram-max-bytes` (one bus beat) is
+            # derived from the config.
             lutram_max = int(config.lutram_max_bytes)
-            uram_min = int(config.uram_min_bytes)
-            hls_arg = (f"-hls-pipeline=top-func={top_func} "
-                       f"loop-tile-size={int(config.loop_tile_size)} "
-                       f"on-chip-bytes={budget} {axi} " +
-                       (f"{stream_flag} " if stream_flag else "") +
-                       f"bram-bytes={int(config.bram_bytes)} "
-                       f"uram-bytes={int(config.uram_bytes)} "
-                       f"lutram-bytes={int(config.lutram_bytes)} "
-                       f"lutram-max-bytes={lutram_max} "
-                       f"uram-min-bytes={uram_min} "
-                       "external-buffer-threshold="
-                       f"{int(config.external_buffer_threshold)}")
 
-            scheduled = run_tool("sar-hls",
-                                 [find_tool("sar-opt"), hls_arg, "-"],
-                                 input_text=lowered)
+            def schedule(threshold: int) -> tuple:
+                """Runs the HLS pipeline; returns (ir, over_budget). An
+                over-budget working set is the one tool failure the caller
+                can fix (stream more planes), so it comes back as a flag
+                rather than an exception."""
+                hls_arg = (f"-hls-pipeline=top-func={top_func} "
+                           f"loop-tile-size={int(config.loop_tile_size)} "
+                           f"{axi} " +
+                           (f"{stream_flag} " if stream_flag else "") +
+                           f"bram-bytes={int(config.bram_bytes)} "
+                           f"uram-bytes={int(config.uram_bytes)} "
+                           f"lutram-bytes={int(config.lutram_bytes)} "
+                           f"lutram-max-bytes={lutram_max} "
+                           f"external-buffer-threshold={threshold}")
+                try:
+                    out = run_tool("sar-hls",
+                                   [find_tool("sar-opt"), hls_arg, "-"],
+                                   input_text=lowered)
+                except CompilationError as err:
+                    if _RETRYABLE_MEMORY_OVERFLOW in str(err):
+                        return None, True
+                    raise
+                return out, False
+
+            # When the resident working set cannot fit the caps, retry once
+            # with every full-size plane streamed: the threshold drops to
+            # the plane size, which is the same decision
+            # `external_buffer_threshold` takes for a scene one size up. A
+            # user-pinned threshold is respected -- the failure then names
+            # it. If even the streamed design overruns, the constraints and
+            # the kernel are irreconcilable and compilation fails: an
+            # over-budget design would be permanently invalid on the
+            # device, so none is emitted.
+            threshold = int(config.external_buffer_threshold)
+            scheduled, over_budget = schedule(threshold)
+            if over_budget and config.provenance.get(
+                    "external_buffer_threshold") == config.DERIVED:
+                facts = metadata.extra["hls_facts"]
+                streamed = autotune.streaming_threshold(facts)
+                if streamed < threshold:
+                    retried, still_over = schedule(streamed)
+                    if not still_over:
+                        scheduled = retried
+                        config.repin("external_buffer_threshold", streamed)
+                        over_budget = False
+            if over_budget:
+                raise HLSConfigError(
+                    f"{metadata.name}: the on-chip working set exceeds the "
+                    "resource caps even with full-size planes streamed; "
+                    "raise bram_bytes/uram_bytes to match a larger device, "
+                    "or shrink the kernel's resident tables")
             cache.write_text("kernel.hls.mlir", scheduled)
+            # The threshold the shipped design was actually built with
+            # (the retry above may have repinned it), persisted beside the
+            # artifact: a later compile served from the cache must report
+            # the configuration this build decided on, not its own
+            # pre-retry estimate.
+            cache.write_text(
+                "kernel.hls.decisions.json",
+                json.dumps({
+                    "external_buffer_threshold":
+                    int(config.external_buffer_threshold)
+                }))
 
             # The bus width is a board property, so the shaping of the AXI
             # masters -- beat width, burst length, how many are in flight
@@ -578,6 +551,17 @@ class Backend(BaseBackend):
                             input_text=scheduled)
 
         cached_stage(cache, "kernel.hls.cpp", build)
+        # A cache hit skips `build` and with it the retry ladder; replay
+        # the persisted decision so cold and warm compiles report the
+        # same configuration.
+        decisions = cache.read_if_cached("kernel.hls.decisions.json")
+        if decisions is not None:
+            threshold = json.loads(decisions).get("external_buffer_threshold")
+            if (threshold is not None
+                    and int(config.external_buffer_threshold) != threshold
+                    and config.provenance.get("external_buffer_threshold")
+                    == config.DERIVED):
+                config.repin("external_buffer_threshold", threshold)
         return str(cache.path("kernel.hls.cpp"))
 
     # ------------------------------------------------------------------ #

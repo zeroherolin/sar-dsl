@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- Passes.h - HLS transform passes --------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -36,11 +36,10 @@ namespace sar {
 enum CreateSubviewMode { Point, Reduction };
 
 void registerHLSPipeline();
-void registerTransformsPasses();
+void registerHLSPasses();
 
 void addSimplifyAffineLoopPasses(OpPassManager &pm);
-void addCreateSubviewPasses(OpPassManager &pm,
-                            CreateSubviewMode mode = CreateSubviewMode::Point);
+void addCreateSubviewPasses(OpPassManager &pm);
 
 std::unique_ptr<Pass> createFuncPreprocessPass(std::string hlsTopFunc = "main");
 
@@ -57,11 +56,10 @@ std::unique_ptr<Pass> createLowerDataflowPass();
 std::unique_ptr<Pass> createParallelizeDataflowNodePass(
     unsigned loopUnrollFactor = 1, bool unrollPointLoopOnly = false,
     bool complexityAware = true, bool correlationAware = true);
-std::unique_ptr<Pass>
-createPlaceDataflowBufferPass(unsigned threshold = 1024, unsigned bramBytes = 0,
-                              unsigned uramBytes = 0, unsigned lutramBytes = 0,
-                              unsigned lutramMaxBytes = 256,
-                              unsigned uramMinBytes = 36864);
+std::unique_ptr<Pass> createPlaceDataflowBufferPass(
+    unsigned threshold = 1024, unsigned bramBytes = 9907200,
+    unsigned uramBytes = 37748736, unsigned lutramBytes = 2883584,
+    unsigned lutramMaxBytes = 64, bool rebalanceOnly = false);
 std::unique_ptr<Pass>
 createScheduleDataflowNodePass(bool ignoreViolations = false);
 std::unique_ptr<Pass> createStreamDataflowTaskPass();
@@ -87,7 +85,7 @@ std::unique_ptr<Pass> createSimplifyAffineIfPass();
 std::unique_ptr<Pass> createSimplifyCopyPass();
 
 /// Directive-related passes.
-std::unique_ptr<Pass> createArrayPartitionPass(unsigned lutramMaxBits = 1024,
+std::unique_ptr<Pass> createArrayPartitionPass(unsigned lutramMaxBits = 512,
                                                unsigned lutramBytes = 0,
                                                unsigned maxFactor = 32);
 std::unique_ptr<Pass>

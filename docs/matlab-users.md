@@ -1,15 +1,15 @@
-# Coming from Matlab
+# Coming from MATLAB
 
 SAR-DSL kernels are Python, and the vocabulary deliberately mirrors
-Matlab / Signal Processing Toolbox naming. The differences that actually
-bite are listed here.
+MATLAB and Signal Processing Toolbox naming. The differences relevant to
+porting are listed here.
 
 ## Indexing is 0-based, and slice ends are exclusive
 
 This is the one difference that silently produces wrong images rather
 than an error.
 
-| Matlab | SAR-DSL | Note |
+| MATLAB | SAR-DSL | Note |
 |--------|---------|------|
 | `x(1)` | `x[0:1]` | first element |
 | `x(end)` | `x[-1:]` | last element |
@@ -23,9 +23,9 @@ than an error.
 Indexing is always by *slice*: `x[0]` is rejected rather than silently
 dropping a dimension, so a single element or line is a length-1 slice
 (`x[0:1]`) and every result keeps the tensor's rank. Negative bounds
-count from the end as in numpy.
+count from the end as in NumPy.
 
-Axis numbers follow the same rule: Matlab's `fft(x, [], 2)` (along
+Axis numbers follow the same rule: MATLAB's `fft(x, [], 2)` (along
 columns) is `sar.fft(x, axis=1)`.
 
 ## Function names
@@ -39,11 +39,11 @@ Most names carry over unchanged: `fft`, `ifft`, `fft2`, `ifft2`,
 
 Where they differ:
 
-| Matlab | SAR-DSL | Note |
+| MATLAB | SAR-DSL | Note |
 |--------|---------|------|
 | `[~, i] = max(x)` | `sar.argmax(x, axis=...)` | index only |
 | `[~, i] = min(x)` | `sar.argmin(x, axis=...)` | index only; composition over `argmax` |
-| `interp1` | `sar.interp1d` | kernel selectable (`sinc`, `cubic`, ...); out of range, `boundary=` (`zero`/`edge`/`reflect`) applies, not Matlab's NaN/`extrapval` |
+| `interp1` | `sar.interp1d` | kernel selectable (`sinc`, `cubic`, ...); out of range, `boundary=` (`zero`/`edge`/`reflect`) applies, not MATLAB's NaN/`extrapval` |
 | `cat(2, a, b)` | `sar.concat([a, b], axis=1)` | also spelled `concatenate` |
 | `padarray` | `sar.pad` | |
 | `fliplr` / `flipud` | `sar.flip(x, axis=1)` / `axis=0` | |
@@ -52,13 +52,13 @@ Where they differ:
 | `db(x)` | `sar.db(x)` or `sar.mag2db(x)` | voltage convention |
 
 `dim=` and `axis=` are accepted interchangeably everywhere (`dim` reads
-like Matlab, `axis` like numpy) -- passing both is an error.
+like MATLAB, `axis` like NumPy) -- passing both is an error.
 
 ## Two convention differences
 
-- **`round` matches Matlab, not numpy**: halves go away from zero, so
+- **`round` matches MATLAB, not NumPy**: halves go away from zero, so
   `round(2.5) == 3`. NumPy would give 2.
-- **`var` / `std` match numpy, not Matlab**: they normalize by `N`, not
+- **`var` / `std` match NumPy, not MATLAB**: they normalize by `N`, not
   `N-1`.
 
 ## No in-place edits; masking replaces logical indexing
@@ -80,7 +80,7 @@ resizing inside a kernel, and no `end`-relative sizing at run time.
 
 ## Getting data in and out
 
-Kernels take and return numpy arrays. `.mat` files load through scipy
+Kernels take and return NumPy arrays. `.mat` files load through SciPy
 (`pip install scipy` -- it is not a SAR-DSL dependency):
 
 ```python
@@ -90,13 +90,13 @@ image = focus(raw, replica)
 scipy.io.savemat("image.mat", {"image": image})
 ```
 
-Complex types map straight across: Matlab `single` complex is
-`sar.c64` (numpy `complex64`), `double` complex is `sar.c128`
+Complex types map straight across: MATLAB `single` complex is
+`sar.c64` (NumPy `complex64`), `double` complex is `sar.c128`
 (`complex128`).
 
 ## Where to look next
 
 - [defining-ops.md](defining-ops.md) -- writing your own operators and
-  how numpy arrays interact with kernels
+  how NumPy arrays interact with kernels
 - [dialect.md](dialect.md) -- the full operation reference
 - [../examples/](../examples/) -- four complete imaging algorithms

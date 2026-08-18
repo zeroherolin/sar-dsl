@@ -124,3 +124,59 @@ def test_bad_bodies_are_rejected():
 
     with pytest.raises(sar.TraceError, match="carried"):
         arity_drift.to_mlir()
+
+
+@requires_cpu
+def test_index_argument_matches_host_loop():
+    """With index=True the body's first argument is the 0-based iteration
+    index as i64[1]; the compiled loop must agree with the host loop that
+    reads Python's own counter."""
+    trips = 5
+
+    @sar.func
+    def scaled(z: sar.c128[N, N]) -> sar.c128[N, N]:
+
+        def step(i, acc):
+            gain = sar.cast(i, sar.f64) + 1.0
+            return acc * sar.broadcast(sar.concatenate((gain, ) * N, dim=0),
+                                       (N, N),
+                                       dim=0)
+
+        return sar.iterate(trips, step, z, index=True)
+
+    z, _ = _inputs()
+    expected = z.copy()
+    for i in range(trips):
+        expected = expected * float(i + 1)
+    np.testing.assert_allclose(scaled(z), expected, rtol=1e-12)
+
+
+@requires_hls
+def test_index_argument_emits_on_hls():
+    """Backend symmetry for the index form (emission gate)."""
+
+    @sar.func
+    def scaled(z: sar.c128[N, N]) -> sar.c128[N, N]:
+
+        def step(i, acc):
+            gain = sar.cast(i, sar.f64) + 1.0
+            return acc * sar.broadcast(sar.concatenate((gain, ) * N, dim=0),
+                                       (N, N),
+                                       dim=0)
+
+        return sar.iterate(3, step, z, index=True)
+
+    scaled.name = "iterate_index_hls"
+    assert "#pragma HLS" in scaled.compile(backend="hls").source()
+
+
+def test_index_body_takes_one_extra_argument():
+    """index=True hands the body exactly one extra leading argument."""
+
+    @sar.func
+    def wrong(z: sar.c128[N, N]) -> sar.c128[N, N]:
+        # body written for the no-index signature
+        return sar.iterate(2, lambda acc: acc, z, index=True)
+
+    with pytest.raises(TypeError):
+        wrong.to_mlir()

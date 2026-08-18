@@ -362,6 +362,7 @@ def SAR_FFTShiftOp : SAR_Op<"fftshift", [Pure, SameOperandsAndResultType]> {
   let results = (outs SAR_Tensor:$result);
   let assemblyFormat = "$input attr-dict `:` type($result)";
   let hasVerifier = 1;
+  let hasCanonicalizer = 1;
   let hasFolder = 1;
 }
 
@@ -581,14 +582,21 @@ def SAR_IterateOp : SAR_Op<"iterate", [RecursiveMemoryEffects,
 
     The block argument types, the operand types, the result types and
     the yielded types all match, position by position. The trip count is
-    a compile-time constant and the body cannot observe the iteration
-    index.
+    a compile-time constant.
+
+    With the `index` attribute the body's first block argument is the
+    iteration index as a `tensor<1xi64>` (0-based), preceding the
+    carries; it is not an operand, not a result and not yielded --
+    lowering materializes it from the loop counter. A tensor rather
+    than a scalar so it composes with every tensor op (`sar.cast`,
+    arithmetic, `broadcast`) on both backends unchanged.
 
     Lowers to `scf.for` with tensor-carried `iter_args`
     (`convert-sar-to-linalg`); `sar-decomplexify` splits complex carries
     into (re, im) plane pairs first on targets without complex support.
   }];
-  let arguments = (ins Variadic<SAR_Tensor>:$inits, I64Attr:$trips);
+  let arguments = (ins Variadic<SAR_Tensor>:$inits, I64Attr:$trips,
+                       UnitAttr:$index);
   let results = (outs Variadic<SAR_Tensor>:$results);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
@@ -626,9 +634,10 @@ def SAR_YieldOp : SAR_Op<"yield", [Pure, ReturnLike, Terminator,
 //===----------------------------------------------------------------------===//
 
 def SAR_CumsumOp : SAR_Op<"cumsum", [Pure, SameOperandsAndResultType]> {
-  let summary = "prefix sum (cumulative sum) along one axis of a rank-2 tensor";
+  let summary = "prefix sum (cumulative sum) along one axis";
   let description = [{
-    Computes the inclusive prefix sum along axis `dim` of a rank-2 tensor:
+    Computes the inclusive prefix sum along axis `dim` of a rank-1 or
+    rank-2 tensor:
 
     - `dim = 0`: `result[i, j] = sum_{k=0}^{i} input[k, j]`
     - `dim = 1`: `result[i, j] = sum_{k=0}^{j} input[i, k]`
@@ -643,11 +652,12 @@ def SAR_CumsumOp : SAR_Op<"cumsum", [Pure, SameOperandsAndResultType]> {
 }
 
 def SAR_RankFilterOp : SAR_Op<"rank_filter", [Pure, SameOperandsAndResultType]> {
-  let summary = "windowed order-statistic filter along one axis of a rank-2 tensor";
+  let summary = "windowed order-statistic filter along one axis";
   let description = [{
-    Applies an order-statistic filter along axis `dim`: for every position a
-    window of `window` elements (clamped at boundaries) is sorted and the
-    element at index `rank` (0-based, ascending order) is written to the result.
+    Applies an order-statistic filter along axis `dim` of a rank-1 or rank-2
+    tensor: for every position a window of `window` elements (clamped at
+    boundaries) is sorted and the element at index `rank` (0-based, ascending
+    order) is written to the result.
 
     - `rank = 0` is the minimum, `rank = window - 1` is the maximum,
       `rank = window / 2` (floor) is the median.
@@ -665,9 +675,10 @@ def SAR_RankFilterOp : SAR_Op<"rank_filter", [Pure, SameOperandsAndResultType]> 
 }
 
 def SAR_SortOp : SAR_Op<"sort", [Pure, SameOperandsAndResultType]> {
-  let summary = "sorts each line of a rank-2 tensor along one axis";
+  let summary = "sorts each line along one axis";
   let description = [{
-    Sorts every line along axis `dim` into ascending order (numpy `sort`):
+    Sorts every line along axis `dim` of a rank-1 or rank-2 tensor into
+    ascending order (numpy `sort`):
 
     - `dim = 0`: each column is sorted independently.
     - `dim = 1`: each row is sorted independently.

@@ -1,4 +1,4 @@
-//===- Passes.td - HLS dialect transformation passes -------*- tablegen -*-===//
+//===- Passes.td - HLS transform pass definitions -------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -35,6 +35,8 @@ def BalanceDataflowNode :
       Pass<"hls-balance-dataflow-node", "func::FuncOp"> {
   let summary = "Balance dataflow nodes";
   let constructor = "mlir::sar::createBalanceDataflowNodePass()";
+  // The balancing copies are memref.copy ops.
+  let dependentDialects = ["mlir::memref::MemRefDialect", "mlir::sar::hls::HLSDialect"];
 }
 
 def ConvertDataflowToFunc :
@@ -46,12 +48,16 @@ def ConvertDataflowToFunc :
     Option<"splitExternalAccess", "split-external-access", "bool",
            /*default=*/"true", "whether split external memory accesses">
   ];
+  // Creates hls dataflow ops (and copies through memref).
+  let dependentDialects = ["mlir::sar::hls::HLSDialect", "mlir::memref::MemRefDialect"];
 }
 
 def CreateDataflowFromAffine :
       Pass<"hls-create-dataflow-from-affine", "func::FuncOp"> {
   let summary = "Create dataflow hierarchy from affine loops";
   let constructor = "mlir::sar::createCreateDataflowFromAffinePass()";
+  // Creates hls dataflow ops (and copies through memref).
+  let dependentDialects = ["mlir::sar::hls::HLSDialect", "mlir::memref::MemRefDialect"];
 }
 
 def CreateTokenStream : Pass<"hls-create-token-stream", "func::FuncOp"> {
@@ -69,6 +75,9 @@ def CreateTokenStream : Pass<"hls-create-token-stream", "func::FuncOp"> {
 
 def EliminateMultiConsumer :
       Pass<"hls-eliminate-multi-consumer", "func::FuncOp"> {
+  // Fork nodes copy buffers with memref.copy.
+  let dependentDialects = ["mlir::memref::MemRefDialect", "mlir::sar::hls::HLSDialect"];
+
   let summary = "Eliminate multi-consumer violations";
   let description = [{
     This pass will insert explicit fork nodes to eliminate multi-consumers.
@@ -80,6 +89,8 @@ def EliminateMultiProducer :
       Pass<"hls-eliminate-multi-producer", "func::FuncOp"> {
   let summary = "Try to eliminate multi-producer violations";
   let constructor = "mlir::sar::createEliminateMultiProducerPass()";
+  // Producer privatization copies through memref ops.
+  let dependentDialects = ["mlir::memref::MemRefDialect", "mlir::sar::hls::HLSDialect"];
 }
 
 def LegalizeDataflow : Pass<"hls-legalize-dataflow", "func::FuncOp"> {
@@ -146,36 +157,47 @@ def PlaceDataflowBuffer :
     Bind each buffer to an on-chip memory tier, or to DRAM when no tier has
     room. A buffer's tier follows its measured size: one small enough to
     sit in distributed RAM without competing with the logic goes to LUTRAM,
-    a contiguous plane large enough to fill ultra RAM blocks goes to URAM,
-    the rest go to block RAM. Tiers are charged in whole primitives -- a
-    36Kb block holding one kilobyte is spent -- so the budgets cannot
-    over-promise. A tier budget of 0 means that tier is unbounded; the
-    lutram-max/uram-min thresholds steer between tiers either way.
+    a contiguous plane at or above one ultra RAM block goes to URAM, the
+    rest go to block RAM, and either block tier overflows into the other
+    before anything spills. Tiers are charged in whole primitives -- a
+    36Kb block holding one kilobyte is spent -- and the budgets are hard
+    caps: a buffer that must stay on chip (a constant table, a
+    per-iteration scratch) but fits no tier fails the pass rather than
+    overcommitting the device.
 
     Buffers at or above `threshold` elements move to DRAM -- that is what
     lets scene size grow past the device -- except constant buffers, which
     are the ROM tables the design needs on entry and never stream.
     Function arguments are placed too and count against the same budgets:
     an interface array occupies the same primitives as a local buffer.
+
+    With `rebalance-only` the pass re-runs on an already-placed scheduled
+    graph (the fork/balance passes copy buffers at the placed type, past
+    what the first placement budgeted): tier assignments are recharged and
+    URAM overflow demotes to block RAM, but nothing newly moves to DRAM --
+    the external set and its ports were fixed by the first placement.
   }];
   let constructor = "mlir::sar::createPlaceDataflowBufferPass()";
 
   let options = [
     Option<"threshold", "threshold", "unsigned", /*default=*/"1024",
            "Element count at or above which a buffer is placed in DRAM">,
-    Option<"bramBytes", "bram-bytes", "unsigned", /*default=*/"0",
-           "Block RAM the design may occupy, in bytes (0 is unbounded)">,
-    Option<"uramBytes", "uram-bytes", "unsigned", /*default=*/"0",
-           "Ultra RAM the design may occupy, in bytes (0 is unbounded)">,
-    Option<"lutramBytes", "lutram-bytes", "unsigned", /*default=*/"0",
-           "Distributed RAM the design may occupy, in bytes (0 is "
-           "unbounded)">,
+    Option<"bramBytes", "bram-bytes", "unsigned", /*default=*/"9907200",
+           "Block RAM the design may occupy, in bytes (hard cap; 0 forbids "
+           "the tier)">,
+    Option<"uramBytes", "uram-bytes", "unsigned", /*default=*/"37748736",
+           "Ultra RAM the design may occupy, in bytes (hard cap; 0 forbids "
+           "the tier)">,
+    Option<"lutramBytes", "lutram-bytes", "unsigned", /*default=*/"2883584",
+           "Distributed RAM the design may occupy, in bytes (hard cap; 0 "
+           "forbids the tier)">,
     Option<"lutramMaxBytes", "lutram-max-bytes", "unsigned",
-           /*default=*/"256",
+           /*default=*/"64",
            "Buffer size, in bytes, at or below which distributed RAM is "
-           "preferred">,
-    Option<"uramMinBytes", "uram-min-bytes", "unsigned", /*default=*/"36864",
-           "Buffer size, in bytes, at or above which ultra RAM is preferred">
+           "preferred (one bus beat at the default 512-bit bus)">,
+    Option<"rebalanceOnly", "rebalance-only", "bool", /*default=*/"false",
+           "Re-place an already-scheduled graph: recharge tiers, demote "
+           "URAM overflow to BRAM, never newly move a buffer to DRAM">
   ];
 }
 
@@ -227,6 +249,8 @@ def AffineLoopPerfection :
     statements to ensure the correctness of the transformation.
   }];
   let constructor = "mlir::sar::createAffineLoopPerfectionPass()";
+  // Buffers sunk results as hls buffers.
+  let dependentDialects = ["mlir::sar::hls::HLSDialect", "mlir::memref::MemRefDialect"];
 }
 
 def AffineLoopTile : Pass<"hls-affine-loop-tile", "func::FuncOp"> {
@@ -390,8 +414,9 @@ def ArrayPartition : Pass<"hls-array-partition", "ModuleOp"> {
 
   let options = [
     Option<"lutramMaxBits", "lutram-max-bits", "unsigned",
-           /*default=*/"1024",
-           "Bank size, in bits, below which distributed RAM is used">,
+           /*default=*/"512",
+           "Bank size, in bits, at or below which distributed RAM is used "
+           "(one bus beat at the default 512-bit bus)">,
     Option<"lutramBytes", "lutram-bytes", "unsigned", /*default=*/"0",
            "Distributed RAM the design may occupy, in bytes (0 is "
            "unbounded). Banking stops promoting into it once spent, so a "
@@ -462,6 +487,10 @@ def CreateMemrefSubview :
     memory.
   }];
   let constructor = "mlir::sar::createCreateMemrefSubviewPass()";
+  // The subviews are memref.subview ops carrying #hls.tile layouts.
+  let dependentDialects = [
+    "mlir::memref::MemRefDialect", "mlir::sar::hls::HLSDialect"
+  ];
 
   let options = [
     Option<"createSubviewMode", "mode", "enum CreateSubviewMode",

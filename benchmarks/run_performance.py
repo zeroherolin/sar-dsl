@@ -7,7 +7,7 @@ interpolation loops are per-line Python).
 
 Throughput is N² / run_best (input samples per second), measured as the
 minimum of 5 timed runs after 3 warmup passes with `time.perf_counter`.
-Points where a single run exceeds 120 s are skipped and flagged in the table.
+Points whose cold run exceeds 120 s are flagged and skipped before repetition.
 
 Cold and warm are reported separately.  `cold` is the first call after
 compilation, which faults in and zeroes the kernel's planes; `run best`
@@ -39,22 +39,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from algorithms import ALL, LABELS, load  # noqa: E402
+from provenance import environment  # noqa: E402
 
 _DEFAULT_SIZES = [128, 256, 512, 1024, 2048, 4096]
 _WARMUP = 3
-_TIMEOUT_S = 120.0
+_SLOW_POINT_S = 120.0
 
 ASSETS = Path(__file__).resolve().parent / "assets"
 
 
 def _timed(fn, repeats: int):
-    """Returns (best, mean) wall time for `repeats` back-to-back calls."""
+    """Returns (best, mean, samples) for back-to-back calls."""
     times = []
     for _ in range(repeats):
         t0 = time.perf_counter()
         fn()
         times.append(time.perf_counter() - t0)
-    return min(times), statistics.mean(times)
+    return min(times), statistics.mean(times), times
 
 
 def throughput_figure(results: list, out_dir=None) -> None:
@@ -107,7 +108,7 @@ def throughput_figure(results: list, out_dir=None) -> None:
                    color="0.6",
                    linewidth=0.8,
                    linestyle=":",
-                   label=f"timeout (>{_TIMEOUT_S:.0f} s)")
+                   label=f"slow point (>{_SLOW_POINT_S:.0f} s)")
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
@@ -163,8 +164,8 @@ def main() -> None:
             chain.run(kernel)
             cold_s = time.perf_counter() - t0
 
-            if cold_s > _TIMEOUT_S:
-                note = f"(>{_TIMEOUT_S:.0f}s)"
+            if cold_s > _SLOW_POINT_S:
+                note = f"(>{_SLOW_POINT_S:.0f}s)"
                 print(f"{name:>9} {n:>6} {compile_s:8.2f}s {cold_s:8.2f}s "
                       f"{'SKIP':>10} {note:>10} {'':>9} {'':>10} {'':>8}")
                 results.append(
@@ -179,13 +180,14 @@ def main() -> None:
             for _ in range(_WARMUP - 1):
                 chain.run(kernel)
 
-            best, mean = _timed(lambda: chain.run(kernel), args.repeats)
+            best, mean, samples = _timed(lambda: chain.run(kernel),
+                                         args.repeats)
             throughput = n * n / best
 
             np_best = None
             if args.numpy:
-                np_best, _ = _timed(chain.run_reference,
-                                    max(1, args.repeats // 3))
+                np_best, _, numpy_samples = _timed(chain.run_reference,
+                                                   max(1, args.repeats // 3))
                 np_txt = f"{np_best:9.2f}s"
                 speedup = f"{np_best / best:7.1f}x"
             else:
@@ -203,12 +205,20 @@ def main() -> None:
                      cold_s=cold_s,
                      best_s=best,
                      mean_s=mean,
+                     samples_s=samples,
                      numpy_s=np_best))
+            if args.numpy:
+                results[-1]["numpy_samples_s"] = numpy_samples
 
     if args.json:
         with open(args.json, "a") as fh:
+            fh.write(
+                json.dumps({
+                    "type": "environment",
+                    **environment()
+                }) + "\n")
             for r in results:
-                fh.write(json.dumps(r) + "\n")
+                fh.write(json.dumps({"type": "measurement", **r}) + "\n")
 
     if not args.no_figure:
         throughput_figure(results)

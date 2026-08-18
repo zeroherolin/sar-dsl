@@ -23,6 +23,7 @@
 #include <cassert>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +32,10 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #include "sar/Runtime/RuntimeEnums.h"
 
@@ -76,40 +81,34 @@ public:
   void *allocate(size_t size, size_t alignment) {
     if (size == 0)
       return nullptr;
+    alignment = std::max(alignment, sizeof(void *));
+    if ((alignment & (alignment - 1)) != 0) {
+      std::fprintf(stderr, "sar_runtime: invalid allocation alignment %zu\n",
+                   alignment);
+      std::abort();
+    }
     bool pooled = enabled && size >= kPoolMinBytes;
-    if (pooled) {
-      std::lock_guard<std::mutex> guard(mutex);
-      for (size_t i = 0; i < cache.size(); ++i) {
-        // Exact-size reuse only. Kernel buffers repeat their shapes call
-        // after call, so a looser fit would only trade pages for slack.
-        if (cache[i].size != size || cache[i].alignment < alignment)
-          continue;
-        void *ptr = cache[i].ptr;
-        cachedBytes -= cache[i].size;
-        cache[i] = cache.back();
-        cache.pop_back();
-        liveBytes += size;
-        peakLiveBytes = std::max(peakLiveBytes, liveBytes);
-        return ptr;
-      }
-    }
+    if (!pooled)
+      return allocateRaw(size, alignment);
 
-    void *ptr = nullptr;
-    if (posix_memalign(&ptr, std::max(alignment, sizeof(void *)), size) != 0) {
-      // The generated kernel code does not check this pointer, so a silent
-      // nullptr would resurface as a segfault far from the cause.
-      std::fprintf(stderr,
-                   "sar_runtime: failed to allocate %zu bytes "
-                   "(alignment %zu)\n",
-                   size, alignment);
-      return nullptr;
-    }
-    if (pooled) {
-      std::lock_guard<std::mutex> guard(mutex);
-      blocks.push_back({ptr, size, alignment});
+    std::lock_guard<std::mutex> guard(mutex);
+    for (size_t i = 0; i < cache.size(); ++i) {
+      if (cache[i].size != size || cache[i].alignment < alignment)
+        continue;
+      void *ptr = cache[i].ptr;
+      cachedBytes -= cache[i].size;
+      cache[i] = cache.back();
+      cache.pop_back();
       liveBytes += size;
       peakLiveBytes = std::max(peakLiveBytes, liveBytes);
+      return ptr;
     }
+
+    evictCachedToFit(size);
+    void *ptr = allocateRaw(size, alignment);
+    blocks.push_back({ptr, size, alignment});
+    liveBytes += size;
+    peakLiveBytes = std::max(peakLiveBytes, liveBytes);
     return ptr;
   }
 
@@ -125,7 +124,7 @@ public:
         Block block = blocks[i];
         liveBytes -= block.size;
         size_t bound = limit ? limit : peakLiveBytes;
-        if (cachedBytes + block.size <= bound) {
+        if (liveBytes + cachedBytes + block.size <= bound) {
           cache.push_back(block);
           cachedBytes += block.size;
           return;
@@ -146,11 +145,41 @@ private:
     size_t alignment;
   };
 
+  static void *allocateRaw(size_t size, size_t alignment) {
+    void *ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) == 0)
+      return ptr;
+    std::fprintf(stderr,
+                 "sar_runtime: failed to allocate %zu bytes "
+                 "(alignment %zu)\n",
+                 size, alignment);
+    std::abort();
+  }
+
+  void evictCachedToFit(size_t request) {
+    size_t requiredLive = liveBytes + request;
+    size_t bound = limit ? std::max(limit, requiredLive)
+                         : std::max(peakLiveBytes, requiredLive);
+    while (!cache.empty() && liveBytes + cachedBytes + request > bound) {
+      Block victim = cache.back();
+      cache.pop_back();
+      cachedBytes -= victim.size;
+      for (size_t i = 0; i < blocks.size(); ++i) {
+        if (blocks[i].ptr != victim.ptr)
+          continue;
+        blocks[i] = blocks.back();
+        blocks.pop_back();
+        break;
+      }
+      free(victim.ptr);
+    }
+  }
+
   PlanePool() {
     if (const char *env = std::getenv("SAR_RT_POOL_MAX_BYTES")) {
       char *end = nullptr;
       long long value = std::strtoll(env, &end, 10);
-      if (end != env && value >= 0) {
+      if (end != env && *end == '\0' && value >= 0) {
         limit = static_cast<size_t>(value);
         enabled = value != 0;
       }
@@ -188,50 +217,137 @@ template <typename T, int Rank> struct MemRefDescriptor {
 // Parallel helpers
 //===----------------------------------------------------------------------===//
 
-/// Worker count for runtime parallelism. Respects SAR_RT_NUM_THREADS, then
-/// OMP_NUM_THREADS (so the runtime does not oversubscribe when the kernel
-/// is already running inside an OpenMP parallel region with a configured
-/// thread budget), then falls back to the hardware concurrency.
+static unsigned availableWorkerCount() {
+#if defined(__linux__)
+  cpu_set_t affinity;
+  CPU_ZERO(&affinity);
+  if (sched_getaffinity(0, sizeof(affinity), &affinity) == 0)
+    return std::max(1, CPU_COUNT(&affinity));
+#endif
+  return std::max(1u, std::thread::hardware_concurrency());
+}
+
+/// Worker count for runtime parallelism. Explicit requests are capped by the
+/// process affinity, so a container cannot accidentally create host-wide
+/// thread counts.
 unsigned runtimeWorkerCount() {
   static const unsigned cached = [] {
-    // Cap requests well above any real machine but below where thread
-    // construction itself would fail.
-    constexpr long kMaxWorkers = 4096;
+    unsigned available = availableWorkerCount();
     for (const char *var : {"SAR_RT_NUM_THREADS", "OMP_NUM_THREADS"}) {
       if (const char *env = std::getenv(var)) {
         char *end = nullptr;
         long value = std::strtol(env, &end, 10);
-        if (end != env && value > 0)
-          return static_cast<unsigned>(std::min(value, kMaxWorkers));
+        if (end != env && *end == '\0' && value > 0)
+          return static_cast<unsigned>(std::min<unsigned long>(
+              static_cast<unsigned long>(value), available));
       }
     }
-    return std::max(1u, std::thread::hardware_concurrency());
+    return std::min(available, 32u);
   }();
   return cached;
 }
 
-/// Runs fn(begin, end) over [0, total) partitioned across worker threads.
+class RuntimeThreadPool {
+public:
+  RuntimeThreadPool() : workerCount(runtimeWorkerCount()) {
+    for (unsigned id = 1; id < workerCount; ++id)
+      threads.emplace_back([this, id] { workerLoop(id); });
+  }
+
+  ~RuntimeThreadPool() {
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      stopping = true;
+      ++generation;
+    }
+    ready.notify_all();
+    for (std::thread &thread : threads)
+      thread.join();
+  }
+
+  void run(int64_t total,
+           const std::function<void(int64_t, int64_t)> &function) {
+    unsigned active = static_cast<unsigned>(
+        std::min<int64_t>(total, static_cast<int64_t>(workerCount)));
+    if (active <= 1) {
+      function(0, total);
+      return;
+    }
+
+    std::lock_guard<std::mutex> runGuard(runMutex);
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      task = function;
+      taskTotal = total;
+      activeWorkers = active;
+      completed = 0;
+      ++generation;
+    }
+    ready.notify_all();
+    runChunk(0, function, total, active);
+
+    std::unique_lock<std::mutex> lock(mutex);
+    done.wait(lock, [&] { return completed == threads.size(); });
+  }
+
+private:
+  static void runChunk(unsigned id,
+                       const std::function<void(int64_t, int64_t)> &function,
+                       int64_t total, unsigned active) {
+    if (id >= active)
+      return;
+    int64_t chunk = (total + active - 1) / active;
+    int64_t begin = static_cast<int64_t>(id) * chunk;
+    int64_t end = std::min<int64_t>(begin + chunk, total);
+    if (begin < end)
+      function(begin, end);
+  }
+
+  void workerLoop(unsigned id) {
+    uint64_t observed = 0;
+    while (true) {
+      std::function<void(int64_t, int64_t)> function;
+      int64_t total = 0;
+      unsigned active = 0;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        ready.wait(lock, [&] { return stopping || generation != observed; });
+        if (stopping)
+          return;
+        observed = generation;
+        function = task;
+        total = taskTotal;
+        active = activeWorkers;
+      }
+      runChunk(id, function, total, active);
+      {
+        std::lock_guard<std::mutex> guard(mutex);
+        ++completed;
+        if (completed == threads.size())
+          done.notify_one();
+      }
+    }
+  }
+
+  unsigned workerCount;
+  std::vector<std::thread> threads;
+  std::mutex runMutex;
+  std::mutex mutex;
+  std::condition_variable ready;
+  std::condition_variable done;
+  std::function<void(int64_t, int64_t)> task;
+  int64_t taskTotal = 0;
+  unsigned activeWorkers = 0;
+  size_t completed = 0;
+  uint64_t generation = 0;
+  bool stopping = false;
+};
+
+/// Runs fn(begin, end) over [0, total) on a process-wide reusable pool.
 void parallelFor(int64_t total,
                  const std::function<void(int64_t, int64_t)> &fn) {
-  unsigned workers = runtimeWorkerCount();
-  if (workers <= 1 || total < 2) {
-    fn(0, total);
-    return;
-  }
-  workers = static_cast<unsigned>(
-      std::min<int64_t>(total, static_cast<int64_t>(workers)));
-  std::vector<std::thread> threads;
-  threads.reserve(workers);
-  int64_t chunk = (total + workers - 1) / workers;
-  for (unsigned w = 0; w < workers; ++w) {
-    int64_t begin = static_cast<int64_t>(w) * chunk;
-    int64_t end = std::min<int64_t>(begin + chunk, total);
-    if (begin >= end)
-      break;
-    threads.emplace_back(fn, begin, end);
-  }
-  for (auto &t : threads)
-    t.join();
+  static RuntimeThreadPool pool;
+  pool.run(total, fn);
 }
 
 //===----------------------------------------------------------------------===//
@@ -470,12 +586,13 @@ inline int64_t applyBoundary(int64_t idx, int64_t cols, int64_t boundary) {
     return -1;
   if (boundary == kEdge)
     return std::max<int64_t>(0, std::min<int64_t>(cols - 1, idx));
-  // kReflect: mirror about the boundaries.
+  if (cols == 1)
+    return 0;
+  int64_t period = 2 * cols;
+  idx %= period;
   if (idx < 0)
-    idx = -idx - 1;
-  else
-    idx = 2 * cols - idx - 1;
-  return std::max<int64_t>(0, std::min<int64_t>(cols - 1, idx));
+    idx += period;
+  return idx < cols ? idx : period - idx - 1;
 }
 
 /// Window taper evaluated at t = d / (taps/2), |t| <= 1 on the support.
@@ -505,17 +622,9 @@ inline std::complex<double> sampleInterp(const std::complex<double> *row,
                                          double invI0Beta, int64_t boundary) {
   if (kernel == kNearest) {
     int64_t idx = static_cast<int64_t>(std::floor(position + 0.5));
-    if (boundary == kZero && (idx < 0 || idx >= cols))
+    idx = applyBoundary(idx, cols, boundary);
+    if (idx < 0)
       return {0.0, 0.0};
-    if (boundary == kEdge)
-      idx = std::max<int64_t>(0, std::min<int64_t>(cols - 1, idx));
-    else if (boundary == kReflect && (idx < 0 || idx >= cols)) {
-      if (idx < 0)
-        idx = -idx - 1;
-      else
-        idx = 2 * cols - idx - 1;
-      idx = std::max<int64_t>(0, std::min<int64_t>(cols - 1, idx));
-    }
     return row[idx];
   }
 
@@ -609,7 +718,7 @@ extern "C" {
 /// callers can reach directly, so a mismatch aborts with a diagnostic in
 /// every build -- an assert would vanish under NDEBUG and turn the mismatch
 /// into an out-of-bounds write.
-static void requireMatchingShapes(bool ok, const char *what) {
+static void requireRuntime(bool ok, const char *what) {
   if (!ok) {
     std::fprintf(stderr, "sar_runtime: %s\n", what);
     std::abort();
@@ -617,11 +726,16 @@ static void requireMatchingShapes(bool ok, const char *what) {
 }
 
 void *_mlir_memref_to_llvm_alloc(int64_t size) {
+  requireRuntime(size >= 0, "allocation size must be non-negative");
   return PlanePool::instance().allocate(static_cast<size_t>(size),
                                         sizeof(void *));
 }
 
 void *_mlir_memref_to_llvm_aligned_alloc(int64_t alignment, int64_t size) {
+  requireRuntime(size >= 0, "allocation size must be non-negative");
+  requireRuntime(alignment > 0 && (alignment & (alignment - 1)) == 0 &&
+                     alignment % static_cast<int64_t>(sizeof(void *)) == 0,
+                 "allocation alignment must be a pointer-sized power of two");
   return PlanePool::instance().allocate(static_cast<size_t>(size),
                                         static_cast<size_t>(alignment));
 }
@@ -632,38 +746,63 @@ void _mlir_memref_to_llvm_free(void *ptr) {
 
 void _mlir_ciface_sar_rt_fft_1d_c64(
     MemRefDescriptor<std::complex<float>, 1> *in,
-    MemRefDescriptor<std::complex<float>, 1> *out, int64_t /*dim*/,
-    bool inverse) {
-  requireMatchingShapes(in->sizes[0] == out->sizes[0],
-                        "fft_1d_c64: output shape must match input shape");
+    MemRefDescriptor<std::complex<float>, 1> *out, int64_t dim, bool inverse) {
+  requireRuntime(dim == 0, "fft_1d_c64: dim must be 0");
+  requireRuntime(in->sizes[0] >= 2, "fft_1d_c64: extent must be at least 2");
+  requireRuntime(in->sizes[0] == out->sizes[0],
+                 "fft_1d_c64: output shape must match input shape");
   fft1d<float>(in, out, inverse);
 }
 
 void _mlir_ciface_sar_rt_fft_1d_c128(
     MemRefDescriptor<std::complex<double>, 1> *in,
-    MemRefDescriptor<std::complex<double>, 1> *out, int64_t /*dim*/,
-    bool inverse) {
-  requireMatchingShapes(in->sizes[0] == out->sizes[0],
-                        "fft_1d_c128: output shape must match input shape");
+    MemRefDescriptor<std::complex<double>, 1> *out, int64_t dim, bool inverse) {
+  requireRuntime(dim == 0, "fft_1d_c128: dim must be 0");
+  requireRuntime(in->sizes[0] >= 2, "fft_1d_c128: extent must be at least 2");
+  requireRuntime(in->sizes[0] == out->sizes[0],
+                 "fft_1d_c128: output shape must match input shape");
   fft1d<double>(in, out, inverse);
 }
 
 void _mlir_ciface_sar_rt_fft_2d_c64(
     MemRefDescriptor<std::complex<float>, 2> *in,
     MemRefDescriptor<std::complex<float>, 2> *out, int64_t dim, bool inverse) {
-  requireMatchingShapes(in->sizes[0] == out->sizes[0] &&
-                            in->sizes[1] == out->sizes[1],
-                        "fft_2d_c64: output shape must match input shape");
+  requireRuntime(dim == 0 || dim == 1, "fft_2d_c64: dim must be 0 or 1");
+  requireRuntime(in->sizes[0] > 0 && in->sizes[1] > 0 && in->sizes[dim] >= 2,
+                 "fft_2d_c64: extents must be positive and transform "
+                 "extent at least 2");
+  requireRuntime(in->sizes[0] == out->sizes[0] && in->sizes[1] == out->sizes[1],
+                 "fft_2d_c64: output shape must match input shape");
   fft2d<float>(in, out, dim, inverse);
 }
 
 void _mlir_ciface_sar_rt_fft_2d_c128(
     MemRefDescriptor<std::complex<double>, 2> *in,
     MemRefDescriptor<std::complex<double>, 2> *out, int64_t dim, bool inverse) {
-  requireMatchingShapes(in->sizes[0] == out->sizes[0] &&
-                            in->sizes[1] == out->sizes[1],
-                        "fft_2d_c128: output shape must match input shape");
+  requireRuntime(dim == 0 || dim == 1, "fft_2d_c128: dim must be 0 or 1");
+  requireRuntime(in->sizes[0] > 0 && in->sizes[1] > 0 && in->sizes[dim] >= 2,
+                 "fft_2d_c128: extents must be positive and transform "
+                 "extent at least 2");
+  requireRuntime(in->sizes[0] == out->sizes[0] && in->sizes[1] == out->sizes[1],
+                 "fft_2d_c128: output shape must match input shape");
   fft2d<double>(in, out, dim, inverse);
+}
+
+static void requireInterpArgs(int64_t rows, int64_t cols, int64_t kernel,
+                              int64_t taps, int64_t window, double beta,
+                              int64_t boundary, const char *what) {
+  requireRuntime(rows > 0 && cols > 0, what);
+  requireRuntime(kernel >= kNearest && kernel <= kSinc,
+                 "interp1d: unknown kernel");
+  requireRuntime(window >= kRect && window <= kKaiser,
+                 "interp1d: unknown window");
+  requireRuntime(boundary >= kZero && boundary <= kReflect,
+                 "interp1d: unknown boundary");
+  requireRuntime(kernel != kSinc || (taps >= 4 && taps <= 32 && taps % 2 == 0),
+                 "interp1d: sinc taps must be even and in [4, 32]");
+  requireRuntime(window != kKaiser ||
+                     (std::isfinite(beta) && beta > 0.0 && beta <= 12.0),
+                 "interp1d: Kaiser beta must be finite and in (0, 12]");
 }
 
 void _mlir_ciface_sar_rt_interp1d_2d_c64(
@@ -671,12 +810,14 @@ void _mlir_ciface_sar_rt_interp1d_2d_c64(
     MemRefDescriptor<double, 2> *positions,
     MemRefDescriptor<std::complex<float>, 2> *out, int64_t kernel, int64_t taps,
     int64_t window, double beta, int64_t boundary) {
-  requireMatchingShapes(data->sizes[0] == positions->sizes[0] &&
-                            data->sizes[1] == positions->sizes[1],
-                        "interp1d_2d_c64: positions shape must match data");
-  requireMatchingShapes(data->sizes[0] == out->sizes[0] &&
-                            data->sizes[1] == out->sizes[1],
-                        "interp1d_2d_c64: output shape must match data");
+  requireInterpArgs(data->sizes[0], data->sizes[1], kernel, taps, window, beta,
+                    boundary, "interp1d_2d_c64: extents must be positive");
+  requireRuntime(data->sizes[0] == positions->sizes[0] &&
+                     data->sizes[1] == positions->sizes[1],
+                 "interp1d_2d_c64: positions shape must match data");
+  requireRuntime(data->sizes[0] == out->sizes[0] &&
+                     data->sizes[1] == out->sizes[1],
+                 "interp1d_2d_c64: output shape must match data");
   interp1d2d<float>(data, positions, out, kernel, taps, window, beta, boundary);
 }
 
@@ -685,12 +826,14 @@ void _mlir_ciface_sar_rt_interp1d_2d_c128(
     MemRefDescriptor<double, 2> *positions,
     MemRefDescriptor<std::complex<double>, 2> *out, int64_t kernel,
     int64_t taps, int64_t window, double beta, int64_t boundary) {
-  requireMatchingShapes(data->sizes[0] == positions->sizes[0] &&
-                            data->sizes[1] == positions->sizes[1],
-                        "interp1d_2d_c128: positions shape must match data");
-  requireMatchingShapes(data->sizes[0] == out->sizes[0] &&
-                            data->sizes[1] == out->sizes[1],
-                        "interp1d_2d_c128: output shape must match data");
+  requireInterpArgs(data->sizes[0], data->sizes[1], kernel, taps, window, beta,
+                    boundary, "interp1d_2d_c128: extents must be positive");
+  requireRuntime(data->sizes[0] == positions->sizes[0] &&
+                     data->sizes[1] == positions->sizes[1],
+                 "interp1d_2d_c128: positions shape must match data");
+  requireRuntime(data->sizes[0] == out->sizes[0] &&
+                     data->sizes[1] == out->sizes[1],
+                 "interp1d_2d_c128: output shape must match data");
   interp1d2d<double>(data, positions, out, kernel, taps, window, beta,
                      boundary);
 }

@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- AffineLoopTile.cpp - affine loop tile ------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -222,7 +222,6 @@ bool sar::applyLoopTiling(AffineLoopBand &band, FactorList tileList,
   if (failed(tilePerfectlyNested(band, tileList, &tiledBand)))
     return false;
 
-  // Get the tile loop band and point loop band.
   AffineLoopBand pointBand(std::next(tiledBand.begin(), originalBandSize),
                            tiledBand.end());
   tiledBand.resize(originalBandSize);

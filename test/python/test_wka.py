@@ -1,10 +1,14 @@
 """End-to-end WKA validation: the DSL kernel must reproduce the numpy
 reference implementation, and it must actually focus point targets."""
 
+import importlib.util
+import json
+import sys
+
 import numpy as np
 import pytest
 
-from conftest import requires_cpu, requires_hls
+from conftest import REPO_ROOT, requires_cpu, requires_hls
 
 from common.params import ALOS_PARAMS, synthetic_params
 from common.simulate import demo_scene, single_target_scene
@@ -14,16 +18,56 @@ from wka.reference import WKAProcessor
 N = 128
 
 
+def test_handwritten_hls_reference_and_report(tmp_path, monkeypatch):
+    root = REPO_ROOT / "examples" / "wka" / "handwritten_hls"
+    reference_path = root / "reference" / "wka_reference.py"
+    spec = importlib.util.spec_from_file_location("handwritten_wka_reference",
+                                                  reference_path)
+    assert spec is not None and spec.loader is not None
+    reference = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reference)
+
+    raw = reference.synthetic_input(64)
+    image = reference.wka_reference(raw)
+    assert image.shape == (64, 64)
+    assert image.dtype == np.float32
+    assert np.all(np.isfinite(image))
+
+    candidate = tmp_path / "candidate.bin"
+    output = tmp_path / "reference.bin"
+    image.tofile(candidate)
+    monkeypatch.setattr(sys, "argv", [
+        str(reference_path), "--n", "64", "--output",
+        str(output), "--compare",
+        str(candidate)
+    ])
+    assert reference.main() == 0
+
+    np.full_like(image, np.nan).tofile(candidate)
+    monkeypatch.setattr(sys, "argv", [
+        str(reference_path), "--n", "64", "--output",
+        str(output), "--compare",
+        str(candidate)
+    ])
+    assert reference.main() == 1
+
+    report = json.loads(
+        (root / "reports" / "production_csynth.json").read_text())
+    assert report["design"]["shape"] == [16384, 16384]
+    assert report["report"]["estimated_clock_ns"] <= (
+        report["constraints"]["clock_ns"])
+
+
 @pytest.fixture(scope="module")
-def compiled_kernel():
+def setup():
     params = synthetic_params(N)
     kernel = build_kernel(N, params)
     return kernel, params
 
 
 @requires_cpu
-def test_wka_matches_numpy_reference(compiled_kernel):
-    kernel, params = compiled_kernel
+def test_wka_matches_numpy_reference(setup):
+    kernel, params = setup
     raw, _ = demo_scene(N, params)
 
     ref = WKAProcessor(N, params).process(raw)
@@ -35,8 +79,8 @@ def test_wka_matches_numpy_reference(compiled_kernel):
 
 
 @requires_cpu
-def test_wka_focuses_point_target(compiled_kernel):
-    kernel, params = compiled_kernel
+def test_wka_focuses_point_target(setup):
+    kernel, params = setup
     raw = single_target_scene(N, params)
 
     wr, wa = make_inputs(N, params)

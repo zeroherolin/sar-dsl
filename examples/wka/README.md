@@ -12,6 +12,7 @@ demonstrated on both synthetic point targets and a real ALOS-1 dataset.
 | `run_point_target_hls.py` | Full hls-backend flow: HLS C++ design + csim package (`hls_project/`) |
 | `run_alos_cpu.py` | Focus the real ALOS-1 San Francisco dataset (16384x16384) |
 | `run_alos_hls.py` | Emit the ALOS-geometry artifact set (see below) |
+| `handwritten_hls/` | Standalone FP32 Vitis HLS reference implementation |
 | `assets/` | Reference imagery |
 
 ## Processing chain
@@ -29,7 +30,13 @@ band-matched Hann tapers as inputs. Acquisition metadata -- scalar radar
 parameters (`fc`, `Vr`, `R0`, `Kr`, ...) and the frequency axes -- bakes
 into the IR at trace time.
 
-## Synthetic scene (either backend)
+The optional [`handwritten_hls/`](handwritten_hls/) directory implements the
+same processing chain directly in Vitis HLS C++. It is kept independent of
+the compiler and normal example runners, and documents packed AXI, radix-4
+row parallelism, engine reuse, fused Stolt processing, and ping-pong corner
+turns as an optimization reference.
+
+## Running
 
 ```bash
 # from the repository root, after `make build`
@@ -64,22 +71,18 @@ python examples/wka/run_alos_cpu.py        # tens of GiB of RAM at full size
 python examples/wka/run_alos_hls.py   # emit the artifacts at that geometry
 ```
 
-The full 16384x16384 scene focuses in 4.6 s on a 240-core machine
-(fused element-wise kernels under OpenMP; multithreaded FFT/interpolation
-runtime), reaching an urban-area contrast of 0.810
+The runner reports wall time and urban-area contrast
 (`benchmarks/metrics.py:urban_contrast`, higher is sharper). The
 effective radar velocity in `ALOS_PARAMS` is autofocus-calibrated by
-image-contrast maximization over the urban area:
+image-contrast maximization over the urban area. Real-data output is not
+tracked because the source product is not redistributed.
 
-![San Francisco Bay](assets/san_francisco_wka.png)
-
-`run_alos_hls.py` writes `hls_project/wka_alos/` with two designs,
-because no single design can be both synthesizable at scene size and
-simulatable:
+`run_alos_hls.py` writes a production AXI design and a reduced
+C-simulation package under `hls_project/wka_alos/`:
 
 | Artifact | What it is |
 |---|---|
-| `wka_alos_axi.cpp` + `_axi_csynth.tcl` | the 16384x16384 design, `axi_interface=True`: streamed planes become AXI master ports, with its synthesis script |
+| `wka_alos_axi.cpp` + `_axi_csynth.tcl` | the 16384x16384 design, `interface="axi"`: streamed planes become AXI master ports, with its synthesis script |
 | `wka_alos.cpp` + `_tb.cpp` + `_csim.tcl` + `_csynth.tcl` + `_tb_data/` + `stubs/` | csim package at `--csim-n` (default 1024), same radar parameters |
 
 Why the AXI design is not simulated, and how the csim package keeps the
@@ -88,3 +91,7 @@ covered in [examples/README.md](../README.md#real-data-alos-1). At
 1024x1024 the reduced package focuses to IRW 1.65 samples in range
 (PSLR -30.9 dB) and csim-matches the reference to 4.7e-10 over
 1048576 samples.
+
+Tests (`test/python/test_wka.py`) check numerical equivalence with the
+reference, point-target focusing, the ALOS parameter set, and HLS C++
+emission.

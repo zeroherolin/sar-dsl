@@ -185,6 +185,12 @@ void mlir::sar::buildSARToAffinePipeline(
   pm.addPass(
       bufferization::createBufferResultsToOutParamsPass(outParamsOptions));
 
+  // When the working precision equals the result precision, bufferization
+  // computes through the out-parameter; a multi-writer result port would
+  // forfeit top-level dataflow, so give the computation a local buffer and
+  // write the port once.
+  pm.addNestedPass<func::FuncOp>(sar::createSARPrivatizeOutParams());
+
   // The HLS dataflow model forbids tasks with results, so compiled loops
   // stop carrying values here: the body iterates in the init buffer and a
   // per-iteration copy replaces the yield.

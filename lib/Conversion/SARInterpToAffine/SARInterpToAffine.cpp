@@ -19,15 +19,20 @@
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "sar/Analysis/DisplacementRange.h"
 #include "sar/Conversion/Passes.h"
 #include "sar/Dialect/SAR/IR/SARDialect.h"
 #include "sar/Dialect/SAR/IR/SAROps.h"
 
+#include "llvm/ADT/StringSwitch.h"
+
 #include <cmath>
+#include <optional>
 
 namespace mlir {
 namespace sar {
@@ -145,6 +150,7 @@ static Value emitSincWindow(ScalarBuilder &s, const InterpSpec &spec, Value t) {
 /// `loadAt` supplies the source sample for an already-clamped i64 column
 /// index, so the full-plane and banded paths share the tap arithmetic.
 using SourceLoader = llvm::function_ref<std::pair<Value, Value>(Value)>;
+using PositionBuilder = llvm::function_ref<Value(Value, Value)>;
 
 static std::pair<Value, Value> emitInterpGather(ScalarBuilder &s,
                                                 const InterpSpec &spec,
@@ -212,19 +218,26 @@ static std::pair<Value, Value> emitInterpGather(ScalarBuilder &s,
     // index here, so the loader's clamp becomes a no-op.
     Value fetchIdx = idxK;
     if (spec.boundary == "reflect") {
-      Value negRefl = arith::SubIOp::create(
-          b, loc, arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(-1)),
-          idxK);
-      Value hiRefl = arith::SubIOp::create(
-          b, loc,
-          arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(2 * cols - 1)),
-          idxK);
-      Value overHi =
-          arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sge, idxK, colsI);
-      fetchIdx = arith::SelectOp::create(b, loc, overHi, hiRefl, idxK);
-      Value underLo =
-          arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, idxK, zeroI);
-      fetchIdx = arith::SelectOp::create(b, loc, underLo, negRefl, fetchIdx);
+      if (cols == 1) {
+        fetchIdx = zeroI;
+      } else {
+        Value period =
+            arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(2 * cols));
+        Value folded = arith::RemSIOp::create(b, loc, idxK, period);
+        Value negative = arith::CmpIOp::create(
+            b, loc, arith::CmpIPredicate::slt, folded, zeroI);
+        folded = arith::SelectOp::create(
+            b, loc, negative, arith::AddIOp::create(b, loc, folded, period),
+            folded);
+        Value firstHalf = arith::CmpIOp::create(
+            b, loc, arith::CmpIPredicate::slt, folded, colsI);
+        Value mirrored = arith::SubIOp::create(
+            b, loc,
+            arith::ConstantOp::create(b, loc,
+                                      b.getI64IntegerAttr(2 * cols - 1)),
+            folded);
+        fetchIdx = arith::SelectOp::create(b, loc, firstHalf, folded, mirrored);
+      }
     }
 
     auto [vRe, vIm] = loadAt(fetchIdx);
@@ -242,10 +255,11 @@ static std::pair<Value, Value> emitInterpGather(ScalarBuilder &s,
       // changes which sample is fetched, not where the kernel is centred.
       Value dist = s.sub(posF64, arith::SIToFPOp::create(b, loc, s.f64, idxK));
       Value pd = s.mul(dist, s.cst(M_PI));
-      Value sincRaw = s.div(s.sin(pd), pd);
       Value small = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OLT,
                                           math::AbsFOp::create(b, loc, dist),
                                           s.cst(1e-12));
+      Value safePd = arith::SelectOp::create(b, loc, small, one, pd);
+      Value sincRaw = s.div(s.sin(pd), safePd);
       Value sinc = arith::SelectOp::create(b, loc, small, one, sincRaw);
       Value t = s.mul(dist, s.cst(1.0 / double(spec.taps / 2)));
       weight = s.mul(sinc, emitSincWindow(s, spec, t));
@@ -284,6 +298,179 @@ static Value toResultTensor(PatternRewriter &rewriter, Location loc,
       rewriter, loc, type, alloc, /*restrict=*/true, /*writable=*/true);
 }
 
+static bool canScalarize(Value value) {
+  if (isa<BlockArgument>(value))
+    return isa<RankedTensorType>(value.getType());
+  Operation *op = value.getDefiningOp();
+  if (!op)
+    return false;
+  if (isa<ConstantOp>(op))
+    return true;
+  if (auto broadcast = dyn_cast<BroadcastOp>(op))
+    return canScalarize(broadcast.getInput());
+
+  auto allOperands = [&] {
+    return llvm::all_of(op->getOperands(),
+                        [&](Value operand) { return canScalarize(operand); });
+  };
+  return isa<AddOp, SubOp, MulOp, DivOp, AddScalarOp, MulScalarOp, SqrtOp,
+             CosOp, SinOp, ExpOp, LogOp, AbsOp, CmpOp, WhereOp, CastOp>(op) &&
+         allOperands();
+}
+
+static FailureOr<Value> scalarize(OpBuilder &b, Location loc, Value value,
+                                  ValueRange indices) {
+  auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensorType || tensorType.getRank() != (int64_t)indices.size())
+    return failure();
+
+  if (isa<BlockArgument>(value))
+    return tensor::ExtractOp::create(b, loc, value, indices).getResult();
+  Operation *op = value.getDefiningOp();
+  if (!op)
+    return failure();
+
+  if (auto constant = dyn_cast<ConstantOp>(op)) {
+    auto elements = dyn_cast<DenseElementsAttr>(constant.getValue());
+    if (!elements)
+      return failure();
+    if (elements.isSplat()) {
+      auto scalar = cast<TypedAttr>(elements.getSplatValue<Attribute>());
+      return arith::ConstantOp::create(b, loc, scalar).getResult();
+    }
+    return tensor::ExtractOp::create(b, loc, value, indices).getResult();
+  }
+  if (auto broadcast = dyn_cast<BroadcastOp>(op)) {
+    Value index = indices[broadcast.getDim()];
+    return scalarize(b, loc, broadcast.getInput(), ValueRange{index});
+  }
+
+  auto binary = [&](Value lhs, Value rhs, auto create) -> FailureOr<Value> {
+    FailureOr<Value> left = scalarize(b, loc, lhs, indices);
+    FailureOr<Value> right = scalarize(b, loc, rhs, indices);
+    if (failed(left) || failed(right))
+      return failure();
+    return create(*left, *right);
+  };
+  if (auto valueOp = dyn_cast<AddOp>(op))
+    return binary(valueOp.getLhs(), valueOp.getRhs(),
+                  [&](Value lhs, Value rhs) {
+                    return arith::AddFOp::create(b, loc, lhs, rhs).getResult();
+                  });
+  if (auto valueOp = dyn_cast<SubOp>(op))
+    return binary(valueOp.getLhs(), valueOp.getRhs(),
+                  [&](Value lhs, Value rhs) {
+                    return arith::SubFOp::create(b, loc, lhs, rhs).getResult();
+                  });
+  if (auto valueOp = dyn_cast<MulOp>(op))
+    return binary(valueOp.getLhs(), valueOp.getRhs(),
+                  [&](Value lhs, Value rhs) {
+                    return arith::MulFOp::create(b, loc, lhs, rhs).getResult();
+                  });
+  if (auto valueOp = dyn_cast<DivOp>(op))
+    return binary(valueOp.getLhs(), valueOp.getRhs(),
+                  [&](Value lhs, Value rhs) {
+                    return arith::DivFOp::create(b, loc, lhs, rhs).getResult();
+                  });
+
+  auto unary = [&](Value input, auto create) -> FailureOr<Value> {
+    FailureOr<Value> scalar = scalarize(b, loc, input, indices);
+    if (failed(scalar))
+      return failure();
+    return create(*scalar);
+  };
+  if (auto valueOp = dyn_cast<AddScalarOp>(op))
+    return unary(valueOp.getInput(), [&](Value input) {
+      auto type = cast<FloatType>(input.getType());
+      Value scalar = arith::ConstantOp::create(
+          b, loc, b.getFloatAttr(type, valueOp.getScalar().convertToDouble()));
+      return arith::AddFOp::create(b, loc, input, scalar).getResult();
+    });
+  if (auto valueOp = dyn_cast<MulScalarOp>(op))
+    return unary(valueOp.getInput(), [&](Value input) {
+      auto type = cast<FloatType>(input.getType());
+      Value scalar = arith::ConstantOp::create(
+          b, loc, b.getFloatAttr(type, valueOp.getScalar().convertToDouble()));
+      return arith::MulFOp::create(b, loc, input, scalar).getResult();
+    });
+  if (auto valueOp = dyn_cast<SqrtOp>(op))
+    return unary(valueOp.getInput(), [&](Value input) {
+      return math::SqrtOp::create(b, loc, input).getResult();
+    });
+  if (auto valueOp = dyn_cast<CosOp>(op))
+    return unary(valueOp.getInput(), [&](Value input) {
+      return math::CosOp::create(b, loc, input).getResult();
+    });
+  if (auto valueOp = dyn_cast<SinOp>(op))
+    return unary(valueOp.getInput(), [&](Value input) {
+      return math::SinOp::create(b, loc, input).getResult();
+    });
+  if (auto valueOp = dyn_cast<ExpOp>(op))
+    return unary(valueOp.getInput(), [&](Value input) {
+      return math::ExpOp::create(b, loc, input).getResult();
+    });
+  if (auto valueOp = dyn_cast<LogOp>(op))
+    return unary(valueOp.getInput(), [&](Value input) {
+      return math::LogOp::create(b, loc, input).getResult();
+    });
+  if (auto valueOp = dyn_cast<AbsOp>(op))
+    return unary(valueOp.getInput(), [&](Value input) {
+      return math::AbsFOp::create(b, loc, input).getResult();
+    });
+
+  if (auto cmp = dyn_cast<CmpOp>(op)) {
+    auto predicate = llvm::StringSwitch<std::optional<arith::CmpFPredicate>>(
+                         cmp.getPredicate())
+                         .Case("eq", arith::CmpFPredicate::OEQ)
+                         .Case("ne", arith::CmpFPredicate::UNE)
+                         .Case("lt", arith::CmpFPredicate::OLT)
+                         .Case("le", arith::CmpFPredicate::OLE)
+                         .Case("gt", arith::CmpFPredicate::OGT)
+                         .Case("ge", arith::CmpFPredicate::OGE)
+                         .Default(std::nullopt);
+    if (!predicate)
+      return failure();
+    return binary(cmp.getLhs(), cmp.getRhs(), [&](Value lhs, Value rhs) {
+      Value held = arith::CmpFOp::create(b, loc, *predicate, lhs, rhs);
+      auto elementType = cast<FloatType>(tensorType.getElementType());
+      Value one =
+          arith::ConstantOp::create(b, loc, b.getFloatAttr(elementType, 1.0));
+      Value zero =
+          arith::ConstantOp::create(b, loc, b.getFloatAttr(elementType, 0.0));
+      return arith::SelectOp::create(b, loc, held, one, zero).getResult();
+    });
+  }
+  if (auto where = dyn_cast<WhereOp>(op)) {
+    FailureOr<Value> mask = scalarize(b, loc, where.getMask(), indices);
+    FailureOr<Value> lhs = scalarize(b, loc, where.getLhs(), indices);
+    FailureOr<Value> rhs = scalarize(b, loc, where.getRhs(), indices);
+    if (failed(mask) || failed(lhs) || failed(rhs))
+      return failure();
+    auto maskType = cast<FloatType>(
+        cast<RankedTensorType>(where.getMask().getType()).getElementType());
+    Value zero =
+        arith::ConstantOp::create(b, loc, b.getFloatAttr(maskType, 0.0));
+    Value held =
+        arith::CmpFOp::create(b, loc, arith::CmpFPredicate::UNE, *mask, zero);
+    return arith::SelectOp::create(b, loc, held, *lhs, *rhs).getResult();
+  }
+  if (auto castOp = dyn_cast<CastOp>(op)) {
+    FailureOr<Value> input = scalarize(b, loc, castOp.getInput(), indices);
+    if (failed(input))
+      return failure();
+    auto source = dyn_cast<FloatType>((*input).getType());
+    auto target = dyn_cast<FloatType>(tensorType.getElementType());
+    if (!source || !target)
+      return failure();
+    if (source == target)
+      return *input;
+    if (source.getWidth() < target.getWidth())
+      return arith::ExtFOp::create(b, loc, target, *input).getResult();
+    return arith::TruncFOp::create(b, loc, target, *input).getResult();
+  }
+  return failure();
+}
+
 /// Returns the smallest power of two >= n (n > 0).
 static int64_t nextPow2(int64_t n) {
   int64_t p = 1;
@@ -297,8 +484,9 @@ static int64_t nextPow2(int64_t n) {
 /// needs the global column bounds for its in-bounds mask.
 static void emitFullPlaneBody(OpBuilder &b, Location loc, ScalarBuilder &s,
                               const InterpSpec &spec, Value reBuf, Value imBuf,
-                              Value posBuf, Value outRe, Value outIm,
-                              int64_t rows, int64_t cols, Type elemType) {
+                              PositionBuilder positionAt, Value outRe,
+                              Value outIm, int64_t rows, int64_t cols,
+                              Type elemType) {
   auto rowLoop = affine::AffineForOp::create(b, loc, 0, rows);
   {
     OpBuilder::InsertionGuard g(b);
@@ -307,7 +495,7 @@ static void emitFullPlaneBody(OpBuilder &b, Location loc, ScalarBuilder &s,
     b.setInsertionPointToStart(colLoop.getBody());
     Value i = rowLoop.getInductionVar();
     Value j = colLoop.getInductionVar();
-    Value pos = affine::AffineLoadOp::create(b, loc, posBuf, ValueRange{i, j});
+    Value pos = positionAt(i, j);
 
     // Named lambda: a function_ref bound to a temporary would dangle.
     auto loader = [&](Value idxI64) -> std::pair<Value, Value> {
@@ -345,9 +533,9 @@ static void emitFullPlaneBody(OpBuilder &b, Location loc, ScalarBuilder &s,
 /// gather, so a clamped value never reaches the accumulator.
 static void emitBandedBody(OpBuilder &b, Location loc, ScalarBuilder &s,
                            const InterpSpec &spec, Value reBuf, Value imBuf,
-                           Value posBuf, Value outRe, Value outIm, int64_t rows,
-                           int64_t cols, Type elemType, int64_t bandLo,
-                           int64_t bandW) {
+                           PositionBuilder positionAt, Value outRe, Value outIm,
+                           int64_t rows, int64_t cols, Type elemType,
+                           int64_t bandLo, int64_t bandW) {
   assert(bandW > 0 && (bandW & (bandW - 1)) == 0 && "bandW must be a pow2");
   int64_t bandHi = bandLo + bandW - 1;
   Type srcElem = cast<MemRefType>(reBuf.getType()).getElementType();
@@ -404,8 +592,7 @@ static void emitBandedBody(OpBuilder &b, Location loc, ScalarBuilder &s,
       // Slide the window: bring in source column j + bandHi.
       stageColumn(i, arith::AddIOp::create(b, loc, jI64, bandHiI));
 
-      Value pos =
-          affine::AffineLoadOp::create(b, loc, posBuf, ValueRange{i, j});
+      Value pos = positionAt(i, j);
       // Named lambda: a function_ref bound to a temporary would dangle.
       auto loader = [&](Value idxI64) -> std::pair<Value, Value> {
         Value slot = arith::IndexCastOp::create(
@@ -452,7 +639,6 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
 
     Value reBuf = toBuffer(rewriter, loc, op.getRe());
     Value imBuf = toBuffer(rewriter, loc, op.getIm());
-    Value posBuf = toBuffer(rewriter, loc, op.getPositions());
     Value outRe = memref::AllocOp::create(rewriter, loc, bufferType);
     Value outIm = memref::AllocOp::create(rewriter, loc, bufferType);
 
@@ -497,16 +683,232 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
 
     FloatType f64 = rewriter.getF64Type();
     ScalarBuilder s{rewriter, loc, f64};
+    bool sinkPositions = canScalarize(op.getPositions());
+    Value posBuf;
+    if (!sinkPositions)
+      posBuf = toBuffer(rewriter, loc, op.getPositions());
+    auto positionAt = [&](Value i, Value j) -> Value {
+      if (!sinkPositions)
+        return affine::AffineLoadOp::create(rewriter, loc, posBuf,
+                                            ValueRange{i, j});
+      FailureOr<Value> position =
+          scalarize(rewriter, loc, op.getPositions(), ValueRange{i, j});
+      assert(succeeded(position) && "preflight accepted position expression");
+      return *position;
+    };
 
     if (useBanded)
-      emitBandedBody(rewriter, loc, s, spec, reBuf, imBuf, posBuf, outRe, outIm,
-                     rows, cols, elemType, bandLo, bandW);
+      emitBandedBody(rewriter, loc, s, spec, reBuf, imBuf, positionAt, outRe,
+                     outIm, rows, cols, elemType, bandLo, bandW);
     else
-      emitFullPlaneBody(rewriter, loc, s, spec, reBuf, imBuf, posBuf, outRe,
+      emitFullPlaneBody(rewriter, loc, s, spec, reBuf, imBuf, positionAt, outRe,
                         outIm, rows, cols, elemType);
 
     rewriter.replaceOp(op, {toResultTensor(rewriter, loc, tensorType, outRe),
                             toResultTensor(rewriter, loc, tensorType, outIm)});
+    return success();
+  }
+};
+
+/// Banded lowering for `sar.gather2d_split`: when the displacement of the
+/// row coordinate off the output row is provably bounded, the gather runs
+/// against a sliding band of whole source rows instead of the resident
+/// plane. The band advances one row per output row (`coeff == 1` is what
+/// the analysis proves), so each source row is read exactly once.
+///
+/// The residency invariant is the row-axis analogue of the interpolation
+/// band: at output row i, `band[t & (bandW-1)]` holds source row
+/// clamp(t) for every t in [i + bandLo, i + bandHi]. Because staging
+/// clamps and the gather masks out-of-plane taps by weight (under the
+/// `zero` boundary) or wants the clamped sample anyway (`edge`), the
+/// numerics match the full-plane path bit for bit.
+///
+/// The column coordinate stays arbitrary -- whole rows are staged -- so
+/// only the row axis needs a bound. When the analysis cannot bound it,
+/// the pattern declines and the op takes the full-plane linalg path.
+struct Gather2DSplitBandedLowering : OpRewritePattern<Gather2DSplitOp> {
+  bool enableBandedGather;
+  int64_t profitThreshold;
+
+  Gather2DSplitBandedLowering(MLIRContext *ctx, bool enableBanded,
+                              int64_t thresh)
+      : OpRewritePattern(ctx), enableBandedGather(enableBanded),
+        profitThreshold(thresh) {}
+
+  LogicalResult matchAndRewrite(Gather2DSplitOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!enableBandedGather)
+      return failure();
+    // Bilinear taps reach [floor(r), floor(r)+1]; nearest reaches the
+    // single rounded row.
+    StringRef kernel = op.getKernel();
+    int64_t tapLo = 0, tapHi = kernel == "nearest" ? 0 : 1;
+
+    auto range = computeDisplacementRange(op.getRows(), /*dim=*/0);
+    if (!range)
+      return failure();
+
+    auto dataType = cast<RankedTensorType>(op.getRe().getType());
+    auto outType = cast<RankedTensorType>(op.getOutRe().getType());
+    int64_t srcRows = dataType.getDimSize(0);
+    int64_t srcCols = dataType.getDimSize(1);
+    int64_t outRows = outType.getDimSize(0);
+    int64_t outCols = outType.getDimSize(1);
+
+    int64_t dLo = static_cast<int64_t>(std::floor(range->lo));
+    int64_t dHi = static_cast<int64_t>(std::ceil(range->hi));
+    int64_t bandLo = dLo + tapLo;
+    int64_t bandW =
+        nextPow2(std::max<int64_t>((dHi - dLo) + (tapHi - tapLo + 1), 1));
+    if (srcRows / bandW < profitThreshold)
+      return failure();
+
+    Location loc = op.getLoc();
+    Type elemType = outType.getElementType();
+    Type srcElem = dataType.getElementType();
+    Value reBuf = toBuffer(rewriter, loc, op.getRe());
+    Value imBuf = toBuffer(rewriter, loc, op.getIm());
+    Value rowsBuf = toBuffer(rewriter, loc, op.getRows());
+    Value colsBuf = toBuffer(rewriter, loc, op.getCols());
+    auto outBufType = MemRefType::get(outType.getShape(), elemType);
+    Value outRe = memref::AllocOp::create(rewriter, loc, outBufType);
+    Value outIm = memref::AllocOp::create(rewriter, loc, outBufType);
+
+    OpBuilder &b = rewriter;
+    FloatType f64 = b.getF64Type();
+    ScalarBuilder s{b, loc, f64};
+
+    MemRefType bandType = MemRefType::get({bandW, srcCols}, srcElem);
+    Value bandRe = memref::AllocOp::create(b, loc, bandType);
+    Value bandIm = memref::AllocOp::create(b, loc, bandType);
+
+    auto i64c = [&](int64_t v) {
+      return arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(v))
+          .getResult();
+    };
+    Value maskI = i64c(bandW - 1);
+    Value bandLoI = i64c(bandLo);
+    Value bandHiI = i64c(bandLo + bandW - 1);
+    Value zeroI = i64c(0), srcRowMax = i64c(srcRows - 1);
+
+    // Stages source row clamp(rowI64) into its slot: one contiguous
+    // row copy, the streaming-friendly access the band exists for.
+    auto stageRow = [&](Value rowI64) {
+      Value clamped = arith::MinSIOp::create(
+          b, loc, arith::MaxSIOp::create(b, loc, rowI64, zeroI), srcRowMax);
+      Value src = arith::IndexCastOp::create(b, loc, b.getIndexType(), clamped);
+      Value slot = arith::IndexCastOp::create(
+          b, loc, b.getIndexType(),
+          arith::AndIOp::create(b, loc, rowI64, maskI));
+      auto copyLoop = affine::AffineForOp::create(b, loc, 0, srcCols);
+      OpBuilder::InsertionGuard g(b);
+      b.setInsertionPointToStart(copyLoop.getBody());
+      Value c = copyLoop.getInductionVar();
+      Value vRe = memref::LoadOp::create(b, loc, reBuf, ValueRange{src, c});
+      Value vIm = memref::LoadOp::create(b, loc, imBuf, ValueRange{src, c});
+      memref::StoreOp::create(b, loc, vRe, bandRe, ValueRange{slot, c});
+      memref::StoreOp::create(b, loc, vIm, bandIm, ValueRange{slot, c});
+    };
+
+    // Reads the band at an unclamped source row (slot by mask) and a
+    // clamped column.
+    auto loadAt = [&](Value rowI64, Value colIdx) -> std::pair<Value, Value> {
+      Value slot = arith::IndexCastOp::create(
+          b, loc, b.getIndexType(),
+          arith::AndIOp::create(b, loc, rowI64, maskI));
+      Value vRe = s.toF64(
+          memref::LoadOp::create(b, loc, bandRe, ValueRange{slot, colIdx}));
+      Value vIm = s.toF64(
+          memref::LoadOp::create(b, loc, bandIm, ValueRange{slot, colIdx}));
+      return {vRe, vIm};
+    };
+
+    // Prime rows [bandLo, bandHi); the push at i = 0 supplies the last.
+    if (bandW > 1) {
+      auto primeLoop = affine::AffineForOp::create(b, loc, 0, bandW - 1);
+      OpBuilder::InsertionGuard g(b);
+      b.setInsertionPointToStart(primeLoop.getBody());
+      Value t = arith::IndexCastOp::create(b, loc, b.getI64Type(),
+                                           primeLoop.getInductionVar());
+      stageRow(arith::AddIOp::create(b, loc, t, bandLoI));
+    }
+
+    auto rowLoop = affine::AffineForOp::create(b, loc, 0, outRows);
+    {
+      OpBuilder::InsertionGuard g(b);
+      b.setInsertionPointToStart(rowLoop.getBody());
+      Value i = rowLoop.getInductionVar();
+      Value iI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), i);
+      stageRow(arith::AddIOp::create(b, loc, iI64, bandHiI));
+
+      auto colLoop = affine::AffineForOp::create(b, loc, 0, outCols);
+      OpBuilder::InsertionGuard g2(b);
+      b.setInsertionPointToStart(colLoop.getBody());
+      Value j = colLoop.getInductionVar();
+
+      Value rowPos = s.toF64(
+          affine::AffineLoadOp::create(b, loc, rowsBuf, ValueRange{i, j}));
+      Value colPos = s.toF64(
+          affine::AffineLoadOp::create(b, loc, colsBuf, ValueRange{i, j}));
+
+      // Tap accumulation, matching the full-plane semantics: weights
+      // masked out of plane under `zero`, clamped sample under `edge`.
+      Value zeroF = s.cst(0.0), oneF = s.cst(1.0);
+      Value srcRowsI = i64c(srcRows), srcColsI = i64c(srcCols);
+      Value srcColMax = i64c(srcCols - 1);
+      Value accRe = zeroF, accIm = zeroF;
+      auto inRange = [&](Value idx, Value extent) {
+        Value lo = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sge, idx,
+                                         zeroI);
+        Value hi = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::slt, idx,
+                                         extent);
+        return arith::AndIOp::create(b, loc, lo, hi).getResult();
+      };
+      auto tap = [&](Value rowIdx, Value colIdx, Value weight) {
+        if (op.getBoundary() == "zero") {
+          Value inb = arith::AndIOp::create(b, loc, inRange(rowIdx, srcRowsI),
+                                            inRange(colIdx, srcColsI));
+          weight = arith::SelectOp::create(b, loc, inb, weight, zeroF);
+        }
+        Value colClamped = arith::IndexCastOp::create(
+            b, loc, b.getIndexType(),
+            arith::MinSIOp::create(
+                b, loc, arith::MaxSIOp::create(b, loc, colIdx, zeroI),
+                srcColMax));
+        auto [re, im] = loadAt(rowIdx, colClamped);
+        accRe = s.add(accRe, s.mul(re, weight));
+        accIm = s.add(accIm, s.mul(im, weight));
+      };
+
+      if (kernel == "nearest") {
+        Value half = s.cst(0.5);
+        Value rowIdx = emitFloorI64(s, s.add(rowPos, half));
+        Value colIdx = emitFloorI64(s, s.add(colPos, half));
+        tap(rowIdx, colIdx, oneF);
+      } else {
+        Value r0 = emitFloorI64(s, rowPos);
+        Value c0 = emitFloorI64(s, colPos);
+        Value fr = s.sub(rowPos, arith::SIToFPOp::create(b, loc, f64, r0));
+        Value fc = s.sub(colPos, arith::SIToFPOp::create(b, loc, f64, c0));
+        Value oneMinusFr = s.sub(oneF, fr);
+        Value oneMinusFc = s.sub(oneF, fc);
+        Value oneI = i64c(1);
+        Value r1 = arith::AddIOp::create(b, loc, r0, oneI);
+        Value c1 = arith::AddIOp::create(b, loc, c0, oneI);
+        tap(r0, c0, s.mul(oneMinusFr, oneMinusFc));
+        tap(r0, c1, s.mul(oneMinusFr, fc));
+        tap(r1, c0, s.mul(fr, oneMinusFc));
+        tap(r1, c1, s.mul(fr, fc));
+      }
+
+      affine::AffineStoreOp::create(b, loc, s.fromF64(accRe, elemType), outRe,
+                                    ValueRange{i, j});
+      affine::AffineStoreOp::create(b, loc, s.fromF64(accIm, elemType), outIm,
+                                    ValueRange{i, j});
+    }
+
+    rewriter.replaceOp(op, {toResultTensor(rewriter, loc, outType, outRe),
+                            toResultTensor(rewriter, loc, outType, outIm)});
     return success();
   }
 };
@@ -517,6 +919,16 @@ struct ConvertSARInterpToAffinePass
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
+
+    // The banded gather2d pattern runs greedily first: the op stays legal
+    // either way (the full-plane linalg path picks up whatever the band
+    // cannot prove), so a conversion driver would never visit it.
+    {
+      RewritePatternSet banded(context);
+      banded.add<Gather2DSplitBandedLowering>(context, enableBandedGather,
+                                              bandedProfitThreshold);
+      (void)applyPatternsGreedily(getOperation(), std::move(banded));
+    }
 
     ConversionTarget target(*context);
     target.addIllegalOp<Interp1DSplitOp>();

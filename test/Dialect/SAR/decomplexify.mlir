@@ -24,6 +24,26 @@ func.func @named_args(%a: tensor<4xcomplex<f64>>, %w: tensor<4xf64>)
   return %0 : tensor<4xcomplex<f64>>
 }
 
+// Function attributes survive signature expansion, and internal complex calls
+// expand their operands and results with the callee.
+// CHECK-LABEL: func.func @complex_callee
+// CHECK-SAME: -> (tensor<4xf32>, tensor<4xf32>)
+// CHECK-SAME: attributes {test.marker}
+func.func @complex_callee(%x: tensor<4xcomplex<f32>>)
+    -> tensor<4xcomplex<f32>> attributes {test.marker} {
+  return %x : tensor<4xcomplex<f32>>
+}
+
+// CHECK-LABEL: func.func @complex_caller
+// CHECK: call @complex_callee
+// CHECK-SAME: (tensor<4xf32>, tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>)
+func.func @complex_caller(%x: tensor<4xcomplex<f32>>)
+    -> tensor<4xcomplex<f32>> {
+  %0 = func.call @complex_callee(%x)
+      : (tensor<4xcomplex<f32>>) -> tensor<4xcomplex<f32>>
+  return %0 : tensor<4xcomplex<f32>>
+}
+
 // CHECK-LABEL: func.func @complex_from_planes
 func.func @complex_from_planes(%p: tensor<8xf32>) -> tensor<8xcomplex<f32>> {
   // CHECK-DAG: sar.cos %arg0

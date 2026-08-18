@@ -1,5 +1,5 @@
 """sar.sort: validates full-line sorting against numpy's sort on both
-backends, covering rank-1/rank-2 normalization and both axes."""
+backends, covering rank-1 and rank-2 inputs and both axes."""
 
 import numpy as np
 import pytest
@@ -16,6 +16,8 @@ def test_sort_matches_numpy_cpu(dim):
     n, m = 16, 32
     rng = np.random.default_rng(41)
     data = rng.uniform(-10.0, 10.0, size=(n, m))
+    data[0, 0] = np.nan
+    data[3, 7] = np.nan
 
     @sar.func
     def kernel(x: sar.f64[n, m]) -> sar.f64[n, m]:
@@ -24,7 +26,8 @@ def test_sort_matches_numpy_cpu(dim):
     np.testing.assert_allclose(kernel(data),
                                np.sort(data, axis=dim),
                                rtol=1e-14,
-                               atol=1e-14)
+                               atol=1e-14,
+                               equal_nan=True)
 
 
 @requires_cpu
@@ -61,19 +64,38 @@ def test_sort_f32_precision():
                                atol=1e-6)
 
 
+@requires_cpu
+def test_sort_rank1():
+    """A rank-1 tensor sorts along its only axis, with and without `axis`."""
+    rng = np.random.default_rng(44)
+    data = rng.uniform(-10.0, 10.0, size=17)
+
+    @sar.func
+    def kernel(x: sar.f64[17]) -> sar.f64[17]:
+        return sar.sort(x)
+
+    @sar.func
+    def kernel_axis0(x: sar.f64[17]) -> sar.f64[17]:
+        return sar.sort(x, axis=0)
+
+    expected = np.sort(data)
+    np.testing.assert_allclose(kernel(data), expected, rtol=1e-14, atol=1e-14)
+    np.testing.assert_allclose(kernel_axis0(data),
+                               expected,
+                               rtol=1e-14,
+                               atol=1e-14)
+
+
 @requires_hls
-@pytest.mark.parametrize("dim", [0, 1])
-def test_sort_emits_on_hls(dim):
-    """The HLS backend lowers sort (emission only -- the backend symmetry
-    gate likewise only compiles; numerical validation is the CPU tests
-    above)."""
+def test_sort_axis0_emits_on_hls():
+    """The transposed dim=0 form emits through the HLS backend."""
     n, m = 8, 16
 
     @sar.func
     def kernel(x: sar.f32[n, m]) -> sar.f32[n, m]:
-        return sar.sort(x, axis=dim)
+        return sar.sort(x, axis=0)
 
-    kernel.name = f"sort_hls_dim{dim}"
+    kernel.name = "sort_hls_dim0"
     compiled = kernel.compile(backend="hls")
     assert "#pragma HLS" in compiled.source()
 

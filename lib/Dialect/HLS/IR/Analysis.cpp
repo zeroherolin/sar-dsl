@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- Analysis.cpp - dataflow analyses -----------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -163,9 +163,9 @@ getBufferIndexDepthsAndStrides(NodeOp node, Value buffer) {
     if (candidates.empty())
       return {};
 
-    // TODO: Better support buffer index to resolve multiple loop ivs.
-    // For now, we just pick the loop iv of parallel loop with the largest loop
-    // trip count.
+    // A buffer index fed by several loop ivs admits no single answer; rank
+    // the candidates and take the parallel loop with the largest trip count,
+    // which is the one parallelization can widen.
     llvm::sort(
         candidates, [](const std::tuple<int64_t, int64_t, bool, int64_t> &lhs,
                        const std::tuple<int64_t, int64_t, bool, int64_t> &rhs) {
@@ -209,7 +209,9 @@ CorrelationAnalysis::CorrelationAnalysis(func::FuncOp func) {
   func.walk([&](hls::BufferLikeInterface bufferOp) {
     auto buffer = bufferOp.getMemref();
 
-    // TODO: Support node that has multiple loop bands.
+    // Correlation relates one producer band to one consumer band; nodes
+    // hold a single band on this pipeline (create-dataflow-from-affine
+    // splits at loop boundaries), so walking the first is exhaustive.
     for (auto producerPair : getNestedProducers(buffer)) {
       auto producer = producerPair.first;
       auto producerBuffer = producerPair.second;

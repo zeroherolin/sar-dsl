@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- EliminateMultiProducer.cpp - eliminate multi producer --------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -94,16 +94,14 @@ struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
             newNode.getNumInputs() - 1, newBufferArg.getType(),
             newBufferArg.getLoc());
 
-        // If the only read user of the buffer is affine load, we can avoid to
-        // create a redundant data copy.
+        // A sole affine-load reader can consume the producer directly.
         auto readUses = llvm::make_filter_range(
             newBufferArg.getUses(), [](OpOperand &use) { return isRead(use); });
         if (llvm::hasSingleElement(readUses))
           if (auto read = dyn_cast<mlir::affine::AffineReadOpInterface>(
                   readUses.begin()->getOwner())) {
-            // We need to make sure all the indices of the affine load are known
-            // loop induction variables and meanwhile the load has identity
-            // memory access map.
+            // Every load index must be a known loop induction variable and the
+            // access map must be the identity.
             AffineLoopBand band;
             getAffineForIVs(*read, &band);
 

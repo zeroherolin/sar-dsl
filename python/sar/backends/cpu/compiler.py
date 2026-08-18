@@ -22,19 +22,19 @@ import functools
 import os
 import subprocess
 
-from sar.backends.base import BaseBackend, KernelMetadata, cached_stage
-from sar.compiler.toolchain import find_runtime_library, find_tool, run_tool
-from sar.errors import ToolchainError
-from sar.runtime import CompiledKernel
+from ..base import BaseBackend, KernelMetadata, cached_stage
+from ...compiler.toolchain import find_runtime_library, find_tool, run_tool
+from ...errors import ToolchainError
+from ...runtime import CompiledKernel
 
 
 @functools.lru_cache(maxsize=None)
 def _native_arch_flags() -> tuple:
     """Best flags for tuning to the host CPU.
 
-    `-march=native` is well supported on x86; on other architectures clang
-    historically prefers `-mcpu=native`. Probe once and fall back to
-    generic codegen if neither is accepted.
+    Clang commonly accepts `-march=native` on x86 and `-mcpu=native` on
+    other targets. Probe once and fall back to generic codegen if neither is
+    accepted.
     """
     clang = find_tool("clang")
     for flag in ("-march=native", "-mcpu=native"):
@@ -87,7 +87,32 @@ class Backend(BaseBackend):
     # Stages
     # ------------------------------------------------------------------ #
 
+    #: The whole option schema of this backend. Anything else is a typo
+    #: or an option meant for another backend, and silently ignoring it
+    #: would let the user believe it took effect.
+    OPTIONS = ("opt_level", "native_codegen")
+
     def add_stages(self, stages, metadata: KernelMetadata) -> None:
+        unknown = sorted(set(metadata.options) - set(self.OPTIONS))
+        if unknown:
+            names = ", ".join(map(repr, unknown))
+            raise ToolchainError(
+                f"unknown cpu backend option(s) {names}; valid options "
+                f"are: {', '.join(self.OPTIONS)}")
+        opt_level = metadata.options.get("opt_level", 3)
+        native_codegen = metadata.options.get("native_codegen", True)
+        if isinstance(opt_level, bool) or not isinstance(
+                opt_level, int) or (not 0 <= opt_level <= 3):
+            raise ToolchainError("cpu option 'opt_level' must be an integer "
+                                 "in [0, 3]")
+        if not isinstance(native_codegen, bool):
+            raise ToolchainError(
+                "cpu option 'native_codegen' must be true or false")
+        metadata.options.clear()
+        metadata.options.update({
+            "opt_level": opt_level,
+            "native_codegen": native_codegen
+        })
         stages["llvm"] = self._stage_llvm_dialect
         stages["ll"] = self._stage_llvm_ir
         stages["shared"] = self._stage_shared_library

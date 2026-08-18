@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-08-18",
+  "source": {
+    "base_commit": "9caee4826f5138579defee0a47a0051720d5e725",
+    "working_tree_modified": true,
+    "command": "vitis_hls -f <algorithm>_csynth.tcl"
+  },
+  "constraints": {
+    "shape": [32, 32],
+    "dtype": "c128",
+    "part": "xcvu13p-fhgb2104-2-i",
+    "clock_ns": 4.0,
+    "axi_bus_bits": 512
+  },
+  "tool": {
+    "name": "Vitis HLS",
+    "version": "2022.2",
+    "flow_target": "vivado"
+  },
+  "designs": [
+    {
+      "algorithm": "omega-K",
+      "top": "wka",
+      "estimated_clock_ns": 3.187,
+      "latency_cycles": 56651,
+      "interval_cycles": 12322,
+      "bram18k": 1300,
+      "uram": 0,
+      "dsp": 2203,
+      "ff": 352944,
+      "lut": 223539,
+      "vitis_csim_passed": true,
+      "report_sha256": "c7b0d32e0a2ac04da0a5281f365df3000250d8ea3a963ce2f86a21a20f45e586"
+    },
+    {
+      "algorithm": "Range-Doppler",
+      "top": "rda",
+      "estimated_clock_ns": 2.899,
+      "latency_cycles": 43407,
+      "interval_cycles": 5986,
+      "bram18k": 1204,
+      "uram": 0,
+      "dsp": 1033,
+      "ff": 267946,
+      "lut": 132139,
+      "vitis_csim_passed": true,
+      "report_sha256": "743725bd1a935cb041e14ea4bd16d1a1491843670ae4d6c97c8d41b502fe966e"
+    },
+    {
+      "algorithm": "Chirp Scaling",
+      "top": "csa",
+      "estimated_clock_ns": 3.048,
+      "latency_cycles": 80611,
+      "interval_cycles": 16515,
+      "bram18k": 1268,
+      "uram": 0,
+      "dsp": 1476,
+      "ff": 289138,
+      "lut": 165799,
+      "vitis_csim_passed": true,
+      "report_sha256": "fda7f95ed9e53fe4e5411947878b808d27aec699f08cacf44dbf520f4634237b"
+    },
+    {
+      "algorithm": "Polar Format",
+      "top": "pfa",
+      "estimated_clock_ns": 2.92,
+      "latency_cycles": 139615,
+      "interval_cycles": 20738,
+      "bram18k": 2958,
+      "uram": 0,
+      "dsp": 1287,
+      "ff": 285132,
+      "lut": 238530,
+      "vitis_csim_passed": true,
+      "report_sha256": "72cc41123f5e72f2b058d027176247d65a096bad1163b7c56b98c65121355115"
+    }
+  ]
+}

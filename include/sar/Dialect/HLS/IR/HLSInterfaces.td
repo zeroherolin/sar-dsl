@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- HLSInterfaces.td - HLS dialect interfaces --------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -11,34 +11,34 @@ include "mlir/IR/OpBase.td"
 
 def BufferLikeInterface : OpInterface<"BufferLikeInterface"> {
   let description = [{
-    This interface is used to represent dataflow buffers.
+    Models an operation that owns a dataflow buffer.
   }];
 
   let methods = [
-    InterfaceMethod<"Return the memref result of the buffer",
+    InterfaceMethod<"Returns the memref result of the buffer",
       "mlir::Value", "getMemref", (ins), [{ return $_op.getMemref(); }]
     >,
-    InterfaceMethod<"Return the memref type of the buffer",
+    InterfaceMethod<"Returns the memref type of the buffer",
       "mlir::MemRefType", "getMemrefType", (ins), [{
         return llvm::cast<mlir::MemRefType>($_op.getMemref().getType());
       }]
     >,
-    InterfaceMethod<"Return the depth of the buffer", "int32_t",
+    InterfaceMethod<"Returns the depth of the buffer", "int32_t",
                     "getBufferDepth">,
-    InterfaceMethod<"Return the initial value of the buffer",
+    InterfaceMethod<"Returns the initial value of the buffer",
                     "std::optional<mlir::TypedAttr>", "getBufferInitValue">,
   ];
 }
 
 def StageLikeInterface : OpInterface<"StageLikeInterface"> {
   let description = [{
-    This interface is used to represent dataflow stage.
+    Models an operation that owns a dataflow stage.
   }];
 
   let methods = [
-    InterfaceMethod<"Return body region of the stage",
+    InterfaceMethod<"Returns the body region of the stage",
       "mlir::Region &", "getBody", (ins), "return $_op.getBody();">,
-    InterfaceMethod<"Check whether the stage has hierarchy",
+    InterfaceMethod<"Returns whether the stage contains another stage",
       "bool", "hasHierarchy", (ins), [{
         return $_op.walk([&](StageLikeInterface stage) {
           if (stage != $_op)
@@ -46,11 +46,11 @@ def StageLikeInterface : OpInterface<"StageLikeInterface"> {
           return WalkResult::advance();
         }).wasInterrupted();
       }]>,
-    InterfaceMethod<"Return whether the value is a stage livein",
+    InterfaceMethod<"Returns whether the value is a stage live-in",
                     "bool", "isLivein", (ins "mlir::Value":$value)>,
-    InterfaceMethod<"Return the liveins of the stage",
+    InterfaceMethod<"Returns the live-ins of the stage",
                     "llvm::SmallVector<mlir::Value>", "getLiveins">,
-    InterfaceMethod<"Return the internal users of a stage livein",
+    InterfaceMethod<"Returns the internal users of a stage live-in",
                     "llvm::SmallVector<mlir::Operation *>", "getLiveinUsers",
                     (ins "mlir::Value":$livein)>,
   ];

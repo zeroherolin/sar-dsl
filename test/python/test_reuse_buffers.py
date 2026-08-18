@@ -17,6 +17,8 @@ import sar
 
 from conftest import requires_cpu
 
+pytestmark = requires_cpu
+
 RNG = np.random.default_rng(20260815)
 
 
@@ -229,9 +231,9 @@ func.func @diff(%in: memref<64xf32>, %tmp: memref<64xf32>,
         _, fn = compile_split_kernel(ir, "diff", work)
         tmp = np.empty(64, dtype=np.float32)
         out = np.empty(32, dtype=np.float64)
-        from sar.runtime import _make_descriptor
+        from sar.runtime import make_descriptor
         import ctypes
-        descriptors = [_make_descriptor(a) for a in (x, tmp, out)]
+        descriptors = [make_descriptor(a) for a in (x, tmp, out)]
         fn(*[ctypes.byref(d) for d in descriptors])
         results.append(out.copy())
 

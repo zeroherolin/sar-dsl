@@ -146,6 +146,16 @@ static bool isPoint(const AffineInterval &a) {
 
 static AffineInterval unbounded() { return AffineInterval::unbounded(); }
 
+static Interval squareInterval(const Interval &value) {
+  if (!intervalFinite(value))
+    return Interval::unbounded();
+  double lo = value.lo * value.lo;
+  double hi = value.hi * value.hi;
+  double maximum = std::max(lo, hi);
+  double minimum = value.lo <= 0.0 && value.hi >= 0.0 ? 0.0 : std::min(lo, hi);
+  return Interval::range(minimum, maximum);
+}
+
 //===----------------------------------------------------------------------===//
 // Abstract operations on `coeff * k + offset`
 //===----------------------------------------------------------------------===//
@@ -398,6 +408,14 @@ struct ConstantFolder {
       return out;
     }
 
+    // Arithmetic in f32 rounds after every operation. Evaluating it in the
+    // host's double type could prove a narrower band than the runtime value;
+    // leave it to the full-plane path unless the value was a constant or a
+    // pure broadcast handled above.
+    if (auto type = dyn_cast<RankedTensorType>(v.getType()))
+      if (type.getElementType().isF32())
+        return std::nullopt;
+
     if (auto o = dyn_cast<AddOp>(op))
       return zip(eval(o.getLhs()), eval(o.getRhs()),
                  [](double a, double b) { return a + b; });
@@ -481,28 +499,29 @@ struct ConstantFolder {
 static std::optional<Interval> foldedDisplacement(Value positions,
                                                   int64_t dim) {
   auto type = dyn_cast<RankedTensorType>(positions.getType());
-  if (!type || type.getRank() != 2 || dim != 1)
+  if (!type || !type.hasStaticShape() || dim < 0 || dim >= type.getRank())
     return std::nullopt;
 
   ConstantFolder folder;
-  auto plane = folder.eval(positions);
-  if (!plane)
+  auto values = folder.eval(positions);
+  if (!values || static_cast<int64_t>(values->size()) != type.getNumElements())
     return std::nullopt;
 
-  int64_t rows = type.getShape()[0], cols = type.getShape()[1];
-  if ((int64_t)plane->size() != rows * cols)
-    return std::nullopt;
+  int64_t stride = 1;
+  for (int64_t d = dim + 1; d < type.getRank(); ++d)
+    stride *= type.getDimSize(d);
+  int64_t extent = type.getDimSize(dim);
 
   double lo = std::numeric_limits<double>::infinity();
   double hi = -std::numeric_limits<double>::infinity();
-  for (int64_t i = 0; i < rows; ++i)
-    for (int64_t j = 0; j < cols; ++j) {
-      double d = (*plane)[i * cols + j] - (double)j;
-      if (!std::isfinite(d))
-        return std::nullopt;
-      lo = std::min(lo, d);
-      hi = std::max(hi, d);
-    }
+  for (int64_t linear = 0; linear < type.getNumElements(); ++linear) {
+    int64_t coordinate = (linear / stride) % extent;
+    double displacement = (*values)[linear] - static_cast<double>(coordinate);
+    if (!std::isfinite(displacement))
+      return std::nullopt;
+    lo = std::min(lo, displacement);
+    hi = std::max(hi, displacement);
+  }
   return Interval::range(lo, hi);
 }
 
@@ -520,20 +539,37 @@ AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis) {
 
   // sar.broadcast -- result axis `dim` is the source's only axis.
   if (auto bc = dyn_cast<BroadcastOp>(op)) {
-    int64_t srcAxis = (rampAxis == bc.getDim()) ? 0 : kNoRamp;
+    int64_t srcAxis =
+        (rampAxis == static_cast<int64_t>(bc.getDim())) ? 0 : kNoRamp;
     AffineInterval src = analyze(bc.getInput(), srcAxis);
     if (srcAxis == kNoRamp && !isPlain(src))
       return unbounded(); // defensive: no ramp may survive replication
     return src;
   }
 
+  // The affine domain models real arithmetic. An f32 operation rounds after
+  // every step and can destroy an identity ramp at large magnitudes, so it
+  // cannot safely establish a band. Fully constant fields still use the
+  // exact-folder fallback above, which declines f32 arithmetic for the same
+  // reason.
+  if (op->getNumResults() == 1)
+    if (auto type = dyn_cast<RankedTensorType>(op->getResult(0).getType()))
+      if (type.getElementType().isF32())
+        return unbounded();
+
   // Element-wise binaries: shapes match, so the ramp axis passes through.
   if (auto o = dyn_cast<AddOp>(op))
     return addAI(analyze(o.getLhs(), rampAxis), analyze(o.getRhs(), rampAxis));
   if (auto o = dyn_cast<SubOp>(op))
     return subAI(analyze(o.getLhs(), rampAxis), analyze(o.getRhs(), rampAxis));
-  if (auto o = dyn_cast<MulOp>(op))
+  if (auto o = dyn_cast<MulOp>(op)) {
+    if (o.getLhs() == o.getRhs()) {
+      AffineInterval value = analyze(o.getLhs(), rampAxis);
+      if (isPlain(value))
+        return AffineInterval::constant(squareInterval(value.offset));
+    }
     return mulAI(analyze(o.getLhs(), rampAxis), analyze(o.getRhs(), rampAxis));
+  }
   if (auto o = dyn_cast<DivOp>(op))
     return divAI(analyze(o.getLhs(), rampAxis), analyze(o.getRhs(), rampAxis));
 
@@ -549,6 +585,60 @@ AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis) {
 
   // sar.sqrt -- monotone, so endpoints map, but a ramp does not survive it.
   if (auto o = dyn_cast<SqrtOp>(op)) {
+    // Preserve a positive ramp through sqrt(x*x + q) by bounding the
+    // residual q / (sqrt(x*x + q) + x). This is a general stable form for
+    // remapping a coordinate ramp by a non-negative orthogonal term.
+    auto trySum = [&](Value sum) -> std::optional<AffineInterval> {
+      auto add = sum.getDefiningOp<AddOp>();
+      if (!add)
+        return std::nullopt;
+      auto tryRampSquare =
+          [&](Value square, Value orthogonal) -> std::optional<AffineInterval> {
+        auto mul = square.getDefiningOp<MulOp>();
+        if (!mul || mul.getLhs() != mul.getRhs())
+          return std::nullopt;
+        Value baseValue = mul.getLhs();
+        AffineInterval base = analyze(baseValue, rampAxis);
+        AffineInterval q = analyze(orthogonal, rampAxis);
+        AffineInterval baseHull = analyze(baseValue, kNoRamp);
+        if (base.coeff == 0.0 || !isPlain(q) || !isPlain(baseHull) ||
+            !intervalFinite(q.offset) || !intervalFinite(baseHull.offset) ||
+            q.offset.lo < 0.0 || baseHull.offset.lo <= 0.0)
+          return std::nullopt;
+
+        auto residual = [](double x, double q) {
+          return q / (std::sqrt(x * x + q) + x);
+        };
+        double lo = residual(baseHull.offset.hi, q.offset.lo);
+        double hi = residual(baseHull.offset.lo, q.offset.hi);
+        return AffineInterval{
+            base.coeff,
+            base.offset + Interval::range(std::min(lo, hi), std::max(lo, hi))};
+      };
+      if (auto result = tryRampSquare(add.getLhs(), add.getRhs()))
+        return *result;
+      if (auto result = tryRampSquare(add.getRhs(), add.getLhs()))
+        return *result;
+      return std::nullopt;
+    };
+
+    SmallVector<Value> candidates{o.getInput()};
+    if (auto outer = o.getInput().getDefiningOp<WhereOp>()) {
+      candidates.push_back(outer.getLhs());
+      candidates.push_back(outer.getRhs());
+      if (auto inner = outer.getLhs().getDefiningOp<WhereOp>()) {
+        candidates.push_back(inner.getLhs());
+        candidates.push_back(inner.getRhs());
+      }
+      if (auto inner = outer.getRhs().getDefiningOp<WhereOp>()) {
+        candidates.push_back(inner.getLhs());
+        candidates.push_back(inner.getRhs());
+      }
+    }
+    for (Value candidate : candidates)
+      if (auto result = trySum(candidate))
+        return *result;
+
     AffineInterval src = analyze(o.getInput(), rampAxis);
     if (!isPlain(src) || !intervalFinite(src.offset))
       return unbounded();

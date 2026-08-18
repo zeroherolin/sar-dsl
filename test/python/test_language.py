@@ -22,6 +22,7 @@ def test_trace_emits_generic_ops():
     assert '"sar.add"' in text
     assert "tensor<16x16xf32>" in text
     assert "func.func @k" in text
+    assert 'loc("' in text and "test_language.py" in text
 
 
 def test_trace_signal_ops():
@@ -75,14 +76,22 @@ def test_fft_accepts_any_size_geq_two():
         too_small.to_mlir()
 
 
-def test_fft_requires_complex():
+def test_fft_promotes_real_input_and_checks_declared_result():
 
     @sar.func
-    def k(x: sar.f32[16]) -> sar.f32[16]:
+    def promoted(x: sar.f32[16]) -> sar.c64[16]:
         return sar.fft(x, dim=0)
 
-    with pytest.raises(TraceError, match="complex"):
-        k.to_mlir()
+    text = promoted.to_mlir()
+    assert '"sar.cast"' in text
+    assert '"sar.fft"' in text
+
+    @sar.func
+    def conflicting(x: sar.f32[16]) -> sar.f32[16]:
+        return sar.fft(x, dim=0)
+
+    with pytest.raises(TraceError, match="declares"):
+        conflicting.to_mlir()
 
 
 def test_result_type_checked_against_annotation():
@@ -122,6 +131,29 @@ def test_constant_from_numpy_array():
 
     text = k.to_mlir()
     assert '"sar.constant"' in text and "dense<[" in text
+
+
+def test_dense_hex_constants_are_little_endian():
+    values = np.arange(65, dtype=">f8")
+
+    @sar.func
+    def k(x: sar.f64[65]) -> sar.f64[65]:
+        return x + sar.constant(values)
+
+    expected = values.astype("<f8").tobytes().hex().upper()
+    assert f'"0x{expected}"' in k.to_mlir()
+
+
+def test_numpy_scalars_preserve_shape_and_dtype():
+
+    @sar.func
+    def k(x: sar.f32[4]) -> sar.f32[4]:
+        bias = sar.constant(np.float32(1.0), shape=(4, ))
+        return x * np.float32(2.0) + bias
+
+    text = k.to_mlir()
+    assert '"sar.mul_scalar"' in text
+    assert "tensor<4xf32>" in text
 
 
 def test_ops_outside_kernel_rejected():
@@ -213,8 +245,7 @@ def test_rank_filter_complex_rejected():
 
 
 def test_where_rejects_integer_branches():
-    """Integer branches used to escape as a bare KeyError from the
-    precision table; the report has to be a TraceError naming the op."""
+    """Integer branches raise a TraceError that identifies `sar.where`."""
     N = 8
 
     @sar.func
@@ -266,6 +297,34 @@ def test_to_mlir_reuses_the_trace():
     assert len(body_runs) == 1
 
 
+def test_renaming_a_traced_kernel_invalidates_its_ir():
+
+    @sar.func
+    def original(x: sar.f32[4]) -> sar.f32[4]:
+        return x + 1.0
+
+    assert "func.func @original" in original.to_mlir()
+    original.name = "renamed"
+    text = original.to_mlir()
+    assert "func.func @renamed" in text
+    assert "func.func @original" not in text
+
+
+def test_explicit_retrace_invalidates_compiled_launchers():
+    scale = [1.0]
+
+    @sar.func
+    def kernel(x: sar.f32[4]) -> sar.f32[4]:
+        return x * scale[0]
+
+    before = kernel.to_mlir()
+    kernel._compiled[("test", ())] = object()
+    scale[0] = 2.0
+    after = kernel.trace()
+    assert before != after
+    assert not kernel._compiled
+
+
 def test_trace_error_is_a_first_class_export():
     from sar.errors import TraceError as from_errors
 
@@ -273,4 +332,5 @@ def test_trace_error_is_a_first_class_export():
     assert sar.language.TraceError is from_errors
     assert "TraceError" in sar.__all__
     assert issubclass(sar.TraceError, sar.SARError)
-    assert issubclass(sar.TraceError, TypeError)  # legacy catches still work
+    # Existing TypeError handlers also catch tracing failures.
+    assert issubclass(sar.TraceError, TypeError)

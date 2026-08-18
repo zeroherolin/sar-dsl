@@ -23,6 +23,12 @@ UPSAMPLE = 32
 
 def upsample(cut: np.ndarray, factor: int = UPSAMPLE) -> np.ndarray:
     """Band-limited upsampling by zero-padding the spectrum."""
+    cut = np.asarray(cut)
+    if cut.ndim != 1 or cut.size == 0:
+        raise ValueError("cut must be a non-empty 1-D array")
+    if (isinstance(factor, (bool, np.bool_))
+            or not isinstance(factor, (int, np.integer)) or factor < 1):
+        raise ValueError("factor must be a positive integer")
     n = len(cut)
     spectrum = np.fft.fftshift(np.fft.fft(np.fft.ifftshift(cut)))
     padded = np.zeros(n * factor, dtype=complex)
@@ -33,7 +39,9 @@ def upsample(cut: np.ndarray, factor: int = UPSAMPLE) -> np.ndarray:
 
 def measure_cut(cut: np.ndarray, factor: int = UPSAMPLE) -> dict:
     """IRW / PSLR / ISLR of a 1-D impulse-response cut through the peak."""
-    fine = upsample(cut.astype(complex), factor)
+    fine = upsample(np.asarray(cut, dtype=complex), factor)
+    if not np.all(np.isfinite(fine)) or not np.any(fine > 0):
+        raise ValueError("cut must contain finite nonzero data")
     peak_idx = int(np.argmax(fine))
     peak = fine[peak_idx]
     power = fine**2
@@ -72,6 +80,8 @@ def measure_cut(cut: np.ndarray, factor: int = UPSAMPLE) -> dict:
     while hi < len(fine) - 1 and fine[hi + 1] < fine[hi]:
         hi += 1
     sidelobes = np.concatenate([fine[:lo], fine[hi + 1:]])
+    if sidelobes.size == 0:
+        raise ValueError("cut has no samples outside the mainlobe")
     pslr = 20.0 * np.log10(sidelobes.max() / peak + 1e-30)
 
     mainlobe_energy = power[lo:hi + 1].sum()
@@ -88,8 +98,15 @@ def urban_contrast(image: np.ndarray,
     brightest `tile x tile` window of the `looks x looks` multilooked
     magnitude image (higher is sharper; used for the ALOS numbers in
     the README and for autofocus calibration)."""
+    image = np.asarray(image)
+    if image.ndim != 2:
+        raise ValueError("image must be a 2-D array")
+    if looks < 1 or tile < looks or tile % looks != 0:
+        raise ValueError("looks must be positive and divide tile")
     mag = np.abs(image)
     h, w = mag.shape
+    if h < tile or w < tile:
+        raise ValueError("image must be at least tile x tile")
     ml = mag[:h - h % looks, :w - w % looks]
     ml = ml.reshape(h // looks, looks, w // looks, looks).mean(axis=(1, 3))
     t = tile // looks
@@ -100,16 +117,22 @@ def urban_contrast(image: np.ndarray,
             if s > best:
                 best, pos = s, (i, j)
     window = ml[pos[0]:pos[0] + t, pos[1]:pos[1] + t]
-    return float(window.std() / window.mean())
+    mean = window.mean()
+    if not np.isfinite(mean) or mean <= 0:
+        raise ValueError("selected tile must have positive finite magnitude")
+    return float(window.std() / mean)
 
 
 def measure_image(image: np.ndarray, expected_peak=None) -> dict:
     """Range/azimuth metrics of a point-target image."""
-    i, j = np.unravel_index(np.argmax(image), image.shape)
+    magnitude = np.abs(np.asarray(image))
+    if magnitude.ndim != 2 or magnitude.size == 0:
+        raise ValueError("image must be a non-empty 2-D array")
+    i, j = np.unravel_index(np.argmax(magnitude), magnitude.shape)
     metrics = {
         "peak": (i, j),
-        "range": measure_cut(image[i, :]),
-        "azimuth": measure_cut(image[:, j]),
+        "range": measure_cut(magnitude[i, :]),
+        "azimuth": measure_cut(magnitude[:, j]),
     }
     if expected_peak is not None:
         metrics["peak_error"] = (i - expected_peak[0], j - expected_peak[1])

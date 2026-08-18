@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- RaiseAffineToCopy.cpp - raise affine to copy -----------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -19,6 +19,7 @@ namespace sar {
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
+using namespace sar::hls;
 
 namespace {
 struct RaiseAffineToCopy
@@ -27,7 +28,6 @@ struct RaiseAffineToCopy
     auto func = getOperation();
     auto builder = OpBuilder(func);
 
-    // Collect all target loop bands.
     AffineLoopBands targetBands;
     getLoopBands(func.front(), targetBands);
 

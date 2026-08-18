@@ -78,8 +78,8 @@ void buildSARToLLVMPipeline(OpPassManager &pm,
 void buildSARToAffinePipeline(OpPassManager &pm,
                               const SARBufferPipelineOptions &options = {});
 
-/// The affine path continued down to the LLVM dialect; used to validate
-/// the Stockham FFT lowering numerically on the CPU.
+/// Continues the affine path to LLVM for numerical validation of the
+/// Stockham FFT lowering on the CPU.
 void buildSARAffineToLLVMPipeline(OpPassManager &pm,
                                   const SARBufferPipelineOptions &options = {});
 

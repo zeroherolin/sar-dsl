@@ -185,15 +185,35 @@ func.func @cumsum_dim0(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
   return %0 : tensor<4x8xf32>
 }
 
+// CHECK-LABEL: func.func @cumsum_rank1
+func.func @cumsum_rank1(%x: tensor<8xf64>) -> tensor<8xf64> {
+  // A rank-1 scan is a single line: the same nest with a unit line loop.
+  // CHECK: scf.for
+  // CHECK: tensor.insert
+  %0 = sar.cumsum %x {dim = 0 : i64} : tensor<8xf64>
+  return %0 : tensor<8xf64>
+}
+
 // CHECK-LABEL: func.func @rank_filter_window3
 func.func @rank_filter_window3(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
   // The body is a straight-line compare-exchange network (bubble sort):
   // three compare-exchanges for window=3, yield the median (rank=1).
   // CHECK: linalg.generic
-  // CHECK-DAG: arith.minimumf
-  // CHECK-DAG: arith.maximumf
+  // CHECK-DAG: arith.cmpf une
+  // CHECK-DAG: arith.cmpf ole
+  // CHECK-DAG: arith.select
   %0 = sar.rank_filter %x {window = 3 : i64, rank = 1 : i64, dim = 1 : i64} : tensor<4x8xf32>
   return %0 : tensor<4x8xf32>
+}
+
+// CHECK-LABEL: func.func @rank_filter_rank1
+func.func @rank_filter_rank1(%x: tensor<16xf64>) -> tensor<16xf64> {
+  // CHECK: linalg.generic
+  // CHECK-DAG: arith.cmpf une
+  // CHECK-DAG: arith.cmpf ole
+  // CHECK-DAG: arith.select
+  %0 = sar.rank_filter %x {window = 3 : i64, rank = 1 : i64, dim = 0 : i64} : tensor<16xf64>
+  return %0 : tensor<16xf64>
 }
 
 // The 2-D gather is one parallel sweep whose body loads through clamped,
@@ -240,6 +260,24 @@ func.func @iterate_lowering(%z: tensor<4x4xf64>) -> tensor<4x4xf64> {
   ^bb0(%acc: tensor<4x4xf64>):
     %1 = sar.mul %acc, %acc : tensor<4x4xf64>
     sar.yield %1 : tensor<4x4xf64>
+  }
+  return %0 : tensor<4x4xf64>
+}
+
+// The index form materializes the loop counter as a one-element tensor
+// inside the scf.for body: an index_cast off the induction variable
+// stored into a stack slot, no allocation per iteration.
+
+// CHECK-LABEL: func.func @iterate_index_lowering
+func.func @iterate_index_lowering(%z: tensor<4x4xf64>) -> tensor<4x4xf64> {
+  // CHECK: scf.for %[[IV:[a-z0-9_]+]] =
+  // CHECK: %[[I64:[a-z0-9_]+]] = arith.index_cast %[[IV]] : index to i64
+  // CHECK: tensor.insert %[[I64]]
+  // CHECK-NOT: sar.iterate
+  %0 = sar.iterate(%z) {trips = 3 : i64, index}
+      : (tensor<4x4xf64>) -> tensor<4x4xf64> {
+  ^bb0(%i: tensor<1xi64>, %acc: tensor<4x4xf64>):
+    sar.yield %acc : tensor<4x4xf64>
   }
   return %0 : tensor<4x4xf64>
 }

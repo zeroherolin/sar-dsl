@@ -1,4 +1,4 @@
-//===- LoopUnrolling.cpp - Fully unroll a loop band ----------------------===//
+//===- LoopUnrolling.cpp - loop unrolling ---------------------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -17,6 +17,7 @@
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
+using namespace sar::hls;
 
 /// Fully unroll all loops insides of a block.
 bool sar::applyFullyLoopUnrolling(Block &block, unsigned maxIterNum) {

@@ -14,6 +14,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <cmath>
+
 using namespace mlir;
 using namespace mlir::sar;
 
@@ -46,6 +48,13 @@ static RankedTensorType getRanked(Type type) {
   return cast<RankedTensorType>(type);
 }
 
+static LogicalResult verifyPositiveShape(Operation *op, RankedTensorType type,
+                                         StringRef role) {
+  if (llvm::any_of(type.getShape(), [](int64_t size) { return size <= 0; }))
+    return op->emitOpError() << role << " must have static positive extents";
+  return success();
+}
+
 /// Returns the float precision backing an element type (f32/f64 or the
 /// element of complex<f32>/complex<f64>).
 static FloatType getFloatPrecision(Type elementType) {
@@ -68,6 +77,46 @@ OpFoldResult ConstantOp::fold(FoldAdaptor) { return getValueAttr(); }
 // are deliberately not folded.
 //===----------------------------------------------------------------------===//
 
+/// A permutation fold cap: constants at or below this many elements are
+/// rearranged at compile time (window and axis tables), larger ones (whole
+/// raster planes) keep the runtime permutation rather than double a huge
+/// constant pool.
+constexpr int64_t kMaxFoldedPermutationElements = 1 << 16;
+
+/// Rebuilds `dense` with each element moved by `makeMapper`'s index map:
+/// the shared engine of the bit-exact permutation folds (fftshift,
+/// reverse), which move data without touching a bit of it.
+template <typename MakeMapper>
+static OpFoldResult foldPermutedConstant(DenseElementsAttr dense,
+                                         MakeMapper makeMapper) {
+  auto type = cast<RankedTensorType>(dense.getType());
+  if (type.getNumElements() > kMaxFoldedPermutationElements)
+    return {};
+  if (dense.isSplat()) // any permutation of a splat is the splat
+    return dense;
+  auto mapper = makeMapper(type.getShape());
+
+  SmallVector<Attribute> elements(dense.getValues<Attribute>().begin(),
+                                  dense.getValues<Attribute>().end());
+  SmallVector<Attribute> permuted(elements.size());
+  ArrayRef<int64_t> shape = type.getShape();
+  SmallVector<int64_t> index(shape.size(), 0);
+  for (int64_t linear = 0, e = elements.size(); linear < e; ++linear) {
+    SmallVector<int64_t> src(index);
+    mapper(src);
+    int64_t srcLinear = 0;
+    for (auto [i, extent] : llvm::enumerate(shape))
+      srcLinear = srcLinear * extent + src[i];
+    permuted[linear] = elements[srcLinear];
+    for (int64_t d = shape.size() - 1; d >= 0; --d) {
+      if (++index[d] < shape[d])
+        break;
+      index[d] = 0;
+    }
+  }
+  return DenseElementsAttr::get(type, permuted);
+}
+
 /// transpose(transpose(x)) == x (a pure permutation, bit-exact).
 OpFoldResult TransposeOp::fold(FoldAdaptor) {
   if (auto inner = getInput().getDefiningOp<TransposeOp>())
@@ -76,11 +125,24 @@ OpFoldResult TransposeOp::fold(FoldAdaptor) {
 }
 
 /// fftshift and ifftshift along the same axis are exact inverses for any
-/// size (forward rotates by ceil(n/2), inverse by floor(n/2)).
-OpFoldResult FFTShiftOp::fold(FoldAdaptor) {
+/// size (forward rotates by ceil(n/2), inverse by floor(n/2)). A shift of
+/// a small compile-time constant folds into a rotated constant: pure data
+/// movement, bit-exact.
+OpFoldResult FFTShiftOp::fold(FoldAdaptor adaptor) {
   auto inner = getInput().getDefiningOp<FFTShiftOp>();
   if (inner && inner.getDim() == getDim() && inner.getInverse() != getInverse())
     return inner.getInput();
+  if (auto dense = dyn_cast_or_null<DenseElementsAttr>(adaptor.getInput()))
+    return foldPermutedConstant(dense, [&](ArrayRef<int64_t> shape) {
+      // Same index map as the lowering: fftshift reads ceil(n/2) ahead,
+      // ifftshift floor(n/2) (they differ for odd sizes).
+      int64_t dim = getDim();
+      int64_t n = shape[dim];
+      int64_t split = getInverse() ? n / 2 : n - n / 2;
+      return [dim, n, split](SmallVectorImpl<int64_t> &index) {
+        index[dim] = (index[dim] + split) % n;
+      };
+    });
   return {};
 }
 
@@ -218,6 +280,9 @@ LogicalResult CastOp::verify() {
 static LogicalResult verifyReduceShapes(Operation *op, RankedTensorType inputTy,
                                         RankedTensorType resultTy,
                                         int64_t dim) {
+  if (failed(verifyPositiveShape(op, inputTy, "input")) ||
+      failed(verifyPositiveShape(op, resultTy, "result")))
+    return failure();
   if (inputTy.getRank() != 2)
     return op->emitOpError("expects a rank-2 input");
   if (dim < 0 || dim > 1)
@@ -256,6 +321,9 @@ LogicalResult ArgMaxOp::verify() {
 LogicalResult TransposeOp::verify() {
   auto inputTy = getRanked(getInput().getType());
   auto resultTy = getRanked(getResult().getType());
+  if (failed(verifyPositiveShape(*this, inputTy, "input")) ||
+      failed(verifyPositiveShape(*this, resultTy, "result")))
+    return failure();
   if (inputTy.getRank() != 2)
     return emitOpError("expects a rank-2 input");
   if (inputTy.getElementType() != resultTy.getElementType())
@@ -275,6 +343,9 @@ LogicalResult TransposeOp::verify() {
 LogicalResult BroadcastOp::verify() {
   auto inputTy = getRanked(getInput().getType());
   auto resultTy = getRanked(getResult().getType());
+  if (failed(verifyPositiveShape(*this, inputTy, "input")) ||
+      failed(verifyPositiveShape(*this, resultTy, "result")))
+    return failure();
   if (inputTy.getRank() != 1)
     return emitOpError("expects a rank-1 input");
   if (resultTy.getRank() != 2)
@@ -296,6 +367,9 @@ LogicalResult BroadcastOp::verify() {
 LogicalResult SliceOp::verify() {
   auto inputTy = getRanked(getInput().getType());
   auto resultTy = getRanked(getResult().getType());
+  if (failed(verifyPositiveShape(*this, inputTy, "input")) ||
+      failed(verifyPositiveShape(*this, resultTy, "result")))
+    return failure();
   int64_t rank = inputTy.getRank();
   if (inputTy.getElementType() != resultTy.getElementType())
     return emitOpError("input and result element types must match");
@@ -323,6 +397,10 @@ LogicalResult ConcatOp::verify() {
   auto lhsTy = getRanked(getLhs().getType());
   auto rhsTy = getRanked(getRhs().getType());
   auto resultTy = getRanked(getResult().getType());
+  if (failed(verifyPositiveShape(*this, lhsTy, "left operand")) ||
+      failed(verifyPositiveShape(*this, rhsTy, "right operand")) ||
+      failed(verifyPositiveShape(*this, resultTy, "result")))
+    return failure();
   int64_t rank = lhsTy.getRank();
   int64_t dim = getDim();
   if (lhsTy.getElementType() != rhsTy.getElementType() ||
@@ -347,6 +425,9 @@ LogicalResult ConcatOp::verify() {
 LogicalResult PadOp::verify() {
   auto inputTy = getRanked(getInput().getType());
   auto resultTy = getRanked(getResult().getType());
+  if (failed(verifyPositiveShape(*this, inputTy, "input")) ||
+      failed(verifyPositiveShape(*this, resultTy, "result")))
+    return failure();
   int64_t rank = inputTy.getRank();
   if (inputTy.getElementType() != resultTy.getElementType())
     return emitOpError("input and result element types must match");
@@ -371,6 +452,8 @@ LogicalResult PadOp::verify() {
 
 LogicalResult ReverseOp::verify() {
   auto type = getRanked(getInput().getType());
+  if (failed(verifyPositiveShape(*this, type, "input")))
+    return failure();
   // The I64Attr getter is unsigned, so a negative dim reads as a huge
   // value and the single comparison rejects both directions.
   if (getDim() >= static_cast<uint64_t>(type.getRank()))
@@ -378,11 +461,20 @@ LogicalResult ReverseOp::verify() {
   return success();
 }
 
-/// reverse(reverse(x)) == x along the same axis (a pure permutation).
-OpFoldResult ReverseOp::fold(FoldAdaptor) {
+/// reverse(reverse(x)) == x along the same axis (a pure permutation);
+/// a reversed small constant folds to a reversed constant.
+OpFoldResult ReverseOp::fold(FoldAdaptor adaptor) {
   if (auto inner = getInput().getDefiningOp<ReverseOp>())
     if (inner.getDim() == getDim())
       return inner.getInput();
+  if (auto dense = dyn_cast_or_null<DenseElementsAttr>(adaptor.getInput()))
+    return foldPermutedConstant(dense, [&](ArrayRef<int64_t> shape) {
+      int64_t dim = getDim();
+      int64_t n = shape[dim];
+      return [dim, n](SmallVectorImpl<int64_t> &index) {
+        index[dim] = n - 1 - index[dim];
+      };
+    });
   return {};
 }
 
@@ -392,10 +484,73 @@ OpFoldResult ReverseOp::fold(FoldAdaptor) {
 
 LogicalResult FFTShiftOp::verify() {
   auto type = getRanked(getInput().getType());
+  if (failed(verifyPositiveShape(*this, type, "input")))
+    return failure();
   int64_t dim = getDim();
   if (dim < 0 || dim >= type.getRank())
     return emitOpError("dim is out of range for the input rank");
   return success();
+}
+
+namespace {
+/// The shift calculus: element-wise operations commute with the pure
+/// permutation `fftshift` is, bit-exactly -- rotating then operating
+/// touches the same values as operating then rotating. Hoisting the
+/// shift over element-wise consumers moves shifts toward each other,
+/// where the shift/unshift fold cancels them; a spectrum multiplied in
+/// its shifted form then costs no rotation at all.
+
+/// binop(fftshift(a, d), fftshift(b, d)) -> fftshift(binop(a, b), d).
+template <typename BinOpTy>
+struct HoistShiftOverBinary : public OpRewritePattern<BinOpTy> {
+  using OpRewritePattern<BinOpTy>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(BinOpTy op,
+                                PatternRewriter &rewriter) const override {
+    auto lhs = op.getLhs().template getDefiningOp<FFTShiftOp>();
+    auto rhs = op.getRhs().template getDefiningOp<FFTShiftOp>();
+    if (!lhs || !rhs || lhs.getDim() != rhs.getDim() ||
+        lhs.getInverse() != rhs.getInverse())
+      return failure();
+    Value inner =
+        BinOpTy::create(rewriter, op.getLoc(), lhs.getInput(), rhs.getInput());
+    rewriter.replaceOpWithNewOp<FFTShiftOp>(op, inner, lhs.getDimAttr(),
+                                            lhs.getInverseAttr());
+    return success();
+  }
+};
+
+/// unary(fftshift(x, d)) -> fftshift(unary(x), d) for single-operand
+/// element-wise ops whose result shape matches the input.
+template <typename UnaryOpTy>
+struct HoistShiftOverUnary : public OpRewritePattern<UnaryOpTy> {
+  using OpRewritePattern<UnaryOpTy>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(UnaryOpTy op,
+                                PatternRewriter &rewriter) const override {
+    auto shift = op.getInput().template getDefiningOp<FFTShiftOp>();
+    if (!shift)
+      return failure();
+    auto inner =
+        UnaryOpTy::create(rewriter, op.getLoc(), op.getResult().getType(),
+                          shift.getInput(), op->getAttrs());
+    rewriter.replaceOpWithNewOp<FFTShiftOp>(
+        op, inner.getResult(), shift.getDimAttr(), shift.getInverseAttr());
+    return success();
+  }
+};
+} // namespace
+
+void FFTShiftOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                             MLIRContext *context) {
+  results.add<HoistShiftOverBinary<AddOp>, HoistShiftOverBinary<SubOp>,
+              HoistShiftOverBinary<MulOp>, HoistShiftOverBinary<DivOp>>(
+      context);
+  results
+      .add<HoistShiftOverUnary<ConjOp>, HoistShiftOverUnary<RealOp>,
+           HoistShiftOverUnary<ImagOp>, HoistShiftOverUnary<AbsOp>,
+           HoistShiftOverUnary<MulScalarOp>, HoistShiftOverUnary<AddScalarOp>>(
+          context);
 }
 
 //===----------------------------------------------------------------------===//
@@ -404,6 +559,8 @@ LogicalResult FFTShiftOp::verify() {
 
 static LogicalResult verifyFFTLike(Operation *op, RankedTensorType type,
                                    int64_t dim) {
+  if (failed(verifyPositiveShape(op, type, "input")))
+    return failure();
   if (type.getRank() < 1 || type.getRank() > 2)
     return op->emitOpError("expects a rank-1 or rank-2 input");
   if (dim < 0 || dim >= type.getRank())
@@ -431,6 +588,9 @@ LogicalResult FFTSplitOp::verify() {
 
 static LogicalResult verifyInterpLike(Operation *op, RankedTensorType dataTy,
                                       RankedTensorType posTy) {
+  if (failed(verifyPositiveShape(op, dataTy, "data")) ||
+      failed(verifyPositiveShape(op, posTy, "positions")))
+    return failure();
   if (dataTy.getRank() != 2)
     return op->emitOpError("expects rank-2 data");
   if (posTy.getShape() != dataTy.getShape())
@@ -449,17 +609,17 @@ static LogicalResult verifyInterpKernel(Operation *op, StringRef kernel,
       kernel != "sinc")
     return op->emitOpError("kernel must be one of: nearest, linear, "
                            "cubic, sinc");
+  if (window != "rect" && window != "hann" && window != "hamming" &&
+      window != "kaiser")
+    return op->emitOpError("window must be one of: rect, hann, "
+                           "hamming, kaiser");
+  // The upper bound keeps the unrolled I0 series accurate in HLS lowering.
+  if (window == "kaiser" &&
+      (!std::isfinite(beta) || beta <= 0.0 || beta > 12.0))
+    return op->emitOpError("beta must be finite and in (0, 12]");
   if (kernel == "sinc") {
     if (taps < 4 || taps > 32 || taps % 2 != 0)
       return op->emitOpError("taps must be even and in [4, 32]");
-    if (window != "rect" && window != "hann" && window != "hamming" &&
-        window != "kaiser")
-      return op->emitOpError("window must be one of: rect, hann, "
-                             "hamming, kaiser");
-    // The upper bound keeps the unrolled I0 series in the affine (HLS)
-    // lowering accurate.
-    if (window == "kaiser" && (beta <= 0.0 || beta > 12.0))
-      return op->emitOpError("beta must be in (0, 12]");
   }
   if (boundary != "zero" && boundary != "edge" && boundary != "reflect")
     return op->emitOpError("boundary must be one of: zero, edge, reflect");
@@ -495,15 +655,23 @@ LogicalResult IterateOp::verify() {
     return emitOpError("trips must be at least 1");
   Block &block = getBody().front();
   ValueRange inits = getInits();
-  if (block.getNumArguments() != inits.size() ||
+  unsigned indexArgs = getIndex() ? 1 : 0;
+  if (block.getNumArguments() != inits.size() + indexArgs ||
       getNumResults() != inits.size())
-    return emitOpError("carries one block argument and one result per init");
+    return emitOpError("carries one block argument and one result per init")
+           << (getIndex() ? " (plus the leading index argument)" : "");
+  if (getIndex()) {
+    auto indexType =
+        RankedTensorType::get({1}, IntegerType::get(getContext(), 64));
+    if (block.getArgument(0).getType() != indexType)
+      return emitOpError("the index block argument must be tensor<1xi64>");
+  }
   auto yield = cast<YieldOp>(block.getTerminator());
   if (yield.getNumOperands() != inits.size())
     return emitOpError("yields one value per init");
   for (auto [index, init] : llvm::enumerate(inits)) {
     Type type = init.getType();
-    if (block.getArgument(index).getType() != type ||
+    if (block.getArgument(index + indexArgs).getType() != type ||
         getResult(index).getType() != type ||
         yield.getOperand(index).getType() != type)
       return emitOpError("carry #")
@@ -523,6 +691,10 @@ static LogicalResult verifyGatherLike(Operation *op, RankedTensorType dataTy,
                                       RankedTensorType posTy,
                                       RankedTensorType resultTy,
                                       StringRef kernel, StringRef boundary) {
+  if (failed(verifyPositiveShape(op, dataTy, "data")) ||
+      failed(verifyPositiveShape(op, posTy, "positions")) ||
+      failed(verifyPositiveShape(op, resultTy, "result")))
+    return failure();
   if (dataTy.getRank() != 2)
     return op->emitOpError("expects rank-2 data");
   if (posTy.getRank() != 2 || !posTy.getElementType().isF64())
@@ -594,21 +766,25 @@ void Interp1DOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 LogicalResult CumsumOp::verify() {
   auto type = getRanked(getInput().getType());
-  if (type.getRank() != 2)
-    return emitOpError("expects a rank-2 input");
+  if (failed(verifyPositiveShape(*this, type, "input")))
+    return failure();
+  if (type.getRank() < 1 || type.getRank() > 2)
+    return emitOpError("expects a rank-1 or rank-2 input");
   Type element = type.getElementType();
   if (!isa<FloatType>(element) && !isa<ComplexType>(element))
     return emitOpError("expects float or complex elements");
   int64_t dim = getDim();
-  if (dim < 0 || dim > 1)
-    return emitOpError("dim must be 0 or 1");
+  if (dim < 0 || dim >= type.getRank())
+    return emitOpError("dim is out of range for the input rank");
   return success();
 }
 
 LogicalResult RankFilterOp::verify() {
   auto type = getRanked(getInput().getType());
-  if (type.getRank() != 2)
-    return emitOpError("expects a rank-2 input");
+  if (failed(verifyPositiveShape(*this, type, "input")))
+    return failure();
+  if (type.getRank() < 1 || type.getRank() > 2)
+    return emitOpError("expects a rank-1 or rank-2 input");
   if (!isa<FloatType>(type.getElementType()))
     return emitOpError("expects float elements");
   int64_t window = getWindow();
@@ -618,20 +794,22 @@ LogicalResult RankFilterOp::verify() {
   if (rank < 0 || rank >= window)
     return emitOpError("rank must be in [0, window)");
   int64_t dim = getDim();
-  if (dim < 0 || dim > 1)
-    return emitOpError("dim must be 0 or 1");
+  if (dim < 0 || dim >= type.getRank())
+    return emitOpError("dim is out of range for the input rank");
   return success();
 }
 
 LogicalResult SortOp::verify() {
   auto type = getRanked(getInput().getType());
-  if (type.getRank() != 2)
-    return emitOpError("expects a rank-2 input");
+  if (failed(verifyPositiveShape(*this, type, "input")))
+    return failure();
+  if (type.getRank() < 1 || type.getRank() > 2)
+    return emitOpError("expects a rank-1 or rank-2 input");
   if (!isa<FloatType>(type.getElementType()))
     return emitOpError("expects float elements");
   int64_t dim = getDim();
-  if (dim < 0 || dim > 1)
-    return emitOpError("dim must be 0 or 1");
+  if (dim < 0 || dim >= type.getRank())
+    return emitOpError("dim is out of range for the input rank");
   return success();
 }
 

@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+//===- Visitor.h - HLS op visitors ------------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -21,8 +21,6 @@
 namespace mlir {
 namespace sar {
 
-using namespace hls;
-
 /// This class is a visitor for SSACFG operation nodes.
 template <typename ConcreteType, typename ResultType, typename... ExtraArgs>
 class HLSVisitorBase {
@@ -32,8 +30,9 @@ public:
     return TypeSwitch<Operation *, ResultType>(op)
         .template Case<
             // HLS dialect operations.
-            BufferOp, ConstBufferOp, StreamOp, StreamReadOp, StreamWriteOp,
-            AxiBundleOp, AxiPortOp, AxiPackOp, hls::AffineSelectOp,
+            hls::BufferOp, hls::ConstBufferOp, hls::StreamOp, hls::StreamReadOp,
+            hls::StreamWriteOp, hls::AxiBundleOp, hls::AxiPortOp,
+            hls::AxiPackOp, hls::AffineSelectOp,
 
             // Function operations.
             func::CallOp, func::ReturnOp,
@@ -107,14 +106,14 @@ public:
   }
 
   // HLS dialect operations.
-  HANDLE(BufferOp);
-  HANDLE(ConstBufferOp);
-  HANDLE(StreamOp);
-  HANDLE(StreamReadOp);
-  HANDLE(StreamWriteOp);
-  HANDLE(AxiBundleOp);
-  HANDLE(AxiPortOp);
-  HANDLE(AxiPackOp);
+  HANDLE(hls::BufferOp);
+  HANDLE(hls::ConstBufferOp);
+  HANDLE(hls::StreamOp);
+  HANDLE(hls::StreamReadOp);
+  HANDLE(hls::StreamWriteOp);
+  HANDLE(hls::AxiBundleOp);
+  HANDLE(hls::AxiPortOp);
+  HANDLE(hls::AxiPackOp);
   HANDLE(hls::AffineSelectOp);
 
   // Control flow operations.

@@ -9,6 +9,7 @@ add_llvm_executable(sar-translate
 )
 target_link_libraries(sar-translate PRIVATE
   HLSTarget
+  SARKernelFactsTarget
   HLSDialect
   ${dialect_libs}
   ${translation_libs}

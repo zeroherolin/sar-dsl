@@ -1,4 +1,4 @@
-//===- EmitHLSCpp.cpp - Translate scheduled HLS IR to Vitis HLS C++ -------===//
+//===- EmitHLSCpp.cpp - scheduled HLS IR to Vitis HLS C++ -----------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -20,6 +20,7 @@
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
+using namespace sar::hls;
 
 static llvm::cl::opt<bool> emitVitisDirectives("emit-vitis-directives",
                                                llvm::cl::init(false));
@@ -488,6 +489,7 @@ public:
   void emitAxiPort(AxiPortOp op);
   template <typename AssignOpType> void emitAssign(AssignOpType op);
   void emitExtUI(arith::ExtUIOp op);
+  template <typename CastOpType> void emitFPToInt(CastOpType op);
   void emitAffineSelect(hls::AffineSelectOp op);
 
   /// Control flow operation emitters.
@@ -554,7 +556,6 @@ private:
   void emitArrayDecl(Value array);
   unsigned emitNestedLoopHeader(Value val);
   void emitNestedLoopFooter(unsigned rank);
-  void emitInfoAndNewLine(Operation *op);
 
   /// MLIR component and HLS C++ pragma emitters.
   void emitBlock(Block &block);
@@ -616,7 +617,7 @@ public:
     emitAffineBinary(expr, "/");
   }
   void visitCeilDivExpr(AffineBinaryOpExpr expr) {
-    // This is super inefficient.
+    // Positive affine bounds use the standard integer ceil-division form.
     os << "(";
     visit(expr.getLHS());
     os << " + ";
@@ -865,8 +866,8 @@ public:
   bool visitOp(arith::IndexCastOp op) { return emitter.emitAssign(op), true; }
   bool visitOp(arith::UIToFPOp op) { return emitter.emitAssign(op), true; }
   bool visitOp(arith::SIToFPOp op) { return emitter.emitAssign(op), true; }
-  bool visitOp(arith::FPToUIOp op) { return emitter.emitAssign(op), true; }
-  bool visitOp(arith::FPToSIOp op) { return emitter.emitAssign(op), true; }
+  bool visitOp(arith::FPToUIOp op) { return emitter.emitFPToInt(op), true; }
+  bool visitOp(arith::FPToSIOp op) { return emitter.emitFPToInt(op), true; }
 
   /// Width conversions emit as plain assignments: the emitted types
   /// (`ap_int<W>`, float/double) carry truncation and extension in their
@@ -950,7 +951,7 @@ void ModuleEmitter::emitStreamChannel(StreamOp op) {
   indent();
   emitValue(op.getChannel());
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 void ModuleEmitter::emitStreamRead(StreamReadOp op) {
@@ -962,7 +963,7 @@ void ModuleEmitter::emitStreamRead(StreamReadOp op) {
   emitValue(op.getChannel());
   os << ".read(";
   os << ");";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 void ModuleEmitter::emitStreamWrite(StreamWriteOp op) {
@@ -971,7 +972,7 @@ void ModuleEmitter::emitStreamWrite(StreamWriteOp op) {
   os << ".write(";
   emitValue(op.getValue());
   os << ");";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 /// Emits the AXI master shaping options for `type`, if it has any.
@@ -1047,7 +1048,22 @@ void ModuleEmitter::emitExtUI(arith::ExtUIOp op) {
   os << " = (ap_uint<" << op.getIn().getType().getIntOrFloatBitWidth() << ">)";
   emitValue(op.getIn(), rank);
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
+  emitNestedLoopFooter(rank);
+}
+
+template <typename CastOpType> void ModuleEmitter::emitFPToInt(CastOpType op) {
+  unsigned rank = emitNestedLoopHeader(op.getResult());
+  auto type = cast<IntegerType>(op.getResult().getType());
+  const char *prefix = type.isUnsigned() ? "uint" : "int";
+  unsigned width = type.getWidth();
+  if (width != 8 && width != 16 && width != 32 && width != 64)
+    width = 64;
+  indent();
+  emitValue(op.getResult(), rank);
+  os << " = (" << prefix << width << "_t)";
+  emitValue(op.getIn(), rank);
+  os << ";\n";
   emitNestedLoopFooter(rank);
 }
 
@@ -1059,7 +1075,7 @@ void ModuleEmitter::emitAssign(AssignOpType op) {
   os << " = ";
   emitValue(op.getOperand(), rank);
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
   emitNestedLoopFooter(rank);
 }
 
@@ -1088,7 +1104,7 @@ void ModuleEmitter::emitAffineSelect(hls::AffineSelectOp op) {
   os << " : ";
   emitValue(op.getFalseValue());
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 /// Control flow operation emitters.
@@ -1129,7 +1145,7 @@ void ModuleEmitter::emitCall(func::CallOp op) {
   }
 
   os << ");";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 /// Loop-carried values compile to ordinary variables: declared and
@@ -1189,7 +1205,7 @@ void ModuleEmitter::emitLoopCarryAssign(ValueRange results, ValueRange yields,
     os << " = ";
     emitValue(yielded, rank);
     os << ";";
-    emitInfoAndNewLine(op);
+    os << "\n";
     emitNestedLoopFooter(rank);
   }
 
@@ -1205,7 +1221,7 @@ void ModuleEmitter::emitLoopCarryAssign(ValueRange results, ValueRange yields,
                << " = ";
       emitValue(yields[idx]);
       os << ";";
-      emitInfoAndNewLine(op);
+      os << "\n";
       temps[idx] = temp;
     }
   }
@@ -1218,7 +1234,7 @@ void ModuleEmitter::emitLoopCarryAssign(ValueRange results, ValueRange yields,
     else
       emitValue(yields[idx]);
     os << ";";
-    emitInfoAndNewLine(op);
+    os << "\n";
   }
 }
 
@@ -1248,7 +1264,7 @@ void ModuleEmitter::emitScfFor(scf::ForOp op) {
   os << " += ";
   emitValue(op.getStep());
   os << ") {";
-  emitInfoAndNewLine(op);
+  os << "\n";
 
   addIndent();
 
@@ -1276,7 +1292,7 @@ void ModuleEmitter::emitScfIf(scf::IfOp op) {
   indent() << "if (";
   emitValue(op.getCondition());
   os << ") {";
-  emitInfoAndNewLine(op);
+  os << "\n";
 
   addIndent();
   emitBlock(op.getThenRegion().front());
@@ -1310,7 +1326,7 @@ void ModuleEmitter::emitScfYield(scf::YieldOp op) {
       os << " = ";
       emitValue(op.getOperand(resultIdx++), rank);
       os << ";";
-      emitInfoAndNewLine(op);
+      os << "\n";
       emitNestedLoopFooter(rank);
     }
   }
@@ -1368,7 +1384,7 @@ void ModuleEmitter::emitAffineFor(AffineForOp op) {
   // Emit increase step.
   emitValue(iterVar);
   os << " += " << op.getStep() << ") {";
-  emitInfoAndNewLine(op);
+  os << "\n";
 
   addIndent();
 
@@ -1411,7 +1427,7 @@ void ModuleEmitter::emitAffineIf(AffineIfOp op) {
       os << " && ";
   }
   os << ") {";
-  emitInfoAndNewLine(op);
+  os << "\n";
 
   addIndent();
   emitBlock(*op.getThenBlock());
@@ -1467,7 +1483,7 @@ void ModuleEmitter::emitAffineParallel(AffineParallelOp op) {
     // Emit increase step.
     emitValue(iterVar);
     os << " += " << steps[i] << ") {";
-    emitInfoAndNewLine(op);
+    os << "\n";
 
     addIndent();
   }
@@ -1489,7 +1505,7 @@ void ModuleEmitter::emitAffineApply(AffineApplyOp op) {
   AffineExprEmitter(state, affineMap.getNumDims(), op.getOperands())
       .emitAffineExpr(affineMap.getResult(0));
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 template <typename OpType>
@@ -1509,7 +1525,7 @@ void ModuleEmitter::emitAffineMaxMin(OpType op, const char *syntax) {
     os << ")";
   }
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 void ModuleEmitter::emitAffineLoad(AffineLoadOp op) {
@@ -1526,7 +1542,7 @@ void ModuleEmitter::emitAffineLoad(AffineLoadOp op) {
     os << "]";
   }
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 void ModuleEmitter::emitAffineStore(AffineStoreOp op) {
@@ -1543,7 +1559,7 @@ void ModuleEmitter::emitAffineStore(AffineStoreOp op) {
   os << " = ";
   emitValue(op.getValueToStore());
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 // The parent op declares the values a yield produces ahead of its regions
@@ -1567,7 +1583,7 @@ void ModuleEmitter::emitAffineYield(AffineYieldOp op) {
       os << " = ";
       emitValue(op.getOperand(resultIdx++), rank);
       os << ";";
-      emitInfoAndNewLine(op);
+      os << "\n";
       emitNestedLoopFooter(rank);
     }
   } else if (auto parentOp = dyn_cast<AffineParallelOp>(op->getParentOp())) {
@@ -1592,7 +1608,7 @@ void ModuleEmitter::emitAffineYield(AffineYieldOp op) {
       os << " = ";
       emitValue(op.getOperand(resultIdx++), rank);
       os << ";";
-      emitInfoAndNewLine(op);
+      os << "\n";
       emitNestedLoopFooter(rank);
     }
     reduceIndent();
@@ -1658,7 +1674,7 @@ void ModuleEmitter::emitAffineYield(AffineYieldOp op) {
         break;
       }
       os << ";";
-      emitInfoAndNewLine(op);
+      os << "\n";
       emitNestedLoopFooter(rank);
     }
     reduceIndent();
@@ -1728,7 +1744,7 @@ void ModuleEmitter::emitInsert(vector::InsertOp op) {
   os << "] = ";
   emitValue(op.getValueToStore());
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 void ModuleEmitter::emitExtract(vector::ExtractOp op) {
@@ -1743,7 +1759,7 @@ void ModuleEmitter::emitExtract(vector::ExtractOp op) {
   else
     emitValue(cast<Value>(position));
   os << "];";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 void ModuleEmitter::emitTransferRead(vector::TransferReadOp op) {
@@ -1763,7 +1779,7 @@ void ModuleEmitter::emitTransferRead(vector::TransferReadOp op) {
   for (auto index : indices)
     os << "[" << index << "]";
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 
   if (!condition.empty()) {
     reduceIndent();
@@ -1797,7 +1813,7 @@ void ModuleEmitter::emitTransferWrite(vector::TransferWriteOp op) {
   os << " = ";
   emitValue(op.getVector(), rank);
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 
   if (!condition.empty())
     reduceIndent();
@@ -1821,7 +1837,7 @@ void ModuleEmitter::emitBroadcast(vector::BroadcastOp op) {
     }
 
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
   emitNestedLoopFooter(rank);
 }
 
@@ -1843,7 +1859,7 @@ template <typename OpType> void ModuleEmitter::emitAlloc(OpType op) {
   indent();
   emitArrayDecl(op.getResult());
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
   emitArrayDirectives(op.getResult());
 }
 
@@ -1858,7 +1874,7 @@ void ModuleEmitter::emitLoad(memref::LoadOp op) {
     os << "]";
   }
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 void ModuleEmitter::emitStore(memref::StoreOp op) {
@@ -1872,7 +1888,7 @@ void ModuleEmitter::emitStore(memref::StoreOp op) {
   os << " = ";
   emitValue(op.getValueToStore());
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
 }
 
 void ModuleEmitter::emitMemCpy(memref::CopyOp op) {
@@ -1885,7 +1901,7 @@ void ModuleEmitter::emitMemCpy(memref::CopyOp op) {
   auto type = cast<MemRefType>(op.getTarget().getType());
   os << type.getNumElements() << " * sizeof("
      << getDataTypeName(op.getTarget().getType()) << "));";
-  emitInfoAndNewLine(op);
+  os << "\n";
   os << "\n";
 }
 
@@ -1897,7 +1913,7 @@ void ModuleEmitter::emitUnary(Operation *op, const char *syntax) {
   os << " = " << syntax << "(";
   emitValue(op->getOperand(0), rank);
   os << ");";
-  emitInfoAndNewLine(op);
+  os << "\n";
   emitNestedLoopFooter(rank);
 }
 
@@ -1910,7 +1926,7 @@ void ModuleEmitter::emitBinary(Operation *op, const char *syntax) {
   os << " " << syntax << " ";
   emitValue(op->getOperand(1), rank);
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
   emitNestedLoopFooter(rank);
 }
 
@@ -1924,7 +1940,7 @@ void ModuleEmitter::emitMaxMin(OpType op, const char *syntax) {
   os << ", ";
   emitValue(op.getRhs(), rank);
   os << ");";
-  emitInfoAndNewLine(op);
+  os << "\n";
   emitNestedLoopFooter(rank);
 }
 
@@ -1944,7 +1960,7 @@ void ModuleEmitter::emitSelect(arith::SelectOp op) {
   os << " : ";
   emitValue(op.getFalseValue(), rank);
   os << ";";
-  emitInfoAndNewLine(op);
+  os << "\n";
   emitNestedLoopFooter(rank);
 }
 
@@ -1969,7 +1985,7 @@ template <typename OpType> void ModuleEmitter::emitConstant(OpType op) {
         os << ", ";
     }
     os << "};";
-    emitInfoAndNewLine(op);
+    os << "\n";
   } else
     emitError(op, "has unsupported constant type.");
 }
@@ -2010,7 +2026,7 @@ void ModuleEmitter::emitValueDecl(Value val, bool isPtr) {
 }
 
 void ModuleEmitter::emitArrayDecl(Value array) {
-  auto arrayType = dyn_cast<MemRefType>(peelAxiType(array.getType()));
+  auto arrayType = cast<MemRefType>(peelAxiType(array.getType()));
 
   if (arrayType.hasStaticShape()) {
     emitValueDecl(array);
@@ -2070,25 +2086,6 @@ void ModuleEmitter::emitNestedLoopFooter(unsigned rank) {
   }
 }
 
-void ModuleEmitter::emitInfoAndNewLine(Operation *op) {
-  // The source location is a line number in the temporary MLIR file that fed
-  // this translation, which the reader of the C++ does not have. Only
-  // schedule and loop facts are worth carrying over.
-  std::string info;
-  llvm::raw_string_ostream infoOs(info);
-
-  if (auto timing = getTiming(op))
-    infoOs << " [" << timing.getBegin() << "," << timing.getEnd() << ")";
-
-  if (auto loopInfo = getLoopInfo(op))
-    infoOs << " iterCycle=" << loopInfo.getIterLatency()
-           << ", II=" << loopInfo.getMinII();
-
-  if (!info.empty())
-    os << "\t//" << info;
-  os << "\n";
-}
-
 /// MLIR component and HLS C++ pragma emitters.
 void ModuleEmitter::emitBlock(Block &block) {
   for (auto &op : block) {
@@ -2107,14 +2104,11 @@ void ModuleEmitter::emitLoopDirectives(Operation *loop) {
   if (!loopDirect)
     return;
 
-  if (!hasParallelAttr(loop) && !loopDirect.getDataflow() &&
-      enforceFalseDependency.getValue())
+  if (!hasParallelAttr(loop) && enforceFalseDependency.getValue())
     indent() << "#pragma HLS dependence false\n";
 
-  if (loopDirect.getPipeline()) {
+  if (loopDirect.getPipeline())
     indent() << "#pragma HLS pipeline II=" << loopDirect.getTargetII() << "\n";
-  } else if (loopDirect.getDataflow())
-    indent() << "#pragma HLS dataflow\n";
 }
 
 void ModuleEmitter::emitArrayDirectives(Value memref, bool isInterface) {
@@ -2184,6 +2178,14 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
                                            ArrayRef<Value> portList) {
   // Only top function should emit interface pragmas.
   if (hasTopFuncAttr(func)) {
+    // Inside a dataflow region every array is checked as a channel: one
+    // writer, one reader. A read-only port is not a channel -- its value
+    // is a run-long constant -- and several nodes reading it is the
+    // normal fan-out of an input raster. `stable` states exactly that
+    // contract, and without it Vitis rejects the design (HLS 200-779).
+    auto funcDirective = getFuncDirective(func);
+    bool isDataflow = funcDirective && funcDirective.getDataflow();
+
     indent() << "#pragma HLS interface s_axilite port=return bundle=ctrl\n";
     for (auto &port : portList) {
       // Axi ports are handled separately.
@@ -2206,6 +2208,13 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
         os << " port=";
         emitValue(port);
         os << "\n";
+
+        if (isDataflow && isa<MemRefType>(port.getType()) &&
+            getPortRole(port) == PortRole::In) {
+          indent() << "#pragma HLS stable variable=";
+          emitValue(port);
+          os << "\n";
+        }
 
       } else {
         // For scalar types, we always emit them as AXI-Lite ports.
@@ -2726,7 +2735,7 @@ void ModuleEmitter::emitGlobalTables() {
 
 void ModuleEmitter::emitFunction(func::FuncOp func) {
   if (func.getBlocks().size() != 1)
-    emitError(func, "has zero or more than one basic blocks.");
+    emitError(func, "must have exactly one basic block.");
 
   // Temporaries and loop counters restart in every function.
   state.localNameIdx = 0;
@@ -2736,22 +2745,9 @@ void ModuleEmitter::emitFunction(func::FuncOp func) {
   if (hasTopFuncAttr(func))
     os << "/// Top function of the design.\n";
 
-  if (auto timing = getTiming(func)) {
-    os << "/// Latency=" << timing.getLatency();
-    os << ", interval=" << timing.getInterval();
-    os << "\n";
-  }
-
-  if (auto resource = getResource(func)) {
-    os << "/// DSP=" << resource.getDsp();
-    os << ", BRAM=" << resource.getBram();
-    os << "\n";
-  }
-
   auto portList = assignPortNames(func);
   emitFunctionSignature(func, portList, /*asPrototype=*/false);
-  os << " {";
-  emitInfoAndNewLine(func);
+  os << " {\n";
 
   // Emit function body.
   addIndent();
