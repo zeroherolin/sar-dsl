@@ -7,13 +7,13 @@
 #include "sar/Dialect/HLS/IR/Utils.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
-#include "sar/Support/HLSHints.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IntegerSet.h"
+#include "sar/Support/HLSHints.h"
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -357,9 +357,8 @@ bool sar::isWritten(OpOperand &use) {
         SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
     if (!callee || callee.isExternal())
       return true; // unknown callee: assume the worst
-    return llvm::any_of(
-        callee.getArgument(use.getOperandNumber()).getUses(),
-        [](OpOperand &argUse) { return isWritten(argUse); });
+    return llvm::any_of(callee.getArgument(use.getOperandNumber()).getUses(),
+                        [](OpOperand &argUse) { return isWritten(argUse); });
   }
   return hasEffect<MemoryEffects::Write>(use.getOwner(), use.get()) ||
          isa<StreamWriteOp>(use.getOwner());

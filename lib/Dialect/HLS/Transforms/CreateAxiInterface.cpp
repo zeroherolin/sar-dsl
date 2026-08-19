@@ -397,10 +397,9 @@ struct CreateAxiInterface
           auto leftConflicts = conflicts(0), rightConflicts = conflicts(1);
           if (rightCost < leftCost)
             bank = 1;
-          else if (rightCost == leftCost &&
-                   (rightConflicts < leftConflicts ||
-                    (rightConflicts == leftConflicts &&
-                     payload[1] < payload[0])))
+          else if (rightCost == leftCost && (rightConflicts < leftConflicts ||
+                                             (rightConflicts == leftConflicts &&
+                                              payload[1] < payload[0])))
             bank = 1;
           banks[bank].push_back(buffer);
           lifetimes[bank].push_back(live);

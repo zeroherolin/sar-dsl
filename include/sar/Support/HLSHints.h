@@ -1,4 +1,5 @@
-//===- HLSHints.h - hint-attribute contract with the HLS backend -*- C++ -*-===//
+//===- HLSHints.h - hint-attribute contract with the HLS backend -*- C++
+//-*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
