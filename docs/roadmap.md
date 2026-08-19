@@ -20,8 +20,8 @@ records its validation boundary and open compiler work.
 - Complete N=32 designs for all four algorithms pass Vitis HLS 2022.2
   C-simulation and synthesis at the 4 ns target.
 - 16384 × 16384 c64 omega-K, Range-Doppler, and Chirp Scaling designs complete
-  synthesis. WKA estimates 3.187 ns against the 4 ns target; RDA and CSA miss
-  it. Implementation timing remains outside this scope.
+  synthesis. WKA estimates 2.92 ns against the 4 ns target at 10.6G cycles;
+  RDA and CSA miss it. Implementation timing remains outside this scope.
 - A Polar Format c64 design completes N=8192 synthesis within resource
   budgets; its 6.067 ns estimate remains open timing work.
 - Shapes are static and specialize per geometry. The CPU backend is validated
@@ -33,6 +33,10 @@ Measured accuracy, performance, and resource data are in
 
 ## Open compiler work
 
+- Vectorize external DRAM ports to wide beats: scalar `m_axi` ports cap
+  at one element per cycle whatever the loop shape, and the wide-port
+  transfers are the dominant remaining latency gap to the hand-written
+  design.
 - Reuse one parameterized FFT engine across compatible transform call sites.
 - Externalize large axis/window tables and deduplicate size-specialized copy
   loops to reduce extreme-raster source and synthesis time.

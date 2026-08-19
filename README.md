@@ -215,7 +215,7 @@ C-simulation at regression sizes. The following rows are complete 16384² c64
 
 | Design | Clock | Latency cycles | Latency time | csynth time |
 |---|---:|---:|---:|---:|
-| WKA, generated | 3.187 ns | 13,185,679,397 | 42.023 s | 216.21 s |
+| WKA, generated | 2.920 ns | 10,623,107,115 | 31.020 s | 320.40 s |
 | WKA, hand-written | 3.500 ns | 2,033,373,247 | 7.117 s | 201.24 s |
 | RDA, generated | 5.840 ns | 42,162,307,154 | 246.228 s | 199.44 s |
 | CSA, generated | 5.698 ns | 25,257,394,240 | 143.917 s | 187.00 s |
@@ -224,13 +224,14 @@ Resource counts and percentages of the full default VU13P device:
 
 | Design | BRAM18K | URAM | DSP | FF | LUT |
 |---|---:|---:|---:|---:|---:|
-| WKA, generated | 162 (3.01%) | 296 (23.12%) | 539 (4.39%) | 153,845 (4.45%) | 252,020 (14.58%) |
+| WKA, generated | 128 (2.38%) | 808 (63.12%) | 1,202 (9.78%) | 359,742 (10.41%) | 386,544 (22.37%) |
 | WKA, hand-written | 384 (7.14%) | 296 (23.12%) | 1,135 (9.24%) | 210,325 (6.09%) | 373,962 (21.64%) |
 | RDA, generated | 96 (1.79%) | 260 (20.31%) | 173 (1.41%) | 111,871 (3.24%) | 223,167 (12.91%) |
 | CSA, generated | 64 (1.19%) | 288 (22.50%) | 269 (2.19%) | 111,795 (3.23%) | 217,079 (12.56%) |
 
-Generated WKA meets the 4 ns target. Its estimated latency is 6.48× the
-worst-case cycles of the independent hand-written baseline. The baseline uses
+Generated WKA meets the 4 ns target. Its estimated latency is 5.22× the
+worst-case cycles of the independent hand-written baseline (4.36× in
+estimated time). The baseline uses
 packed AXI and a different microarchitecture, so the comparison is directional
 rather than like-for-like. Vitis reports a latency range for the hand-written
 design because it reuses transform and corner-turn instances across runtime

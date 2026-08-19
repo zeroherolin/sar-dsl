@@ -29,14 +29,19 @@ and synthesizable Vitis HLS C++.
   rechecked, spilled lifetimes are colored across two scratch masters per
   scalar type, and a design that cannot fit even fully streamed fails
   compilation.
-  Mixed-radix FFT grouping, row parallelism, tiling, and banking are derived
-  per kernel and reported with provenance in each generated manifest.
+  Mixed-radix FFT grouping, lane parallelism, transfer unrolling, tiling,
+  and banking are derived per kernel and reported with provenance in each
+  generated manifest. The affine FFT works on prefetched on-chip line
+  blocks with the lane loop innermost; lowerings pin the banking their
+  access patterns need through partition hints, and the scratch masters
+  are colored to keep read and write streams of one loop apart.
 - **Algorithms and validation**: four complete imaging chains (omega-K,
   Range-Doppler, Chirp Scaling, Polar Format + SVA) validated against
   NumPy references; the three stripmap chains also run on real ALOS-1
   data, while PFA uses a synthetic spotlight collection. All pass
   generated C-simulation at both precisions. N=32 designs for all four
-  algorithms and the 16384² c64 WKA design meet the 4 ns Vitis HLS estimate;
+  algorithms and the 16384² c64 WKA design meet the 4 ns Vitis HLS estimate
+  (WKA at 2.92 ns, 10.6G cycles);
   16384² Range-Doppler and Chirp Scaling synthesize within resource budgets
   but miss 4 ns. The WKA example also includes an
   independent hand-written FP32 HLS implementation documenting packed
