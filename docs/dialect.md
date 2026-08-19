@@ -110,10 +110,11 @@ Passes:
   linalg-on-tensors. Signal ops are illegal here.
 - `--convert-sar-signal-to-runtime`: `fft`/`ifft`/`interp1d` to
   `libsar_runtime` calls (`_mlir_ciface_sar_rt_*`).
-- `--convert-sar-fft-to-affine`: `fft_split` to mixed radix-4/2 Stockham affine
-  loop nests; non-power-of-two sizes go through Bluestein's chirp-z
-  reduction. Why those two algorithms:
-  [architecture.md](architecture.md#6-hls-backend).
+- `--convert-sar-fft-to-affine`: `fft_split` to mixed radix-4/2 Stockham
+  affine loop nests working on prefetched on-chip line blocks, with the
+  lane loop innermost and banking hints on the buffers; non-power-of-two
+  sizes go through Bluestein's chirp-z reduction. Why those two
+  algorithms: [architecture.md](architecture.md#6-hls-backend).
 - `--convert-sar-interp-to-affine`: `interp1d_split` to affine loops
   with the interpolation taps statically unrolled (the Kaiser window's
   Bessel `I0` expands into a straight-line power series); gathers use
@@ -163,9 +164,10 @@ Registered pipelines (see `lib/Pipelines/`):
 - `--sar-to-affine-pipeline`: split-complex affine/memref hand-off; this
   is what the HLS backend compiles from. Options: `fft-stage-group`
   (Stockham stages per scratch slot, 0 = full unroll),
-  `fft-parallel-rows` (independent rows per compact unrolled engine),
-  `reuse-buffer-min-elements` and `recompute-min-elements` (the sharing
-  and recompute thresholds of the passes above),
+  `fft-parallel-rows` (lanes per prefetched FFT line block),
+  `fft-io-unroll` (elements per external access in the FFT transfer
+  sweeps), `reuse-buffer-min-elements` and `recompute-min-elements` (the
+  sharing and recompute thresholds of the passes above),
   `transpose-block-bytes` (staged corner-turn block size; 0 leaves
   transposes unstaged) and `interp-enable-banded-gather` (allow the
   banded interpolation gather).

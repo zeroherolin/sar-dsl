@@ -253,11 +253,17 @@ What remains strided in the omega-K chain at `512 x 512`:
 | Block fills of the staged corner turns | 10 | a transpose must stride one side; the block bounds the stride by the staging budget rather than the scene |
 | Stolt band gather reads | 4 | not cross-row (the innermost loop drives the fastest axis) but non-affine: the address is clamped against the raster edge, and the position it clamps is computed from the data |
 
-### FFT stage grouping and row parallelism
+### FFT line blocks, lanes and stage grouping
 
 A power-of-two Stockham transform uses radix-4 stages plus one radix-2 stage
-when the exponent is odd, for `ceil(log2(N)/2)` butterfly passes. With
-`fft_stage_group=0`, each intermediate pass writes its own scratch line.
+when the exponent is odd, for `ceil(log2(N)/2)` butterfly passes. Lines are
+processed in blocks of `fft_parallel_rows` lanes: a prefetch sweep copies the
+block from the source planes into on-chip line buffers with unit-stride
+external accesses (`fft_io_unroll` elements per access, so an AXI master can
+burst), the butterfly stages run entirely on chip with the lane loop
+innermost -- one twiddle fetch per butterfly is shared by every lane -- and a
+mirrored sweep writes the block back. Between prefetch and write-back, with
+`fft_stage_group=0`, each intermediate pass writes its own scratch block.
 
 `fft_stage_group` trades that overlap for area. With `k > 0` the stages
 are packed into groups that share scratch, cutting the live buffers to
@@ -273,11 +279,16 @@ destination were the same line would overwrite values a later iteration
 still has to read. A grouping at or above the mixed-radix stage count
 saturates at that floor rather than collapsing to one buffer.
 
-`fft_parallel_rows` is derived from complete complex samples per AXI beat
-and the DSP budget. Each lane owns separate scratch; the generated C++ keeps
-one compact lane loop with an HLS unroll directive instead of cloning every
-stage in source. Values may be pinned for synthesis experiments, but they are
-compiler strategy rather than required user constraints.
+`fft_parallel_rows` is bounded by the DSP budget (about six slices per
+butterfly lane and stage, charged across every transform site) and by what
+the banked line blocks cost the block-RAM tiers. Each lane owns its banks --
+the line buffers are hinted complete over the lane dimension, which no local
+access analysis could recover from the compact lane loop -- and the generated
+C++ keeps one lane loop with an HLS unroll directive instead of cloning every
+stage in source. `fft_io_unroll` is half a bus beat per plane, since the real
+and imaginary sweeps run in one loop. Values may be pinned for synthesis
+experiments, but they are compiler strategy rather than required user
+constraints.
 
 Each stage keeps its own affine loop nest whatever the grouping: stage
 t+1 reads elements that many different iterations of stage t produce, so
@@ -480,7 +491,8 @@ marks those keys `derived`. The policy lives in
 | Derived | From |
 |---------|------|
 | `fft_stage_group` | the least grouping whose Stockham scratch fits the working share of the on-chip budget; full unroll where it fits |
-| `fft_parallel_rows` | complete complex samples per AXI beat, bounded by the DSP budget |
+| `fft_parallel_rows` | lanes per prefetched line block, bounded by the DSP budget across all transform sites and by the banked line buffers' block-RAM cost |
+| `fft_io_unroll` | elements per external access in the FFT transfer sweeps: half a bus beat per plane |
 | `loop_tile_size` | the element count in one bus beat, bounded by the pass limits |
 | `lutram_max_bytes` | one bus beat: a bank no larger than one transfer does not earn a block RAM primitive |
 | `array_partition_max_factor` | the largest power-of-two bank count no wider than one AXI beat; reduced automatically if final primitive accounting exceeds a cap |

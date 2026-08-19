@@ -280,7 +280,11 @@ def fft_parallel_rows(facts: KernelFacts, dsp_budget: int, budget: int,
                       for length, _ in facts.transforms)
     dsp_lanes = max(1, dsp_budget // max(1, stage_lanes))
     lanes = 1 << (min(dsp_lanes, 16).bit_length() - 1)
-    while lanes > 1 and _fft_scratch_bytes(facts.transforms, 0, lanes,
+    # Feasibility is checked at the saturated stage grouping (the two-slot
+    # floor), because that is what the grouping decision itself falls back
+    # to under the same pressure; checking at full unroll would give up
+    # lanes to scratch the design will never allocate.
+    while lanes > 1 and _fft_scratch_bytes(facts.transforms, 64, lanes,
                                            io) > budget // 2:
         lanes >>= 1
     return lanes if lanes > 1 else 0

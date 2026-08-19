@@ -165,10 +165,16 @@ All kernels follow the split-complex affine path (`sar-to-affine-pipeline`):
    Cooley-Tukey: it needs no bit-reversal permutation, so every access is
    an affine function of loop indices -- which is what HLS loop analysis,
    pipelining and array partitioning require. Twiddle factors are
-   precomputed into constant memref globals. Radix-4 halves the stage count
-   where possible. Stages share reusable line-sized scratch slots, and a
-   compact lane loop processes the bandwidth- and DSP-derived number of rows
-   without cloning the complete stage graph in generated source.
+   precomputed into constant memref globals, padded so the three radix-4
+   reads of one butterfly bank apart. Radix-4 halves the stage count where
+   possible. Lines are transformed in blocks: a prefetch sweep copies each
+   block into on-chip line buffers with unit-stride external accesses, the
+   butterfly stages run on chip with a compact DSP-budgeted lane loop
+   innermost (each twiddle fetch shared across lanes, the stage chain
+   drawing scratch blocks from a reusable pool), and a mirrored sweep
+   writes the block back -- so the external planes only ever see
+   burst-friendly transfers. The buffers carry banking hints
+   (`hls.partition_*`) the backend's partition pass applies verbatim.
 
    Corner turns -- the transposes that carry a raster between the range and
    azimuth domains -- are staged through an on-chip block
