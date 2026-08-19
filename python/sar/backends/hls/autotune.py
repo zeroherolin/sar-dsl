@@ -264,21 +264,22 @@ def fft_parallel_rows(facts: KernelFacts, dsp_budget: int, budget: int,
 
     Lines are prefetched in blocks, so lane parallelism no longer multiplies
     external traffic -- the transfers stay unit-stride whatever the count.
-    What lanes do consume is DSP slices (one butterfly datapath each, ~512
-    slices with the f64 position arithmetic around it) and line-buffer
-    banks, whose block RAM cost the scratch model charges per lane. The
-    lane count is the largest power of two both budgets accept, capped at
-    16: past that the banked line buffers outgrow what placement can pay.
-    A result of one is represented as zero because the pass uses zero to
-    mean "serial lines".
+    What lanes do consume is DSP slices and line-buffer banks. Every
+    transform site instantiates its own stage datapaths, so the arithmetic
+    bound charges lanes across all sites and stages (about six slices per
+    butterfly lane and stage at the achieved II, calibrated against
+    synthesized designs); the memory bound charges the banked line blocks
+    against the block-RAM tiers, which is where they live. The lane count
+    is the largest power of two both accept, capped at 16. A result of one
+    is represented as zero because the pass uses zero to mean "serial
+    lines".
     """
     if not facts.transforms:
         return 0
-    dsp_lanes = max(1, dsp_budget // 512)
+    stage_lanes = sum(6 * _transform_stages(length)[0]
+                      for length, _ in facts.transforms)
+    dsp_lanes = max(1, dsp_budget // max(1, stage_lanes))
     lanes = 1 << (min(dsp_lanes, 16).bit_length() - 1)
-    # Line buffers live in the block tiers and pay a whole primitive per
-    # bank, so the check is against BRAM+URAM, not the aggregate that
-    # includes distributed RAM.
     while lanes > 1 and _fft_scratch_bytes(facts.transforms, 0, lanes,
                                            io) > budget // 2:
         lanes >>= 1

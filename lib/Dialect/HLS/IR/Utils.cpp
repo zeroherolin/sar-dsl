@@ -350,6 +350,17 @@ bool sar::isWritten(OpOperand &use) {
   else if (auto view = dyn_cast<ViewLikeOpInterface>(use.getOwner()))
     return llvm::any_of(view->getUses(),
                         [](OpOperand &viewUse) { return isWritten(viewUse); });
+  else if (auto call = dyn_cast<func::CallOp>(use.getOwner())) {
+    // Once dataflow nodes are outlined the effects live in the callee;
+    // follow the operand to the matching argument.
+    auto callee = dyn_cast_or_null<func::FuncOp>(
+        SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+    if (!callee || callee.isExternal())
+      return true; // unknown callee: assume the worst
+    return llvm::any_of(
+        callee.getArgument(use.getOperandNumber()).getUses(),
+        [](OpOperand &argUse) { return isWritten(argUse); });
+  }
   return hasEffect<MemoryEffects::Write>(use.getOwner(), use.get()) ||
          isa<StreamWriteOp>(use.getOwner());
 }

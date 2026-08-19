@@ -150,11 +150,15 @@ def test_parallelism_needs_a_transform():
 def test_parallelism_respects_the_dsp_budget():
     facts = _facts(transforms=((1024, 4), ))
     plenty = 1 << 30
-    # One lane's worth of DSP slices means serial lines.
-    assert fft_parallel_rows(facts, 1023, plenty) == 0
-    assert fft_parallel_rows(facts, 1024, plenty) == 2
-    # The VU13P budget affords the full 16 lanes.
+    # A 1024-point transform runs five stages; each lane costs about six
+    # slices per stage. One lane's worth means serial lines.
+    assert fft_parallel_rows(facts, 30, plenty) == 0
+    assert fft_parallel_rows(facts, 60, plenty) == 2
+    # The VU13P budget affords the full 16 lanes, even across the four
+    # transform sites of a complete chain.
     assert fft_parallel_rows(facts, 9830, plenty) == 16
+    four_sites = _facts(transforms=((1024, 4), ) * 4)
+    assert fft_parallel_rows(four_sites, 9830, plenty) == 16
 
 
 def test_parallelism_respects_the_memory_budget():

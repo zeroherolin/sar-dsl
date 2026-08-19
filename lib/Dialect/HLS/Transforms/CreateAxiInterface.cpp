@@ -344,33 +344,48 @@ struct CreateAxiInterface
       return std::pair(first, last);
     };
     for (Type elementType : scratchTypes) {
+      using UserDirs = DenseMap<Operation *, unsigned>; // 1=read, 2=written
       std::array<SmallVector<hls::BufferLikeInterface>, 2> banks;
       std::array<SmallVector<std::pair<unsigned, unsigned>>, 2> lifetimes;
-      std::array<SmallVector<DenseSet<Operation *>>, 2> bankUsers;
+      std::array<SmallVector<UserDirs>, 2> bankUsers;
       std::array<uint64_t, 2> payload = {0, 0};
       for (auto buffer : func.getOps<hls::BufferLikeInterface>()) {
         if (isExtBuffer(buffer.getMemref()) && !isa<ConstBufferOp>(*buffer) &&
             buffer.getMemrefType().getElementType() == elementType) {
           auto live = interval(buffer);
-          // The top-level operations that read or write this buffer. Two
-          // buffers touched by the same operation contend for the master
-          // every iteration -- a split-complex sweep reads its real and
-          // imaginary planes in one loop -- so sharing users is the
-          // costliest way two buffers can share a port.
-          DenseSet<Operation *> users;
+          // How each top-level operation touches this buffer. Two buffers
+          // under one loop contend for the master every iteration, and the
+          // direction decides how badly: a read stream and a write stream
+          // interlock their requests and responses (II in the tens), while
+          // two same-direction streams merely halve the issue rate. The
+          // split-complex sweeps this backend emits read re/im pairs and
+          // write re/im pairs in one loop, so the coloring keeps opposing
+          // directions apart first and splits same-direction pairs second.
+          UserDirs users;
           for (OpOperand &use : buffer.getMemref().getUses()) {
             Operation *owner = use.getOwner();
+            Operation *leaf = owner;
             while (owner->getParentOp() != func && owner->getParentOp())
               owner = owner->getParentOp();
-            if (owner->getParentOp() == func)
-              users.insert(owner);
+            if (owner->getParentOp() != func)
+              continue;
+            unsigned dir = isWritten(use) ? 2 : 1;
+            // A call reads and writes through its own body; be pessimistic
+            // only when the operand is genuinely written there.
+            (void)leaf;
+            users[owner] |= dir;
           }
-          auto coAccess = [&](unsigned bank) {
-            unsigned count = 0;
+          auto cost = [&](unsigned bank) {
+            uint64_t total = 0;
             for (const auto &other : bankUsers[bank])
-              for (Operation *op : users)
-                count += other.contains(op);
-            return count;
+              for (auto [op, dir] : users) {
+                auto it = other.find(op);
+                if (it == other.end())
+                  continue;
+                unsigned both = dir | it->second;
+                total += both == 3 ? 16 : 1;
+              }
+            return total;
           };
           auto conflicts = [&](unsigned bank) {
             return llvm::count_if(lifetimes[bank], [&](auto other) {
@@ -378,11 +393,11 @@ struct CreateAxiInterface
             });
           };
           unsigned bank = 0;
-          auto leftShared = coAccess(0), rightShared = coAccess(1);
+          auto leftCost = cost(0), rightCost = cost(1);
           auto leftConflicts = conflicts(0), rightConflicts = conflicts(1);
-          if (rightShared < leftShared)
+          if (rightCost < leftCost)
             bank = 1;
-          else if (rightShared == leftShared &&
+          else if (rightCost == leftCost &&
                    (rightConflicts < leftConflicts ||
                     (rightConflicts == leftConflicts &&
                      payload[1] < payload[0])))
