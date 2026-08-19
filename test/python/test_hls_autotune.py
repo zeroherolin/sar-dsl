@@ -141,17 +141,34 @@ class TestLoopTileSize:
 # ---------------------------------------------------------------------- #
 
 
-def test_parallelism_follows_bus_width_and_precision():
-    assert fft_parallel_rows(_facts(element_bytes=8), 512, 9830) == 2
-    assert fft_parallel_rows(_facts(element_bytes=4), 512, 9830) == 2
-    assert fft_parallel_rows(_facts(element_bytes=4), 128, 9830) == 0
-    assert fft_parallel_rows(_facts(element_bytes=4), 512, 9830, "axi") == 0
+def test_parallelism_needs_a_transform():
+    # Lanes belong to the transform engine; a kernel without one has no
+    # engine to widen.
+    assert fft_parallel_rows(_facts(), 9830, 1 << 30) == 0
 
 
 def test_parallelism_respects_the_dsp_budget():
-    facts = _facts(element_bytes=4)
-    assert fft_parallel_rows(facts, 512, 1023) == 0
-    assert fft_parallel_rows(facts, 512, 1024) == 2
+    facts = _facts(transforms=((1024, 4), ))
+    plenty = 1 << 30
+    # One lane's worth of DSP slices means serial lines.
+    assert fft_parallel_rows(facts, 1023, plenty) == 0
+    assert fft_parallel_rows(facts, 1024, plenty) == 2
+    # The VU13P budget affords the full 16 lanes.
+    assert fft_parallel_rows(facts, 9830, plenty) == 16
+
+
+def test_parallelism_respects_the_memory_budget():
+    facts = _facts(transforms=((1024, 4), ))
+    # A tight on-chip budget pulls the lane count down before the DSP
+    # budget would.
+    assert fft_parallel_rows(facts, 9830, 1 << 22) < 16
+
+
+def test_io_unroll_is_half_a_beat_per_plane():
+    from sar.backends.hls.autotune import fft_io_unroll
+    assert fft_io_unroll(_facts(transforms=((1024, 4), )), 512) == 8
+    assert fft_io_unroll(_facts(transforms=((1024, 8), )), 512) == 4
+    assert fft_io_unroll(_facts(), 512) == 1
 
 
 def test_partition_factor_is_bounded_by_one_bus_beat():

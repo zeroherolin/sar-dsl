@@ -158,9 +158,18 @@ OPTIONS: Dict[str, _Spec] = {
           nullable=True,
           advanced=True),
     "fft_parallel_rows":
-    _Spec("int", "FFT rows computed in parallel (0 disables row unrolling, "
-          "null = the compiler derives it from bandwidth and DSP constraints)",
+    _Spec("int", "FFT lines transformed in parallel per prefetched block "
+          "(0 disables lane parallelism, null = the compiler derives it "
+          "from the DSP and memory constraints)",
           minimum=0,
+          maximum=1024,
+          nullable=True,
+          power_of_two=True,
+          advanced=True),
+    "fft_io_unroll":
+    _Spec("int", "Elements each FFT prefetch/write-back access moves (one "
+          "bus beat lets the AXI port widen; null = the compiler decides)",
+          minimum=1,
           maximum=1024,
           nullable=True,
           power_of_two=True,

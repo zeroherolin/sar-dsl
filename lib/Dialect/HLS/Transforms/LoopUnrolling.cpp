@@ -13,19 +13,26 @@
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
+#include "sar/Support/HLSHints.h"
 
 using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
 using namespace sar::hls;
 
-/// Fully unroll all loops insides of a block.
+/// Fully unroll all loops insides of a block. Loops carrying an unroll
+/// directive stay standing: they are compact stand-ins the emitter unrolls
+/// through a pragma, and cloning them here is exactly what the directive
+/// exists to avoid.
 bool sar::applyFullyLoopUnrolling(Block &block, unsigned maxIterNum) {
   for (unsigned i = 0; i < maxIterNum; ++i) {
     bool hasFullyUnrolled = true;
-    block.walk([&](AffineForOp loop) {
+    block.walk<WalkOrder::PreOrder>([&](AffineForOp loop) {
+      if (loop->hasAttr(kUnrollFactorAttr))
+        return WalkResult::skip();
       if (failed(loopUnrollFull(loop)))
         hasFullyUnrolled = false;
+      return WalkResult::advance();
     });
 
     if (hasFullyUnrolled)

@@ -7,6 +7,7 @@
 #include "sar/Dialect/HLS/IR/Utils.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
+#include "sar/Support/HLSHints.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -1001,7 +1002,18 @@ void sar::getLoopBands(Block &block, AffineLoopBands &bands,
                        bool allowHavingChilds) {
   bands.clear();
   block.walk([&](AffineForOp loop) {
-    auto childNum = getChildLoopNum(loop);
+    // A loop carrying an unroll directive is a compact stand-in for
+    // parallel lanes: it belongs to the body of the loop above it, not to
+    // the band, so neither it nor its presence as a child counts here.
+    if (loop->hasAttr(kUnrollFactorAttr))
+      return;
+    unsigned childNum = 0;
+    for (auto &region : loop->getRegions())
+      for (auto &childBlock : region)
+        for (auto &op : childBlock)
+          if (auto child = dyn_cast<AffineForOp>(op))
+            if (!child->hasAttr(kUnrollFactorAttr))
+              ++childNum;
 
     if (childNum == 0 || (childNum > 1 && allowHavingChilds)) {
       AffineLoopBand band;

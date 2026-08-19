@@ -28,6 +28,7 @@
 #include "sar/Conversion/Passes.h"
 #include "sar/Dialect/SAR/IR/SARDialect.h"
 #include "sar/Dialect/SAR/IR/SAROps.h"
+#include "sar/Support/HLSHints.h"
 
 #include "llvm/ADT/StringSwitch.h"
 
@@ -543,6 +544,16 @@ static void emitBandedBody(OpBuilder &b, Location loc, ScalarBuilder &s,
 
   Value bandRe = memref::AllocOp::create(b, loc, bandType);
   Value bandIm = memref::AllocOp::create(b, loc, bandType);
+  // Every unrolled tap reads the band in the same cycle through a
+  // data-dependent index no affine analysis can bank; registers are the
+  // only layout that serves them all. Wide bands would burn a register
+  // per element, so they keep the default banking and pay the port limit.
+  if (bandW <= 128)
+    for (Value band : {bandRe, bandIm}) {
+      auto *alloc = band.getDefiningOp();
+      alloc->setAttr(kPartitionKindsAttr, b.getStrArrayAttr({"complete"}));
+      alloc->setAttr(kPartitionFactorsAttr, b.getI64ArrayAttr({bandW}));
+    }
 
   Value maskI =
       arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(bandW - 1));

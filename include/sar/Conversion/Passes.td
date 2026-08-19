@@ -37,6 +37,14 @@ def ConvertSARFFTToAffine : Pass<"convert-sar-fft-to-affine", "ModuleOp"> {
     twiddle-factor globals. Stockham requires no bit-reversal, so all accesses
     are affine -- suitable for HLS flows.
 
+    Lines are processed in blocks of `fft-parallel-rows` lanes: a prefetch
+    sweep copies the block into on-chip line buffers with unit-stride
+    external accesses (`fft-io-unroll` elements per beat, so an AXI port
+    can widen and burst), the butterfly stages run on the line buffers
+    with the lane loop innermost sharing each twiddle fetch, and a
+    mirrored sweep writes the block back. Line buffers carry banking
+    hints matched to the transfer and butterfly strides.
+
     Sizes that are not powers of two are handled by Bluestein's chirp-z
     reduction: the DFT becomes a convolution carried by two padded
     Stockham transforms, with the chirp and the kernel spectrum folded
@@ -76,7 +84,11 @@ def ConvertSARFFTToAffine : Pass<"convert-sar-fft-to-affine", "ModuleOp"> {
            "buffer group">,
     Option<"fftParallelRows", "fft-parallel-rows", "unsigned",
            /*default=*/"0",
-           "Power-of-two row unroll factor; 0 keeps one row in flight">
+           "Power-of-two lane count: lines transformed in parallel per "
+           "prefetched block; 0 or 1 keeps one line in flight">,
+    Option<"fftIoUnroll", "fft-io-unroll", "unsigned", /*default=*/"1",
+           "Elements moved per external access in the prefetch/write-back "
+           "sweeps (one bus beat's worth lets the AXI port widen)">
   ];
 }
 

@@ -2611,17 +2611,23 @@ static std::string describeTable(DenseElementsAttr attr, unsigned idx) {
     if (isRamp)
       return ("kAxis" + Twine(idx) + "_" + Twine(n)).str();
 
-    // Unit-bounded tables of 2^k-1 entries are the FFT twiddle layout; the
-    // first entry separates the sine table from the cosine one.
+    // Unit-bounded tables are the FFT twiddle layout: L-1 entries for an
+    // L-point transform, padded up to a multiple of three so the three
+    // radix-4 reads of one butterfly can be banked apart. Depending on
+    // log2(L) that leaves L-1 or L+1 stored entries; the first entry
+    // separates the sine table from the cosine one.
     bool unitBounded = true;
     for (double v : values)
       unitBounded &= std::abs(v) <= 1.0;
-    int64_t points = n + 1;
-    if (unitBounded && points >= 4 && (points & (points - 1)) == 0) {
-      if (values[0] == 0.0)
-        return ("kTwiddleSin_" + Twine(points)).str();
-      if (values[0] == 1.0)
-        return ("kTwiddleCos_" + Twine(points)).str();
+    if (unitBounded && n >= 3) {
+      for (int64_t points : {n + 1, n - 1})
+        if (points >= 4 && (points & (points - 1)) == 0 &&
+            (points - 1 + 2) / 3 * 3 == n) {
+          if (values[0] == 0.0)
+            return ("kTwiddleSin_" + Twine(points)).str();
+          if (values[0] == 1.0)
+            return ("kTwiddleCos_" + Twine(points)).str();
+        }
     }
   }
 

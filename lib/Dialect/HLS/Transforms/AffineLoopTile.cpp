@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Affine/Utils.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
+#include "sar/Support/HLSHints.h"
 
 namespace mlir {
 namespace sar {
@@ -309,6 +310,17 @@ struct AffineLoopTile : public sar::impl::AffineLoopTileBase<AffineLoopTile> {
 
     // Tile each band.
     for (auto &band : bands) {
+      // A band holding a compact unrolled lane loop was shaped by its
+      // lowering -- transfer order, banking and unrolling are already
+      // decided -- so tiling or interchanging it can only undo that.
+      if (band.front()
+              ->walk([&](AffineForOp loop) {
+                return loop->hasAttr(kUnrollFactorAttr)
+                           ? WalkResult::interrupt()
+                           : WalkResult::advance();
+              })
+              .wasInterrupted())
+        continue;
       auto layout = getStreamingLayout(band);
 
       // Put the dimension the accesses stream along innermost. A sweep of

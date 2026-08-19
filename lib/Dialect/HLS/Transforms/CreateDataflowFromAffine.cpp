@@ -7,6 +7,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
+#include "sar/Support/HLSHints.h"
 
 namespace mlir {
 namespace sar {
@@ -33,9 +34,13 @@ struct TaskPartition : public OpRewritePattern<DispatchOp> {
         }))
       return failure();
     auto &block = dispatch.getRegion().front();
-    if (llvm::none_of(block, [](Operation &op) {
-          return isa<AffineForOp, scf::ForOp>(op);
-        }))
+    auto isTaskSeed = [](Operation &op) {
+      // Compact unrolled lane loops are body, not tasks (see the band
+      // filter in the pass entry).
+      return isa<AffineForOp, scf::ForOp>(op) &&
+             !op.hasAttr(kUnrollFactorAttr);
+    };
+    if (llvm::none_of(block, isTaskSeed))
       return failure();
 
     // Fuse operations into dataflow tasks: each loop seeds a task and takes
@@ -49,7 +54,7 @@ struct TaskPartition : public OpRewritePattern<DispatchOp> {
         // Allocations stay outside tasks at the beginning of the block.
         op.moveBefore(&block, block.begin());
 
-      } else if (isa<AffineForOp, scf::ForOp>(op)) {
+      } else if (isTaskSeed(op)) {
         // Each loop roots a task together with the operations collected before
         // it.
         opsToFuse.push_back(&op);
@@ -85,8 +90,19 @@ struct CreateDataflowFromAffine
     dispatchBlock(&func.front());
     AffineLoopBands targetBands;
     getLoopBands(func.front(), targetBands, /*allowHavingChilds=*/true);
-    for (auto &band : llvm::reverse(targetBands))
-      dispatchBlock(band.back().getBody());
+    for (auto &band : llvm::reverse(targetBands)) {
+      // A body whose only loops are compact unrolled lanes is a leaf
+      // compute body: the lane loop stands in for parallel copies of the
+      // body, not for a task, and carving it out would put a call where
+      // the enclosing loop needs a pipeline.
+      auto *body = band.back().getBody();
+      bool hasTaskableLoop = llvm::any_of(*body, [](Operation &op) {
+        return isa<AffineForOp, scf::ForOp>(op) &&
+               !op.hasAttr(kUnrollFactorAttr);
+      });
+      if (hasTaskableLoop)
+        dispatchBlock(body);
+    }
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<TaskPartition>(context);

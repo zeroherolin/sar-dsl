@@ -468,7 +468,8 @@ class Backend(BaseBackend):
                         f"transpose-block-bytes={staging} "
                         f"interp-enable-banded-gather={banded} "
                         f"fft-stage-group={int(config.fft_stage_group)} "
-                        f"fft-parallel-rows={int(config.fft_parallel_rows)}")
+                        f"fft-parallel-rows={int(config.fft_parallel_rows)} "
+                        f"fft-io-unroll={int(config.fft_io_unroll)}")
             command = [find_tool("sar-opt")]
             if config.precision != "native":
                 command.append(

@@ -6,6 +6,8 @@
 
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
+#include "sar/Support/HLSHints.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
 
 namespace mlir {
@@ -323,6 +325,10 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
 
     for (auto [memref, loadStores] : accessesMap) {
       auto memrefType = cast<MemRefType>(memref.getType());
+      // A partition layout in the type means the banking was pinned by a
+      // hint (or an outer call); the search must not override it.
+      if (isa<PartitionLayoutAttr>(memrefType.getLayout()))
+        continue;
       auto &partitions = partitionsMap[memref];
 
       // If the current partitionsMap is empty, initialize it with no partition.
@@ -524,6 +530,10 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
     for (auto [type, operand] :
          llvm::zip(subFunc.getArgumentTypes(), op.getOperands())) {
       if (auto memrefType = dyn_cast<MemRefType>(type)) {
+        // Pinned by a hint before the search ran; leave it alone.
+        if (auto operandType = dyn_cast<MemRefType>(operand.getType()))
+          if (isa<PartitionLayoutAttr>(operandType.getLayout()))
+            continue;
         auto &partitions = partitionsMap[operand];
 
         // If the current partitionsMap is empty, initialize it with no
@@ -733,6 +743,36 @@ struct ArrayPartition : public sar::impl::ArrayPartitionBase<ArrayPartition> {
         lutramBitsUsed += (uint64_t)spent.getInt() * 8;
         func->removeAttr("lutram_spent");
       }
+    // Banking hints first: a lowering that shaped an access pattern knows
+    // the banking it needs, which local distance analysis cannot always
+    // recover (compact unrolled lanes, data-dependent gathers). A buffer
+    // partitioned here is final -- the automatic search below skips any
+    // type that already carries a partition layout.
+    module.walk([&](hls::BufferLikeInterface buffer) {
+      auto kindsAttr =
+          buffer->getAttrOfType<ArrayAttr>(sar::kPartitionKindsAttr);
+      auto factorsAttr =
+          buffer->getAttrOfType<ArrayAttr>(sar::kPartitionFactorsAttr);
+      if (!kindsAttr || !factorsAttr)
+        return;
+      SmallVector<PartitionKind> kinds;
+      SmallVector<unsigned> factors;
+      for (auto [kind, factor] :
+           llvm::zip(kindsAttr.getAsRange<StringAttr>(),
+                     factorsAttr.getAsRange<IntegerAttr>())) {
+        kinds.push_back(llvm::StringSwitch<PartitionKind>(kind.getValue())
+                            .Case("complete", PartitionKind::COMPLETE)
+                            .Case("cyclic", PartitionKind::CYCLIC)
+                            .Case("block", PartitionKind::BLOCK)
+                            .Default(PartitionKind::NONE));
+        factors.push_back(factor.getInt());
+      }
+      applyArrayPartition(buffer.getMemref(), factors, kinds,
+                          /*updateFuncSignature=*/true, lutramMaxBits,
+                          (uint64_t)lutramBytes * 8, &lutramBitsUsed);
+      buffer->removeAttr(sar::kPartitionKindsAttr);
+      buffer->removeAttr(sar::kPartitionFactorsAttr);
+    });
     applyAutoArrayPartition(topFunc, lutramMaxBits, maxFactor,
                             (uint64_t)lutramBytes * 8, &lutramBitsUsed);
     if (failed(

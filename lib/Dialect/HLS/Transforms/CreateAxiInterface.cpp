@@ -346,23 +346,50 @@ struct CreateAxiInterface
     for (Type elementType : scratchTypes) {
       std::array<SmallVector<hls::BufferLikeInterface>, 2> banks;
       std::array<SmallVector<std::pair<unsigned, unsigned>>, 2> lifetimes;
+      std::array<SmallVector<DenseSet<Operation *>>, 2> bankUsers;
       std::array<uint64_t, 2> payload = {0, 0};
       for (auto buffer : func.getOps<hls::BufferLikeInterface>()) {
         if (isExtBuffer(buffer.getMemref()) && !isa<ConstBufferOp>(*buffer) &&
             buffer.getMemrefType().getElementType() == elementType) {
           auto live = interval(buffer);
+          // The top-level operations that read or write this buffer. Two
+          // buffers touched by the same operation contend for the master
+          // every iteration -- a split-complex sweep reads its real and
+          // imaginary planes in one loop -- so sharing users is the
+          // costliest way two buffers can share a port.
+          DenseSet<Operation *> users;
+          for (OpOperand &use : buffer.getMemref().getUses()) {
+            Operation *owner = use.getOwner();
+            while (owner->getParentOp() != func && owner->getParentOp())
+              owner = owner->getParentOp();
+            if (owner->getParentOp() == func)
+              users.insert(owner);
+          }
+          auto coAccess = [&](unsigned bank) {
+            unsigned count = 0;
+            for (const auto &other : bankUsers[bank])
+              for (Operation *op : users)
+                count += other.contains(op);
+            return count;
+          };
           auto conflicts = [&](unsigned bank) {
             return llvm::count_if(lifetimes[bank], [&](auto other) {
               return !(live.second < other.first || other.second < live.first);
             });
           };
           unsigned bank = 0;
+          auto leftShared = coAccess(0), rightShared = coAccess(1);
           auto leftConflicts = conflicts(0), rightConflicts = conflicts(1);
-          if (rightConflicts < leftConflicts ||
-              (rightConflicts == leftConflicts && payload[1] < payload[0]))
+          if (rightShared < leftShared)
+            bank = 1;
+          else if (rightShared == leftShared &&
+                   (rightConflicts < leftConflicts ||
+                    (rightConflicts == leftConflicts &&
+                     payload[1] < payload[0])))
             bank = 1;
           banks[bank].push_back(buffer);
           lifetimes[bank].push_back(live);
+          bankUsers[bank].push_back(std::move(users));
           payload[bank] += buffer.getMemrefType().getNumElements();
         }
       }

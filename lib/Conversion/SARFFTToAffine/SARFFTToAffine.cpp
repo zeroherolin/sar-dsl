@@ -16,9 +16,20 @@
 //     DFT_radix(X[q + s*(p + j*m)]) -> Y[q + s*(radix*p + k)]
 //     Y[k>0] *= exp(-+ 2 pi i p*k / n_cur)
 //
-// Twiddle factors are precomputed into constant memref globals; X and Y are
-// scratch lines drawn from a pool, which keeps the unrolled stages a chain
-// rather than a cycle -- see emitStockham and scratchSlots.
+// The generated structure is shaped for an HLS backend end to end. Lines are
+// processed in blocks of `fft-parallel-rows` lanes: a prefetch sweep copies
+// the block from the source planes into on-chip line buffers with unit-stride
+// external accesses (`fft-io-unroll` elements per beat, so the bus can widen
+// and burst), the butterfly stages run entirely on the line buffers with the
+// lane loop innermost (twiddle factors are fetched once per butterfly and
+// shared across lanes), and a mirrored write-back sweep stores the block.
+// Buffers carry banking hints (`hls.partition_*`) matched to the butterfly
+// and transfer strides; the CPU validation pipeline ignores them.
+//
+// Twiddle factors are precomputed into constant memref globals; the stages
+// between prefetch and write-back draw scratch lines from a pool, which keeps
+// the unrolled stages a chain rather than a cycle -- see emitStockham and
+// scratchSlots.
 //
 // Sizes that are not powers of two go through Bluestein's chirp-z
 // reduction, which expresses the DFT as a convolution that a padded
@@ -31,7 +42,9 @@
 // Because n is a compile-time constant, the chirp and the spectrum
 // B = FFT_M(b) are both folded on the host and emitted as constant globals,
 // so the device-side work is two power-of-two Stockham transforms plus
-// three element-wise passes -- all affine, all HLS-friendly.
+// three element-wise passes -- all affine, all HLS-friendly. The chirp-z
+// path stays line-serial: its working set is already on chip and the
+// non-power-of-two sizes it serves are not the production rasters.
 //
 //===----------------------------------------------------------------------===//
 
@@ -46,6 +59,7 @@
 #include "sar/Conversion/Passes.h"
 #include "sar/Dialect/SAR/IR/SARDialect.h"
 #include "sar/Dialect/SAR/IR/SAROps.h"
+#include "sar/Support/HLSHints.h"
 
 #include <cmath>
 #include <complex>
@@ -63,9 +77,10 @@ using namespace mlir::sar;
 
 namespace {
 
-/// Maps an element index expression onto the storage indices of a buffer.
-/// Map operands are always (line, p, q).
-using StorageMapFn = llvm::function_ref<AffineMap(AffineExpr)>;
+/// A pair of float-plane buffers holding the real and imaginary halves.
+struct PlanePair {
+  Value re, im;
+};
 
 /// Ensures a private constant memref global named `name` exists and returns
 /// its name.
@@ -109,16 +124,28 @@ static SmallVector<int> radixSchedule(int64_t length) {
   return radices;
 }
 
+/// Attaches the banking hint the HLS partition pass applies verbatim.
+static void setPartitionHint(OpBuilder &builder, Operation *op,
+                             ArrayRef<StringRef> kinds,
+                             ArrayRef<int64_t> factors) {
+  op->setAttr(kPartitionKindsAttr, builder.getStrArrayAttr(kinds));
+  op->setAttr(kPartitionFactorsAttr, builder.getI64ArrayAttr(factors));
+}
+
 /// Creates (or reuses) the flattened per-stage Stockham twiddle tables for a
 /// transform of size `length`, returning the loaded cos/sin buffers.
+///
+/// A radix-4 butterfly reads the three adjacent entries p*3 .. p*3+2 in one
+/// iteration, so the tables are padded to a multiple of three and hinted
+/// cyclic-3: each read lands in its own bank. The padding is never read.
 static std::pair<Value, Value>
 materializeTwiddles(PatternRewriter &rewriter, Location loc, ModuleOp module,
                     int64_t length, FloatType elemType) {
   // Stage t occupies [L - (L >> t), ...) with (L >> (t+1)) entries of
   // cos/sin(2 pi p / n_cur).
   SmallVector<double> cosTable, sinTable;
-  cosTable.reserve(length - 1);
-  sinTable.reserve(length - 1);
+  cosTable.reserve(length + 2);
+  sinTable.reserve(length + 2);
   int64_t span = 1;
   for (int radix : radixSchedule(length)) {
     int64_t nCur = length / span;
@@ -133,6 +160,10 @@ materializeTwiddles(PatternRewriter &rewriter, Location loc, ModuleOp module,
     span *= radix;
   }
   assert(cosTable.size() == static_cast<size_t>(length - 1));
+  while (cosTable.size() % 3 != 0) {
+    cosTable.push_back(0.0);
+    sinTable.push_back(0.0);
+  }
   std::string suffix = (Twine(length) + "_" + typeSuffix(elemType)).str();
   std::string cosName = ensureConstantGlobal(
       rewriter, module, ("__sar_fft_twiddle_cos_" + suffix), elemType,
@@ -140,9 +171,19 @@ materializeTwiddles(PatternRewriter &rewriter, Location loc, ModuleOp module,
   std::string sinName = ensureConstantGlobal(
       rewriter, module, ("__sar_fft_twiddle_sin_" + suffix), elemType,
       sinTable);
-  auto twiddleType = MemRefType::get({length - 1}, elemType);
-  return {memref::GetGlobalOp::create(rewriter, loc, twiddleType, cosName),
-          memref::GetGlobalOp::create(rewriter, loc, twiddleType, sinName)};
+  auto twiddleType =
+      MemRefType::get({static_cast<int64_t>(cosTable.size())}, elemType);
+  auto cosBuf =
+      memref::GetGlobalOp::create(rewriter, loc, twiddleType, cosName);
+  auto sinBuf =
+      memref::GetGlobalOp::create(rewriter, loc, twiddleType, sinName);
+  // Banking pays a whole memory primitive per bank, so only tables large
+  // enough to span several primitives are worth splitting.
+  if (cosTable.size() % 3 == 0 && length >= 256) {
+    setPartitionHint(rewriter, cosBuf, {"cyclic"}, {3});
+    setPartitionHint(rewriter, sinBuf, {"cyclic"}, {3});
+  }
+  return {cosBuf, sinBuf};
 }
 
 /// Returns the number of distinct scratch-buffer slots required for a
@@ -153,9 +194,9 @@ materializeTwiddles(PatternRewriter &rewriter, Location loc, ModuleOp module,
 /// buffer, giving stages-1 slots in total.
 ///
 /// With stageGroup == k, stages are packed into ceil(stages/k) groups; the
-/// first stage reads the input and the last writes the destination, so the
-/// groups in between need ceil(stages/k) - 1 slots. Two is the floor once
-/// more than one stage writes scratch: a Stockham butterfly reads
+/// first stage reads the prefetched block and the last writes the write-back
+/// block, so the groups in between need ceil(stages/k) - 1 slots. Two is the
+/// floor once more than one stage writes scratch: a Stockham butterfly reads
 /// X[q + sp], X[q + s(p + m)] and writes Y[q + 2sp], Y[q + s(2p + 1)], so a
 /// stage whose source and destination were the same line would overwrite
 /// values a later iteration still has to read.
@@ -173,74 +214,82 @@ static int scratchSlots(int stages, unsigned stageGroup) {
   return slots > intermediates ? intermediates : slots;
 }
 
-/// Emits the statically unrolled Stockham stages for a transform of size
-/// `length`, for the line selected by `lineIV`.
+/// Allocates one line-block buffer: `lanes` lines of `length` elements
+/// (rank-1 when `lanes` is one). A parallel block is hinted complete over
+/// the lane dimension -- each unrolled lane owns its banks, which no local
+/// access analysis can recover from the compact lane loop. `elemFactor`
+/// banks the element dimension cyclically for the io-unrolled transfer
+/// sweeps; only the prefetch and write-back blocks need it, so the
+/// butterfly scratch passes zero and keeps one primitive per lane.
+static Value allocLineBuffer(PatternRewriter &rewriter, Location loc,
+                             int64_t lanes, int64_t length, FloatType elemType,
+                             int64_t elemFactor = 0) {
+  auto type = lanes > 1 ? MemRefType::get({lanes, length}, elemType)
+                        : MemRefType::get({length}, elemType);
+  auto alloc = memref::AllocOp::create(rewriter, loc, type);
+  if (lanes > 1 && elemFactor > 1)
+    setPartitionHint(rewriter, alloc, {"complete", "cyclic"},
+                     {lanes, elemFactor});
+  else if (lanes > 1)
+    setPartitionHint(rewriter, alloc, {"complete", "none"}, {lanes, 1});
+  return alloc;
+}
+
+/// Emits the statically unrolled Stockham stages for one block of `lanes`
+/// lines, from the prefetched `src` block through the scratch pool into the
+/// `dst` block. All buffers are lane-major line blocks; nothing here touches
+/// the transform's external planes.
 ///
-/// The caller owns the line loop and passes scratch lines whose count is
-/// determined by `scratchSlots()` -- see that function's comment for the
-/// trade-off.  The working set is O(length * scratchSlots) whatever the
-/// scene height.
+/// Each stage is a (p, q) butterfly nest with the lane loop innermost. The
+/// lane loop carries `hls.unroll_factor` instead of being cloned: the
+/// emitter prints an unroll directive, so the generated source stays one
+/// engine description however many lanes run. Twiddle factors are loaded
+/// once per butterfly, above the lane loop, and shared by every lane.
 ///
 /// Each group reads the previous group's output and writes its own. Reusing
 /// two buffers in ping-pong across all stages would be smaller but turns the
 /// stage chain into a cycle in the dataflow graph -- the backend cannot order
 /// a cycle and falls back to sequential execution. Distinct group buffers keep
-/// the transform a chain, which is what lets a dataflow backend overlap one
-/// line's late groups with the next line's early groups.
+/// the transform a chain.
 ///
-/// Stage 0 reads `srcRe`/`srcIm` and the last stage writes `dstRe`/`dstIm`
-/// (scaled by `scale` when set), so the transform costs exactly its
-/// mixed-radix butterfly passes -- no copy in, no copy out.
-///
-/// `stageGroup` is the grouping parameter forwarded from the pass option:
-/// 0 (default) gives each stage its own scratch, maximising pipeline
-/// parallelism; k > 0 gives every k consecutive stages one shared scratch
-/// slot, reducing live buffers at the cost of pipeline granularity.
+/// The 1/L of an inverse transform rides along on the final stage's stores
+/// (`scale`), so no extra pass over the data is needed.
 static void emitStockham(PatternRewriter &rewriter, Location loc,
-                         MLIRContext *ctx, int64_t length, Value lineIV,
-                         Value srcRe, Value srcIm,
-                         ArrayRef<std::pair<Value, Value>> scratch, Value dstRe,
-                         Value dstIm, Value cosBuf, Value sinBuf, bool inverse,
-                         Value scale, StorageMapFn srcDstMap,
-                         unsigned stageGroup, unsigned parallelRows) {
-  auto lineDim = getAffineDimExpr(0, ctx);
-  auto pDim = getAffineDimExpr(1, ctx);
-  auto qDim = getAffineDimExpr(2, ctx);
+                         MLIRContext *ctx, int64_t length, int64_t lanes,
+                         PlanePair src, ArrayRef<PlanePair> scratch,
+                         PlanePair dst, Value cosBuf, Value sinBuf,
+                         bool inverse, Value scale, unsigned stageGroup) {
+  auto pDim = getAffineDimExpr(0, ctx);
+  auto qDim = getAffineDimExpr(1, ctx);
   auto radices = radixSchedule(length);
   int stages = static_cast<int>(radices.size());
   int slots = scratchSlots(stages, stageGroup);
   assert(scratch.size() >= static_cast<size_t>(slots) &&
          "not enough scratch lines for the chosen stage grouping");
 
-  // Serial scratch is one line. A row-parallel engine adds a leading lane
-  // dimension selected by line modulo the lane count.
-  auto scratchMap = [&](AffineExpr elem) {
-    if (parallelRows > 1)
-      return AffineMap::get(3, 0, {lineDim % parallelRows, elem}, ctx);
-    return AffineMap::get(3, 0, {elem}, ctx);
+  // Element maps onto the lane-major line blocks. Butterfly operands are
+  // (p, q) plus, when lanes run in parallel, the innermost lane.
+  unsigned numDims = lanes > 1 ? 3 : 2;
+  auto elementMap = [&](AffineExpr elem) {
+    if (lanes > 1)
+      return AffineMap::get(numDims, 0, {getAffineDimExpr(2, ctx), elem}, ctx);
+    return AffineMap::get(numDims, 0, {elem}, ctx);
+  };
+  // Twiddle loads sit above the lane loop and depend on p alone.
+  auto twiddleMap = [&](AffineExpr index) {
+    return AffineMap::get(1, 0, {index}, ctx);
   };
 
-  Value curRe = srcRe, curIm = srcIm;
-  bool curIsScratch = false;
-
+  PlanePair cur = src;
   int64_t span = 1;
   int64_t twiddleOffset = 0;
   for (int t = 0; t < stages; ++t) {
     int radix = radices[t];
-    Value nxtRe, nxtIm;
-    bool nxtIsScratch = t != stages - 1;
-    if (nxtIsScratch) {
-      // Round-robin over the scratch pool: full unroll makes `t % slots`
-      // the identity (one line per stage); a grouped pool sends later
-      // stages back onto earlier lines. The pool never shrinks below two
-      // (see scratchSlots), so no butterfly is emitted in place.
-      const auto &slot = scratch[t % slots];
-      nxtRe = slot.first;
-      nxtIm = slot.second;
-    } else {
-      nxtRe = dstRe;
-      nxtIm = dstIm;
-    }
+    // Round-robin over the scratch pool: full unroll makes `t % slots`
+    // the identity (one line per stage); a grouped pool sends later
+    // stages back onto earlier lines. The pool never shrinks below two
+    // (see scratchSlots), so no butterfly is emitted in place.
+    PlanePair nxt = t != stages - 1 ? scratch[t % slots] : dst;
 
     int64_t nCur = length / span;
     int64_t m = nCur / radix;
@@ -251,17 +300,32 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
     auto qLoop = affine::AffineForOp::create(rewriter, loc, 0, span);
     rewriter.setInsertionPointToStart(qLoop.getBody());
 
-    SmallVector<Value> operands{lineIV, pLoop.getInductionVar(),
-                                qLoop.getInductionVar()};
+    // One twiddle fetch per butterfly, shared across all lanes.
+    SmallVector<Value, 3> twCos, twSin;
+    for (int output = 1; output < radix; ++output) {
+      AffineExpr twiddleIndex =
+          pDim * (radix - 1) + (output - 1) + twiddleOffset;
+      twCos.push_back(affine::AffineLoadOp::create(
+          rewriter, loc, cosBuf, twiddleMap(twiddleIndex),
+          ValueRange{pLoop.getInductionVar()}));
+      twSin.push_back(affine::AffineLoadOp::create(
+          rewriter, loc, sinBuf, twiddleMap(twiddleIndex),
+          ValueRange{pLoop.getInductionVar()}));
+    }
 
-    auto srcMap = curIsScratch ? StorageMapFn(scratchMap) : srcDstMap;
-    auto dstMap = nxtIsScratch ? StorageMapFn(scratchMap) : srcDstMap;
+    SmallVector<Value> operands{pLoop.getInductionVar(),
+                                qLoop.getInductionVar()};
+    if (lanes > 1) {
+      auto laneLoop = affine::AffineForOp::create(rewriter, loc, 0, lanes);
+      laneLoop->setAttr(kUnrollFactorAttr,
+                        rewriter.getI64IntegerAttr(lanes));
+      rewriter.setInsertionPointToStart(laneLoop.getBody());
+      operands.push_back(laneLoop.getInductionVar());
+    }
 
     auto load = [&](Value buf, AffineMap map) -> Value {
       return affine::AffineLoadOp::create(rewriter, loc, buf, map, operands);
     };
-    // The 1/L of an inverse transform rides along on the final stage's
-    // stores, so no extra pass over the data is needed.
     bool scaleHere = scale && t == stages - 1;
     auto store = [&](Value v, Value buf, AffineMap map) {
       if (scaleHere)
@@ -282,8 +346,8 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
     SmallVector<Value, 4> inputRe, inputIm;
     for (int input = 0; input < radix; ++input) {
       AffineExpr index = qDim + (pDim + input * m) * span;
-      inputRe.push_back(load(curRe, srcMap(index)));
-      inputIm.push_back(load(curIm, srcMap(index)));
+      inputRe.push_back(load(cur.re, elementMap(index)));
+      inputIm.push_back(load(cur.im, elementMap(index)));
     }
 
     SmallVector<Value, 4> dftRe(radix), dftIm(radix);
@@ -318,11 +382,8 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
     for (int output = 0; output < radix; ++output) {
       Value outRe = dftRe[output], outIm = dftIm[output];
       if (output != 0) {
-        AffineExpr twiddleIndex =
-            pDim * (radix - 1) + (output - 1) + twiddleOffset;
-        AffineMap twiddleMap = AffineMap::get(3, 0, {twiddleIndex}, ctx);
-        Value cosine = load(cosBuf, twiddleMap);
-        Value sine = load(sinBuf, twiddleMap);
+        Value cosine = twCos[output - 1];
+        Value sine = twSin[output - 1];
         Value reC = mul(outRe, cosine), reS = mul(outIm, sine);
         Value imC = mul(outIm, cosine), imS = mul(outRe, sine);
         if (!inverse) {
@@ -334,13 +395,11 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
         }
       }
       AffineExpr outputIndex = qDim + (pDim * radix + output) * span;
-      store(outRe, nxtRe, dstMap(outputIndex));
-      store(outIm, nxtIm, dstMap(outputIndex));
+      store(outRe, nxt.re, elementMap(outputIndex));
+      store(outIm, nxt.im, elementMap(outputIndex));
     }
 
-    curRe = nxtRe;
-    curIm = nxtIm;
-    curIsScratch = nxtIsScratch;
+    cur = nxt;
     twiddleOffset += m * (radix - 1);
     span *= radix;
   }
@@ -376,14 +435,17 @@ static void hostFFT(std::vector<std::complex<double>> &data) {
 
 struct FFTSplitToAffinePattern : OpRewritePattern<FFTSplitOp> {
   FFTSplitToAffinePattern(MLIRContext *context, unsigned stageGroup,
-                          unsigned parallelRows)
+                          unsigned parallelRows, unsigned ioUnroll)
       : OpRewritePattern<FFTSplitOp>(context), stageGroup(stageGroup),
-        parallelRows(parallelRows) {}
+        parallelRows(parallelRows), ioUnroll(ioUnroll) {}
 
   /// How many consecutive Stockham stages share one scratch slot; 0 keeps
   /// the full unroll (one slot per intermediate stage).
   unsigned stageGroup;
+  /// Lines transformed in parallel per block (the lane count).
   unsigned parallelRows;
+  /// Elements moved per external access in the prefetch/write-back sweeps.
+  unsigned ioUnroll;
 
   LogicalResult matchAndRewrite(FFTSplitOp op,
                                 PatternRewriter &rewriter) const override {
@@ -424,9 +486,9 @@ struct FFTSplitToAffinePattern : OpRewritePattern<FFTSplitOp> {
     Value outBufIm = memref::AllocOp::create(rewriter, loc, bufferType);
 
     if (llvm::isPowerOf2_64(length))
-      emitPowerOfTwo(rewriter, loc, ctx, module, length, lines, elemType,
-                     bufferType, inRe, inIm, outBufRe, outBufIm, inverse,
-                     storageMap, stageGroup, parallelRows);
+      emitPowerOfTwo(rewriter, loc, ctx, module, length, lines, rank, dim,
+                     elemType, {inRe, inIm}, {outBufRe, outBufIm}, inverse,
+                     stageGroup, parallelRows, ioUnroll);
     else
       emitBluestein(rewriter, loc, ctx, module, length, dim, lines, elemType,
                     tensorType, inRe, inIm, outBufRe, outBufIm, inverse,
@@ -447,22 +509,113 @@ struct FFTSplitToAffinePattern : OpRewritePattern<FFTSplitOp> {
   }
 
 private:
-  /// Direct Stockham transform.
+  /// Emits one transfer sweep between the external planes and a local line
+  /// block: the prefetch (`toLocal`) or its write-back mirror.
   ///
-  /// The stages read the input in place of a copy-in pass and write the
-  /// result in place of a copy-out pass, so the whole transform is exactly
-  /// its mixed-radix butterfly passes.
+  /// The loop order puts whichever index is contiguous in the external
+  /// planes innermost, statically unrolled by `io` (`hls.unroll_factor`),
+  /// so the bus sees unit-stride runs it can widen and burst:
   ///
-  /// `stageGroup` is forwarded from the pass option; 0 gives each
-  /// intermediate stage its own scratch line (full unroll), while k > 0
-  /// packs every k consecutive stages into one scratch slot.
+  ///   dim == 1 (or rank 1): for lane { for j step io { for w unroll } }
+  ///   dim == 0:             for j { for lane unroll }
+  ///
+  /// where the external element index is contiguous in (j, w) for dim 1 and
+  /// in lane for dim 0 (adjacent lines are adjacent columns).
+  static void emitTransfer(PatternRewriter &rewriter, Location loc,
+                           MLIRContext *ctx, bool toLocal, int64_t rank,
+                           int64_t dim, int64_t length, int64_t lanes,
+                           int64_t io, Value blockIV, PlanePair ext,
+                           PlanePair local) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    // Dim positions in the composed maps; operands are collected in loop
+    // nesting order.
+    SmallVector<Value> operands{blockIV};
+    AffineExpr blockExpr = getAffineDimExpr(0, ctx);
+    AffineExpr laneExpr, elemExpr;
+    unsigned numDims = 1;
+
+    auto transferBody = [&]() {
+      AffineExpr lineExpr = lanes > 1 ? blockExpr + laneExpr : blockExpr;
+      SmallVector<AffineExpr, 2> extExprs;
+      if (rank == 1)
+        extExprs = {elemExpr};
+      else if (dim == 1)
+        extExprs = {lineExpr, elemExpr};
+      else
+        extExprs = {elemExpr, lineExpr};
+      auto extMap = AffineMap::get(numDims, 0, extExprs, ctx);
+      SmallVector<AffineExpr, 2> localExprs;
+      if (lanes > 1)
+        localExprs = {laneExpr, elemExpr};
+      else
+        localExprs = {elemExpr};
+      auto localMap = AffineMap::get(numDims, 0, localExprs, ctx);
+
+      for (auto [extBuf, localBuf] :
+           {std::pair{ext.re, local.re}, std::pair{ext.im, local.im}}) {
+        Value src = toLocal ? extBuf : localBuf;
+        auto srcMap = toLocal ? extMap : localMap;
+        Value dst = toLocal ? localBuf : extBuf;
+        auto dstMap = toLocal ? localMap : extMap;
+        Value v =
+            affine::AffineLoadOp::create(rewriter, loc, src, srcMap, operands);
+        affine::AffineStoreOp::create(rewriter, loc, v, dst, dstMap, operands);
+      }
+    };
+
+    if (rank == 2 && dim == 0) {
+      // Columns: adjacent lanes are contiguous in external storage.
+      auto elemLoop = affine::AffineForOp::create(rewriter, loc, 0, length);
+      rewriter.setInsertionPointToStart(elemLoop.getBody());
+      operands.push_back(elemLoop.getInductionVar());
+      elemExpr = getAffineDimExpr(numDims++, ctx);
+      if (lanes > 1) {
+        auto laneLoop = affine::AffineForOp::create(rewriter, loc, 0, lanes);
+        laneLoop->setAttr(kUnrollFactorAttr,
+                          rewriter.getI64IntegerAttr(lanes));
+        rewriter.setInsertionPointToStart(laneLoop.getBody());
+        operands.push_back(laneLoop.getInductionVar());
+        laneExpr = getAffineDimExpr(numDims++, ctx);
+      }
+      transferBody();
+      return;
+    }
+
+    // Rows (or a rank-1 vector): the element index is contiguous.
+    if (lanes > 1) {
+      auto laneLoop = affine::AffineForOp::create(rewriter, loc, 0, lanes);
+      rewriter.setInsertionPointToStart(laneLoop.getBody());
+      operands.push_back(laneLoop.getInductionVar());
+      laneExpr = getAffineDimExpr(numDims++, ctx);
+    }
+    auto elemLoop =
+        affine::AffineForOp::create(rewriter, loc, 0, length, io);
+    rewriter.setInsertionPointToStart(elemLoop.getBody());
+    operands.push_back(elemLoop.getInductionVar());
+    elemExpr = getAffineDimExpr(numDims++, ctx);
+    if (io > 1) {
+      auto beatLoop = affine::AffineForOp::create(rewriter, loc, 0, io);
+      beatLoop->setAttr(kUnrollFactorAttr, rewriter.getI64IntegerAttr(io));
+      rewriter.setInsertionPointToStart(beatLoop.getBody());
+      operands.push_back(beatLoop.getInductionVar());
+      elemExpr = elemExpr + getAffineDimExpr(numDims++, ctx);
+    }
+    transferBody();
+  }
+
+  /// Direct Stockham transform over blocks of `parallelRows` lines.
+  ///
+  /// Every block iteration prefetches its lines into an on-chip block,
+  /// runs the butterfly stages on chip with the lane loop innermost, and
+  /// writes the block back -- so the external planes only ever see the
+  /// unit-stride transfer sweeps.
   static void emitPowerOfTwo(PatternRewriter &rewriter, Location loc,
                              MLIRContext *ctx, ModuleOp module, int64_t length,
-                             int64_t lines, FloatType elemType,
-                             MemRefType bufferType, Value inRe, Value inIm,
-                             Value outBufRe, Value outBufIm, bool inverse,
-                             StorageMapFn storageMap, unsigned stageGroup,
-                             unsigned requestedParallelRows) {
+                             int64_t lines, int64_t rank, int64_t dim,
+                             FloatType elemType, PlanePair in, PlanePair out,
+                             bool inverse, unsigned stageGroup,
+                             unsigned requestedParallelRows,
+                             unsigned requestedIoUnroll) {
     auto [cosBuf, sinBuf] =
         materializeTwiddles(rewriter, loc, module, length, elemType);
 
@@ -472,48 +625,44 @@ private:
           rewriter, loc,
           rewriter.getFloatAttr(elemType, 1.0 / static_cast<double>(length)));
 
-    // Stage 0 reads the input and the last stage writes the result; the
-    // number of scratch slots between them depends on the grouping.
+    int64_t lanes =
+        std::min<int64_t>(std::max(1u, requestedParallelRows), lines);
+    while (lanes > 1 && lines % lanes != 0)
+      lanes >>= 1;
+    int64_t io = std::min<int64_t>(std::max(1u, requestedIoUnroll), length);
+    while (io > 1 && length % io != 0)
+      io >>= 1;
+
     int stages = static_cast<int>(radixSchedule(length).size());
     int slots = scratchSlots(stages, stageGroup);
-    unsigned parallelRows =
-        std::min<uint64_t>(std::max(1u, requestedParallelRows), lines);
-    while (parallelRows > 1 && lines % parallelRows != 0)
-      parallelRows >>= 1;
-    auto lineType =
-        parallelRows > 1
-            ? MemRefType::get({static_cast<int64_t>(parallelRows), length},
-                              elemType)
-            : MemRefType::get({length}, elemType);
-    SmallVector<std::pair<Value, Value>> scratch;
+    auto allocBlock = [&](int64_t elemFactor) -> PlanePair {
+      return {allocLineBuffer(rewriter, loc, lanes, length, elemType,
+                              elemFactor),
+              allocLineBuffer(rewriter, loc, lanes, length, elemType,
+                              elemFactor)};
+    };
+    // Only the transfer blocks bank their element dimension: the io-wide
+    // sweeps store io consecutive elements per cycle. The butterfly
+    // scratch keeps one bank per lane -- radix taps conflict under any
+    // static banking, and the lanes absorb the II they cost.
+    PlanePair srcBlock = allocBlock(io);
+    PlanePair dstBlock = allocBlock(io);
+    SmallVector<PlanePair> scratch;
     for (int i = 0; i < slots; ++i)
-      scratch.emplace_back(
-          memref::AllocOp::create(rewriter, loc, lineType).getResult(),
-          memref::AllocOp::create(rewriter, loc, lineType).getResult());
+      scratch.push_back(allocBlock(0));
 
-    // Keep row parallelism compact in IR and generated C++: an explicitly
-    // unrolled lane loop shares one mixed-radix engine description instead of
-    // cloning the complete stage graph once per row.
-    auto lineLoop =
-        affine::AffineForOp::create(rewriter, loc, 0, lines, parallelRows);
+    auto blockLoop =
+        affine::AffineForOp::create(rewriter, loc, 0, lines, lanes);
     OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(lineLoop.getBody());
-    Value line = lineLoop.getInductionVar();
-    if (parallelRows > 1) {
-      auto laneLoop =
-          affine::AffineForOp::create(rewriter, loc, 0, parallelRows);
-      laneLoop->setAttr("hls.unroll_factor",
-                        rewriter.getI64IntegerAttr(parallelRows));
-      rewriter.setInsertionPointToStart(laneLoop.getBody());
-      auto map = AffineMap::get(
-          2, 0, getAffineDimExpr(0, ctx) + getAffineDimExpr(1, ctx));
-      line = affine::AffineApplyOp::create(
-          rewriter, loc, map,
-          ValueRange{lineLoop.getInductionVar(), laneLoop.getInductionVar()});
-    }
-    emitStockham(rewriter, loc, ctx, length, line, inRe, inIm, scratch,
-                 outBufRe, outBufIm, cosBuf, sinBuf, inverse, scale, storageMap,
-                 stageGroup, parallelRows);
+    rewriter.setInsertionPointToStart(blockLoop.getBody());
+    Value blockIV = blockLoop.getInductionVar();
+
+    emitTransfer(rewriter, loc, ctx, /*toLocal=*/true, rank, dim, length,
+                 lanes, io, blockIV, in, srcBlock);
+    emitStockham(rewriter, loc, ctx, length, lanes, srcBlock, scratch,
+                 dstBlock, cosBuf, sinBuf, inverse, scale, stageGroup);
+    emitTransfer(rewriter, loc, ctx, /*toLocal=*/false, rank, dim, length,
+                 lanes, io, blockIV, out, dstBlock);
   }
 
   /// Bluestein's chirp-z reduction for non-power-of-two sizes.
@@ -526,7 +675,9 @@ private:
                             int64_t dim, int64_t lines, FloatType elemType,
                             RankedTensorType tensorType, Value inRe, Value inIm,
                             Value outBufRe, Value outBufIm, bool inverse,
-                            StorageMapFn storageMap, unsigned stageGroup) {
+                            llvm::function_ref<AffineMap(AffineExpr)>
+                                storageMap,
+                            unsigned stageGroup) {
     auto pDim = getAffineDimExpr(1, ctx);
 
     // Bluestein convolves two length-n sequences, so the circular
@@ -599,10 +750,10 @@ private:
     auto alloc = [&] {
       return memref::AllocOp::create(rewriter, loc, scratchType).getResult();
     };
-    Value stageRe = alloc(), stageIm = alloc();
-    Value specRe = alloc(), specIm = alloc();
-    Value prodRe = alloc(), prodIm = alloc();
-    Value convRe = alloc(), convIm = alloc();
+    PlanePair stage = {alloc(), alloc()};
+    PlanePair spec = {alloc(), alloc()};
+    PlanePair prod = {alloc(), alloc()};
+    PlanePair conv = {alloc(), alloc()};
 
     // The two transforms get their own stage buffers. Sharing them would put
     // both on the same scratch and turn the chain into a cycle, which is the
@@ -610,17 +761,14 @@ private:
     // grouping option decides how many slots the stages draw from.
     int paddedStages = static_cast<int>(radixSchedule(padded).size());
     int paddedSlots = scratchSlots(paddedStages, stageGroup);
-    SmallVector<std::pair<Value, Value>> fwdScratch, invScratch;
+    SmallVector<PlanePair> fwdScratch, invScratch;
     for (int i = 0; i < paddedSlots; ++i) {
-      fwdScratch.emplace_back(alloc(), alloc());
-      invScratch.emplace_back(alloc(), alloc());
+      fwdScratch.push_back({alloc(), alloc()});
+      invScratch.push_back({alloc(), alloc()});
     }
 
     AffineMap ioMap = storageMap(pDim);
     AffineMap lineMap = AffineMap::get(3, 0, {pDim}, ctx);
-    auto scratchMap = [&](AffineExpr elem) {
-      return AffineMap::get(3, 0, {elem}, ctx);
-    };
 
     // Lines are independent; one loop carries the whole chirp-z reduction.
     auto lineLoop = affine::AffineForOp::create(rewriter, loc, 0, lines);
@@ -655,37 +803,35 @@ private:
       Value wr = load(chirpCosBuf, lineMap, ops);
       Value wi = load(chirpSinBuf, lineMap, ops);
       store(arith::SubFOp::create(rewriter, loc, mul(xr, wr), mul(xi, wi)),
-            stageRe, lineMap, ops);
+            stage.re, lineMap, ops);
       store(arith::AddFOp::create(rewriter, loc, mul(xr, wi), mul(xi, wr)),
-            stageIm, lineMap, ops);
+            stage.im, lineMap, ops);
     });
     elementLoop(length, padded, [&](ValueRange ops) {
       Value fzero = arith::ConstantOp::create(
           rewriter, loc, rewriter.getFloatAttr(elemType, 0.0));
-      store(fzero, stageRe, lineMap, ops);
-      store(fzero, stageIm, lineMap, ops);
+      store(fzero, stage.re, lineMap, ops);
+      store(fzero, stage.im, lineMap, ops);
     });
 
     // ---- forward transform, pointwise product, inverse transform ------ //
-    emitStockham(rewriter, loc, ctx, padded, lineIV, stageRe, stageIm,
-                 fwdScratch, specRe, specIm, cosBuf, sinBuf,
-                 /*inverse=*/false, /*scale=*/nullptr, scratchMap, stageGroup,
-                 /*parallelRows=*/1);
+    emitStockham(rewriter, loc, ctx, padded, /*lanes=*/1, stage, fwdScratch,
+                 spec, cosBuf, sinBuf,
+                 /*inverse=*/false, /*scale=*/nullptr, stageGroup);
 
     elementLoop(0, padded, [&](ValueRange ops) {
-      Value ar = load(specRe, lineMap, ops), ai = load(specIm, lineMap, ops);
+      Value ar = load(spec.re, lineMap, ops), ai = load(spec.im, lineMap, ops);
       Value br = load(kernelReBuf, lineMap, ops);
       Value bi = load(kernelImBuf, lineMap, ops);
       store(arith::SubFOp::create(rewriter, loc, mul(ar, br), mul(ai, bi)),
-            prodRe, lineMap, ops);
+            prod.re, lineMap, ops);
       store(arith::AddFOp::create(rewriter, loc, mul(ar, bi), mul(ai, br)),
-            prodIm, lineMap, ops);
+            prod.im, lineMap, ops);
     });
 
-    emitStockham(rewriter, loc, ctx, padded, lineIV, prodRe, prodIm, invScratch,
-                 convRe, convIm, cosBuf, sinBuf,
-                 /*inverse=*/true, /*scale=*/nullptr, scratchMap, stageGroup,
-                 /*parallelRows=*/1);
+    emitStockham(rewriter, loc, ctx, padded, /*lanes=*/1, prod, invScratch,
+                 conv, cosBuf, sinBuf,
+                 /*inverse=*/true, /*scale=*/nullptr, stageGroup);
 
     // ---- post-multiply by the chirp, cropping back to n --------------- //
     // `emitStockham` emits butterflies only, so the 1/M the convolution
@@ -697,7 +843,7 @@ private:
     Value postScale = arith::ConstantOp::create(
         rewriter, loc, rewriter.getFloatAttr(elemType, post));
     elementLoop(0, length, [&](ValueRange ops) {
-      Value cr = load(convRe, lineMap, ops), ci = load(convIm, lineMap, ops);
+      Value cr = load(conv.re, lineMap, ops), ci = load(conv.im, lineMap, ops);
       Value wr = load(chirpCosBuf, lineMap, ops);
       Value wi = load(chirpSinBuf, lineMap, ops);
       Value re = arith::SubFOp::create(rewriter, loc, mul(cr, wr), mul(ci, wi));
@@ -724,7 +870,7 @@ struct ConvertSARFFTToAffinePass
 
     RewritePatternSet patterns(context);
     patterns.add<FFTSplitToAffinePattern>(context, fftStageGroup,
-                                          fftParallelRows);
+                                          fftParallelRows, fftIoUnroll);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))

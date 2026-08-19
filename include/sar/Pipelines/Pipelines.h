@@ -59,12 +59,20 @@ struct SARBufferPipelineOptions
       llvm::cl::desc("Stockham stages per scratch slot (0 = full unroll)"),
       llvm::cl::init(0)};
 
-  /// Independent transform rows computed together. The lowering allocates a
-  /// separate scratch lane for each row before unrolling the line loop.
+  /// Independent transform lines computed together per prefetched block.
+  /// Each lane owns its banks in the on-chip line buffers; the lane loop
+  /// sits innermost in the butterflies and unrolls in the backend.
   Option<unsigned> fftParallelRows{
       *this, "fft-parallel-rows",
-      llvm::cl::desc("Power-of-two FFT row parallelism (0 = serial rows)"),
+      llvm::cl::desc("Power-of-two FFT lane count (0 = serial lines)"),
       llvm::cl::init(0)};
+
+  /// Elements moved per external access in the FFT prefetch/write-back
+  /// sweeps. One bus beat's worth lets an AXI port widen the transfer.
+  Option<unsigned> fftIoUnroll{
+      *this, "fft-io-unroll",
+      llvm::cl::desc("FFT transfer elements per external access"),
+      llvm::cl::init(1)};
 };
 
 /// Lowers SAR kernels to linalg-on-tensors: the hand-off level for external

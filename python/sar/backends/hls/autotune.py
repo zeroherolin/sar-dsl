@@ -13,7 +13,6 @@ left at null.
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -25,7 +24,8 @@ from ...compiler.toolchain import find_tool, run_tool
 __all__ = [
     "AUTO_OPTIONS", "KernelFacts", "array_partition_max_factor",
     "buffer_extents", "derive", "external_buffer_threshold", "fft_stage_group",
-    "interp_banded_gather", "fft_parallel_rows", "kernel_facts_from_json",
+    "fft_io_unroll", "fft_parallel_rows", "interp_banded_gather",
+    "kernel_facts_from_json",
     "loop_tile_size", "lutram_max_bytes", "measure_kernel",
     "storage_min_elements", "streaming_threshold", "transpose_block_bytes"
 ]
@@ -178,29 +178,39 @@ def _transform_stages(length: int) -> Tuple[int, int, bool]:
     return (exponent + 1) // 2, padded, True
 
 
-def _fft_scratch_bytes(transforms, group: int) -> int:
-    """Primitive-aware bytes for transform scratch at `group`.
+def _fft_scratch_bytes(transforms, group: int, lanes: int = 1,
+                       io: int = 1) -> int:
+    """Primitive-aware bytes for transform storage at `group`/`lanes`/`io`.
 
-    Stockham accesses induce cyclic banking. Each bank occupies at least one
-    BRAM/URAM primitive, so logical payload bytes alone understate large
-    partitioned designs by an order of magnitude.
+    Each bank occupies at least one BRAM/URAM primitive, so logical payload
+    bytes alone understate banked designs by an order of magnitude. A
+    lane-parallel engine banks every buffer completely over the lane
+    dimension; the prefetch and write-back blocks additionally bank the
+    element dimension by the io unroll. Serial engines leave banking to
+    the automatic search, whose factor caps at one bus beat.
     """
+
+    def physical(line_bytes: int, banks: int) -> int:
+        bank_bytes = -(-line_bytes // banks)
+        primitive = 36864 if line_bytes >= 36864 else 4608
+        return banks * (-(-bank_bytes // primitive)) * primitive
+
     total = 0
     for length, width in transforms:
         stages, line, bluestein = _transform_stages(length)
         slots = _scratch_slots(stages, group)
-        payload = line * width
-        banks = min(32, line)
-        bank_bytes = -(-payload // banks)
-        primitive = 36864 if payload >= 36864 else 4608
-        physical_line = banks * (-(-bank_bytes // primitive)) * primitive
+        line_bytes = line * width * max(1, lanes)
         if bluestein:
             # Chirp-z runs two transforms over shared stage/spectrum/
             # product/convolution lines, so eight lines stand whatever the
-            # grouping and each transform draws its own slots.
-            total += (8 + 4 * slots) * physical_line
+            # grouping and each transform draws its own slots. It stays
+            # line-serial, so lanes and io do not enter.
+            total += (8 + 4 * slots) * physical(line * width, min(32, line))
+        elif lanes > 1:
+            total += slots * 2 * physical(line_bytes, lanes)
+            total += 2 * 2 * physical(line_bytes, lanes * max(1, io))
         else:
-            total += slots * 2 * physical_line
+            total += (slots + 2) * 2 * physical(line_bytes, min(32, line))
     return total
 
 
@@ -216,22 +226,27 @@ def _fft_groups(transforms) -> Tuple[int, ...]:
     return (0, ) + tuple(range(2, max(longest, 2) + 1))
 
 
-def fft_stage_group(facts: KernelFacts, budget: int) -> int:
+def fft_stage_group(facts: KernelFacts, budget: int, lanes: int = 1,
+                    io: int = 1) -> int:
     """Stockham stages per scratch slot: the least grouping whose scratch
     fits the working share of the budget (the tightest available when none
     does), because full unroll is the throughput point and grouping buys
-    area back with pipeline depth."""
+    area back with pipeline depth. Charged at the lane count the engine
+    will actually run."""
     if not facts.transforms:
         return 0
     groups = _fft_groups(facts.transforms)
     if budget <= 0:
         return min(groups,
-                   key=lambda g: _fft_scratch_bytes(facts.transforms, g))
+                   key=lambda g: _fft_scratch_bytes(facts.transforms, g,
+                                                    lanes, io))
     share = max(1, budget // _WORKING_SHARE)
     for group in groups:
-        if _fft_scratch_bytes(facts.transforms, group) <= share:
+        if _fft_scratch_bytes(facts.transforms, group, lanes, io) <= share:
             return group
-    return min(groups, key=lambda g: _fft_scratch_bytes(facts.transforms, g))
+    return min(groups,
+               key=lambda g: _fft_scratch_bytes(facts.transforms, g,
+                                                lanes, io))
 
 
 def loop_tile_size(facts: KernelFacts, axi_bus_bits: int) -> int:
@@ -243,33 +258,43 @@ def loop_tile_size(facts: KernelFacts, axi_bus_bits: int) -> int:
     return max(_MIN_TILE, min(_MAX_TILE, tile))
 
 
-def fft_parallel_rows(facts: KernelFacts,
-                      axi_bus_bits: int,
-                      dsp_budget: int,
-                      interface: str = "ap_memory") -> int:
-    """Power-of-two parallelism supported by both memory and arithmetic.
+def fft_parallel_rows(facts: KernelFacts, dsp_budget: int, budget: int,
+                      io: int = 1) -> int:
+    """Power-of-two FFT lane count the arithmetic and memory afford.
 
-    The square root of the elements in one AXI beat balances independent
-    rows against banks within each row; the DSP bound reserves 512 slices per
-    lane for mixed-precision phase, interpolation, and FFT operators. A
-    result of one is represented as zero because the pass uses zero to mean
-    "do not run the parallelizer".
+    Lines are prefetched in blocks, so lane parallelism no longer multiplies
+    external traffic -- the transfers stay unit-stride whatever the count.
+    What lanes do consume is DSP slices (one butterfly datapath each, ~512
+    slices with the f64 position arithmetic around it) and line-buffer
+    banks, whose block RAM cost the scratch model charges per lane. The
+    lane count is the largest power of two both budgets accept, capped at
+    16: past that the banked line buffers outgrow what placement can pay.
+    A result of one is represented as zero because the pass uses zero to
+    mean "serial lines".
     """
-    # Separate AXI rows are separate bursts on one master. Without an
-    # explicit load/compute/store engine, unrolling raises the port-limited II.
-    if interface != "ap_memory":
+    if not facts.transforms:
         return 0
-
-    # A complex row consumes matching real and imaginary lanes. Budget the
-    # parallel rows against complete samples even though lowering stores the
-    # planes separately.
-    sample_bits = max(16, facts.element_bytes * 16)
-    beat_lanes = max(1, axi_bus_bits // sample_bits)
-    bandwidth = 1 << (math.isqrt(beat_lanes).bit_length() - 1)
     dsp_lanes = max(1, dsp_budget // 512)
-    arithmetic = 1 << (dsp_lanes.bit_length() - 1)
-    factor = min(bandwidth, arithmetic)
-    return factor if factor > 1 else 0
+    lanes = 1 << (min(dsp_lanes, 16).bit_length() - 1)
+    # Line buffers live in the block tiers and pay a whole primitive per
+    # bank, so the check is against BRAM+URAM, not the aggregate that
+    # includes distributed RAM.
+    while lanes > 1 and _fft_scratch_bytes(facts.transforms, 0, lanes,
+                                           io) > budget // 2:
+        lanes >>= 1
+    return lanes if lanes > 1 else 0
+
+
+def fft_io_unroll(facts: KernelFacts, axi_bus_bits: int) -> int:
+    """Elements one FFT transfer access moves. Half a beat per plane: the
+    real and imaginary sweeps run in one loop, so together they fill the
+    bus; wider unrolls only multiply the line-buffer banks each lane pays
+    a memory primitive for."""
+    if not facts.transforms:
+        return 1
+    element_bytes = min(width for _, width in facts.transforms)
+    beat = max(1, axi_bus_bits // 16) // max(1, element_bytes)
+    return max(1, 1 << (min(beat, 8).bit_length() - 1))
 
 
 def lutram_max_bytes(axi_bus_bits: int) -> int:
@@ -366,14 +391,19 @@ def derive(config,
     assert (metadata is None) == (lowered_facts is None), \
         "the placement decision needs the metadata and the lowered IR together"
     budget = config.on_chip_bytes()
+    io = fft_io_unroll(facts, int(config.axi_bus_bits))
+    lanes = fft_parallel_rows(
+        facts, int(config.dsp),
+        int(config.bram_bytes) + int(config.uram_bytes), io)
     values = {
         "fft_stage_group":
-        fft_stage_group(facts, budget),
+        fft_stage_group(facts, budget, max(1, lanes), io),
         "loop_tile_size":
         loop_tile_size(facts, int(config.axi_bus_bits)),
         "fft_parallel_rows":
-        fft_parallel_rows(facts, int(config.axi_bus_bits), int(config.dsp),
-                          str(config.interface)),
+        lanes,
+        "fft_io_unroll":
+        io,
         "interp_banded_gather":
         interp_banded_gather(),
         "reuse_buffer_min_elements":

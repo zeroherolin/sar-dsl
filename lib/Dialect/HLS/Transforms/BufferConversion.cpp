@@ -14,12 +14,28 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
+#include "sar/Support/HLSHints.h"
 
 using namespace mlir;
 using namespace sar;
 using namespace hls;
 
 namespace {
+/// Reads a lowering's banking hint before the op is replaced, and re-attaches
+/// it to the replacement so the partition pass still sees it.
+struct PartitionHint {
+  Attribute kinds, factors;
+  explicit PartitionHint(Operation *op)
+      : kinds(op->getAttr(sar::kPartitionKindsAttr)),
+        factors(op->getAttr(sar::kPartitionFactorsAttr)) {}
+  void attachTo(Operation *op) const {
+    if (!kinds)
+      return;
+    op->setAttr(sar::kPartitionKindsAttr, kinds);
+    op->setAttr(sar::kPartitionFactorsAttr, factors);
+  }
+};
+
 // If an alloc is filled before any other uses, the alloc can be converted to a
 // buffer with initial value.
 template <typename OpType>
@@ -44,8 +60,11 @@ struct ConvertAllocToBufferWithInitValue : public OpRewritePattern<OpType> {
 
     if (auto fill = dyn_cast<linalg::FillOp>(first))
       if (auto constant = fill.value().getDefiningOp<arith::ConstantOp>()) {
-        rewriter.replaceOpWithNewOp<BufferOp>(op, op.getType(),
-                                              /*depth=*/1, constant.getValue());
+        PartitionHint hint(op);
+        auto buffer = rewriter.replaceOpWithNewOp<BufferOp>(
+            op, op.getType(),
+            /*depth=*/1, constant.getValue());
+        hint.attachTo(buffer);
         rewriter.eraseOp(fill);
         return success();
       }
@@ -63,7 +82,9 @@ struct ConvertAllocToBuffer : public OpRewritePattern<OpType> {
                                 PatternRewriter &rewriter) const override {
     if (!op.getDynamicSizes().empty() || !op.getSymbolOperands().empty())
       return failure();
-    rewriter.replaceOpWithNewOp<BufferOp>(op, op.getType());
+    PartitionHint hint(op);
+    auto buffer = rewriter.replaceOpWithNewOp<BufferOp>(op, op.getType());
+    hint.attachTo(buffer);
     return success();
   }
 };
@@ -86,7 +107,10 @@ struct ConvertGetGlobalToConstBuffer
       return op.emitOpError("refers to a global without a constant "
                             "initializer, which has no on-chip form"),
              failure();
-    rewriter.replaceOpWithNewOp<ConstBufferOp>(op, global.getType(), init);
+    PartitionHint hint(op);
+    auto buffer =
+        rewriter.replaceOpWithNewOp<ConstBufferOp>(op, global.getType(), init);
+    hint.attachTo(buffer);
     return success();
   }
 };
