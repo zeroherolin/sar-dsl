@@ -34,7 +34,7 @@ from ...errors import SARError
 
 __all__ = [
     "CONFIG_ENV_VAR", "HLSConfig", "HLSConfigError", "OPTIONS",
-    "check_precision", "shipped_config_path"
+    "check_cpp_identifier", "check_precision", "shipped_config_path"
 ]
 
 #: Names a YAML file replacing the shipped defaults for a whole project.
@@ -96,6 +96,16 @@ OPTIONS: Dict[str, _Spec] = {
           "(`precision` is the pre-synthesis lever)",
           minimum=0,
           maximum=_UINT32_MAX),
+    "ff":
+    _Spec("int",
+          "Flip-flop budget checked against synthesis reports",
+          minimum=0,
+          maximum=_UINT32_MAX),
+    "lut":
+    _Spec("int",
+          "Lookup-table budget checked against synthesis reports",
+          minimum=0,
+          maximum=_UINT32_MAX),
     "interface":
     _Spec("choice",
           "Protocol the top function's ports speak: 'ap_memory' (plain "
@@ -147,6 +157,14 @@ OPTIONS: Dict[str, _Spec] = {
           maximum=1024,
           nullable=True,
           advanced=True),
+    "fft_parallel_rows":
+    _Spec("int", "FFT rows computed in parallel (0 disables row unrolling, "
+          "null = the compiler derives it from bandwidth and DSP constraints)",
+          minimum=0,
+          maximum=1024,
+          nullable=True,
+          power_of_two=True,
+          advanced=True),
     "interp_banded_gather":
     _Spec("bool", "Gather interpolation taps from an on-chip band (null = the "
           "compiler decides)",
@@ -182,6 +200,14 @@ OPTIONS: Dict[str, _Spec] = {
           maximum=_UINT32_MAX,
           nullable=True,
           advanced=True),
+    "array_partition_max_factor":
+    _Spec("int", "Largest automatic memory-bank factor (null = the compiler "
+          "derives it from one AXI beat)",
+          minimum=1,
+          maximum=1024,
+          nullable=True,
+          power_of_two=True,
+          advanced=True),
     "top_func":
     _Spec("identifier",
           "Name of the emitted top function (null = the kernel's name)",
@@ -208,8 +234,21 @@ _FALSE_TOKENS = {"false", "no", "off"}
 _KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-]*")
 _INT_RE = re.compile(r"[+-]?\d[\d_]*")
-_BASED_INT_RE = re.compile(r"[+-]?0[xXbBoO][0-9a-fA-F_]+")
+_BASED_INT_RE = re.compile(
+    r"[+-]?(0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+)")
 _FLOAT_RE = re.compile(r"[+-]?(\d[\d_]*\.?\d*|\.\d+)([eE][+-]?\d+)?")
+_CXX_KEYWORDS = frozenset("""
+alignas alignof and and_eq asm atomic_cancel atomic_commit atomic_noexcept
+auto bitand bitor bool break case catch char char16_t char32_t class compl
+concept const constexpr const_cast continue co_await co_return co_yield
+decltype default delete do double dynamic_cast else enum explicit export
+extern false float for friend goto if import inline int long module mutable
+namespace new noexcept not not_eq nullptr operator or or_eq private protected
+public register reinterpret_cast requires return short signed sizeof static
+static_assert static_cast struct switch synchronized template this
+thread_local throw true try typedef typeid typename union unsigned using
+virtual void volatile wchar_t while xor xor_eq
+""".split())
 
 
 def _strip_comment(line: str) -> str:
@@ -312,6 +351,15 @@ def _bad_value(key: str, origin: str, detail: str, value) -> HLSConfigError:
         f"HLS option {key!r} in {origin}: {detail}, got {value!r}")
 
 
+def check_cpp_identifier(value: str, origin: str = "kernel name") -> str:
+    """Validate a name that is emitted verbatim into Vitis C++."""
+    if (not isinstance(value, str) or not _KEY_RE.fullmatch(value)
+            or value in _CXX_KEYWORDS):
+        raise HLSConfigError(
+            f"{origin} {value!r} is not a valid C++ identifier")
+    return value
+
+
 def _validate(key: str, value, origin: str):
     """Checks one option against the schema, returning the stored value."""
     spec = OPTIONS.get(key)
@@ -335,11 +383,14 @@ def _validate(key: str, value, origin: str):
         return value
 
     if spec.kind == "identifier":
-        if not isinstance(value, str) or not _KEY_RE.fullmatch(value):
+        try:
+            return check_cpp_identifier(value, f"HLS option {key!r} in "
+                                        f"{origin}")
+        except HLSConfigError:
             raise _bad_value(
                 key, origin, "expected a C identifier (the name goes into "
-                "the emitted C++)", value)
-        return value
+                "the emitted C++ and must not be a C++ keyword)", value) \
+                from None
 
     if spec.kind == "part":
         if not isinstance(value, str) or not _PART_RE.fullmatch(value):
@@ -392,8 +443,9 @@ def _read_file(path: Path, origin: str) -> Dict[str, object]:
 
 def _user_config(options: Dict[str, object]) -> Tuple[Optional[Path], str]:
     """The user's own config file, from the option or the environment."""
-    given = options.pop(_CONFIG_KEY, None)
-    if given is not None:
+    missing = object()
+    given = options.pop(_CONFIG_KEY, missing)
+    if given is not missing:
         if not isinstance(given, (str, Path)):
             raise _bad_value(_CONFIG_KEY, "compile options", "expected a path",
                              given)

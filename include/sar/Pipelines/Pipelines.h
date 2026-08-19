@@ -58,6 +58,13 @@ struct SARBufferPipelineOptions
       *this, "fft-stage-group",
       llvm::cl::desc("Stockham stages per scratch slot (0 = full unroll)"),
       llvm::cl::init(0)};
+
+  /// Independent transform rows computed together. The lowering allocates a
+  /// separate scratch lane for each row before unrolling the line loop.
+  Option<unsigned> fftParallelRows{
+      *this, "fft-parallel-rows",
+      llvm::cl::desc("Power-of-two FFT row parallelism (0 = serial rows)"),
+      llvm::cl::init(0)};
 };
 
 /// Lowers SAR kernels to linalg-on-tensors: the hand-off level for external

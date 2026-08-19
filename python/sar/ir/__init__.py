@@ -149,22 +149,34 @@ class DenseAttr:
     text: str
 
     @staticmethod
+    def _render(value, dtype: DType) -> str:
+        if dtype.is_complex:
+            return (f"({_format_float(value.real)},"
+                    f"{_format_float(value.imag)})")
+        if dtype.is_float:
+            return _format_float(value)
+        return str(int(value))
+
+    @classmethod
+    def splat(cls, value, type: TensorType) -> "DenseAttr":
+        """Build a scalar dense attribute without allocating the tensor."""
+        scalar = np.asarray(value, dtype=type.dtype.to_numpy()).item()
+        return cls(f"dense<{cls._render(scalar, type.dtype)}> : {type.mlir}")
+
+    @staticmethod
     def from_array(array: np.ndarray, type: TensorType) -> "DenseAttr":
         if tuple(array.shape) != type.shape:
             raise ValueError(
                 f"constant shape {tuple(array.shape)} does not match type "
                 f"{type.shape}")
 
-        def render(x) -> str:
-            if type.dtype.is_complex:
-                return f"({_format_float(x.real)},{_format_float(x.imag)})"
-            if type.dtype.is_float:
-                return _format_float(x)
-            return str(int(x))
-
         flat = array.reshape(-1)
-        if flat.size > 0 and np.all(flat == flat[0]):
-            body = render(flat[0])  # splat
+        # Compare object representations, not numeric equality: +0.0 and
+        # -0.0 are equal numerically but are observably different constants.
+        bits = np.ascontiguousarray(flat).view(
+            np.dtype((np.void, array.dtype.itemsize)))
+        if flat.size > 0 and np.all(bits == bits[0]):
+            body = DenseAttr._render(flat[0], type.dtype)
         elif (flat.size > _HEX_DENSE_THRESHOLD
               and (type.dtype.is_float or type.dtype.is_complex)):
             # MLIR hex blobs are little-endian regardless of the host.
@@ -176,7 +188,8 @@ class DenseAttr:
 
             def nest(arr) -> str:
                 if arr.ndim == 1:
-                    return "[" + ", ".join(render(x) for x in arr) + "]"
+                    values = (DenseAttr._render(x, type.dtype) for x in arr)
+                    return "[" + ", ".join(values) + "]"
                 return "[" + ", ".join(nest(sub) for sub in arr) + "]"
 
             body = nest(array)

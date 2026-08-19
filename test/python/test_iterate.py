@@ -170,6 +170,71 @@ def test_index_argument_emits_on_hls():
     assert "#pragma HLS" in scaled.compile(backend="hls").source()
 
 
+def _chunked_kernel(name):
+    block = 4
+
+    @sar.func
+    def chunked(z: sar.c128[N, N]) -> sar.c128[N, N]:
+
+        def step(i, out):
+            offset = i * block
+            tile = sar.dynamic_slice(z, (offset, 0), (block, N))
+            return sar.dynamic_update_slice(out, tile * 2.0, (offset, 0))
+
+        return sar.iterate(N // block, step, z * 0.0, index=True)
+
+    chunked.name = name
+    return chunked
+
+
+@requires_cpu
+def test_index_drives_dynamic_slice_and_update():
+    z, _ = _inputs()
+    np.testing.assert_allclose(_chunked_kernel("iterate_chunks_cpu")(z),
+                               z * 2.0,
+                               rtol=1e-12)
+
+
+@requires_hls
+def test_dynamic_slice_loop_csim(tmp_path):
+    from sar.compiler.toolchain import find_tool
+
+    z, _ = _inputs()
+    design = _chunked_kernel("iterate_chunks_hls").compile(backend="hls")
+    design.write_testbench([z], [z * 2.0], tmp_path, rtol=1e-12)
+    clang = find_tool("clang")
+    subprocess.run([
+        clang + "++", "-O2", "-Wno-unknown-pragmas", "-I", "stubs",
+        "iterate_chunks_hls.cpp", "iterate_chunks_hls_tb.cpp", "-o", "csim",
+        "-pthread"
+    ],
+                   cwd=tmp_path,
+                   check=True,
+                   capture_output=True)
+    result = subprocess.run(["./csim"],
+                            cwd=tmp_path,
+                            capture_output=True,
+                            text=True)
+    assert result.returncode == 0, result.stdout
+
+
+def test_dynamic_slice_argument_validation():
+
+    @sar.func
+    def bad_offset(z: sar.c128[N, N]) -> sar.c128[4, N]:
+        return sar.dynamic_slice(z, (1.5, 0), (4, N))
+
+    with pytest.raises(sar.TraceError, match="offset #0"):
+        bad_offset.to_mlir()
+
+    @sar.func
+    def bad_size(z: sar.c128[N, N]) -> sar.c128[N + 1, N]:
+        return sar.dynamic_slice(z, (0, 0), (N + 1, N))
+
+    with pytest.raises(sar.TraceError, match="span exceeds"):
+        bad_size.to_mlir()
+
+
 def test_index_body_takes_one_extra_argument():
     """index=True hands the body exactly one extra leading argument."""
 

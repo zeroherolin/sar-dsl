@@ -157,7 +157,7 @@ getBufferIndexDepthsAndStrides(NodeOp node, Value buffer) {
       unsigned depth = llvm::find(band, loop) - band.begin();
       if (depth != band.size())
         candidates.push_back(std::tuple(depth, flattenedExpr[i],
-                                        isLoopParallel(loop),
+                                        hasParallelAttr(loop),
                                         getAverageTripCount(loop).value_or(1)));
     }
     if (candidates.empty())

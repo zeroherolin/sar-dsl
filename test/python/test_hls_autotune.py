@@ -9,12 +9,11 @@ kernel and a 16384-scale kernel both get sensible choices.
 import sar
 import pytest
 from sar.backends.base import KernelMetadata
-from sar.backends.hls.autotune import (AUTO_OPTIONS, KernelFacts, derive,
-                                       fft_stage_group, interp_banded_gather,
-                                       kernel_facts_from_json, loop_tile_size,
-                                       lutram_max_bytes, measure_kernel,
-                                       storage_min_elements,
-                                       transpose_block_bytes, _scratch_slots)
+from sar.backends.hls.autotune import (
+    AUTO_OPTIONS, KernelFacts, array_partition_max_factor, derive,
+    fft_parallel_rows, fft_stage_group, interp_banded_gather,
+    kernel_facts_from_json, loop_tile_size, lutram_max_bytes, measure_kernel,
+    storage_min_elements, transpose_block_bytes, _scratch_slots)
 from sar.backends.hls.config import HLSConfig
 
 from conftest import requires_hls
@@ -53,14 +52,14 @@ class TestFftStageGroup:
 
     def test_zero_budget_uses_the_smallest_scratch(self):
         f = _facts(transforms=((512, 8), ))
-        assert fft_stage_group(f, budget=0) == 3
+        assert fft_stage_group(f, budget=0) == 2
 
     @pytest.mark.parametrize("budget,expected", [
-        (1 << 20, 3),
-        (1 << 19, 3),
-        (1 << 18, 3),
-        (1 << 17, 3),
-        (1 << 10, 3),
+        (1 << 20, 2),
+        (1 << 19, 2),
+        (1 << 18, 2),
+        (1 << 17, 2),
+        (1 << 10, 2),
     ])
     def test_budget_picks_the_grouping(self, budget, expected):
         """Partitioned lines are charged in whole memory primitives, so this
@@ -135,6 +134,30 @@ class TestLoopTileSize:
     def test_maximum_is_64(self):
         # A very wide bus should not produce an oversized tile.
         assert loop_tile_size(_facts(element_bytes=1), 1024) <= 64
+
+
+# ---------------------------------------------------------------------- #
+# fft_parallel_rows
+# ---------------------------------------------------------------------- #
+
+
+def test_parallelism_follows_bus_width_and_precision():
+    assert fft_parallel_rows(_facts(element_bytes=8), 512, 9830) == 2
+    assert fft_parallel_rows(_facts(element_bytes=4), 512, 9830) == 2
+    assert fft_parallel_rows(_facts(element_bytes=4), 128, 9830) == 0
+    assert fft_parallel_rows(_facts(element_bytes=4), 512, 9830, "axi") == 0
+
+
+def test_parallelism_respects_the_dsp_budget():
+    facts = _facts(element_bytes=4)
+    assert fft_parallel_rows(facts, 512, 1023) == 0
+    assert fft_parallel_rows(facts, 512, 1024) == 2
+
+
+def test_partition_factor_is_bounded_by_one_bus_beat():
+    assert array_partition_max_factor(_facts(element_bytes=4), 512) == 16
+    assert array_partition_max_factor(_facts(element_bytes=8), 512) == 8
+    assert array_partition_max_factor(_facts(element_bytes=4), 1024) == 32
 
 
 # ---------------------------------------------------------------------- #
@@ -436,9 +459,10 @@ def test_tighter_budget_moves_storage_threshold():
         return x * 2.0
 
     scale.name = "autotune_budget_threshold"
-    big = scale.compile(backend="hls").config
+    big = scale.compile(backend="hls", options={"interface": "axi"}).config
     small = scale.compile(backend="hls",
                           options={
+                              "interface": "axi",
                               "bram_bytes": 65536,
                               "uram_bytes": 0,
                               "lutram_bytes": 0

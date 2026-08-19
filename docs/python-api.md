@@ -22,7 +22,7 @@ element dtypes; indexing builds a tensor type annotation
 |------|---------|
 | `@sar.func` | traces a Python function into a compiled kernel; annotation-free kernels specialize per call signature |
 | `@sar.op` | defines an operator as a composition: inlines into kernels, runs eagerly on NumPy arrays ([defining-ops.md](defining-ops.md)) |
-| `sar.Kernel`, `sar.GenericKernel` | traced kernel handles for fixed and call-specialized signatures |
+| `sar.Kernel` | compiled kernel handle after tracing or specialization |
 | `Kernel.compile(backend=, options=)` | compiles for a backend; returns a callable (cpu) or a design handle (hls) |
 | `Kernel.specialize(*types)` | pins an annotation-free kernel to explicit types |
 | `Kernel.to_mlir()` | the traced MLIR module text |
@@ -56,7 +56,15 @@ ties), `cumsum` (inclusive prefix sum), `sort`, `rank_filter`,
 ## Layout and data movement
 
 `transpose`, `broadcast` (rank-1 to rank-2 along `dim`), `concatenate`/
-`concat`, `pad`, `flip`, `circshift`, `multilook`.
+`concat`, `pad`, `flip`, `circshift`, `multilook`, `dynamic_slice` /
+`dynamic_update_slice` (static-shape windows at runtime `i64[1]` offsets;
+offsets clamp so the window stays in bounds).
+
+## Compiled loops
+
+`iterate(n, body, *carries)` stays one loop in the design; a Python `for`
+unrolls at trace time. `index=True` exposes a 0-based `i64[1]` index that
+can drive `dynamic_slice` / `dynamic_update_slice`.
 
 ## Signal processing
 
@@ -67,7 +75,6 @@ ties), `cumsum` (inclusive prefix sum), `sort`, `rank_filter`,
 | `fftshift`, `ifftshift` | center / uncenter a spectrum; all axes when `dim` is omitted |
 | `interp1d` | resampling at fractional positions; `kernel=` nearest/linear/cubic/sinc, `boundary=` zero/edge/reflect |
 | `gather2d` | 2-D gather at data-dependent positions (`out[i,j] = data[rows[i,j], cols[i,j]]`), the backprojection access pattern; `kernel=` nearest/linear, `boundary=` zero/edge |
-| `iterate` | compiled counted loop with tensor-carried state: `iterate(n, body, *carries)` stays one loop in the design instead of unrolling at trace time |
 | `stolt_interp` | omega-K Stolt remapping, composed from `interp1d` and phase ramps |
 | `dechirp`, `matched_filter` | pulse-compression idioms |
 | `mag2db`, `pow2db`, `db`, `db2mag`, `db2pow` | decibel conversions |

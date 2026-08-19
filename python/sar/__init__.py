@@ -25,10 +25,10 @@ from .language import DomainWarning, PrecisionWarning, func, op
 from .language import (Kernel, Tensor, absolute, angle, argmax, argmin, atan2,
                        broadcast, c64, c128, cast, ceil, clip, concat,
                        concatenate, conj, conjugate, constant, cos, exp, expj,
-                       f32, f64, fft, fftshift, floor, gather2d, i32, i64,
-                       ifft, ifftshift, imag, interp1d, iterate, log,
-                       make_complex, maximum, minimum, pad, real, sign, sin,
-                       sqrt, transpose, where)
+                       dynamic_slice, dynamic_update_slice, f32, f64, fft,
+                       fftshift, floor, gather2d, i32, i64, ifft, ifftshift,
+                       imag, interp1d, iterate, log, make_complex, maximum,
+                       minimum, pad, real, sign, sin, sqrt, transpose, where)
 from .language import abs, max, min, round, sum  # noqa: A004 - numpy
 from .language import flip, cumsum, rank_filter, median_filter, sort
 from .language.signal import (blackman, circshift, db, db2mag, db2pow, dechirp,
@@ -83,6 +83,8 @@ __all__ = [
     "round",
     "transpose",
     "broadcast",
+    "dynamic_slice",
+    "dynamic_update_slice",
     "concatenate",
     "concat",
     "pad",

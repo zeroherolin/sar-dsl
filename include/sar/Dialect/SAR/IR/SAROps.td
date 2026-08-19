@@ -314,6 +314,33 @@ def SAR_SliceOp : SAR_Op<"slice", [Pure]> {
   let hasVerifier = 1;
 }
 
+def SAR_DynamicSliceOp : SAR_Op<"dynamic_slice", [Pure]> {
+  let summary = "extract a statically shaped slice at runtime offsets";
+  let description = [{
+    Copies `sizes` elements per axis from runtime scalar `offsets`, stepping
+    by `strides`. Each offset is clamped to the range in which the complete
+    slice remains in bounds, so CPU and HLS targets have identical behavior.
+  }];
+  let arguments = (ins SAR_Tensor:$input, Variadic<SAR_I64Tensor>:$offsets,
+                       DenseI64ArrayAttr:$sizes,
+                       DenseI64ArrayAttr:$strides);
+  let results = (outs SAR_Tensor:$result);
+  let hasVerifier = 1;
+}
+
+def SAR_DynamicUpdateSliceOp : SAR_Op<"dynamic_update_slice", [Pure]> {
+  let summary = "update a tensor-shaped window at runtime offsets";
+  let description = [{
+    Copies `update` into `input` at runtime scalar `offsets`. Offsets are
+    clamped so the complete update remains in bounds. The result has the
+    same type as `input`.
+  }];
+  let arguments = (ins SAR_Tensor:$input, SAR_Tensor:$update,
+                       Variadic<SAR_I64Tensor>:$offsets);
+  let results = (outs SAR_Tensor:$result);
+  let hasVerifier = 1;
+}
+
 def SAR_ConcatOp : SAR_Op<"concat", [Pure]> {
   let summary = "concatenate two tensors along an axis";
   let arguments = (ins SAR_Tensor:$lhs, SAR_Tensor:$rhs, I64Attr:$dim);

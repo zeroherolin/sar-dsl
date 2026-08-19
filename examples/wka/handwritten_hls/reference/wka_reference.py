@@ -13,7 +13,6 @@ from pathlib import Path
 
 import numpy as np
 
-
 C0 = np.float64(299792458.0)
 FC = np.float64(1269999750.06)
 FS = np.float64(32000000.0)
@@ -59,8 +58,7 @@ def band_windows(n: int) -> tuple[np.ndarray, np.ndarray]:
     range_fraction = min(1.0, abs(KR) * PULSE_LEN / FS)
     doppler_span = 2.0 * VR**2 * (n / PRF) / ((C0 / FC) * R0)
     azimuth_fraction = min(1.0, doppler_span / PRF)
-    return (band_window(n, range_fraction),
-            band_window(n, azimuth_fraction))
+    return (band_window(n, range_fraction), band_window(n, azimuth_fraction))
 
 
 def time_shift(n: int) -> np.float64:
@@ -70,7 +68,8 @@ def time_shift(n: int) -> np.float64:
     return np.float64(n / (2.0 * FS))
 
 
-def bulk_and_stolt(data: np.ndarray, row_limit: int | None = None) -> np.ndarray:
+def bulk_and_stolt(data: np.ndarray,
+                   row_limit: int | None = None) -> np.ndarray:
     n = data.shape[0]
     df_a = PRF / n
     df_r = FS / n
@@ -88,14 +87,14 @@ def bulk_and_stolt(data: np.ndarray, row_limit: int | None = None) -> np.ndarray
     c_over_2v = C0 / (2.0 * VR)
 
     for i in range(rows_to_run):
-        term2 = (c_over_2v * fa[i]) ** 2
+        term2 = (c_over_2v * fa[i])**2
         bulk_root = np.sqrt(np.maximum(x * x - term2, 0.0))
         bulk_diff = -term2 / (bulk_root + x)
         bulk_phase = coeff * bulk_diff + fr * fr * pi_over_kr
         source = data[i].astype(np.complex128)
         source *= np.exp(1j * (bulk_phase + range_phase))
 
-        # Stable form of sqrt(x*x+term2)-FC expressed around the destination bin.
+        # Stable sqrt(x*x+term2)-FC form around the destination bin.
         stolt_root = np.sqrt(x * x + term2)
         delta = term2 / (stolt_root + x)
         idx_float = np.arange(n, dtype=np.float64) + delta / df_r
@@ -107,12 +106,10 @@ def bulk_and_stolt(data: np.ndarray, row_limit: int | None = None) -> np.ndarray
         for tap_slot, tap in enumerate(range(TAP_START, TAP_END + 1)):
             src_idx = idx_int + tap
             valid = (src_idx >= 0) & (src_idx < n)
-            accum[valid] += (
-                source[src_idx[valid]] * weights[lut_idx[valid], tap_slot]
-            )
+            accum[valid] += (source[src_idx[valid]] *
+                             weights[lut_idx[valid], tap_slot])
         output[i] = (accum * np.exp(-1j * 2.0 * np.pi * fr * shift)).astype(
-            np.complex64
-        )
+            np.complex64)
     return output
 
 
@@ -129,7 +126,8 @@ def wka_reference_complex(data: np.ndarray,
     return image.astype(np.complex64)
 
 
-def wka_reference(data: np.ndarray, row_limit: int | None = None) -> np.ndarray:
+def wka_reference(data: np.ndarray,
+                  row_limit: int | None = None) -> np.ndarray:
     return np.abs(wka_reference_complex(data, row_limit)).astype(np.float32)
 
 
@@ -141,12 +139,13 @@ def metrics(reference: np.ndarray, candidate: np.ndarray) -> dict[str, float]:
     err_energy = np.vdot(error, error).real
     nrmse = np.sqrt(err_energy / max(ref_energy, np.finfo(float).tiny))
     correlation = abs(np.vdot(ref, got)) / np.sqrt(
-        max(ref_energy * np.vdot(got, got).real, np.finfo(float).tiny)
-    )
+        max(ref_energy * np.vdot(got, got).real,
+            np.finfo(float).tiny))
     return {
         "max_abs_error": float(np.max(np.abs(error))),
         "nrmse": float(nrmse),
-        "snr_db": float(-20.0 * np.log10(max(nrmse, np.finfo(float).tiny))),
+        "snr_db": float(-20.0 * np.log10(max(nrmse,
+                                             np.finfo(float).tiny))),
         "complex_correlation": float(correlation),
     }
 
@@ -164,7 +163,8 @@ def main() -> int:
         raw = np.fromfile(args.input, dtype=np.complex64)
         expected = args.n * args.n
         if raw.size != expected:
-            raise ValueError(f"expected {expected} complex samples, got {raw.size}")
+            raise ValueError(
+                f"expected {expected} complex samples, got {raw.size}")
         data = raw.reshape(args.n, args.n)
     else:
         data = synthetic_input(args.n)
@@ -182,9 +182,8 @@ def main() -> int:
     if args.compare:
         candidate = np.fromfile(args.compare, dtype=np.float32)
         if candidate.size != result.size:
-            raise ValueError(
-                f"expected {result.size} candidate samples, got "
-                f"{candidate.size}")
+            raise ValueError(f"expected {result.size} candidate samples, got "
+                             f"{candidate.size}")
         candidate = candidate.reshape(result.shape)
         candidate_finite = bool(np.all(np.isfinite(candidate)))
         summary.update(metrics(result, candidate))

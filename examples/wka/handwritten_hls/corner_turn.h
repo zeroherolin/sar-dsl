@@ -9,6 +9,7 @@
 
 #include "wka_common.h"
 
-void corner_turn(bus_t *__restrict in, bus_t *__restrict out, bool magnitude_output);
+void corner_turn(bus_t *__restrict in, bus_t *__restrict out,
+                 bool magnitude_output);
 
 #endif

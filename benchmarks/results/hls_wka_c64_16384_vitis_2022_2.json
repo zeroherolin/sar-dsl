@@ -2,17 +2,19 @@
   "schema_version": 1,
   "measured_at_utc": "2026-08-18",
   "source": {
-    "base_commit": "9caee4826f5138579defee0a47a0051720d5e725",
+    "base_commit": "10e5dcce50ae70b96cc57e99749b6c8768de5dfa",
     "working_tree_modified": true,
-    "command": "vitis_hls -f wka_c64_grouped_csynth.tcl"
+    "command": "vitis_hls -f wka_c64_csynth.tcl",
+    "generated_cpp_sha256": "4bde8a0c99978208f573e271d891e3a4e12649b059f2141704090a3289fe214a"
   },
   "design": {
     "algorithm": "omega-K",
-    "top": "wka_c64_grouped",
+    "top": "wka_c64",
     "shape": [16384, 16384],
     "dtype": "c64",
     "interface": "axi",
-    "fft_stage_group": 5
+    "fft_stage_group": 3,
+    "fft_parallel_rows": 0
   },
   "constraints": {
     "part": "xcvu13p-fhgb2104-2-i",
@@ -26,19 +28,19 @@
     "name": "Vitis HLS",
     "version": "2022.2",
     "flow_target": "vivado",
-    "csynth_elapsed_s": 383.97
+    "csynth_elapsed_s": 216.21
   },
   "report": {
-    "estimated_clock_ns": 5.698,
-    "latency_cycles": 47013232685,
-    "interval_cycles": 47013232686,
-    "bram18k": 130,
-    "uram": 552,
-    "dsp": 289,
-    "ff": 110478,
-    "lut": 348722,
-    "report_sha256": "9cd5719eb5b78a7cd33bec2466ac55965c45b287b8127d6f2a50d6660fd4f9ae",
+    "estimated_clock_ns": 3.187,
+    "latency_cycles": 13185679397,
+    "interval_cycles": 13185679398,
+    "bram18k": 162,
+    "uram": 296,
+    "dsp": 539,
+    "ff": 153845,
+    "lut": 252020,
+    "report_sha256": "00d1b709aaf2038ede176680dbf3ad60e6b73bbeffda3e4c1cb174a4ba606ec3",
     "resource_constraints_met": true,
-    "timing_constraint_met": false
+    "timing_constraint_met": true
   }
 }

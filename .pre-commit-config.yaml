@@ -2,8 +2,7 @@ default_stages: [pre-commit, pre-push, manual]
 
 exclude: |
   (?x)(
-    ^externals/|
-    \.(png|jpg|bin)$
+    ^externals/
   )
 
 repos:

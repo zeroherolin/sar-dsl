@@ -160,14 +160,15 @@ All kernels follow the split-complex affine path (`sar-to-affine-pipeline`):
    4-multiply form, `abs` becomes `sqrt(re^2+im^2)`), and the
    signal/interpolation ops map to their split-complex forms
    (`fft_split`, `interp1d_split`).
-2. `convert-sar-fft-to-affine` lowers `fft_split` to radix-2 **Stockham
-   autosort** loop nests. Stockham is the deliberate choice over
+2. `convert-sar-fft-to-affine` lowers `fft_split` to mixed radix-4/2
+   **Stockham autosort** loop nests. Stockham is the deliberate choice over
    Cooley-Tukey: it needs no bit-reversal permutation, so every access is
    an affine function of loop indices -- which is what HLS loop analysis,
    pipelining and array partitioning require. Twiddle factors are
-   precomputed into constant memref globals. Stages are statically
-   specialized and share reusable line-sized scratch slots according to
-   the resource-derived stage grouping.
+   precomputed into constant memref globals. Radix-4 halves the stage count
+   where possible. Stages share reusable line-sized scratch slots, and a
+   compact lane loop processes the bandwidth- and DSP-derived number of rows
+   without cloning the complete stage graph in generated source.
 
    Corner turns -- the transposes that carry a raster between the range and
    azimuth domains -- are staged through an on-chip block
@@ -194,13 +195,17 @@ All kernels follow the split-complex affine path (`sar-to-affine-pipeline`):
    f64, mirroring the CPU runtime.
 4. `sar.gather2d` lowers like the interpolation -- clamped,
    select-masked loads in a straight-line body -- and compiled loops
-   (`sar.iterate`) reach this flow as `scf.for`; since a dataflow task
+   (`sar.iterate`) reach this flow as `scf.for`; runtime-offset
+   `dynamic_slice`/`dynamic_update_slice` lower to bounded indexed accesses.
+   Since a dataflow task
    may not yield values, `sar-demote-loop-carries` first rewrites the
    buffer carry into side effects (the body iterates in the init buffer,
    a per-iteration copy replaces the yield).
 5. The bufferized affine IR enters the HLS pipeline (`-hls-pipeline`),
    which builds the dataflow hierarchy, places buffers on or off chip and
-   shapes the interfaces; `sar-translate` then emits Vitis HLS C++.
+   shapes the interfaces. Independent sibling sweeps with identical bounds
+   fuse before task formation, so split real/imaginary outputs share phase
+   arithmetic. `sar-translate` then emits the final C++.
 
 With that, every SAR operation lowers in the affine flow and complete
 imaging chains (omega-K, range-Doppler, chirp scaling, polar format)
@@ -225,3 +230,5 @@ Keeping it in-tree means one LLVM build and one set of tools:
 `sar-opt` runs every pass from SAR down to scheduled HLS IR, and
 `sar-translate` writes the C++. A second emission target registers itself
 in `include/sar/Target/InitAllTranslations.h` and needs no new tool.
+Memory placement, AXI shaping, and the configuration schema are in
+[backends.md](backends.md).

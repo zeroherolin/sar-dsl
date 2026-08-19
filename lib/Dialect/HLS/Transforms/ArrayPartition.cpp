@@ -149,9 +149,11 @@ bool sar::applyArrayPartition(Value array, ArrayRef<unsigned> factors,
     for (unsigned f : factors)
       banks *= std::max(1u, f);
     uint64_t cost = bankBits * banks;
-    bool affordable =
-        lutramBitsBudget == 0 ||
-        (lutramBitsUsed && *lutramBitsUsed + cost <= lutramBitsBudget);
+    // A zero budget forbids distributed RAM, matching the configuration and
+    // placement contracts. "Unlimited" is not a useful hardware budget and
+    // must not be encoded by the same value as "disabled".
+    bool affordable = lutramBitsBudget != 0 && lutramBitsUsed &&
+                      *lutramBitsUsed + cost <= lutramBitsBudget;
     if (affordable) {
       if (lutramBitsUsed)
         *lutramBitsUsed += cost;
@@ -582,14 +584,122 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
 }
 
 namespace {
+static uint64_t roundUpTo(uint64_t value, uint64_t grain) {
+  return ((value + grain - 1) / grain) * grain;
+}
+
+static LogicalResult verifyFinalMemoryBudget(ModuleOp module,
+                                             uint64_t bramBudget,
+                                             uint64_t uramBudget,
+                                             uint64_t lutramBudget) {
+  constexpr uint64_t bramBlockBytes = 4608;
+  constexpr uint64_t uramBlockBytes = 36864;
+  struct Usage {
+    uint64_t bram = 0;
+    uint64_t uram = 0;
+    uint64_t lutram = 0;
+  };
+  DenseMap<Operation *, Usage> functionUsage;
+  DenseSet<Value> charged;
+
+  auto charge = [&](Value value, uint64_t copies, Usage &usage) {
+    if (!charged.insert(value).second)
+      return;
+    auto type = dyn_cast<MemRefType>(value.getType());
+    if (!type || !type.hasStaticShape() ||
+        !type.getElementType().isIntOrFloat())
+      return;
+    auto kind = getMemoryKind(type);
+    if (kind == MemoryKind::UNKNOWN || kind == MemoryKind::DRAM)
+      return;
+    uint64_t bytes = (uint64_t)type.getNumElements() *
+                     ((type.getElementTypeBitWidth() + 7) / 8);
+    uint64_t banks = std::max<int64_t>(1, getPartitionFactors(type));
+    uint64_t bankBytes = (bytes + banks - 1) / banks;
+    switch (kind) {
+    case MemoryKind::LUTRAM_1P:
+    case MemoryKind::LUTRAM_2P:
+    case MemoryKind::LUTRAM_S2P:
+      usage.lutram += copies * bytes;
+      break;
+    case MemoryKind::BRAM_1P:
+    case MemoryKind::BRAM_2P:
+    case MemoryKind::BRAM_S2P:
+    case MemoryKind::BRAM_T2P:
+      usage.bram += copies * banks * roundUpTo(bankBytes, bramBlockBytes);
+      break;
+    case MemoryKind::URAM_1P:
+    case MemoryKind::URAM_2P:
+    case MemoryKind::URAM_S2P:
+    case MemoryKind::URAM_T2P:
+      usage.uram += copies * banks * roundUpTo(bankBytes, uramBlockBytes);
+      break;
+    case MemoryKind::UNKNOWN:
+    case MemoryKind::DRAM:
+      break;
+    }
+  };
+
+  module.walk([&](hls::BufferLikeInterface buffer) {
+    auto func = buffer->getParentOfType<func::FuncOp>();
+    if (func)
+      charge(buffer.getMemref(), isa<ConstBufferOp>(*buffer) ? 1 : 2,
+             functionUsage[func.getOperation()]);
+  });
+
+  func::FuncOp designTop;
+  for (auto func : module.getOps<func::FuncOp>())
+    if (hasTopFuncAttr(func))
+      designTop = func;
+  bool hasRuntimeWrapper =
+      llvm::any_of(module.getOps<func::FuncOp>(),
+                   [](func::FuncOp func) { return hasRuntimeAttr(func); });
+  if (!hasRuntimeWrapper)
+    for (auto func : module.getOps<func::FuncOp>())
+      if (hasTopFuncAttr(func))
+        for (BlockArgument arg : func.getArguments())
+          charge(arg, 1, functionUsage[func.getOperation()]);
+
+  // Outlined helpers execute under the design top. Their local arrays have
+  // disjoint call lifetimes, so peak storage is the top's persistent buffers
+  // plus the largest helper frame, not the sum of every helper in the module.
+  Usage peak = designTop ? functionUsage[designTop.getOperation()] : Usage{};
+  Usage helperPeak;
+  for (auto &[func, usage] : functionUsage)
+    if (!designTop || func != designTop.getOperation()) {
+      helperPeak.bram = std::max(helperPeak.bram, usage.bram);
+      helperPeak.uram = std::max(helperPeak.uram, usage.uram);
+      helperPeak.lutram = std::max(helperPeak.lutram, usage.lutram);
+    }
+  uint64_t bram = peak.bram + helperPeak.bram;
+  uint64_t uram = peak.uram + helperPeak.uram;
+  uint64_t lutram = peak.lutram + helperPeak.lutram;
+
+  auto over = [](uint64_t used, uint64_t budget) {
+    return used > budget || (budget == 0 && used != 0);
+  };
+  if (!over(bram, bramBudget) && !over(uram, uramBudget) &&
+      !over(lutram, lutramBudget))
+    return success();
+  module.emitError() << "SAR_HLS_RETRYABLE_PARTITION_OVERFLOW: final banked "
+                        "memories exceed the resource budgets: BRAM "
+                     << bram << "/" << bramBudget << " bytes, URAM " << uram
+                     << "/" << uramBudget << " bytes, LUTRAM " << lutram << "/"
+                     << lutramBudget << " bytes";
+  return failure();
+}
+
 struct ArrayPartition : public sar::impl::ArrayPartitionBase<ArrayPartition> {
   using sar::impl::ArrayPartitionBase<ArrayPartition>::ArrayPartitionBase;
 
   ArrayPartition() = default;
   ArrayPartition(unsigned argLutramMaxBits, unsigned argLutramBytes,
+                 unsigned argBramBytes, unsigned argUramBytes,
                  unsigned argMaxFactor) {
     lutramMaxBits = argLutramMaxBits;
     lutramBytes = argLutramBytes;
+    bramBytes = argBramBytes;
+    uramBytes = argUramBytes;
     maxFactor = argMaxFactor;
   }
 
@@ -625,13 +735,18 @@ struct ArrayPartition : public sar::impl::ArrayPartitionBase<ArrayPartition> {
       }
     applyAutoArrayPartition(topFunc, lutramMaxBits, maxFactor,
                             (uint64_t)lutramBytes * 8, &lutramBitsUsed);
+    if (failed(
+            verifyFinalMemoryBudget(module, bramBytes, uramBytes, lutramBytes)))
+      signalPassFailure();
   }
 };
 } // namespace
 
 std::unique_ptr<Pass> sar::createArrayPartitionPass(unsigned lutramMaxBits,
                                                     unsigned lutramBytes,
+                                                    unsigned bramBytes,
+                                                    unsigned uramBytes,
                                                     unsigned maxFactor) {
-  return std::make_unique<ArrayPartition>(lutramMaxBits, lutramBytes,
-                                          maxFactor);
+  return std::make_unique<ArrayPartition>(lutramMaxBits, lutramBytes, bramBytes,
+                                          uramBytes, maxFactor);
 }

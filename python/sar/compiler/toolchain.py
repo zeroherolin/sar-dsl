@@ -10,7 +10,6 @@ Search order for a tool named `foo-bar`:
 
 from __future__ import annotations
 
-import functools
 import importlib.util
 import math
 import os
@@ -60,20 +59,17 @@ def _load_build_config() -> Optional[ModuleType]:
     return None
 
 
-_config = _load_build_config()
-
-
 def _config_dirs() -> List[str]:
     dirs = []
-    if _config is not None:
-        dirs.append(getattr(_config, "SAR_DSL_TOOL_DIR", ""))
-        dirs.append(getattr(_config, "LLVM_TOOL_DIR", ""))
+    config = _load_build_config()
+    if config is not None:
+        dirs.append(getattr(config, "SAR_DSL_TOOL_DIR", ""))
+        dirs.append(getattr(config, "LLVM_TOOL_DIR", ""))
     extra = os.environ.get("SAR_DSL_TOOL_PATH", "")
     dirs.extend(p for p in extra.split(os.pathsep) if p)
     return [d for d in dirs if d]
 
 
-@functools.lru_cache(maxsize=None)
 def find_tool(name: str, required: bool = True) -> Optional[str]:
     env_key = "SAR_DSL_TOOL_" + name.upper().replace("-", "_")
     override = os.environ.get(env_key)
@@ -100,7 +96,6 @@ def find_tool(name: str, required: bool = True) -> Optional[str]:
     return None
 
 
-@functools.lru_cache(maxsize=None)
 def find_runtime_library() -> str:
     override = os.environ.get("SAR_DSL_RUNTIME_LIB")
     if override:
@@ -108,8 +103,9 @@ def find_runtime_library() -> str:
             raise ToolchainError(
                 f"SAR_DSL_RUNTIME_LIB={override} does not exist")
         return override
-    if _config is not None:
-        candidate = getattr(_config, "SAR_DSL_RUNTIME_LIB", "")
+    config = _load_build_config()
+    if config is not None:
+        candidate = getattr(config, "SAR_DSL_RUNTIME_LIB", "")
         if candidate and os.path.isfile(candidate):
             return candidate
     tool = find_tool("sar-opt", required=False)
@@ -121,6 +117,16 @@ def find_runtime_library() -> str:
     raise ToolchainError(
         "libsar_runtime.so not found; build the project or set "
         "SAR_DSL_RUNTIME_LIB")
+
+
+# Kept for callers that cleared the former lookup cache. Resolution is now
+# environment-sensitive on every call, so clearing is intentionally a no-op.
+def _no_cache() -> None:
+    pass
+
+
+find_tool.cache_clear = _no_cache
+find_runtime_library.cache_clear = _no_cache
 
 
 def run_tool(stage: str,

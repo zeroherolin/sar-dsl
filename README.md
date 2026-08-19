@@ -11,9 +11,10 @@
 [![Vitis HLS 2022.2](https://img.shields.io/badge/Vitis%20HLS-2022.2-brightgreen.svg)](docs/backends.md)
 [![Platform](https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey.svg)](#getting-started)
 
-Write complete SAR imaging pipelines in Python with whole-array operations —
-FFTs, phase operations, interpolation, and corner turns — and compile the same
-program to native CPU code or synthesizable Vitis HLS C++.
+Express complete SAR imaging pipelines in Python with whole-array operations
+such as FFTs, phase transforms, interpolation, and corner turns, then compile
+the same statically specialized program to native CPU code or synthesizable
+Vitis HLS C++.
 
 <img src="examples/wka/assets/san_francisco_wka.png" width="72%"
      alt="San Francisco Bay, ALOS-1 raw echoes focused by the SAR-DSL omega-K kernel"/>
@@ -25,29 +26,29 @@ omega-K kernel.*
 
 ## Highlights
 
-- **One language, two backends.** The same statically specialized kernel
-  compiles to native CPU code or synthesizable Vitis HLS C++; backend
-  symmetry is enforced by tests rather than backend-specific DSL operators.
-- **Signal-processing structure survives tracing.** FFTs, phase operations,
-  interpolation, reductions, and layout changes remain explicit in MLIR long
-  enough for backend-wide scheduling and memory decisions.
-- **Extensible in Python.** `@sar.op` defines reusable operators by composing
-  the same primitives available to kernels, with eager NumPy and compiled
-  semantics.
+- **One language, two backends.** Every public DSL construct lowers through
+  both the native CPU and Vitis HLS paths; backend-specific language operators
+  are prohibited by the symmetry tests.
+- **Signal-processing structure survives tracing.** FFTs, phase transforms,
+  interpolation, reductions, and layout changes remain explicit in MLIR for
+  whole-graph scheduling and memory planning.
+- **Extensible in Python.** `@sar.op` builds reusable operators from the same
+  primitives available to kernels. One definition runs eagerly with NumPy and
+  traces into compiled kernels.
 - **Complete imaging chains.** Four examples exercise the language and both
   backends end to end:
 
 | Chain | Imaging mode | Main operations |
 |-------|--------------|-----------------|
-| [omega-K](examples/wka/) | stripmap | matched filtering, Stolt interpolation |
+| [Omega-K](examples/wka/) | stripmap | matched filtering, Stolt interpolation |
 | [Range-Doppler](examples/rda/) | stripmap | range compression, RCMC |
 | [Chirp Scaling](examples/csa/) | stripmap | phase-only range migration correction |
 | [Polar Format](examples/pfa/) | spotlight | polar resampling, SVA |
 
-SAR-DSL is a research compiler, not an FPGA deployment stack. This repository
-tests native execution, generated C-simulation, and Vitis HLS synthesis.
-Vivado implementation, board drivers, and on-device benchmarking are
-intentionally outside its scope.
+SAR-DSL is a research compiler rather than an FPGA deployment stack. The
+repository validates native execution, generated C-simulation, and Vitis HLS
+synthesis; Vivado implementation, board drivers, and on-device benchmarking
+are outside its scope.
 
 ## Quick example
 
@@ -59,19 +60,18 @@ def range_compress(raw, replica):
     spectrum = sar.fft(raw, axis=1) * replica
     return sar.ifft(spectrum, axis=1)
 
-# Eager specialization and native CPU execution.
+# The first call specializes the kernel and executes it on the CPU.
 image = range_compress(raw_np, replica_np)
 
-# Ahead-of-time specialization and HLS C++ emission.
+# The same kernel can be specialized ahead of time for HLS emission.
 design = range_compress.specialize(
     sar.c64[512, 512], sar.c64[512, 512]
 ).compile("hls", options={"interface": "axi"})
 print(design.cpp_path)
 ```
 
-Kernels specialize by static shape and dtype. NumPy arrays may be captured as
-constants or passed as arguments. `@sar.op` defines reusable operators with the
-same eager NumPy and compiled semantics; see
+Kernels specialize by static shape and dtype. NumPy arrays can be captured as
+compile-time constants or passed as runtime arguments. See
 [Defining operators](docs/defining-ops.md).
 
 ## Getting started
@@ -116,17 +116,16 @@ dialect to native CPU code and Vitis HLS C++"/>
 <!-- Diagram source: docs/assets/how_it_works.html. Regenerate the PNG with
      the command in that file's header after changing the architecture. -->
 
-The frontend boundary is textual MLIR, keeping Python independent of LLVM
-bindings while leaving verification to `sar-opt`. Both backends consume the
-same core operations. Backend symmetry is regression-tested: the DSL does not
-expose CPU-only or HLS-only language operators.
+The Python frontend serializes textual MLIR, avoiding a runtime dependency on
+the MLIR Python bindings while leaving authoritative verification to
+`sar-opt`. Both backends consume the same core operations.
 
-The CPU pipeline uses linalg fusion, bufferization, OpenMP, LLVM, and a small
-runtime for FFT and interpolation. The HLS pipeline lowers complex values into
-real planes, emits affine Stockham FFTs and bounded gathers, plans on-chip and
-external buffers, and adds AXI, partition, pipeline, and storage directives.
-The compiler can emit a package containing source, testbench, and Vitis Tcl
-scripts without requiring Vitis in the user's environment.
+The CPU pipeline combines linalg fusion, bufferization, OpenMP, LLVM, and a
+small FFT/interpolation runtime. The HLS pipeline splits complex values into
+real planes, emits mixed-radix affine Stockham FFTs and bounded gathers, plans
+on-chip and external storage, and attaches AXI, partition, pipeline, and
+storage directives. It emits source, testbench, manifest, and Vitis Tcl files
+without requiring Vitis in the user's environment.
 
 Detailed design rationale and IR contracts are in
 [Architecture](docs/architecture.md) and [Dialect reference](docs/dialect.md).
@@ -186,28 +185,59 @@ first-sidelobe reference, not a bound on the complete imaging chain.*
 Peak location, IRW, PSLR, and ISLR thresholds are regression-tested against
 the same NumPy references used for cross-backend accuracy checks.
 
+### CPU whole-graph performance
+
+Warm end-to-end times for the three stripmap examples at 16384 × 16384,
+including every FFT, phase operation, interpolation and corner turn:
+
+| Algorithm | SAR-DSL CPU | NumPy reference | Speedup | Throughput |
+|---|---:|---:|---:|---:|
+| omega-K (WKA) | 3.582 s | 124.08 s | 34.6× | 74.94 Msamples/s |
+| Range-Doppler (RDA) | 3.849 s | 157.90 s | 41.0× | 69.74 Msamples/s |
+| Chirp Scaling (CSA) | 2.807 s | 73.58 s | 26.2× | 95.64 Msamples/s |
+
+Each row is one timed sample after three warmups, using c128 working
+precision. The reference host has 240 logical CPUs; the runtime pool uses 32
+workers with LLVM 22, Python 3.12.12, and NumPy 1.26.4. Compilation and
+first-touch allocation are excluded. Polar Format is a spotlight chain with a
+2× oversampled grid; its CPU sweep through 4096 is in
+[benchmarks/](benchmarks/).
+
 ### HLS synthesis
 
 The reference HLS target is `xcvu13p-fhgb2104-2-i`, with a 4 ns clock,
 512-bit AXI, and 80% device resource budgets. Vitis HLS 2022.2 is used for
 validation but is optional for building and using the compiler.
 
-Complete N=32 designs for all four algorithms pass local Vitis synthesis and
-meet the 4 ns target. Their generated packages pass both plain-C++ and Vitis
-C-simulation against NumPy golden outputs. Reports and methods are listed in
-[benchmarks/](benchmarks/). A full 16384 × 16384 c64 omega-K design also
-completes synthesis:
+Generated C++ is checked against NumPy golden outputs in plain-C++ and Vitis
+C-simulation at regression sizes. The following rows are complete 16384² c64
+`csynth` reports; time is latency multiplied by the estimated clock period:
 
-| Estimated clock | Latency at 4 ns target | BRAM18K | URAM | DSP | FF | LUT |
-|----------------:|-----------------------:|--------:|-----:|----:|---:|----:|
-| 5.698 ns | 47,013,232,685 cycles / 188.053 s | 130 | 552 | 289 | 110,478 | 348,722 |
+| Design | Clock | Latency cycles | Latency time | csynth time |
+|---|---:|---:|---:|---:|
+| WKA, generated | 3.187 ns | 13,185,679,397 | 42.023 s | 216.21 s |
+| WKA, hand-written | 3.500 ns | 2,033,373,247 | 7.117 s | 201.24 s |
+| RDA, generated | 5.840 ns | 42,162,307,154 | 246.228 s | 199.44 s |
+| CSA, generated | 5.698 ns | 25,257,394,240 | 143.917 s | 187.00 s |
 
-This large design fits the configured resource budgets but misses the 4 ns
-timing target. The result demonstrates synthesizability and exposes the current
-research bottleneck; it is not a claim of timing closure or hand-tuned
-throughput. The
-[machine-readable report summary](benchmarks/results/hls_wka_c64_16384_vitis_2022_2.json)
-records its constraints and provenance.
+Resource counts and percentages of the full default VU13P device:
+
+| Design | BRAM18K | URAM | DSP | FF | LUT |
+|---|---:|---:|---:|---:|---:|
+| WKA, generated | 162 (3.01%) | 296 (23.12%) | 539 (4.39%) | 153,845 (4.45%) | 252,020 (14.58%) |
+| WKA, hand-written | 384 (7.14%) | 296 (23.12%) | 1,135 (9.24%) | 210,325 (6.09%) | 373,962 (21.64%) |
+| RDA, generated | 96 (1.79%) | 260 (20.31%) | 173 (1.41%) | 111,871 (3.24%) | 223,167 (12.91%) |
+| CSA, generated | 64 (1.19%) | 288 (22.50%) | 269 (2.19%) | 111,795 (3.23%) | 217,079 (12.56%) |
+
+Generated WKA meets the 4 ns target. Its estimated latency is 6.48× the
+worst-case cycles of the independent hand-written baseline. The baseline uses
+packed AXI and a different microarchitecture, so the comparison is directional
+rather than like-for-like. Vitis reports a latency range for the hand-written
+design because it reuses transform and corner-turn instances across runtime
+modes; the table records the worst case. RDA and CSA fit the resource budgets
+but miss 4 ns. All timing values are HLS estimates, not post-place-and-route
+closure. Constraints and provenance for generated WKA are in the
+[machine-readable summary](benchmarks/results/hls_wka_c64_16384_vitis_2022_2.json).
 
 ## Documentation
 

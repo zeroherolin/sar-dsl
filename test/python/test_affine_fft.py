@@ -260,6 +260,31 @@ module {{
                                atol=1e-12)
 
 
+def test_affine_fft_parallel_rows_matches_numpy(tmp_path):
+    lines, length = 8, 64
+    mlir = f"""
+module {{
+  func.func @pr(%re: tensor<{lines}x{length}xf64>,
+                %im: tensor<{lines}x{length}xf64>)
+      -> (tensor<{lines}x{length}xf64>, tensor<{lines}x{length}xf64>) {{
+    %r, %i = sar.fft_split %re, %im {{dim = 1 : i64}}
+        : tensor<{lines}x{length}xf64>
+    return %r, %i : tensor<{lines}x{length}xf64>,
+                    tensor<{lines}x{length}xf64>
+  }}
+}}"""
+    pipeline = "--sar-affine-to-llvm-pipeline=fft-parallel-rows=4"
+    lib, fn = compile_split_kernel(mlir, "pr", tmp_path, pipeline=pipeline)
+    rng = np.random.default_rng(24)
+    re = rng.standard_normal((lines, length))
+    im = rng.standard_normal((lines, length))
+    out_re, out_im = run_split(fn, [re, im], [(lines, length)] * 2, np.float64)
+    np.testing.assert_allclose(out_re + 1j * out_im,
+                               np.fft.fft(re + 1j * im, axis=1),
+                               rtol=1e-12,
+                               atol=1e-12)
+
+
 @pytest.mark.parametrize("group", [0, 1, 2])
 def test_affine_bluestein_stage_group_matches_numpy(group, tmp_path):
     """Grouping also reaches the two padded transforms Bluestein runs."""

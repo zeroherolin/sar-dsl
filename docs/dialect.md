@@ -46,6 +46,8 @@ ranked tensors with **static shapes**; supported element types are `f32`,
 | `sar.reverse {dim}` | element order reversed along one axis (frontend: `sar.flip`) |
 | `sar.broadcast {dim}` | 1-D -> 2-D; the vector lies along axis `dim` |
 | `sar.slice {offsets, sizes, strides}` | statically strided sub-tensor (NumPy basic slicing; frontend: `x[2:6, ::2]`) |
+| `sar.dynamic_slice {sizes, strides}` | static-shape sub-tensor at runtime `i64[1]` offsets; offsets clamp so the complete slice remains in bounds |
+| `sar.dynamic_update_slice` | copies a static-shape update into a tensor at clamped runtime offsets |
 | `sar.concat {dim}` | concatenation of two tensors along `dim` |
 | `sar.pad {low, high, value}` | constant padding per axis (NumPy `pad`) |
 | `sar.fftshift {dim, inverse?}` | NumPy `fftshift`/`ifftshift` along one axis |
@@ -54,7 +56,7 @@ ranked tensors with **static shapes**; supported element types are `f32`,
 
 | Op | Semantics |
 |----|-----------|
-| `sar.fft {dim}` | unscaled forward DFT along `dim` (NumPy convention); any size >= 2 on both backends (radix-2 where the size allows, Bluestein's chirp-z reduction otherwise) |
+| `sar.fft {dim}` | unscaled forward DFT along `dim` (NumPy convention); any size >= 2 on both backends (mixed radix-4/2 for powers of two, Bluestein's chirp-z reduction otherwise) |
 | `sar.ifft {dim}` | inverse DFT scaled by `1/N` |
 | `sar.fft_split {dim, inverse?}` | split-complex FFT on (re, im) float planes; produced by `sar-decomplexify`, not by the frontend |
 | `sar.interp1d {dim?, kernel?, taps?, window?, beta?, boundary?}` | resampling along `dim` (default 1) at fractional `positions` (f64 tensor) with a selectable kernel: `nearest`, `linear`, `cubic` (Keys) or `sinc` (default: 8 taps); sinc taper: `rect`/`hann`/`hamming`/`kaiser(beta)`. `boundary` controls out-of-range taps: `zero` (default), `edge` (clamp), or `reflect` (mirror repeating the edge sample, i.e. NumPy `symmetric`). The orthogonal primitive behind Stolt remapping and RCMC |
@@ -66,7 +68,7 @@ ranked tensors with **static shapes**; supported element types are `f32`,
 
 | Op | Semantics |
 |----|-----------|
-| `sar.iterate {trips}` | counted loop with tensor-carried state: applies its region `trips` times, feeding each iteration's `sar.yield` to the next as block arguments. Stays a single loop in the design (a Python `for` unrolls at trace time). Carry types match position by position. With the `index` attribute the body's first block argument is the 0-based iteration index as `tensor<1xi64>` (not a carry; lowering materializes it from the loop counter). Lowers to `scf.for` over tensors (`convert-sar-to-linalg`); the HLS path then demotes the carries to side effects (`sar-demote-loop-carries`). Frontend: `sar.iterate(n, body, *carries, index=False)` |
+| `sar.iterate {trips}` | counted loop with tensor-carried state: applies its region `trips` times, feeding each iteration's `sar.yield` to the next as block arguments. Stays a single loop in the design (a Python `for` unrolls at trace time). Carry types match position by position. With the `index` attribute the body's first block argument is the 0-based iteration index as `tensor<1xi64>`; it can directly drive `dynamic_slice` and `dynamic_update_slice`. Lowers to `scf.for` over tensors (`convert-sar-to-linalg`); the HLS path then demotes carries to side effects. Frontend: `sar.iterate(n, body, *carries, index=False)` |
 | `sar.yield` | terminates one `sar.iterate` step with the next iteration's carried values |
 
 Exact formulas are documented on the ops themselves
@@ -108,7 +110,7 @@ Passes:
   linalg-on-tensors. Signal ops are illegal here.
 - `--convert-sar-signal-to-runtime`: `fft`/`ifft`/`interp1d` to
   `libsar_runtime` calls (`_mlir_ciface_sar_rt_*`).
-- `--convert-sar-fft-to-affine`: `fft_split` to radix-2 Stockham affine
+- `--convert-sar-fft-to-affine`: `fft_split` to mixed radix-4/2 Stockham affine
   loop nests; non-power-of-two sizes go through Bluestein's chirp-z
   reduction. Why those two algorithms:
   [architecture.md](architecture.md#6-hls-backend).
@@ -161,6 +163,7 @@ Registered pipelines (see `lib/Pipelines/`):
 - `--sar-to-affine-pipeline`: split-complex affine/memref hand-off; this
   is what the HLS backend compiles from. Options: `fft-stage-group`
   (Stockham stages per scratch slot, 0 = full unroll),
+  `fft-parallel-rows` (independent rows per compact unrolled engine),
   `reuse-buffer-min-elements` and `recompute-min-elements` (the sharing
   and recompute thresholds of the passes above),
   `transpose-block-bytes` (staged corner-turn block size; 0 leaves

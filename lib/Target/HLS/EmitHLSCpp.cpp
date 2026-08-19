@@ -308,6 +308,8 @@ public:
 
   // Constant tables lifted to file scope, and the names they were given.
   DenseMap<Value, std::string> globalTables;
+  DenseMap<Value, std::string> globalTableDeclNames;
+  DenseMap<Value, std::pair<double, double>> linearTables;
 
   // Sub-functions renamed for readability: original symbol -> emitted name.
   llvm::StringMap<std::string> funcNames;
@@ -407,6 +409,8 @@ SmallString<8> HLSEmitterBase::addAlias(Value val, Value alias) {
 /// and small phase coefficients).
 template <typename FloatT>
 static std::string formatFloat(FloatT value, const char *format) {
+  if (std::isnan(value))
+    return "NAN";
   if (!std::isfinite(value))
     return value > 0 ? "INFINITY" : "-INFINITY";
   char buffer[64];
@@ -818,7 +822,9 @@ public:
   bool visitOp(arith::SubFOp op) { return emitter.emitBinary(op, "-"), true; }
   bool visitOp(arith::MulFOp op) { return emitter.emitBinary(op, "*"), true; }
   bool visitOp(arith::DivFOp op) { return emitter.emitBinary(op, "/"), true; }
-  bool visitOp(arith::RemFOp op) { return emitter.emitBinary(op, "%"), true; }
+  bool visitOp(arith::RemFOp op) {
+    return emitter.emitMaxMin(op, "std::fmod"), true;
+  }
   bool visitOp(arith::MaximumFOp op) {
     return emitter.emitMaxMin(op, "std::max"), true;
   }
@@ -887,25 +893,21 @@ private:
 bool ExprVisitor::visitOp(arith::CmpFOp op) {
   switch (op.getPredicate()) {
   case arith::CmpFPredicate::OEQ:
-  case arith::CmpFPredicate::UEQ:
     return emitter.emitBinary(op, "=="), true;
-  case arith::CmpFPredicate::ONE:
   case arith::CmpFPredicate::UNE:
     return emitter.emitBinary(op, "!="), true;
   case arith::CmpFPredicate::OLT:
-  case arith::CmpFPredicate::ULT:
     return emitter.emitBinary(op, "<"), true;
   case arith::CmpFPredicate::OLE:
-  case arith::CmpFPredicate::ULE:
     return emitter.emitBinary(op, "<="), true;
   case arith::CmpFPredicate::OGT:
-  case arith::CmpFPredicate::UGT:
     return emitter.emitBinary(op, ">"), true;
   case arith::CmpFPredicate::OGE:
-  case arith::CmpFPredicate::UGE:
     return emitter.emitBinary(op, ">="), true;
   default:
-    op.emitError("has unsupported compare type.");
+    emitter.emitError(op, "has an unsupported floating-point predicate; "
+                          "unordered comparisons other than une require "
+                          "explicit NaN handling");
     return false;
   }
 }
@@ -2100,6 +2102,9 @@ void ModuleEmitter::emitBlock(Block &block) {
 }
 
 void ModuleEmitter::emitLoopDirectives(Operation *loop) {
+  if (auto factor = loop->getAttrOfType<IntegerAttr>("hls.unroll_factor"))
+    indent() << "#pragma HLS unroll factor=" << factor.getInt() << "\n";
+
   auto loopDirect = getLoopDirective(loop);
   if (!loopDirect)
     return;
@@ -2547,6 +2552,40 @@ void ModuleEmitter::nameLoopIV(Value iv) {
 
 /// Names a lifted table after what can actually be proven about its values,
 /// so the name never claims more than the data supports.
+static std::optional<std::pair<double, double>>
+getExactLinearTable(DenseElementsAttr attr) {
+  auto type = cast<ShapedType>(attr.getType());
+  auto elementType = dyn_cast<FloatType>(type.getElementType());
+  if (!elementType || type.getNumElements() <= 2)
+    return std::nullopt;
+
+  SmallVector<double> values;
+  values.reserve(type.getNumElements());
+  for (APFloat element : attr.getValues<APFloat>()) {
+    bool lossy = false;
+    element.convert(APFloat::IEEEdouble(), APFloat::rmNearestTiesToEven,
+                    &lossy);
+    values.push_back(element.convertToDouble());
+  }
+  if (elementType.isF32()) {
+    float base = static_cast<float>(values[0]);
+    float step = static_cast<float>(values[1]) - base;
+    if (step == 0.0f)
+      return std::nullopt;
+    for (size_t i = 2; i < values.size(); ++i)
+      if (base + step * static_cast<float>(i) != static_cast<float>(values[i]))
+        return std::nullopt;
+    return std::pair<double, double>(base, step);
+  }
+  double base = values[0], step = values[1] - base;
+  if (step == 0.0)
+    return std::nullopt;
+  for (size_t i = 2; i < values.size(); ++i)
+    if (base + step * static_cast<double>(i) != values[i])
+      return std::nullopt;
+  return std::pair(base, step);
+}
+
 static std::string describeTable(DenseElementsAttr attr, unsigned idx) {
   auto type = cast<ShapedType>(attr.getType());
   int64_t n = type.getNumElements();
@@ -2608,6 +2647,9 @@ void ModuleEmitter::collectGlobalTables(ModuleOp module,
       name = base + "_" + std::to_string(suffix);
 
     state.globalTables.try_emplace(op.getResult(), name);
+    state.globalTableDeclNames.try_emplace(op.getResult(), name);
+    if (auto linear = getExactLinearTable(attr))
+      state.linearTables.try_emplace(op.getResult(), *linear);
     hoistedTables.insert(op.getOperation());
   });
 
@@ -2672,6 +2714,10 @@ void ModuleEmitter::collectGlobalTables(ModuleOp module,
       }
     }
   }
+  for (auto &[value, linear] : state.linearTables)
+    if (!mutableTables.count(value))
+      state.globalTables[value] =
+          state.globalTableDeclNames.lookup(value) + ".values";
 }
 
 void ModuleEmitter::emitGlobalTables() {
@@ -2685,6 +2731,20 @@ void ModuleEmitter::emitGlobalTables() {
         "//===----------------------------------------------------------"
         "------------===//\n\n";
 
+  bool hasLinearTable =
+      llvm::any_of(state.linearTables, [&](const auto &entry) {
+        return !mutableTables.count(entry.first);
+      });
+  if (hasLinearTable)
+    os << "template <typename T, int N>\n"
+          "struct LinearTable {\n"
+          "  T values[N];\n"
+          "  constexpr LinearTable(T base, T step) : values{} {\n"
+          "    for (int i = 0; i < N; ++i)\n"
+          "      values[i] = base + step * static_cast<T>(i);\n"
+          "  }\n"
+          "};\n\n";
+
   // Emit in creation order for a stable, diffable file.
   for (auto *op : hoistedTables) {
     auto constOp = cast<ConstBufferOp>(op);
@@ -2696,11 +2756,29 @@ void ModuleEmitter::emitGlobalTables() {
     auto memrefType = cast<MemRefType>(result.getType());
     auto elementType = memrefType.getElementType();
     auto attr = cast<DenseElementsAttr>(constOp.getValue());
+    const std::string &declName = state.globalTableDeclNames.lookup(result);
+
+    if (auto linear = state.linearTables.find(result);
+        linear != state.linearTables.end() && !mutableTables.count(result)) {
+      os << "static constexpr LinearTable<" << getDataTypeName(elementType)
+         << ", " << memrefType.getNumElements() << "> " << declName << "(";
+      if (cast<FloatType>(elementType).isF32())
+        os << formatFloat(static_cast<float>(linear->second.first), "%.9g")
+           << "f, "
+           << formatFloat(static_cast<float>(linear->second.second), "%.9g")
+           << "f";
+      else
+        os << formatFloat(linear->second.first, "%.17g") << ", "
+           << formatFloat(linear->second.second, "%.17g");
+      os << ");\n\n";
+      state.nameTable[result] = SmallString<8>(StringRef(it->second));
+      continue;
+    }
 
     os << "static ";
     if (!mutableTables.count(result))
       os << "const ";
-    os << getDataTypeName(elementType) << " " << it->second;
+    os << getDataTypeName(elementType) << " " << declName;
     for (auto &shape : memrefType.getShape())
       os << "[" << shape << "]";
     os << " = {";
@@ -2888,7 +2966,74 @@ void ModuleEmitter::emitModule(ModuleOp module) {
 // Entry of the HLS C++ translation
 //===----------------------------------------------------------------------===//
 
+static bool isSupportedHLSCppType(Type type) {
+  type = peelAxiType(type);
+  if (auto bundle = dyn_cast<BundleType>(type))
+    return isSupportedHLSCppType(bundle.getDataType());
+  if (auto memref = dyn_cast<MemRefType>(type))
+    return memref.hasStaticShape() &&
+           isSupportedHLSCppType(memref.getElementType());
+  if (auto stream = dyn_cast<StreamType>(type))
+    return isSupportedHLSCppType(stream.getElementType());
+  if (auto vector = dyn_cast<VectorType>(type))
+    return vector.hasStaticShape() &&
+           isSupportedHLSCppType(vector.getElementType());
+  if (auto floating = dyn_cast<FloatType>(type))
+    return floating.getWidth() == 32 || floating.getWidth() == 64;
+  return isa<IndexType, IntegerType>(type);
+}
+
+static LogicalResult verifyHLSCppTarget(ModuleOp module) {
+  bool failed = false;
+  unsigned tops = 0;
+  module.walk([&](Operation *op) {
+    if (auto func = dyn_cast<func::FuncOp>(op)) {
+      if (!hasRuntimeAttr(func) && hasTopFuncAttr(func))
+        ++tops;
+      if (!func.isExternal() && func.getBlocks().size() != 1) {
+        func.emitError("HLS C++ target requires exactly one basic block");
+        failed = true;
+      }
+    }
+    for (Region &region : op->getRegions())
+      if (!region.empty() && !llvm::hasSingleElement(region.getBlocks())) {
+        op->emitError("HLS C++ target does not support multi-block regions");
+        failed = true;
+      }
+    for (Type type :
+         llvm::concat<Type>(op->getOperandTypes(), op->getResultTypes()))
+      if (!isSupportedHLSCppType(type)) {
+        op->emitError("HLS C++ target does not support type ") << type;
+        failed = true;
+      }
+    if (isa<memref::ViewOp, memref::SubViewOp, memref::ReinterpretCastOp,
+            memref::ExpandShapeOp, memref::CollapseShapeOp>(op)) {
+      op->emitError("HLS C++ target requires views to be folded before "
+                    "emission");
+      failed = true;
+    }
+    if (auto cmp = dyn_cast<arith::CmpFOp>(op))
+      if (!llvm::is_contained(
+              {arith::CmpFPredicate::OEQ, arith::CmpFPredicate::UNE,
+               arith::CmpFPredicate::OLT, arith::CmpFPredicate::OLE,
+               arith::CmpFPredicate::OGT, arith::CmpFPredicate::OGE},
+              cmp.getPredicate())) {
+        cmp.emitError("HLS C++ target requires explicit NaN handling for "
+                      "this floating-point predicate");
+        failed = true;
+      }
+  });
+  if (tops > 1) {
+    module.emitError("HLS C++ target allows at most one top function; found ")
+        << tops;
+    failed = true;
+  }
+  return failure(failed);
+}
+
 LogicalResult sar::emitHLSCpp(ModuleOp module, llvm::raw_ostream &os) {
+  if (failed(verifyHLSCppTarget(module)))
+    return failure();
   HLSEmitterState state(os);
   ModuleEmitter(state).emitModule(module);
   return failure(state.encounteredError);

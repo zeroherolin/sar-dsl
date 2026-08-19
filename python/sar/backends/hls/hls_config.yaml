@@ -5,9 +5,9 @@
 # 360 Mb UltraRAM (1280 x 288 Kb), 27.5 Mb distributed RAM,
 # 12288 DSP48E2 slices.
 #
-# Memory budgets are hard compiler caps. DSP is a synthesis-report budget:
-# Vitis binds floating-point operators after emission, so the compiler records
-# the target but cannot honestly enforce it before synthesis.
+# Memory budgets are hard compiler caps. DSP, FF, and LUT are synthesis-report
+# budgets: Vitis binds operators and control after emission, so the compiler
+# records those targets but cannot enforce them before synthesis.
 #
 # The defaults reserve 20% of each resource for control, interconnect and
 # placement. Dedicated-memory budgets are rounded down to whole primitives.
@@ -29,6 +29,10 @@ lutram_bytes: 2883584
 
 # 80% synthesis-report budget (9830 of 12288 DSP48E2 slices).
 dsp: 9830
+
+# 80% synthesis-report budgets for logic resources.
+ff: 2764800
+lut: 1382400
 
 # --- Interfaces -------------------------------------------------------
 

@@ -59,7 +59,8 @@ std::unique_ptr<Pass> createParallelizeDataflowNodePass(
 std::unique_ptr<Pass> createPlaceDataflowBufferPass(
     unsigned threshold = 1024, unsigned bramBytes = 9907200,
     unsigned uramBytes = 37748736, unsigned lutramBytes = 2883584,
-    unsigned lutramMaxBytes = 64, bool rebalanceOnly = false);
+    unsigned lutramMaxBytes = 64, bool rebalanceOnly = false,
+    bool allowDram = true);
 std::unique_ptr<Pass>
 createScheduleDataflowNodePass(bool ignoreViolations = false);
 std::unique_ptr<Pass> createStreamDataflowTaskPass();
@@ -74,6 +75,7 @@ std::unique_ptr<Pass> createRemoveVariableBoundPass();
 
 /// Memory-related passes.
 std::unique_ptr<Pass> createAffineStoreForwardPass();
+std::unique_ptr<Pass> createFuseSiblingLoopsPass();
 std::unique_ptr<Pass> createCollapseMemrefUnitDimsPass();
 std::unique_ptr<Pass> createCreateMemrefSubviewPass(
     CreateSubviewMode createSubviewMode = CreateSubviewMode::Point);
@@ -87,6 +89,8 @@ std::unique_ptr<Pass> createSimplifyCopyPass();
 /// Directive-related passes.
 std::unique_ptr<Pass> createArrayPartitionPass(unsigned lutramMaxBits = 512,
                                                unsigned lutramBytes = 0,
+                                               unsigned bramBytes = 9907200,
+                                               unsigned uramBytes = 37748736,
                                                unsigned maxFactor = 32);
 std::unique_ptr<Pass>
 createCreateAxiInterfacePass(std::string hlsTopFunc = "main",

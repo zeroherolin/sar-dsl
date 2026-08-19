@@ -145,7 +145,8 @@ void mlir::sar::buildSARToAffinePipeline(
     OpPassManager &pm, const SARBufferPipelineOptions &options) {
   pm.addPass(createCanonicalizerPass());
   pm.addPass(sar::createSARDecomplexify());
-  pm.addPass(sar::createConvertSARFFTToAffine({options.fftStageGroup}));
+  pm.addPass(sar::createConvertSARFFTToAffine(
+      {options.fftStageGroup, options.fftParallelRows}));
   ConvertSARInterpToAffineOptions interpOptions;
   interpOptions.enableBandedGather = options.interpEnableBandedGather;
   pm.addPass(sar::createConvertSARInterpToAffine(interpOptions));

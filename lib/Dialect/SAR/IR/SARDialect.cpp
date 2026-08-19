@@ -393,6 +393,71 @@ LogicalResult SliceOp::verify() {
   return success();
 }
 
+static LogicalResult verifyDynamicOffsets(Operation *op, ValueRange offsets,
+                                          int64_t rank) {
+  if (static_cast<int64_t>(offsets.size()) != rank)
+    return op->emitOpError("requires one scalar offset tensor per input axis");
+  for (auto [dim, offset] : llvm::enumerate(offsets)) {
+    auto type = getRanked(offset.getType());
+    if (!type || type.getRank() != 1 || type.getDimSize(0) != 1 ||
+        !type.getElementType().isInteger(64))
+      return op->emitOpError("offset #")
+             << dim << " must have type tensor<1xi64>";
+  }
+  return success();
+}
+
+LogicalResult DynamicSliceOp::verify() {
+  auto inputTy = getRanked(getInput().getType());
+  auto resultTy = getRanked(getResult().getType());
+  if (failed(verifyPositiveShape(*this, inputTy, "input")) ||
+      failed(verifyPositiveShape(*this, resultTy, "result")))
+    return failure();
+  int64_t rank = inputTy.getRank();
+  if (inputTy.getElementType() != resultTy.getElementType())
+    return emitOpError("input and result element types must match");
+  if (resultTy.getRank() != rank ||
+      static_cast<int64_t>(getSizes().size()) != rank ||
+      static_cast<int64_t>(getStrides().size()) != rank)
+    return emitOpError("sizes, strides and result rank must match the input "
+                       "rank");
+  if (failed(verifyDynamicOffsets(*this, getOffsets(), rank)))
+    return failure();
+  for (int64_t dim = 0; dim < rank; ++dim) {
+    int64_t size = getSizes()[dim];
+    int64_t stride = getStrides()[dim];
+    if (size < 1 || stride < 1)
+      return emitOpError("sizes and strides must be positive");
+    if (size > 1 + (inputTy.getDimSize(dim) - 1) / stride)
+      return emitOpError("slice span exceeds the input along dim ") << dim;
+    if (resultTy.getDimSize(dim) != size)
+      return emitOpError("result shape must equal sizes");
+  }
+  return success();
+}
+
+LogicalResult DynamicUpdateSliceOp::verify() {
+  auto inputTy = getRanked(getInput().getType());
+  auto updateTy = getRanked(getUpdate().getType());
+  auto resultTy = getRanked(getResult().getType());
+  if (failed(verifyPositiveShape(*this, inputTy, "input")) ||
+      failed(verifyPositiveShape(*this, updateTy, "update")) ||
+      failed(verifyPositiveShape(*this, resultTy, "result")))
+    return failure();
+  int64_t rank = inputTy.getRank();
+  if (updateTy.getRank() != rank || resultTy != inputTy)
+    return emitOpError("update rank must match the input and result type must "
+                       "equal the input type");
+  if (updateTy.getElementType() != inputTy.getElementType())
+    return emitOpError("input and update element types must match");
+  if (failed(verifyDynamicOffsets(*this, getOffsets(), rank)))
+    return failure();
+  for (int64_t dim = 0; dim < rank; ++dim)
+    if (updateTy.getDimSize(dim) > inputTy.getDimSize(dim))
+      return emitOpError("update exceeds the input along dim ") << dim;
+  return success();
+}
+
 LogicalResult ConcatOp::verify() {
   auto lhsTy = getRanked(getLhs().getType());
   auto rhsTy = getRanked(getRhs().getType());

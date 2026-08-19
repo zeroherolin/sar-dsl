@@ -259,6 +259,20 @@ def test_neg_sqrt_abs_maximum():
     np.testing.assert_allclose(k(a), np.sqrt(np.maximum(-a, 1e-3)), rtol=1e-12)
 
 
+def test_scalar_division_preserves_ieee_and_f32_rounding():
+
+    @sar.func
+    def divide(x: sar.f32[4]) -> (sar.f32[4], sar.f32[4]):
+        return x / 0.0, 3.0 / x
+
+    x = np.array([0.0, -0.0, 3.0, 7.0], dtype=np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        expected = (x / np.float32(0.0), np.float32(3.0) / x)
+    got = divide(x)
+    for actual, reference in zip(got, expected):
+        np.testing.assert_array_equal(actual, reference)
+
+
 def test_abs_complex_magnitude():
     N = 32
 

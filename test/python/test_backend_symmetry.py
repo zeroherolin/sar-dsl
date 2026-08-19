@@ -59,6 +59,9 @@ CONSTRUCTS = {
     sar.transpose,
     "slice_concat":
     lambda x: sar.concatenate((x[:N // 2, :], x[N // 2:, :]), dim=0),
+    "dynamic_slice":
+    lambda x: sar.dynamic_update_slice(
+        x, sar.dynamic_slice(x, (1, 2), (N // 2, N // 2)), (N // 2, N // 2)),
     "pad":
     lambda x: sar.pad(x, ((1, 2), (0, 3)), value=0.5),
     "reverse":

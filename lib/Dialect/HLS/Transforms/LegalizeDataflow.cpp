@@ -195,24 +195,27 @@ struct FuseBypassPath : public OpRewritePattern<ScheduleOp> {
 };
 } // namespace
 
-/// Whether any external buffer in `schedule` is written by more than one node.
+/// Whether an interface or external buffer is used by concurrent nodes.
 ///
-/// That is the signature of a DRAM buffer being reused across lifetimes that
-/// do not overlap -- a sequence of whole-raster passes handing one plane back
-/// and forth. Reuse and concurrency exclude each other: tokens order the
-/// read-after-write edges between producers and consumers, but nothing orders
-/// the write-after-read edge that reuse introduces, so a dataflow region here
-/// would let a later pass overwrite a plane an earlier one is still reading.
-/// Such a schedule stays sequential; the loops nested inside it, whose
-/// buffers are on chip and unshared, are still free to become dataflow.
+/// Reused DRAM scratch cannot be written by independent processes, and Vitis
+/// 2022.2 likewise rejects one AXI master read by multiple processes. Such a
+/// schedule stays sequential; nested schedules whose ports are independent
+/// remain eligible for dataflow.
 static bool hasSharedExternalBuffer(ScheduleOp schedule) {
-  auto isShared = [](Value buffer) {
-    return isExtBuffer(buffer) && getProducers(buffer).size() > 1;
+  auto isShared = [](Value buffer, bool interfaceArgument) {
+    if (!interfaceArgument && !isExtBuffer(buffer))
+      return false;
+    return getProducers(buffer).size() > 1 ||
+           getConsumersExcept(buffer, NodeOp()).size() > 1;
   };
   return llvm::any_of(schedule.getBody().getArguments(),
-                      [&](Value arg) { return isShared(arg); }) ||
-         llvm::any_of(schedule.getOps<BufferOp>(),
-                      [&](BufferOp buffer) { return isShared(buffer); });
+                      [&](Value arg) {
+                        return isShared(arg, /*interfaceArgument=*/true);
+                      }) ||
+         llvm::any_of(schedule.getOps<BufferOp>(), [&](BufferOp buffer) {
+           return isShared(buffer,
+                           /*interfaceArgument=*/false);
+         });
 }
 
 namespace {

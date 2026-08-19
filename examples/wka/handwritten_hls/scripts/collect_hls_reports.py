@@ -9,7 +9,6 @@ import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-
 FIELDS = {
     "target_clock_ns": ".//TargetClockPeriod",
     "estimated_clock_ns": ".//EstimatedClockPeriod",
@@ -33,11 +32,13 @@ def parse_report(path: Path) -> dict[str, str]:
         row[key] = value(root, path_expr)
     for resource in RESOURCES:
         used = value(root, f".//AreaEstimates/Resources/{resource}")
-        available = value(root, f".//AreaEstimates/AvailableResources/{resource}")
+        available = value(root,
+                          f".//AreaEstimates/AvailableResources/{resource}")
         row[resource.lower()] = used
         row[f"{resource.lower()}_available"] = available
         try:
-            row[f"{resource.lower()}_pct"] = f"{100.0 * float(used) / float(available):.3f}"
+            percent = 100.0 * float(used) / float(available)
+            row[f"{resource.lower()}_pct"] = f"{percent:.3f}"
         except (ValueError, ZeroDivisionError):
             row[f"{resource.lower()}_pct"] = ""
     return row
@@ -46,18 +47,23 @@ def parse_report(path: Path) -> dict[str, str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--work", type=Path, default=Path("work"))
-    parser.add_argument("--output", type=Path, default=Path("reports/hls_summary"))
+    parser.add_argument("--output",
+                        type=Path,
+                        default=Path("reports/hls_summary"))
     args = parser.parse_args()
 
     reports = sorted(args.work.glob("**/syn/report/*_csynth.xml"))
     rows = [parse_report(path) for path in reports]
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.with_suffix(".json").write_text(
-        json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    args.output.with_suffix(".json").write_text(json.dumps(rows,
+                                                           indent=2,
+                                                           sort_keys=True),
+                                                encoding="utf-8")
     if rows:
         fieldnames = sorted({key for row in rows for key in row})
-        with args.output.with_suffix(".csv").open("w", newline="", encoding="utf-8") as handle:
+        with args.output.with_suffix(".csv").open("w",
+                                                  newline="",
+                                                  encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)

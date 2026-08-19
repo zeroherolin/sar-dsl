@@ -4,17 +4,19 @@
 // RUN:   | FileCheck %s --check-prefix=GROUP2
 // RUN: sar-opt %s --convert-sar-fft-to-affine=fft-stage-group=99 \
 // RUN:   | FileCheck %s --check-prefix=SATURATE
+// RUN: sar-opt %s --convert-sar-fft-to-affine=fft-parallel-rows=4 \
+// RUN:   | FileCheck %s --check-prefix=PAR4
 
-// A 64-point transform has log2(64) = 6 stages, so 5 of them are
-// intermediate and the full unroll allocates 5 (re, im) scratch pairs.
+// A 64-point transform has three radix-4 stages, so two are intermediate
+// and the full unroll allocates two (re, im) scratch pairs.
 
 // The default is the full unroll: one scratch line per intermediate stage,
-// so 5 pairs = 10 line allocations, and no eleventh.
+// so two pairs = four line allocations, and no fifth.
 // UNROLL-LABEL: func.func @grouped
-// UNROLL-COUNT-10: memref.alloc() : memref<64xf64>
+// UNROLL-COUNT-4: memref.alloc() : memref<64xf64>
 // UNROLL-NOT: memref.alloc() : memref<64xf64>
 
-// Grouping two stages per slot leaves ceil(6/2) - 1 = 2 pairs.
+// Grouping two stages reaches the two-line safety floor.
 // GROUP2-LABEL: func.func @grouped
 // GROUP2-COUNT-4: memref.alloc() : memref<64xf64>
 // GROUP2-NOT: memref.alloc() : memref<64xf64>
@@ -27,8 +29,14 @@
 // SATURATE-COUNT-4: memref.alloc() : memref<64xf64>
 // SATURATE-NOT: memref.alloc() : memref<64xf64>
 
-func.func @grouped(%re: tensor<4x64xf64>, %im: tensor<4x64xf64>)
-    -> (tensor<4x64xf64>, tensor<4x64xf64>) {
-  %r, %i = sar.fft_split %re, %im {dim = 1 : i64} : tensor<4x64xf64>
-  return %r, %i : tensor<4x64xf64>, tensor<4x64xf64>
+// Four rows in flight receive independent scratch lanes, and the line loop
+// advances one four-row block per iteration.
+// PAR4-LABEL: func.func @grouped
+// PAR4-COUNT-4: memref.alloc() : memref<4x64xf64>
+// PAR4: affine.for {{.*}} = 0 to 8 step 4
+
+func.func @grouped(%re: tensor<8x64xf64>, %im: tensor<8x64xf64>)
+    -> (tensor<8x64xf64>, tensor<8x64xf64>) {
+  %r, %i = sar.fft_split %re, %im {dim = 1 : i64} : tensor<8x64xf64>
+  return %r, %i : tensor<8x64xf64>, tensor<8x64xf64>
 }

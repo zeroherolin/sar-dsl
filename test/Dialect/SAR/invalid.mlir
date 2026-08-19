@@ -98,6 +98,16 @@ func.func @slice_out_of_bounds(%x: tensor<4x8xf64>) -> tensor<2x8xf64> {
 
 // -----
 
+func.func @dynamic_slice_bad_offset(%x: tensor<4x8xf64>,
+                                    %offset: tensor<2xi64>)
+    -> tensor<2x8xf64> {
+  // expected-error @+1 {{offset #0 must have type tensor<1xi64>}}
+  %0 = "sar.dynamic_slice"(%x, %offset, %offset) <{sizes = array<i64: 2, 8>, strides = array<i64: 1, 1>}> : (tensor<4x8xf64>, tensor<2xi64>, tensor<2xi64>) -> tensor<2x8xf64>
+  return %0 : tensor<2x8xf64>
+}
+
+// -----
+
 func.func @concat_shape_mismatch(%a: tensor<4x8xf64>, %b: tensor<4x6xf64>) -> tensor<8x8xf64> {
   // expected-error @+1 {{operand shapes must match outside dim}}
   %0 = sar.concat %a, %b {dim = 0 : i64} : (tensor<4x8xf64>, tensor<4x6xf64>) -> (tensor<8x8xf64>)

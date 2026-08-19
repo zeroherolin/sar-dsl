@@ -82,17 +82,17 @@ jobs:
       - run: pip install numpy pytest
       - run: sudo apt-get install -y ninja-build
 
+      # Sources are always needed: the cached build tree carries CMake configs
+      # that point back into the submodule source directory.
+      - name: Check out submodule sources
+        run: git submodule update --init externals/llvm-project
+
       - name: Cache LLVM/MLIR/Clang build
         id: cache-llvm
         uses: actions/cache@v4
         with:
           path: externals/llvm-project/build
           key: llvm-${{ runner.os }}-${{ steps.subrev.outputs.llvm }}-${{ hashFiles('scripts/build-llvm.sh') }}
-
-      # Sources are always needed: the cached build tree carries CMake configs
-      # that point back into the submodule source directory.
-      - name: Check out submodule sources
-        run: git submodule update --init externals/llvm-project
 
       - name: Build LLVM
         if: steps.cache-llvm.outputs.cache-hit != 'true'

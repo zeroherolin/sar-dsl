@@ -15,6 +15,7 @@ add_mlir_library(HLSTransforms
   EliminateMultiConsumer.cpp
   EliminateMultiProducer.cpp
   FuncPreprocess.cpp
+  FuseSiblingLoops.cpp
   LegalizeDataflow.cpp
   LoopPipelining.cpp
   LoopUnrolling.cpp

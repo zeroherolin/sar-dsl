@@ -600,6 +600,121 @@ struct SliceOpLowering : OpRewritePattern<SliceOp> {
   }
 };
 
+static Value getClampedOffset(OpBuilder &builder, Location loc,
+                              Value offsetTensor, int64_t maximum) {
+  Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
+  Value raw =
+      tensor::ExtractOp::create(builder, loc, offsetTensor, ValueRange{zero});
+  raw = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), raw);
+  Value high = arith::ConstantIndexOp::create(builder, loc, maximum);
+  return arith::MinSIOp::create(
+      builder, loc, arith::MaxSIOp::create(builder, loc, raw, zero), high);
+}
+
+struct DynamicSliceOpLowering : OpRewritePattern<DynamicSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(DynamicSliceOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto inputType = cast<RankedTensorType>(op.getInput().getType());
+    auto resultType = cast<RankedTensorType>(op.getType());
+    int64_t rank = resultType.getRank();
+    ArrayRef<int64_t> sizes = op.getSizes();
+    ArrayRef<int64_t> strides = op.getStrides();
+    SmallVector<utils::IteratorType> iterators(rank,
+                                               utils::IteratorType::parallel);
+    Value init = tensor::EmptyOp::create(rewriter, loc, resultType.getShape(),
+                                         resultType.getElementType());
+    auto generic = linalg::GenericOp::create(
+        rewriter, loc, TypeRange{resultType}, ValueRange{}, ValueRange{init},
+        ArrayRef<AffineMap>{rewriter.getMultiDimIdentityMap(rank)}, iterators,
+        [&](OpBuilder &builder, Location nested, ValueRange) {
+          SmallVector<Value> indices;
+          for (int64_t dim = 0; dim < rank; ++dim) {
+            int64_t span = (sizes[dim] - 1) * strides[dim] + 1;
+            Value offset =
+                getClampedOffset(builder, nested, op.getOffsets()[dim],
+                                 inputType.getDimSize(dim) - span);
+            Value index = linalg::IndexOp::create(builder, nested, dim);
+            if (strides[dim] != 1)
+              index = arith::MulIOp::create(builder, nested, index,
+                                            arith::ConstantIndexOp::create(
+                                                builder, nested, strides[dim]));
+            indices.push_back(
+                arith::AddIOp::create(builder, nested, index, offset));
+          }
+          linalg::YieldOp::create(
+              builder, nested,
+              tensor::ExtractOp::create(builder, nested, op.getInput(), indices)
+                  .getResult());
+        });
+    rewriter.replaceOp(op, generic.getResults());
+    return success();
+  }
+};
+
+struct DynamicUpdateSliceOpLowering : OpRewritePattern<DynamicUpdateSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(DynamicUpdateSliceOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto resultType = cast<RankedTensorType>(op.getType());
+    auto updateType = cast<RankedTensorType>(op.getUpdate().getType());
+    int64_t rank = resultType.getRank();
+    SmallVector<utils::IteratorType> iterators(rank,
+                                               utils::IteratorType::parallel);
+    Value init = tensor::EmptyOp::create(rewriter, loc, resultType.getShape(),
+                                         resultType.getElementType());
+    auto generic = linalg::GenericOp::create(
+        rewriter, loc, TypeRange{resultType}, ValueRange{}, ValueRange{init},
+        ArrayRef<AffineMap>{rewriter.getMultiDimIdentityMap(rank)}, iterators,
+        [&](OpBuilder &builder, Location nested, ValueRange) {
+          SmallVector<Value> inputIndices;
+          SmallVector<Value> updateIndices;
+          Value inside;
+          Value zero = arith::ConstantIndexOp::create(builder, nested, 0);
+          for (int64_t dim = 0; dim < rank; ++dim) {
+            Value index = linalg::IndexOp::create(builder, nested, dim);
+            Value offset = getClampedOffset(
+                builder, nested, op.getOffsets()[dim],
+                resultType.getDimSize(dim) - updateType.getDimSize(dim));
+            Value relative =
+                arith::SubIOp::create(builder, nested, index, offset);
+            Value extent = arith::ConstantIndexOp::create(
+                builder, nested, updateType.getDimSize(dim));
+            Value inDimension = arith::AndIOp::create(
+                builder, nested,
+                arith::CmpIOp::create(
+                    builder, nested, arith::CmpIPredicate::sge, relative, zero),
+                arith::CmpIOp::create(builder, nested,
+                                      arith::CmpIPredicate::slt, relative,
+                                      extent));
+            inside = inside ? arith::AndIOp::create(builder, nested, inside,
+                                                    inDimension)
+                                  .getResult()
+                            : inDimension;
+            Value last = arith::ConstantIndexOp::create(
+                builder, nested, updateType.getDimSize(dim) - 1);
+            updateIndices.push_back(arith::MinSIOp::create(
+                builder, nested,
+                arith::MaxSIOp::create(builder, nested, relative, zero), last));
+            inputIndices.push_back(index);
+          }
+          Value original = tensor::ExtractOp::create(
+              builder, nested, op.getInput(), inputIndices);
+          Value replacement = tensor::ExtractOp::create(
+              builder, nested, op.getUpdate(), updateIndices);
+          linalg::YieldOp::create(builder, nested,
+                                  arith::SelectOp::create(builder, nested,
+                                                          inside, replacement,
+                                                          original)
+                                      .getResult());
+        });
+    rewriter.replaceOp(op, generic.getResults());
+    return success();
+  }
+};
+
 struct ConcatOpLowering : OpRewritePattern<ConcatOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(ConcatOp op,
@@ -1306,10 +1421,10 @@ void mlir::sar::populateSARToLinalgConversionPatterns(
                CmpOpLowering, WhereOpLowering, ComplexOpLowering,
                ConjOpLowering, ComplexPartOpLowering<RealOp, complex::ReOp>,
                ComplexPartOpLowering<ImagOp, complex::ImOp>, ReduceOpLowering,
-               ArgMaxOpLowering, SliceOpLowering, ConcatOpLowering,
-               PadOpLowering, ReverseOpLowering, TransposeOpLowering,
-               BroadcastOpLowering, FFTShiftOpLowering, CumsumOpLowering,
-               RankFilterOpLowering, SortOpLowering, Gather2DOpLowering,
-               Gather2DSplitOpLowering, IterateOpLowering>(
-      patterns.getContext());
+               ArgMaxOpLowering, SliceOpLowering, DynamicSliceOpLowering,
+               DynamicUpdateSliceOpLowering, ConcatOpLowering, PadOpLowering,
+               ReverseOpLowering, TransposeOpLowering, BroadcastOpLowering,
+               FFTShiftOpLowering, CumsumOpLowering, RankFilterOpLowering,
+               SortOpLowering, Gather2DOpLowering, Gather2DSplitOpLowering,
+               IterateOpLowering>(patterns.getContext());
 }

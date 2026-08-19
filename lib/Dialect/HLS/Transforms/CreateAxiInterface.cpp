@@ -13,6 +13,8 @@
 
 #include "llvm/ADT/SetVector.h"
 
+#include <array>
+
 namespace mlir {
 namespace sar {
 #define GEN_PASS_DEF_CREATEAXIINTERFACE
@@ -29,12 +31,13 @@ using namespace hls;
 // Internal DRAM scratch
 //
 // The top function's signature is the design's contract with its caller, so it
-// is fixed: the kernel's declared arguments/results and one scratch arena per
+// is fixed: the kernel's declared arguments/results and two scratch arenas per
 // scalar element type in the lowered design. Buffers the compiler decides to
 // keep off chip are internal, so they may not appear as ports of their own.
-// Each is carved into its typed arena at a compile-time offset. Placeholder
-// arenas remain in the signature when their type has no spill, so placement
-// decisions change extents but never the number or order of ports.
+// Successive buffers are distributed between the two physical masters and
+// carved at compile-time offsets. Placeholder arenas remain in the signature
+// when their type has no spill, so placement decisions change extents but never
+// the number or order of ports.
 //
 // Serialization within one scratch port is not a new cost: the carved
 // buffers already take turns on the port's data bus, whether or not each
@@ -201,20 +204,15 @@ static void redirectToScratch(const ScratchUses &uses, Value buffer,
 /// Replaces the top function's internal DRAM buffers with slices of a single
 /// scratch buffer, and returns that buffer for the caller to turn into the one
 /// extra port.
-static FailureOr<Value> createScratchBuffer(func::FuncOp func, ModuleOp module,
-                                            OpBuilder &builder,
-                                            Type elementType) {
+static FailureOr<Value>
+createScratchBuffer(func::FuncOp func, ModuleOp module, OpBuilder &builder,
+                    Type elementType,
+                    ArrayRef<hls::BufferLikeInterface> candidates) {
   DenseMap<StringRef, unsigned> callerCounts;
   module.walk([&](func::CallOp call) { ++callerCounts[call.getCallee()]; });
 
   // A constant buffer holds data the design needs on entry, so it is not
   // scratch: it keeps its own storage and its initializer.
-  SmallVector<hls::BufferLikeInterface> candidates;
-  for (auto buffer : func.getOps<hls::BufferLikeInterface>())
-    if (isExtBuffer(buffer.getMemref()) && !isa<ConstBufferOp>(*buffer) &&
-        buffer.getMemrefType().getElementType() == elementType)
-      candidates.push_back(buffer);
-
   unsigned widest = elementType.getIntOrFloatBitWidth();
 
   // A buffer may ask to start at a value. One allocation carries one such
@@ -326,9 +324,53 @@ struct CreateAxiInterface
           scratchTypes.insert(elementType);
     if (scratchTypes.empty())
       scratchTypes.insert(builder.getF64Type());
-    for (Type elementType : scratchTypes)
-      if (failed(createScratchBuffer(func, module, builder, elementType)))
-        return signalPassFailure();
+    DenseMap<Operation *, unsigned> operationOrder;
+    unsigned nextOrder = 0;
+    for (Operation &op : func.front())
+      operationOrder[&op] = nextOrder++;
+    auto interval = [&](hls::BufferLikeInterface buffer) {
+      unsigned first = operationOrder.lookup(buffer.getOperation());
+      unsigned last = first;
+      for (OpOperand &use : buffer.getMemref().getUses()) {
+        Operation *owner = use.getOwner();
+        while (owner->getParentOp() != func && owner->getParentOp())
+          owner = owner->getParentOp();
+        if (owner->getParentOp() == func) {
+          unsigned position = operationOrder.lookup(owner);
+          first = std::min(first, position);
+          last = std::max(last, position);
+        }
+      }
+      return std::pair(first, last);
+    };
+    for (Type elementType : scratchTypes) {
+      std::array<SmallVector<hls::BufferLikeInterface>, 2> banks;
+      std::array<SmallVector<std::pair<unsigned, unsigned>>, 2> lifetimes;
+      std::array<uint64_t, 2> payload = {0, 0};
+      for (auto buffer : func.getOps<hls::BufferLikeInterface>()) {
+        if (isExtBuffer(buffer.getMemref()) && !isa<ConstBufferOp>(*buffer) &&
+            buffer.getMemrefType().getElementType() == elementType) {
+          auto live = interval(buffer);
+          auto conflicts = [&](unsigned bank) {
+            return llvm::count_if(lifetimes[bank], [&](auto other) {
+              return !(live.second < other.first || other.second < live.first);
+            });
+          };
+          unsigned bank = 0;
+          auto leftConflicts = conflicts(0), rightConflicts = conflicts(1);
+          if (rightConflicts < leftConflicts ||
+              (rightConflicts == leftConflicts && payload[1] < payload[0]))
+            bank = 1;
+          banks[bank].push_back(buffer);
+          lifetimes[bank].push_back(live);
+          payload[bank] += buffer.getMemrefType().getNumElements();
+        }
+      }
+      for (auto &candidates : banks)
+        if (failed(createScratchBuffer(func, module, builder, elementType,
+                                       candidates)))
+          return signalPassFailure();
+    }
 
     // Preserve `main` for the interface wrapper when the implementation itself
     // uses the pipeline's default top-function name.

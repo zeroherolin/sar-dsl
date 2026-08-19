@@ -10,7 +10,17 @@ python/sar/_build_config.py
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+.venv/
+venv/
 .cache/
+*.prof
+core
+core.*
 
 # Editors and assistants
 .vscode/*

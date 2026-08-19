@@ -31,10 +31,9 @@ static bool conflictsWith(Type type, unsigned width) {
   if (auto shapedType = dyn_cast<ShapedType>(type))
     return conflictsWith(shapedType.getElementType(), width);
   if (auto functionType = dyn_cast<FunctionType>(type)) {
-    return llvm::any_of(functionType.getInputs(),
-                        [width](Type input) {
-                          return conflictsWith(input, width);
-                        }) ||
+    return llvm::any_of(
+               functionType.getInputs(),
+               [width](Type input) { return conflictsWith(input, width); }) ||
            llvm::any_of(functionType.getResults(), [width](Type result) {
              return conflictsWith(result, width);
            });

@@ -33,9 +33,9 @@ def ConvertSARFFTToAffine : Pass<"convert-sar-fft-to-affine", "ModuleOp"> {
   let summary = "Lower split-complex FFTs to affine Stockham loop nests";
   let description = [{
     Converts `sar.fft_split` (produced by `sar-decomplexify`) into affine
-    loop nests implementing the radix-2 Stockham autosort FFT with
-    precomputed twiddle-factor globals. Stockham requires no bit-reversal,
-    so all accesses are affine -- suitable for HLS flows.
+    loop nests implementing a radix-4/2 Stockham autosort FFT with precomputed
+    twiddle-factor globals. Stockham requires no bit-reversal, so all accesses
+    are affine -- suitable for HLS flows.
 
     Sizes that are not powers of two are handled by Bluestein's chirp-z
     reduction: the DFT becomes a convolution carried by two padded
@@ -73,7 +73,10 @@ def ConvertSARFFTToAffine : Pass<"convert-sar-fft-to-affine", "ModuleOp"> {
   let options = [
     Option<"fftStageGroup", "fft-stage-group", "unsigned", /*default=*/"0",
            "Group Stockham stages: 0=full unroll, k>0=k stages per scratch "
-           "buffer group">
+           "buffer group">,
+    Option<"fftParallelRows", "fft-parallel-rows", "unsigned",
+           /*default=*/"0",
+           "Power-of-two row unroll factor; 0 keeps one row in flight">
   ];
 }
 

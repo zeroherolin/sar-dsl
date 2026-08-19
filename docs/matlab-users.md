@@ -61,6 +61,12 @@ like MATLAB, `axis` like NumPy) -- passing both is an error.
 - **`var` / `std` match NumPy, not MATLAB**: they normalize by `N`, not
   `N-1`.
 
+## Compiled loops
+
+A Python `for` unrolls at trace time. Use `sar.iterate(n, body, *carries)`
+when the loop must remain one loop in the design. With `index=True` the
+body can drive `dynamic_slice` / `dynamic_update_slice`.
+
 ## No in-place edits; masking replaces logical indexing
 
 There is no `x(x < 0) = 0`. Selection is a value-producing operation:

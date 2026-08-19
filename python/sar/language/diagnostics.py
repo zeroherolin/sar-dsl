@@ -93,11 +93,10 @@ def propagate_axes(op: str, operands: Sequence, attributes, unit_attributes,
         axes = [_UNKNOWN_AXIS, _UNKNOWN_AXIS]
         axes[attributes["dim"]] = preserve[0]
         return tuple(axes)
-    if op in ("add", "sub", "mul", "div", "complex", "atan2", "cmp",
-              "where"):
+    if op in ("add", "sub", "mul", "div", "complex", "atan2", "cmp", "where"):
         merged = []
-        for dim, states in enumerate(zip(*(tensor._axes
-                                           for tensor in operands))):
+        for dim, states in enumerate(
+                zip(*(tensor._axes for tensor in operands))):
             known = {state for state in states if state[0] is not None}
             if len({state[0] for state in known}) > 1:
                 warn_user(
@@ -116,8 +115,8 @@ def propagate_axes(op: str, operands: Sequence, attributes, unit_attributes,
             merged.append(
                 next(iter(known)) if len(known) == 1 else _UNKNOWN_AXIS)
         return tuple(merged)
-    if op in ("add_scalar", "mul_scalar", "sqrt", "cos", "sin", "exp",
-              "log", "abs", "cast", "conj", "real", "imag"):
+    if op in ("add_scalar", "mul_scalar", "sqrt", "cos", "sin", "exp", "log",
+              "abs", "cast", "conj", "real", "imag"):
         return preserve[:result_rank]
     return unknown
 

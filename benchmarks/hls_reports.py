@@ -24,33 +24,38 @@ def parse_csynth_xml(path) -> dict:
         for name in ("BRAM_18K", "DSP", "FF", "LUT", "URAM")
     }
     available = {
-        name.lower(): int(
-            _text(root, f"./AreaEstimates/AvailableResources/{name}"))
+        name.lower():
+        int(_text(root, f"./AreaEstimates/AvailableResources/{name}"))
         for name in ("BRAM_18K", "DSP", "FF", "LUT", "URAM")
     }
     return {
-        "version": _text(root, "./ReportVersion/Version"),
-        "part": _text(root, "./UserAssignments/Part"),
-        "top": _text(root, "./UserAssignments/TopModelName"),
+        "version":
+        _text(root, "./ReportVersion/Version"),
+        "part":
+        _text(root, "./UserAssignments/Part"),
+        "top":
+        _text(root, "./UserAssignments/TopModelName"),
         "target_clock_ns":
         float(_text(root, "./UserAssignments/TargetClockPeriod")),
         "estimated_clock_ns":
         float(
-            _text(root,
-                  "./PerformanceEstimates/SummaryOfTimingAnalysis/"
-                  "EstimatedClockPeriod")),
+            _text(
+                root, "./PerformanceEstimates/SummaryOfTimingAnalysis/"
+                "EstimatedClockPeriod")),
         "latency_cycles":
         int(
-            _text(root,
-                  "./PerformanceEstimates/SummaryOfOverallLatency/"
-                  "Worst-caseLatency")),
+            _text(
+                root, "./PerformanceEstimates/SummaryOfOverallLatency/"
+                "Worst-caseLatency")),
         "interval_cycles":
         int(
-            _text(root,
-                  "./PerformanceEstimates/SummaryOfOverallLatency/"
-                  "Interval-max")),
-        "resources": resources,
-        "available": available,
+            _text(
+                root, "./PerformanceEstimates/SummaryOfOverallLatency/"
+                "Interval-max")),
+        "resources":
+        resources,
+        "available":
+        available,
     }
 
 
@@ -72,6 +77,8 @@ def validate_constraints(report: dict, config) -> list:
         "bram_18k": int(config.bram_bytes) // _BRAM18_BYTES,
         "uram": int(config.uram_bytes) // _URAM_BYTES,
         "dsp": int(config.dsp),
+        "ff": int(config.ff),
+        "lut": int(config.lut),
     }
     for name, limit in limits.items():
         if resources[name] > limit:

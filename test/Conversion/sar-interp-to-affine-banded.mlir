@@ -15,8 +15,8 @@
 // Output planes, then the two narrow band buffers.
 // CHECK: memref.alloc() : memref<8x32xf64>
 // CHECK: memref.alloc() : memref<8x32xf64>
-// CHECK: memref.alloc() : memref<16xf64>
-// CHECK: memref.alloc() : memref<16xf64>
+// CHECK: memref.alloc(){{.*}} : memref<16xf64>
+// CHECK: memref.alloc(){{.*}} : memref<16xf64>
 // Row loop, then the prologue that primes the window, then the column loop.
 // CHECK: affine.for %{{.*}} = 0 to 8
 // CHECK: affine.for %{{.*}} = 0 to 15
@@ -52,8 +52,8 @@ func.func @interp_banded(%re: tensor<8x32xf64>, %im: tensor<8x32xf64>)
 // The unknown mask prevents whole-plane constant folding.
 
 // CHECK-LABEL: func.func @sqrt_residual_banded
-// CHECK: memref.alloc() : memref<16xf64>
-// CHECK: memref.alloc() : memref<16xf64>
+// CHECK: memref.alloc(){{.*}} : memref<16xf64>
+// CHECK: memref.alloc(){{.*}} : memref<16xf64>
 // CHECK-NOT: sar.interp1d_split
 func.func @sqrt_residual_banded(
     %re: tensor<8x32xf64>, %im: tensor<8x32xf64>,
@@ -89,7 +89,7 @@ func.func @sqrt_residual_banded(
 
 // CHECK-LABEL: func.func @interp_banded_perturbed
 // Displacement spans [-2, 3]; with the tap span that rounds to a 16-wide band.
-// CHECK: memref.alloc() : memref<16xf64>
+// CHECK: memref.alloc(){{.*}} : memref<16xf64>
 // CHECK-NOT: sar.interp1d_split
 func.func @interp_banded_perturbed(%re: tensor<4x64xf64>, %im: tensor<4x64xf64>)
     -> (tensor<4x64xf64>, tensor<4x64xf64>) {
@@ -127,7 +127,7 @@ func.func @interp_banded_perturbed(%re: tensor<4x64xf64>, %im: tensor<4x64xf64>)
 
 // CHECK-LABEL: func.func @interp_banded_edges
 // The ramp is an exact shift, so the band is just the tap span.
-// CHECK: memref.alloc() : memref<8xf64>
+// CHECK: memref.alloc(){{.*}} : memref<8xf64>
 // Clamp on the staging address.
 // CHECK: arith.maxsi
 // CHECK: arith.minsi

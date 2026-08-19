@@ -14,6 +14,7 @@ entries are evicted. Eviction runs once per cache root per process.
 from __future__ import annotations
 
 import hashlib
+import functools
 import os
 import platform
 import shutil
@@ -72,6 +73,16 @@ def _default_cache_root() -> Path:
 _FINGERPRINTED_TOOLS = ("sar-opt", "sar-translate", "mlir-translate", "clang")
 
 
+@functools.lru_cache(maxsize=32)
+def _file_identity(path: str, mtime_ns: int, size: int) -> bytes:
+    digest = hashlib.sha256()
+    digest.update(str(Path(path).resolve()).encode())
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
 def _driver_fingerprint() -> str:
     """Content identity of the Python code that orchestrates compilation."""
     package = Path(__file__).resolve().parents[1]
@@ -119,8 +130,8 @@ def _cpu_identity() -> str:
 def _toolchain_fingerprint() -> str:
     """Identity of the compilers that produced the cached artifacts.
 
-    Each tool's size and mtime stand in for its content: rebuilding one
-    changes them, which changes every cache key.
+    The path and content are authoritative. Size and mtime only memoize the
+    content hash within this process.
     """
     from .toolchain import find_runtime_library, find_tool
 
@@ -131,7 +142,10 @@ def _toolchain_fingerprint() -> str:
             info = None
         if info is None:
             return b"absent"
-        return f"{info.st_mtime_ns}:{info.st_size}".encode()
+        try:
+            return _file_identity(str(path), info.st_mtime_ns, info.st_size)
+        except OSError:  # pragma: no cover - racing tool replacement
+            return b"unreadable"
 
     digest = hashlib.sha256()
     for name in _FINGERPRINTED_TOOLS:

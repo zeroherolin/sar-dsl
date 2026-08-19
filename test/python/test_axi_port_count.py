@@ -89,7 +89,7 @@ def test_port_count_is_the_algorithm_io(chain, n, placement):
     kernel = build_kernel(chain, n)
     args = signature(axi_design(kernel, placement))
     scratch_count = len(args) - io_port_count(kernel)
-    assert 1 <= scratch_count <= 2, args
+    assert 2 <= scratch_count <= 4 and scratch_count % 2 == 0, args
 
 
 def port_shapes(args, io_ports: int) -> list:
@@ -143,7 +143,7 @@ def test_every_port_carries_exactly_one_interface_pragma(interface):
     defaults to, which differs between the IP and the kernel flows -- the
     signature stops being a contract. Every argument, including an unused
     placeholder scratch arena, therefore needs one explicit pragma."""
-    kernel = build_kernel("wka", 256)
+    kernel = build_kernel("wka", 64)
     kernel._compiled.clear()
     design = kernel.compile(backend="hls", options={"interface": interface})
     ports = [

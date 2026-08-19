@@ -127,10 +127,10 @@ streamed buffers reach the top function:
 | `interface='stream'` | AXI4-Stream ports for pure inputs and outputs; scratch arenas remain AXI masters | streaming radar front ends |
 
 Internal buffers that spill to DRAM never surface as ports of their own:
-they are carved into a fixed arena for their element type. Each arena's
-array bound is the storage size the host must bind. A one-element
-placeholder preserves an arena that has no spilled buffer, so placement
-decisions do not change the interface.
+they are distributed between two fixed arenas for their element type and
+carved at aligned offsets. Each arena's array bound is the storage size the
+host must bind. One-element placeholders preserve both masters when nothing
+spills, so placement decisions do not change the interface.
 
 An imaging chain is a sequence of whole-raster passes, so a plane dies
 as soon as the next pass has read it and the ones whose lifetimes do not
@@ -168,6 +168,8 @@ for its own raster, and the ALOS example runners emit one next to each
 `_axi.cpp` design. The script names the `part` and `clock_ns` from the
 configuration, so the budgets the compiler placed against and the device
 the tool builds for stay the same device.
+Each package includes `design_manifest.json` with the resolved configuration,
+its provenance, and the generated source SHA-256.
 
 Reports land in `<top>_csynth_proj/sol1/syn/report/`; the checklist,
 in the order failures usually appear:
@@ -184,9 +186,9 @@ in the order failures usually appear:
    A large II names the loop that needs attention.
 4. **Memory utilization.** BRAM/URAM usage must sit within the
    `bram_bytes`/`uram_bytes` caps. The caps are hard: the compiler
-   charges every dataflow buffer at twice its primitive count (Vitis
-   ping-pong double-buffers each channel), so meeting a cap at compile
-   time means meeting it in the report -- and when the working set
+   charges dataflow buffers at primitive granularity, rechecks the final
+   banked layout, and reduces automatic partition factors before spilling
+   more planes. When the working set
    cannot fit, the backend first retries with every full-size plane
    streamed, then fails compilation rather than emit a design that
    cannot fit the device (the fix is raising the caps to a larger
@@ -197,6 +199,9 @@ in the order failures usually appear:
    axis ROMs) should appear as memories, at one or two BRAM primitives
    per reading process -- dozens means the tool replicated ROMs that
    ought to be shared, which is worth a report.
+   Exactly linear axes use a compact `constexpr` generator; non-exact ramps
+   remain explicit arrays so source compaction cannot change a floating-point
+   value.
 5. **Interfaces.** One `m_axi` port per I/O plane plus the typed scratch
    arenas, on the bundles the design declared; burst length and outstanding
    depths as configured (see the header comment of the emitted C++).
@@ -248,16 +253,15 @@ What remains strided in the omega-K chain at `512 x 512`:
 | Block fills of the staged corner turns | 10 | a transpose must stride one side; the block bounds the stride by the staging budget rather than the scene |
 | Stolt band gather reads | 4 | not cross-row (the innermost loop drives the fastest axis) but non-affine: the address is clamped against the raster edge, and the position it clamps is computed from the data |
 
-### FFT stage grouping
+### FFT stage grouping and row parallelism
 
-A Stockham transform of length N is log2(N) butterfly passes. With
-`fft_stage_group=0`, each pass writes its own scratch line, which makes the
-passes a chain: a dataflow backend can overlap one line's late stages with
-the next line's early ones. It also means log2(N)-1 live scratch buffers.
+A power-of-two Stockham transform uses radix-4 stages plus one radix-2 stage
+when the exponent is odd, for `ceil(log2(N)/2)` butterfly passes. With
+`fft_stage_group=0`, each intermediate pass writes its own scratch line.
 
 `fft_stage_group` trades that overlap for area. With `k > 0` the stages
 are packed into groups that share scratch, cutting the live buffers to
-roughly log2(N)/k. Reusing a line puts a write-after-read edge between
+roughly `ceil(log2(N)/2)/k`. Reusing a line puts a write-after-read edge between
 the stages that share it, so the backend can no longer run them
 concurrently -- the cost is pipeline depth, not arithmetic, and the
 result is bit-identical either way.
@@ -266,24 +270,14 @@ Two scratch lines are the floor whenever more than one stage writes
 scratch: a Stockham butterfly reads `X[q + sp]`, `X[q + s(p + m)]` and
 writes `Y[q + 2sp]`, `Y[q + s(2p+1)]`, so a stage whose source and
 destination were the same line would overwrite values a later iteration
-still has to read. `k` at or above log2(N) saturates at that floor
-rather than collapsing to one buffer.
+still has to read. A grouping at or above the mixed-radix stage count
+saturates at that floor rather than collapsing to one buffer.
 
-Omega-K at `512 x 512`, measured from the emitted C++ by
-`benchmarks/run_resources.py`:
-
-| `fft_stage_group` | on-chip | vs. default | dataflow regions |
-|---|---|---|---|
-| 0 (default) | 1024.5 KiB | -- | 12 |
-| 1 | 1024.5 KiB | 0.0% | 12 |
-| 2 | 896.5 KiB | -12.5% | 8 |
-| 4 | 832.5 KiB | -18.7% | 8 |
-| 8 | 832.5 KiB | -18.7% | 8 |
-
-`k=1` gives every stage its own slot, so it is the full unroll's buffer
-count under another name. The saving arrives at `k=2` and flattens once
-the pool reaches its floor. The dataflow-region count falling from 12 to
-8 is the throughput being spent.
+`fft_parallel_rows` is derived from complete complex samples per AXI beat
+and the DSP budget. Each lane owns separate scratch; the generated C++ keeps
+one compact lane loop with an HLS unroll directive instead of cloning every
+stage in source. Values may be pinned for synthesis experiments, but they are
+compiler strategy rather than required user constraints.
 
 Each stage keeps its own affine loop nest whatever the grouping: stage
 t+1 reads elements that many different iterations of stage t produce, so
@@ -436,6 +430,8 @@ operator binding happens inside Vitis.
 | `uram_bytes` | `37748736` | 1024 of 1280 UltraRAM primitives; hard cap |
 | `lutram_bytes` | `2883584` | 80% of the distributed-RAM capacity; hard cap |
 | `dsp` | `9830` | 80% DSP synthesis-report budget |
+| `ff` | `2764800` | 80% flip-flop synthesis-report budget |
+| `lut` | `1382400` | 80% lookup-table synthesis-report budget |
 | `interface` | `ap_memory` | Protocol the top-function ports speak: `ap_memory` (plain arrays), `axi` (AXI4 memory-mapped masters), or `stream` (AXI4-Stream) |
 | `axi_bus_bits` | `512` | Data width of the AXI masters, in bits |
 | `axi_max_burst_length` | `256` | Beats per burst at full bus width (the AXI4 maximum) |
@@ -456,9 +452,9 @@ The caps are the whole constraint surface: placement charges each tier
 in whole primitives (a 36 Kb block holding one kilobyte is spent),
 overflows one block tier into the other before spilling anything, and
 fails the design when a buffer that cannot stream fits no tier. Vitis binds
-floating-point operators after emission, so the DSP budget is validated from
-`*_csynth.xml`; `precision` is the pre-synthesis lever when DSP pressure
-matters.
+operators and control after emission, so DSP, FF, and LUT budgets are
+validated from `*_csynth.xml`; `precision` is the pre-synthesis lever when
+datapath pressure matters.
 
 `precision` is a gate, not a conversion: the declared dtypes *are* the
 data path (see "Precision contract"), so `precision="f32"` rejects a
@@ -468,8 +464,8 @@ downstream reports it.
 
 ### What the compiler decides for itself
 
-Optimization strategy is not configured. FFT stage grouping, loop tiling,
-banded gathers, and the buffer-sharing, recompute and off-chip thresholds
+Optimization strategy is not configured. FFT grouping and row parallelism,
+loop tiling, banking, banded gathers, and buffer thresholds
 are derived from the constraints above and from what the compiler measures
 in the kernel: plane sizes, transform lengths, element widths, buffer
 lifetimes. They are absent from `hls_config.yaml` because no value written
@@ -484,8 +480,10 @@ marks those keys `derived`. The policy lives in
 | Derived | From |
 |---------|------|
 | `fft_stage_group` | the least grouping whose Stockham scratch fits the working share of the on-chip budget; full unroll where it fits |
+| `fft_parallel_rows` | complete complex samples per AXI beat, bounded by the DSP budget |
 | `loop_tile_size` | the element count in one bus beat, bounded by the pass limits |
 | `lutram_max_bytes` | one bus beat: a bank no larger than one transfer does not earn a block RAM primitive |
+| `array_partition_max_factor` | the largest power-of-two bank count no wider than one AXI beat; reduced automatically if final primitive accounting exceeds a cap |
 | `interp_banded_gather` | on: the pass proves a bounded displacement per operation and falls back on its own when it cannot |
 | `reuse_buffer_min_elements` | a full-scene plane against what the budget can afford to keep private |
 | `recompute_min_elements` | the same measure -- storage traded for arithmetic instead of for sharing |

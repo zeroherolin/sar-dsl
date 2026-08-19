@@ -3,19 +3,18 @@
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 // Lowers sar.fft_split (the split-complex FFT produced by sar-decomplexify)
-// into affine loop nests implementing the radix-2 Stockham autosort FFT.
+// into affine loop nests implementing a mixed radix-4/2 Stockham autosort FFT.
 // Stockham is chosen over Cooley-Tukey deliberately: it needs no
 // bit-reversal permutation, so every memory access is an affine function of
 // the loop indices -- exactly what an HLS flow requires for
 // loop analysis, pipelining and array partitioning.
 //
-// Per stage t (statically unrolled; n_cur = L >> t, m = n_cur / 2,
-// s = 1 << t, DIF formulation):
+// Radix-4 stages consume exponent pairs; an odd exponent starts with one
+// radix-2 stage. Both use the same DIF Stockham layout:
 //
-//   for p in [0, m), q in [0, s):
-//     a = X[q + s p];  b = X[q + s (p + m)]
-//     Y[q + 2 s p]     = a + b
-//     Y[q + s (2p + 1)] = (a - b) * w,   w = exp(-+ 2 pi i p / n_cur)
+//   for p in [0, n_cur/radix), q in [0, s):
+//     DFT_radix(X[q + s*(p + j*m)]) -> Y[q + s*(radix*p + k)]
+//     Y[k>0] *= exp(-+ 2 pi i p*k / n_cur)
 //
 // Twiddle factors are precomputed into constant memref globals; X and Y are
 // scratch lines drawn from a pool, which keeps the unrolled stages a chain
@@ -99,6 +98,17 @@ static StringRef typeSuffix(FloatType elemType) {
   return elemType.isF32() ? "f32" : "f64";
 }
 
+/// Mixed-radix schedule for a power-of-two transform. One radix-2 stage is
+/// used only when the exponent is odd; all remaining pairs are radix-4.
+static SmallVector<int> radixSchedule(int64_t length) {
+  int exponent = llvm::Log2_64(length);
+  SmallVector<int> radices;
+  if (exponent & 1)
+    radices.push_back(2);
+  radices.append(exponent / 2, 4);
+  return radices;
+}
+
 /// Creates (or reuses) the flattened per-stage Stockham twiddle tables for a
 /// transform of size `length`, returning the loaded cos/sin buffers.
 static std::pair<Value, Value>
@@ -109,15 +119,20 @@ materializeTwiddles(PatternRewriter &rewriter, Location loc, ModuleOp module,
   SmallVector<double> cosTable, sinTable;
   cosTable.reserve(length - 1);
   sinTable.reserve(length - 1);
-  for (int t = 0, stages = llvm::Log2_64(length); t < stages; ++t) {
-    int64_t nCur = length >> t;
-    for (int64_t p = 0; p < nCur / 2; ++p) {
-      double angle =
-          2.0 * M_PI * static_cast<double>(p) / static_cast<double>(nCur);
-      cosTable.push_back(std::cos(angle));
-      sinTable.push_back(std::sin(angle));
-    }
+  int64_t span = 1;
+  for (int radix : radixSchedule(length)) {
+    int64_t nCur = length / span;
+    int64_t butterflies = nCur / radix;
+    for (int64_t p = 0; p < butterflies; ++p)
+      for (int output = 1; output < radix; ++output) {
+        double angle = 2.0 * M_PI * static_cast<double>(p * output) /
+                       static_cast<double>(nCur);
+        cosTable.push_back(std::cos(angle));
+        sinTable.push_back(std::sin(angle));
+      }
+    span *= radix;
   }
+  assert(cosTable.size() == static_cast<size_t>(length - 1));
   std::string suffix = (Twine(length) + "_" + typeSuffix(elemType)).str();
   std::string cosName = ensureConstantGlobal(
       rewriter, module, ("__sar_fft_twiddle_cos_" + suffix), elemType,
@@ -175,7 +190,7 @@ static int scratchSlots(int stages, unsigned stageGroup) {
 ///
 /// Stage 0 reads `srcRe`/`srcIm` and the last stage writes `dstRe`/`dstIm`
 /// (scaled by `scale` when set), so the transform costs exactly its
-/// log2(length) butterfly passes -- no copy in, no copy out.
+/// mixed-radix butterfly passes -- no copy in, no copy out.
 ///
 /// `stageGroup` is the grouping parameter forwarded from the pass option:
 /// 0 (default) gives each stage its own scratch, maximising pipeline
@@ -187,24 +202,31 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
                          ArrayRef<std::pair<Value, Value>> scratch, Value dstRe,
                          Value dstIm, Value cosBuf, Value sinBuf, bool inverse,
                          Value scale, StorageMapFn srcDstMap,
-                         unsigned stageGroup) {
+                         unsigned stageGroup, unsigned parallelRows) {
+  auto lineDim = getAffineDimExpr(0, ctx);
   auto pDim = getAffineDimExpr(1, ctx);
   auto qDim = getAffineDimExpr(2, ctx);
-  int stages = llvm::Log2_64(length);
+  auto radices = radixSchedule(length);
+  int stages = static_cast<int>(radices.size());
   int slots = scratchSlots(stages, stageGroup);
   assert(scratch.size() >= static_cast<size_t>(slots) &&
          "not enough scratch lines for the chosen stage grouping");
 
-  // Scratch is a single line, so it is indexed by the element expression
-  // alone; the source and destination keep the caller's 2-D layout.
+  // Serial scratch is one line. A row-parallel engine adds a leading lane
+  // dimension selected by line modulo the lane count.
   auto scratchMap = [&](AffineExpr elem) {
+    if (parallelRows > 1)
+      return AffineMap::get(3, 0, {lineDim % parallelRows, elem}, ctx);
     return AffineMap::get(3, 0, {elem}, ctx);
   };
 
   Value curRe = srcRe, curIm = srcIm;
   bool curIsScratch = false;
 
+  int64_t span = 1;
+  int64_t twiddleOffset = 0;
   for (int t = 0; t < stages; ++t) {
+    int radix = radices[t];
     Value nxtRe, nxtIm;
     bool nxtIsScratch = t != stages - 1;
     if (nxtIsScratch) {
@@ -220,15 +242,13 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
       nxtIm = dstIm;
     }
 
-    int64_t nCur = length >> t;
-    int64_t m = nCur / 2;
-    int64_t s = int64_t{1} << t;
-    int64_t twiddleOffset = length - (length >> t);
+    int64_t nCur = length / span;
+    int64_t m = nCur / radix;
 
     OpBuilder::InsertionGuard g1(rewriter);
     auto pLoop = affine::AffineForOp::create(rewriter, loc, 0, m);
     rewriter.setInsertionPointToStart(pLoop.getBody());
-    auto qLoop = affine::AffineForOp::create(rewriter, loc, 0, s);
+    auto qLoop = affine::AffineForOp::create(rewriter, loc, 0, span);
     rewriter.setInsertionPointToStart(qLoop.getBody());
 
     SmallVector<Value> operands{lineIV, pLoop.getInductionVar(),
@@ -236,11 +256,6 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
 
     auto srcMap = curIsScratch ? StorageMapFn(scratchMap) : srcDstMap;
     auto dstMap = nxtIsScratch ? StorageMapFn(scratchMap) : srcDstMap;
-    AffineMap mapA = srcMap(qDim + pDim * s);
-    AffineMap mapB = srcMap(qDim + (pDim + m) * s);
-    AffineMap mapOutEven = dstMap(qDim + pDim * 2 * s);
-    AffineMap mapOutOdd = dstMap(qDim + (pDim * 2 + 1) * s);
-    AffineMap twiddleMap = AffineMap::get(3, 0, {pDim + twiddleOffset}, ctx);
 
     auto load = [&](Value buf, AffineMap map) -> Value {
       return affine::AffineLoadOp::create(rewriter, loc, buf, map, operands);
@@ -254,35 +269,80 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
       affine::AffineStoreOp::create(rewriter, loc, v, buf, map, operands);
     };
 
-    Value aRe = load(curRe, mapA), aIm = load(curIm, mapA);
-    Value bRe = load(curRe, mapB), bIm = load(curIm, mapB);
-    Value c = load(cosBuf, twiddleMap), sn = load(sinBuf, twiddleMap);
+    auto add = [&](Value lhs, Value rhs) -> Value {
+      return arith::AddFOp::create(rewriter, loc, lhs, rhs);
+    };
+    auto sub = [&](Value lhs, Value rhs) -> Value {
+      return arith::SubFOp::create(rewriter, loc, lhs, rhs);
+    };
+    auto mul = [&](Value lhs, Value rhs) -> Value {
+      return arith::MulFOp::create(rewriter, loc, lhs, rhs);
+    };
 
-    store(arith::AddFOp::create(rewriter, loc, aRe, bRe), nxtRe, mapOutEven);
-    store(arith::AddFOp::create(rewriter, loc, aIm, bIm), nxtIm, mapOutEven);
-
-    Value dRe = arith::SubFOp::create(rewriter, loc, aRe, bRe);
-    Value dIm = arith::SubFOp::create(rewriter, loc, aIm, bIm);
-    // forward: w = c - i s -> (dRe c + dIm s) + i (dIm c - dRe s)
-    // inverse: w = c + i s -> (dRe c - dIm s) + i (dIm c + dRe s)
-    Value reC = arith::MulFOp::create(rewriter, loc, dRe, c);
-    Value reS = arith::MulFOp::create(rewriter, loc, dIm, sn);
-    Value imC = arith::MulFOp::create(rewriter, loc, dIm, c);
-    Value imS = arith::MulFOp::create(rewriter, loc, dRe, sn);
-    Value outRe, outIm;
-    if (!inverse) {
-      outRe = arith::AddFOp::create(rewriter, loc, reC, reS);
-      outIm = arith::SubFOp::create(rewriter, loc, imC, imS);
-    } else {
-      outRe = arith::SubFOp::create(rewriter, loc, reC, reS);
-      outIm = arith::AddFOp::create(rewriter, loc, imC, imS);
+    SmallVector<Value, 4> inputRe, inputIm;
+    for (int input = 0; input < radix; ++input) {
+      AffineExpr index = qDim + (pDim + input * m) * span;
+      inputRe.push_back(load(curRe, srcMap(index)));
+      inputIm.push_back(load(curIm, srcMap(index)));
     }
-    store(outRe, nxtRe, mapOutOdd);
-    store(outIm, nxtIm, mapOutOdd);
+
+    SmallVector<Value, 4> dftRe(radix), dftIm(radix);
+    if (radix == 2) {
+      dftRe[0] = add(inputRe[0], inputRe[1]);
+      dftIm[0] = add(inputIm[0], inputIm[1]);
+      dftRe[1] = sub(inputRe[0], inputRe[1]);
+      dftIm[1] = sub(inputIm[0], inputIm[1]);
+    } else {
+      auto sum4 = [&](Value a, Value b, Value c, Value d) {
+        return add(add(a, b), add(c, d));
+      };
+      dftRe[0] = sum4(inputRe[0], inputRe[1], inputRe[2], inputRe[3]);
+      dftIm[0] = sum4(inputIm[0], inputIm[1], inputIm[2], inputIm[3]);
+      dftRe[2] = add(sub(inputRe[0], inputRe[1]), sub(inputRe[2], inputRe[3]));
+      dftIm[2] = add(sub(inputIm[0], inputIm[1]), sub(inputIm[2], inputIm[3]));
+
+      Value forward1Re =
+          sub(add(inputRe[0], inputIm[1]), add(inputRe[2], inputIm[3]));
+      Value forward1Im =
+          add(sub(inputIm[0], inputRe[1]), sub(inputRe[3], inputIm[2]));
+      Value forward3Re =
+          add(sub(inputRe[0], inputIm[1]), sub(inputIm[3], inputRe[2]));
+      Value forward3Im =
+          sub(add(inputIm[0], inputRe[1]), add(inputIm[2], inputRe[3]));
+      dftRe[1] = inverse ? forward3Re : forward1Re;
+      dftIm[1] = inverse ? forward3Im : forward1Im;
+      dftRe[3] = inverse ? forward1Re : forward3Re;
+      dftIm[3] = inverse ? forward1Im : forward3Im;
+    }
+
+    for (int output = 0; output < radix; ++output) {
+      Value outRe = dftRe[output], outIm = dftIm[output];
+      if (output != 0) {
+        AffineExpr twiddleIndex =
+            pDim * (radix - 1) + (output - 1) + twiddleOffset;
+        AffineMap twiddleMap = AffineMap::get(3, 0, {twiddleIndex}, ctx);
+        Value cosine = load(cosBuf, twiddleMap);
+        Value sine = load(sinBuf, twiddleMap);
+        Value reC = mul(outRe, cosine), reS = mul(outIm, sine);
+        Value imC = mul(outIm, cosine), imS = mul(outRe, sine);
+        if (!inverse) {
+          outRe = add(reC, reS);
+          outIm = sub(imC, imS);
+        } else {
+          outRe = sub(reC, reS);
+          outIm = add(imC, imS);
+        }
+      }
+      AffineExpr outputIndex = qDim + (pDim * radix + output) * span;
+      store(outRe, nxtRe, dstMap(outputIndex));
+      store(outIm, nxtIm, dstMap(outputIndex));
+    }
 
     curRe = nxtRe;
     curIm = nxtIm;
     curIsScratch = nxtIsScratch;
+    twiddleOffset += m * (radix - 1);
+    span *= radix;
   }
 }
 
@@ -315,12 +375,15 @@ static void hostFFT(std::vector<std::complex<double>> &data) {
 }
 
 struct FFTSplitToAffinePattern : OpRewritePattern<FFTSplitOp> {
-  FFTSplitToAffinePattern(MLIRContext *context, unsigned stageGroup)
-      : OpRewritePattern<FFTSplitOp>(context), stageGroup(stageGroup) {}
+  FFTSplitToAffinePattern(MLIRContext *context, unsigned stageGroup,
+                          unsigned parallelRows)
+      : OpRewritePattern<FFTSplitOp>(context), stageGroup(stageGroup),
+        parallelRows(parallelRows) {}
 
   /// How many consecutive Stockham stages share one scratch slot; 0 keeps
   /// the full unroll (one slot per intermediate stage).
   unsigned stageGroup;
+  unsigned parallelRows;
 
   LogicalResult matchAndRewrite(FFTSplitOp op,
                                 PatternRewriter &rewriter) const override {
@@ -363,7 +426,7 @@ struct FFTSplitToAffinePattern : OpRewritePattern<FFTSplitOp> {
     if (llvm::isPowerOf2_64(length))
       emitPowerOfTwo(rewriter, loc, ctx, module, length, lines, elemType,
                      bufferType, inRe, inIm, outBufRe, outBufIm, inverse,
-                     storageMap, stageGroup);
+                     storageMap, stageGroup, parallelRows);
     else
       emitBluestein(rewriter, loc, ctx, module, length, dim, lines, elemType,
                     tensorType, inRe, inIm, outBufRe, outBufIm, inverse,
@@ -388,7 +451,7 @@ private:
   ///
   /// The stages read the input in place of a copy-in pass and write the
   /// result in place of a copy-out pass, so the whole transform is exactly
-  /// its log2(L) butterfly passes.
+  /// its mixed-radix butterfly passes.
   ///
   /// `stageGroup` is forwarded from the pass option; 0 gives each
   /// intermediate stage its own scratch line (full unroll), while k > 0
@@ -398,7 +461,8 @@ private:
                              int64_t lines, FloatType elemType,
                              MemRefType bufferType, Value inRe, Value inIm,
                              Value outBufRe, Value outBufIm, bool inverse,
-                             StorageMapFn storageMap, unsigned stageGroup) {
+                             StorageMapFn storageMap, unsigned stageGroup,
+                             unsigned requestedParallelRows) {
     auto [cosBuf, sinBuf] =
         materializeTwiddles(rewriter, loc, module, length, elemType);
 
@@ -410,23 +474,46 @@ private:
 
     // Stage 0 reads the input and the last stage writes the result; the
     // number of scratch slots between them depends on the grouping.
-    int stages = llvm::Log2_64(length);
+    int stages = static_cast<int>(radixSchedule(length).size());
     int slots = scratchSlots(stages, stageGroup);
-    auto lineType = MemRefType::get({length}, elemType);
+    unsigned parallelRows =
+        std::min<uint64_t>(std::max(1u, requestedParallelRows), lines);
+    while (parallelRows > 1 && lines % parallelRows != 0)
+      parallelRows >>= 1;
+    auto lineType =
+        parallelRows > 1
+            ? MemRefType::get({static_cast<int64_t>(parallelRows), length},
+                              elemType)
+            : MemRefType::get({length}, elemType);
     SmallVector<std::pair<Value, Value>> scratch;
     for (int i = 0; i < slots; ++i)
       scratch.emplace_back(
           memref::AllocOp::create(rewriter, loc, lineType).getResult(),
           memref::AllocOp::create(rewriter, loc, lineType).getResult());
 
-    // Lines are independent, so the line loop wraps the whole transform and
-    // is what a dataflow backend pipelines over.
-    auto lineLoop = affine::AffineForOp::create(rewriter, loc, 0, lines);
+    // Keep row parallelism compact in IR and generated C++: an explicitly
+    // unrolled lane loop shares one mixed-radix engine description instead of
+    // cloning the complete stage graph once per row.
+    auto lineLoop =
+        affine::AffineForOp::create(rewriter, loc, 0, lines, parallelRows);
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(lineLoop.getBody());
-    emitStockham(rewriter, loc, ctx, length, lineLoop.getInductionVar(), inRe,
-                 inIm, scratch, outBufRe, outBufIm, cosBuf, sinBuf, inverse,
-                 scale, storageMap, stageGroup);
+    Value line = lineLoop.getInductionVar();
+    if (parallelRows > 1) {
+      auto laneLoop =
+          affine::AffineForOp::create(rewriter, loc, 0, parallelRows);
+      laneLoop->setAttr("hls.unroll_factor",
+                        rewriter.getI64IntegerAttr(parallelRows));
+      rewriter.setInsertionPointToStart(laneLoop.getBody());
+      auto map = AffineMap::get(
+          2, 0, getAffineDimExpr(0, ctx) + getAffineDimExpr(1, ctx));
+      line = affine::AffineApplyOp::create(
+          rewriter, loc, map,
+          ValueRange{lineLoop.getInductionVar(), laneLoop.getInductionVar()});
+    }
+    emitStockham(rewriter, loc, ctx, length, line, inRe, inIm, scratch,
+                 outBufRe, outBufIm, cosBuf, sinBuf, inverse, scale, storageMap,
+                 stageGroup, parallelRows);
   }
 
   /// Bluestein's chirp-z reduction for non-power-of-two sizes.
@@ -521,7 +608,7 @@ private:
     // both on the same scratch and turn the chain into a cycle, which is the
     // one shape a dataflow backend cannot schedule. Within each transform the
     // grouping option decides how many slots the stages draw from.
-    int paddedStages = llvm::Log2_64(padded);
+    int paddedStages = static_cast<int>(radixSchedule(padded).size());
     int paddedSlots = scratchSlots(paddedStages, stageGroup);
     SmallVector<std::pair<Value, Value>> fwdScratch, invScratch;
     for (int i = 0; i < paddedSlots; ++i) {
@@ -582,7 +669,8 @@ private:
     // ---- forward transform, pointwise product, inverse transform ------ //
     emitStockham(rewriter, loc, ctx, padded, lineIV, stageRe, stageIm,
                  fwdScratch, specRe, specIm, cosBuf, sinBuf,
-                 /*inverse=*/false, /*scale=*/nullptr, scratchMap, stageGroup);
+                 /*inverse=*/false, /*scale=*/nullptr, scratchMap, stageGroup,
+                 /*parallelRows=*/1);
 
     elementLoop(0, padded, [&](ValueRange ops) {
       Value ar = load(specRe, lineMap, ops), ai = load(specIm, lineMap, ops);
@@ -596,7 +684,8 @@ private:
 
     emitStockham(rewriter, loc, ctx, padded, lineIV, prodRe, prodIm, invScratch,
                  convRe, convIm, cosBuf, sinBuf,
-                 /*inverse=*/true, /*scale=*/nullptr, scratchMap, stageGroup);
+                 /*inverse=*/true, /*scale=*/nullptr, scratchMap, stageGroup,
+                 /*parallelRows=*/1);
 
     // ---- post-multiply by the chirp, cropping back to n --------------- //
     // `emitStockham` emits butterflies only, so the 1/M the convolution
@@ -634,7 +723,8 @@ struct ConvertSARFFTToAffinePass
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
     RewritePatternSet patterns(context);
-    patterns.add<FFTSplitToAffinePattern>(context, fftStageGroup);
+    patterns.add<FFTSplitToAffinePattern>(context, fftStageGroup,
+                                          fftParallelRows);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))

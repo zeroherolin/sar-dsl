@@ -119,22 +119,41 @@ memory budget and the 9830-DSP report budget. All four generated packages
 also pass Vitis csim against their NumPy golden outputs. The
 [machine-readable summary](results/hls_algorithms_c128_32_vitis_2022_2.json)
 records constraints and report hashes. These small designs validate lowering,
-directives and timing feasibility; the large-raster result below is measured
+directives and timing feasibility; large-raster results below are measured
 separately.
 
 Additional synthesis coverage includes AXI4-Stream interfaces, compiled
 `sar.iterate` loops, f32 data paths and RTL co-simulation of the
-copy-elision path. At scale, the 4096x4096 RDA AXI design completes
-synthesis with nine masters; the remaining II-limited site is the shared
-DRAM scratch port.
+copy-elision path. Spilled lifetimes are colored across two fixed scratch
+masters per scalar type so a single arena does not serialize independent
+accesses.
 
-The current 16384x16384 c64 omega-K design completes full csynth in
-Vitis HLS 2022.2. Its report estimates 5.698 ns, 47,013,232,685 cycles,
-130 BRAM18K, 552 URAM, 289 DSP, 110,478 FF, and 348,722 LUT. It fits the
-80% resource budgets but misses the 4 ns target. This is a
-synthesizability and scaling result, not timing closure or a projected
-board throughput. The machine-readable summary, including constraints
-and synthesis elapsed time, is in
+Production-scale c64 AXI designs, measured with the same device, 4 ns
+target, and 80% resource budgets. Latency time is cycles multiplied by the
+estimated clock. The hand-written WKA row is the worst-case latency; Vitis
+reports a range because that design reuses transform and corner-turn
+instances across runtime modes.
+
+| Design | Grid | Clock | Latency cycles | Latency time | csynth |
+|---|---:|---:|---:|---:|---:|
+| WKA, generated | 16384² | 3.187 ns | 13,185,679,397 | 42.023 s | 216.21 s |
+| WKA, hand-written | 16384² | 3.500 ns | 2,033,373,247 | 7.117 s | 201.24 s |
+| RDA, generated | 16384² | 5.840 ns | 42,162,307,154 | 246.228 s | 199.44 s |
+| CSA, generated | 16384² | 5.698 ns | 25,257,394,240 | 143.917 s | 187.00 s |
+| PFA, generated | 8192² | 6.067 ns | 41,145,090,789 | 249.627 s | 168 s |
+
+| Design | BRAM18K | URAM | DSP | FF | LUT |
+|---|---:|---:|---:|---:|---:|
+| WKA, generated | 162 | 296 | 539 | 153,845 | 252,020 |
+| WKA, hand-written | 384 | 296 | 1,135 | 210,325 | 373,962 |
+| RDA, generated | 96 | 260 | 173 | 111,871 | 223,167 |
+| CSA, generated | 64 | 288 | 269 | 111,795 | 217,079 |
+| PFA, generated | 160 | 216 | 391 | 163,127 | 258,089 |
+
+Generated WKA meets 4 ns. RDA, CSA, and PFA fit the resource budgets and
+miss 4 ns; remaining bottlenecks are external-load paths and
+interpolation/gather throughput. These are HLS estimates, not
+place-and-route closure. Generated WKA constraints and provenance are in
 [`results/hls_wka_c64_16384_vitis_2022_2.json`](results/hls_wka_c64_16384_vitis_2022_2.json).
 
 ## Throughput
@@ -247,11 +266,12 @@ PYTHONPATH=python:examples python benchmarks/run_performance.py \
   --sizes 128 256 512 1024 2048 4096 --repeats 3 --numpy
 ```
 
-Times are the best warm sample after three warmups. Raw wall-time samples
-and environment provenance are available through `--json`. Compile and
-first-call times are reported by the runner but omitted here because
-compiler cache state and prior allocations in a shared process make them
-unsuitable for comparison.
+Times are the best warm sample after three warmups. The 16384 × 16384
+stripmap rows were measured separately with `--sizes 16384 --repeats 1`.
+Raw wall-time samples and environment provenance are available through
+`--json`. Compile and first-call times are reported by the runner but
+omitted here because compiler cache state and prior allocations in a
+shared process make them unsuitable for comparison.
 
 | Algorithm | size | warm | NumPy reference | speedup |
 |-----------|-----:|-----:|----------------:|--------:|
@@ -261,18 +281,21 @@ unsuitable for comparison.
 | omega-K | 1024 | 0.077 s | 0.69 s | 9.0x |
 | omega-K | 2048 | 0.124 s | 1.89 s | 15.2x |
 | omega-K | 4096 | 0.414 s | 7.37 s | 17.8x |
+| omega-K | 16384 | 3.582 s | 124.08 s | 34.6x |
 | Range-Doppler | 128 | 0.004 s | 0.03 s | 6.5x |
 | Range-Doppler | 256 | 0.007 s | 0.07 s | 10.2x |
 | Range-Doppler | 512 | 0.020 s | 0.31 s | 15.6x |
 | Range-Doppler | 1024 | 0.064 s | 0.67 s | 10.5x |
 | Range-Doppler | 2048 | 0.280 s | 2.09 s | 7.5x |
 | Range-Doppler | 4096 | 0.465 s | 8.98 s | 19.3x |
+| Range-Doppler | 16384 | 3.849 s | 157.90 s | 41.0x |
 | Chirp Scaling | 128 | 0.002 s | 0.00 s | 2.0x |
 | Chirp Scaling | 256 | 0.003 s | 0.01 s | 5.1x |
 | Chirp Scaling | 512 | 0.010 s | 0.19 s | 19.9x |
 | Chirp Scaling | 1024 | 0.032 s | 0.36 s | 11.2x |
 | Chirp Scaling | 2048 | 0.102 s | 1.00 s | 9.8x |
 | Chirp Scaling | 4096 | 0.299 s | 4.39 s | 14.7x |
+| Chirp Scaling | 16384 | 2.807 s | 73.58 s | 26.2x |
 | PFA | 128 | 0.006 s | 0.06 s | 10.3x |
 | PFA | 256 | 0.012 s | 0.17 s | 14.4x |
 | PFA | 512 | 0.035 s | 0.46 s | 13.3x |

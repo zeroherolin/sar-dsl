@@ -100,8 +100,7 @@ static LogicalResult emitKernelFacts(Operation *root, llvm::raw_ostream &os) {
   if (narrowest == std::numeric_limits<unsigned>::max())
     narrowest = 8;
 
-  os << "{\"plane_elements\":" << largest
-     << ",\"element_bytes\":" << narrowest
+  os << "{\"plane_elements\":" << largest << ",\"element_bytes\":" << narrowest
      << ",\"transposes\":" << transposes << ",\"transforms\":[";
   for (auto [index, transform] : llvm::enumerate(transforms)) {
     if (index)

@@ -470,3 +470,18 @@ def test_tool_override_must_be_executable(tmp_path, monkeypatch):
     with pytest.raises(sar.ToolchainError, match="not executable"):
         toolchain.find_tool("not-executable-probe")
     toolchain.find_tool.cache_clear()
+
+
+def test_tool_override_changes_are_visible_in_process(tmp_path, monkeypatch):
+    from sar.compiler import toolchain
+
+    name = "dynamic-tool-probe"
+    variable = "SAR_DSL_TOOL_DYNAMIC_TOOL_PROBE"
+    monkeypatch.delenv(variable, raising=False)
+    assert toolchain.find_tool(name, required=False) is None
+
+    probe = tmp_path / name
+    probe.write_text("#!/bin/sh\nexit 0\n")
+    probe.chmod(0o755)
+    monkeypatch.setenv(variable, str(probe))
+    assert toolchain.find_tool(name) == str(probe)

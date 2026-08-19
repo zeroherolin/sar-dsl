@@ -103,7 +103,8 @@
 #endif
 #define WKA_STOLT_WEIGHT_TAP_START (-3)
 #define WKA_STOLT_WEIGHT_TAP_END 4
-#define WKA_STOLT_WEIGHT_TAP_COUNT (WKA_STOLT_WEIGHT_TAP_END - WKA_STOLT_WEIGHT_TAP_START + 1)
+#define WKA_STOLT_WEIGHT_TAP_COUNT                                             \
+  (WKA_STOLT_WEIGHT_TAP_END - WKA_STOLT_WEIGHT_TAP_START + 1)
 
 // Testbench defaults
 #define WKA_TB_NONZERO_MAG_EPS 1e-6f

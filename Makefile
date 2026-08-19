@@ -1,6 +1,7 @@
 # Convenience entry points for SAR-DSL development.
 
 BUILD_DIR ?= build
+ARTIFACT_DIR ?= $(BUILD_DIR)/artifacts
 JOBS ?= $(shell nproc)
 
 .PHONY: all llvm build test test-lit test-python examples bench clean
@@ -27,10 +28,15 @@ test-python:              ## Python frontend + backend tests
 	PYTHONPATH=python python3 -m pytest test/python -q
 
 examples:                 ## Focus every synthetic example end-to-end
-	PYTHONPATH=python python3 examples/wka/run_point_target_cpu.py --n 512
-	PYTHONPATH=python python3 examples/rda/run_point_target_cpu.py --n 512
-	PYTHONPATH=python python3 examples/csa/run_point_target_cpu.py --n 512
-	PYTHONPATH=python python3 examples/pfa/run_point_target_cpu.py --n 512
+	cmake -E make_directory "$(ARTIFACT_DIR)/examples"
+	PYTHONPATH=python python3 examples/wka/run_point_target_cpu.py --n 512 \
+	  --output "$(ARTIFACT_DIR)/examples/wka.png"
+	PYTHONPATH=python python3 examples/rda/run_point_target_cpu.py --n 512 \
+	  --output "$(ARTIFACT_DIR)/examples/rda.png"
+	PYTHONPATH=python python3 examples/csa/run_point_target_cpu.py --n 512 \
+	  --output "$(ARTIFACT_DIR)/examples/csa.png"
+	PYTHONPATH=python python3 examples/pfa/run_point_target_cpu.py --n 512 \
+	  --output "$(ARTIFACT_DIR)/examples/pfa.png"
 
 bench:                    ## Imaging-chain performance benchmarks
 	PYTHONPATH=python python3 benchmarks/run_performance.py \

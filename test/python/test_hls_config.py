@@ -60,6 +60,8 @@ def test_defaults_budget_eighty_percent_of_vu13p():
     assert config.uram_bytes == int(1280 * 0.8) * 288 * 1024 // 8
     assert config.lutram_bytes == int(27.5 * 1024 * 1024 / 8 * 0.8)
     assert config.dsp == int(12288 * 0.8)
+    assert config.ff == int(3456000 * 0.8)
+    assert config.lut == int(1728000 * 0.8)
     assert config.part == "xcvu13p-fhgb2104-2-i"
     assert config.clock_ns == 4.0
     # The aggregate the streaming decisions reason against is the tier sum.
@@ -204,6 +206,9 @@ def test_out_of_range_values_are_rejected(options, expected):
         "top_func": "2fast"
     }, "expected a C identifier"),
     ({
+        "top_func": "class"
+    }, "expected a C identifier"),
+    ({
         "axi_bus_bits": None
     }, "null is not allowed"),
     ({
@@ -278,6 +283,18 @@ def test_yaml_subset_rejects_what_it_cannot_read(text, expected):
 
     with pytest.raises(HLSConfigError, match=expected):
         _parse_yaml(text, "<test>")
+
+
+def test_invalid_based_integer_is_a_config_error(tmp_path):
+    path = tmp_path / "device.yaml"
+    path.write_text("bram_bytes: 0b2\n")
+    with pytest.raises(HLSConfigError, match="expected an integer"):
+        HLSConfig.resolve({"config": path})
+
+
+def test_explicit_null_config_path_is_rejected():
+    with pytest.raises(HLSConfigError, match="expected a path"):
+        HLSConfig.resolve({"config": None})
 
 
 # --------------------------------------------------------------------- #
@@ -362,6 +379,8 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
                   options={
                       "top_func": "renamed_top",
                       "loop_tile_size": 4,
+                      "fft_parallel_rows": 8,
+                      "array_partition_max_factor": 8,
                       "fft_stage_group": 2,
                       "interp_banded_gather": False,
                       "reuse_buffer_min_elements": 7,
@@ -370,6 +389,7 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
                       "bram_bytes": 2048,
                       "uram_bytes": 4096,
                       "lutram_bytes": 0,
+                      "interface": "axi",
                   })
     lower, hls, emit = recorded_commands
 
@@ -377,6 +397,7 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
     assert "recompute-min-elements=9" in lower
     assert "interp-enable-banded-gather=false" in lower
     assert "fft-stage-group=2" in lower
+    assert "fft-parallel-rows=8" in lower
     # No corner turn in the kernel, so a quarter of the block RAM cap
     # is offered to a staging block -- floored at one 4 KiB burst.
     assert "transpose-block-bytes=4096" in lower
@@ -386,11 +407,12 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
     assert "bram-bytes=2048" in hls
     assert "uram-bytes=4096" in hls
     assert "lutram-bytes=0" in hls
-    assert "axi-interface=false" in hls
+    assert "axi-interface=true" in hls
     assert "external-buffer-threshold=11" in hls
     # The LUT-bank threshold is derived rather than frozen as a pass
     # default, and arrives in bytes: one bus beat (512/8).
     assert "lutram-max-bytes=64" in hls
+    assert "array-partition-max-factor=8" in hls
 
     assert "-axi-bus-bits=512" in emit
     # Buffering is both directions' worth of full-length bursts.
@@ -426,6 +448,18 @@ def test_top_func_names_the_emitted_function():
     design = scale.compile(backend="hls", options={"top_func": "custom_top"})
     assert design.name == "custom_top"
     assert "void custom_top" in design.source()
+
+
+@requires_hls
+def test_kernel_name_must_also_be_a_cpp_identifier():
+
+    @sar.func
+    def scale(x: sar.f32[4]) -> sar.f32[4]:
+        return x * 2.0
+
+    scale.name = "valid.mlir"
+    with pytest.raises(HLSConfigError, match="valid C\\+\\+ identifier"):
+        scale.compile(backend="hls")
 
 
 def _axi_shape(source):
@@ -536,7 +570,7 @@ def test_tier_budgets_steer_placement():
     common = {"external_buffer_threshold": n * n + 1}
     plentiful = corner_turn.compile(backend="hls",
                                     options={
-                                        **common, "uram_bytes": 23592960
+                                        **common, "uram_bytes": 37748736
                                     }).source()
     # Starving URAM must demote its buffers, not refuse the design, so
     # the block RAM cap is raised to hold what URAM no longer may.

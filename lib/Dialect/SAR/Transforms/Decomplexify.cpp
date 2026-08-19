@@ -425,6 +425,35 @@ LogicalResult FunctionDecomplexifier::rewriteOp(Operation *op) {
                             slice.getSizesAttr(), slice.getStridesAttr())};
         return success();
       })
+      .Case<DynamicSliceOp>([&](DynamicSliceOp slice) {
+        auto [re, im] = getSplit(slice.getInput());
+        SmallVector<Value> offsets;
+        llvm::transform(slice.getOffsets(), std::back_inserter(offsets),
+                        [&](Value value) { return getReal(value); });
+        auto plane = getPlaneType(slice.getType());
+        splitValues[slice.getResult()] = {
+            DynamicSliceOp::create(builder, loc, plane, re, offsets,
+                                   slice.getSizesAttr(),
+                                   slice.getStridesAttr()),
+            DynamicSliceOp::create(builder, loc, plane, im, offsets,
+                                   slice.getSizesAttr(),
+                                   slice.getStridesAttr())};
+        return success();
+      })
+      .Case<DynamicUpdateSliceOp>([&](DynamicUpdateSliceOp update) {
+        auto [inputRe, inputIm] = getSplit(update.getInput());
+        auto [updateRe, updateIm] = getSplit(update.getUpdate());
+        SmallVector<Value> offsets;
+        llvm::transform(update.getOffsets(), std::back_inserter(offsets),
+                        [&](Value value) { return getReal(value); });
+        auto plane = getPlaneType(update.getType());
+        splitValues[update.getResult()] = {
+            DynamicUpdateSliceOp::create(builder, loc, plane, inputRe, updateRe,
+                                         offsets),
+            DynamicUpdateSliceOp::create(builder, loc, plane, inputIm, updateIm,
+                                         offsets)};
+        return success();
+      })
       .Case<ConcatOp>([&](ConcatOp concat) {
         auto [lre, lim] = getSplit(concat.getLhs());
         auto [rre, rim] = getSplit(concat.getRhs());

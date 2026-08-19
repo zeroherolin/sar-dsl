@@ -91,6 +91,8 @@ __all__ = [
     "round",
     "transpose",
     "broadcast",
+    "dynamic_slice",
+    "dynamic_update_slice",
     "concatenate",
     "concat",
     "pad",
@@ -293,10 +295,19 @@ class Tensor:
         return self._emit(op, [self], self._value.type,
                           {"scalar": float(scalar)})
 
+    def _integer_scalar(self, op: str, scalar, reflected=False) -> "Tensor":
+        if isinstance(scalar,
+                      bool) or not isinstance(scalar, numbers.Integral):
+            raise TraceError(f"integer tensor {op} requires an integer scalar")
+        other = _constant_splat(scalar, self._value.type)
+        return self._binary(op, other, reflected=reflected)
+
     # -- operators ----------------------------------------------------------
 
     def __add__(self, other):
         if _is_real_scalar(other):
+            if self.dtype.is_int:
+                return self._integer_scalar("add", other)
             return self._scalar("add_scalar", other)
         return self._binary("add", other)
 
@@ -304,16 +315,22 @@ class Tensor:
 
     def __sub__(self, other):
         if _is_real_scalar(other):
+            if self.dtype.is_int:
+                return self._integer_scalar("sub", other)
             return self._scalar("add_scalar", -float(other))
         return self._binary("sub", other)
 
     def __rsub__(self, other):
         if _is_real_scalar(other):
+            if self.dtype.is_int:
+                return self._integer_scalar("sub", other, reflected=True)
             return (-self)._scalar("add_scalar", float(other))
         return self._binary("sub", other, reflected=True)
 
     def __mul__(self, other):
         if _is_real_scalar(other):
+            if self.dtype.is_int:
+                return self._integer_scalar("mul", other)
             return self._scalar("mul_scalar", other)
         return self._binary("mul", other)
 
@@ -321,12 +338,12 @@ class Tensor:
 
     def __truediv__(self, other):
         if _is_real_scalar(other):
-            return self._scalar("mul_scalar", 1.0 / float(other))
+            other = _constant_splat(other, self._value.type)
         return self._binary("div", other)
 
     def __rtruediv__(self, other):
         if _is_real_scalar(other):
-            other = np.full(self.shape, other, dtype=self.dtype.to_numpy())
+            other = _constant_splat(other, self._value.type)
         return self._binary("div", other, reflected=True)
 
     def __neg__(self):
@@ -362,9 +379,7 @@ class Tensor:
             raise TraceError("comparisons require float tensors "
                              "(compare magnitudes or components)")
         if isinstance(other, (int, float)):
-            other = np.full(self.shape,
-                            float(other),
-                            dtype=self.dtype.to_numpy())
+            other = _constant_splat(other, self._value.type)
         if isinstance(other, np.ndarray):
             other = constant(other)
         lhs, rhs = _coerce_pair(self, other, "cmp")
@@ -507,6 +522,12 @@ class Tensor:
                                                           "strides": strides
                                                       })
 
+    def dynamic_slice(self, offsets, sizes, strides=None) -> "Tensor":
+        return dynamic_slice(self, offsets, sizes, strides)
+
+    def dynamic_update_slice(self, update, offsets) -> "Tensor":
+        return dynamic_update_slice(self, update, offsets)
+
     @property
     def T(self) -> "Tensor":
         return transpose(self)
@@ -538,6 +559,18 @@ def _resolve_axis(what: str,
     return value
 
 
+def _emit_constant(ttype: TensorType, attr: ir.DenseAttr) -> Tensor:
+    fn = _current_function()
+    value = fn.emit("sar.constant", [],
+                    ttype, {"value": attr},
+                    location=_source_location())
+    return Tensor(value, from_host=True)
+
+
+def _constant_splat(value, ttype: TensorType) -> Tensor:
+    return _emit_constant(ttype, ir.DenseAttr.splat(value, ttype))
+
+
 def constant(value,
              dtype: Optional[_DTypeSpec] = None,
              shape: Optional[Sequence[int]] = None) -> Tensor:
@@ -556,9 +589,14 @@ def constant(value,
                 dtype = _SPEC_BY_DTYPE[matches[0]]
             else:
                 dtype = c64 if isinstance(value, complex) else f64
-        array = np.full(tuple(shape), value, dtype=dtype.dtype.to_numpy())
+        ttype = TensorType(tuple(shape), dtype.dtype)
+        return _constant_splat(value, ttype)
     else:
         array = np.asarray(value)
+        if shape is not None and tuple(shape) != tuple(array.shape):
+            raise TraceError(
+                f"constant shape {tuple(shape)} does not match array shape "
+                f"{tuple(array.shape)}")
         if dtype is not None:
             array = array.astype(dtype.dtype.to_numpy())
         np_name = array.dtype.name
@@ -571,11 +609,7 @@ def constant(value,
 
     ttype = TensorType(tuple(array.shape), dtype.dtype)
     attr = ir.DenseAttr.from_array(array, ttype)
-    fn = _current_function()
-    value_ = fn.emit("sar.constant", [],
-                     ttype, {"value": attr},
-                     location=_source_location())
-    return Tensor(value_, from_host=True)
+    return _emit_constant(ttype, attr)
 
 
 def _float_unary(op: str, x: Tensor) -> Tensor:
@@ -720,17 +754,24 @@ def where(mask: Tensor, a, b) -> Tensor:
 
     def splat(value, template):
         if isinstance(template, Tensor):
-            np_dtype = template.dtype.to_numpy()
+            dtype = _SPEC_BY_DTYPE[template.dtype]
         elif isinstance(template, np.ndarray):
-            np_dtype = template.dtype
+            matches = [
+                dtype for dtype in DTYPES.values()
+                if dtype.np_dtype == template.dtype.name
+            ]
+            if not matches:
+                raise TraceError(f"sar.where: unsupported branch dtype "
+                                 f"{template.dtype.name}")
+            dtype = _SPEC_BY_DTYPE[matches[0]]
         else:
             # Both branches are Python scalars, so there is no tensor to take
             # the precision from. Follow the mask, which carries the working
             # precision of the surrounding computation: inferring f64 from a
             # Python float would silently promote an f32 pipeline (and, on
             # HLS, synthesize double-precision hardware).
-            np_dtype = mask.dtype.to_numpy()
-        return np.full(mask.shape, value, dtype=np_dtype)
+            dtype = _SPEC_BY_DTYPE[mask.dtype]
+        return _constant_splat(value, TensorType(mask.shape, dtype.dtype))
 
     if isinstance(a, (int, float)):
         a = splat(a, b)
@@ -918,6 +959,92 @@ def round(x: Tensor) -> Tensor:  # noqa: A001 - numpy-style rounding
     if not x.dtype.is_float:
         raise TraceError("sar.round expects a float tensor")
     return sign(x) * floor(absolute(x) + 0.5)
+
+
+def _shape_values(values, rank: int, what: str, minimum: int = 1):
+    if isinstance(values, (int, np.integer)):
+        values = (values, )
+    try:
+        values = tuple(values)
+    except TypeError:
+        raise TraceError(f"{what} must contain {rank} integers") from None
+    if len(values) != rank:
+        raise TraceError(f"{what} must contain {rank} values")
+    result = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TraceError(f"{what} values must be integers")
+        value = int(value)
+        if value < minimum:
+            raise TraceError(f"{what} values must be at least {minimum}")
+        result.append(value)
+    return tuple(result)
+
+
+def _dynamic_offsets(offsets, rank: int, what: str):
+    if isinstance(offsets, (Tensor, int, np.integer)):
+        offsets = (offsets, )
+    try:
+        offsets = tuple(offsets)
+    except TypeError:
+        raise TraceError(
+            f"{what} offsets must contain {rank} scalar values") from None
+    if len(offsets) != rank:
+        raise TraceError(f"{what} offsets must contain {rank} values")
+    result = []
+    for dim, offset in enumerate(offsets):
+        if isinstance(offset,
+                      (int, np.integer)) and not isinstance(offset, bool):
+            offset = constant(np.int64(offset), shape=(1, ))
+        if (not isinstance(offset, Tensor) or offset.shape != (1, )
+                or offset.dtype != I64):
+            raise TraceError(
+                f"{what} offset #{dim} must be an integer or i64[1] tensor")
+        result.append(offset)
+    return result
+
+
+def dynamic_slice(x: Tensor, offsets, sizes, strides=None) -> Tensor:
+    """Extract a static-shape window at runtime offsets.
+
+    Offsets outside the valid range are clamped so the complete result stays
+    in bounds. This makes an ``sar.iterate(..., index=True)`` index usable for
+    chunked and sub-aperture processing without unrolling the loop.
+    """
+    x = _require_tensor(x, "sar.dynamic_slice")
+    sizes = _shape_values(sizes, x.rank, "sar.dynamic_slice sizes")
+    if strides is None:
+        strides = (1, ) * x.rank
+    strides = _shape_values(strides, x.rank, "sar.dynamic_slice strides")
+    for dim, (size, stride, extent) in enumerate(zip(sizes, strides, x.shape)):
+        if (size - 1) * stride + 1 > extent:
+            raise TraceError(
+                f"sar.dynamic_slice span exceeds dim {dim} of shape {x.shape}")
+    offset_tensors = _dynamic_offsets(offsets, x.rank, "sar.dynamic_slice")
+    return x._emit("dynamic_slice", [x, *offset_tensors],
+                   TensorType(sizes, x.dtype), {
+                       "sizes": sizes,
+                       "strides": strides
+                   })
+
+
+def dynamic_update_slice(x: Tensor, update: Tensor, offsets) -> Tensor:
+    """Copy ``update`` into ``x`` at runtime, clamped offsets."""
+    x = _require_tensor(x, "sar.dynamic_update_slice")
+    update = _require_tensor(update, "sar.dynamic_update_slice")
+    if update.rank != x.rank or update.dtype != x.dtype:
+        raise TraceError(
+            "sar.dynamic_update_slice input and update must have matching "
+            "rank and dtype")
+    for dim, (update_size, extent) in enumerate(zip(update.shape, x.shape)):
+        if update_size > extent:
+            raise TraceError(
+                f"sar.dynamic_update_slice update exceeds dim {dim} of "
+                f"shape {x.shape}")
+    offset_tensors = _dynamic_offsets(offsets, x.rank,
+                                      "sar.dynamic_update_slice")
+    return x._emit("dynamic_update_slice", [x, update, *offset_tensors],
+                   x._value.type)
 
 
 def concatenate(tensors: Sequence[Tensor],

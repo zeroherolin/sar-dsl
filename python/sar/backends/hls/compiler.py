@@ -14,8 +14,8 @@ first, then one output array per result plane;
 `HLSDesign.write_testbench` emits a matching C-simulation testbench
 with golden data.
 
-Every SAR operation has an HLS lowering, so complete imaging chains
-(omega-K, range-Doppler, chirp scaling) emit as single designs.
+Every SAR operation has an HLS lowering, so the omega-K, range-Doppler,
+chirp-scaling, and polar-format chains emit as single designs.
 
 Options are validated against the schema in `config.py` and default from
 the shipped `hls_config.yaml` (see `docs/backends.md`). The strategy half
@@ -34,18 +34,20 @@ import numpy as np
 
 from ..base import BaseBackend, KernelMetadata, cached_stage
 from . import autotune
-from .config import HLSConfig, HLSConfigError, check_precision
+from .config import (HLSConfig, HLSConfigError, check_cpp_identifier,
+                     check_precision)
 from .design import HLSDesign
 from ...compiler.toolchain import find_tool, run_tool
 from ...errors import CompilationError, LaunchError, ToolchainError
 
 _C_TYPES = {"f32": "float", "f64": "double"}
 _RETRYABLE_MEMORY_OVERFLOW = "SAR_HLS_RETRYABLE_MEMORY_OVERFLOW"
+_RETRYABLE_PARTITION_OVERFLOW = "SAR_HLS_RETRYABLE_PARTITION_OVERFLOW"
 
 
 def _top_func(config, metadata: KernelMetadata) -> str:
     """Name the emitted top function carries."""
-    return config.top_func or metadata.name
+    return check_cpp_identifier(config.top_func or metadata.name)
 
 
 def _rename_symbol(module_text: str, old: str, new: str) -> str:
@@ -229,15 +231,23 @@ int main(int argc, char **argv) {{
     return rc;
   }};
   pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 1ull << 30);
+  if (pthread_attr_init(&attr) != 0 ||
+      pthread_attr_setstacksize(&attr, 1ull << 30) != 0) {{
+    std::fprintf(stderr, "cannot configure the csim worker stack\\n");
+    return 3;
+  }}
   pthread_t worker;
   if (pthread_create(&worker, &attr, trampoline, (void *)&dir) != 0) {{
+    pthread_attr_destroy(&attr);
     std::fprintf(stderr, "cannot start the csim worker thread\\n");
     return 3;
   }}
+  pthread_attr_destroy(&attr);
   void *result = nullptr;
-  pthread_join(worker, &result);
+  if (pthread_join(worker, &result) != 0 || result == nullptr) {{
+    std::fprintf(stderr, "cannot join the csim worker thread\\n");
+    return 3;
+  }}
   int fail = *static_cast<int *>(result);
   delete static_cast<int *>(result);
   return fail;
@@ -247,20 +257,37 @@ int main(int argc, char **argv) {{
 
 _AP_INT_STUB = """\
 #pragma once
-// Minimal stand-in for the Vitis `ap_int`/`ap_uint` types: wide enough
-// for the index arithmetic the designs emit, so any C++ compiler can
-// run the C simulation without the Vitis headers.
+// Stand-ins for the integer widths emitted by SAR-DSL. They preserve
+// truncation and sign extension for widths up to the host storage type.
 template <int W> struct ap_int {
   long long v;
   ap_int() : v(0) {}
-  ap_int(long long x) : v(x) {}
+  ap_int(long long x) : v(normalize(x)) {}
   operator long long() const { return v; }
+private:
+  static long long normalize(unsigned long long x) {
+    static_assert(W > 0 && W <= 64, "stub supports widths 1..64");
+    if constexpr (W == 64)
+      return static_cast<long long>(x);
+    const unsigned long long mask = (1ull << W) - 1;
+    x &= mask;
+    if (x & (1ull << (W - 1)))
+      x |= ~mask;
+    return static_cast<long long>(x);
+  }
 };
 template <int W> struct ap_uint {
   unsigned long long v;
   ap_uint() : v(0) {}
-  ap_uint(unsigned long long x) : v(x) {}
+  ap_uint(unsigned long long x) : v(normalize(x)) {}
   operator unsigned long long() const { return v; }
+private:
+  static unsigned long long normalize(unsigned long long x) {
+    static_assert(W > 0 && W <= 64, "stub supports widths 1..64");
+    if constexpr (W == 64)
+      return x;
+    return x & ((1ull << W) - 1);
+  }
 };
 """
 
@@ -310,14 +337,27 @@ private:
 } // namespace hls
 """
 
+_HLS_VECTOR_STUB = """\
+#pragma once
+#include <cstddef>
+
+namespace hls {
+template <typename T, std::size_t N> struct vector {
+  T data[N] = {};
+  T &operator[](std::size_t index) { return data[index]; }
+  const T &operator[](std::size_t index) const { return data[index]; }
+};
+} // namespace hls
+"""
+
 
 def _write_header_stubs(stub_dir: Path) -> None:
     """Vitis header stand-ins so the package csims with any compiler."""
     stub_dir.mkdir(parents=True, exist_ok=True)
     (stub_dir / "ap_int.h").write_text(_AP_INT_STUB)
     (stub_dir / "hls_stream.h").write_text(_HLS_STREAM_STUB)
-    for header in ("ap_axi_sdata.h", "ap_fixed.h", "hls_math.h",
-                   "hls_vector.h"):
+    (stub_dir / "hls_vector.h").write_text(_HLS_VECTOR_STUB)
+    for header in ("ap_axi_sdata.h", "ap_fixed.h", "hls_math.h"):
         (stub_dir / header).write_text("#pragma once\n#include <cmath>\n")
 
 
@@ -427,7 +467,8 @@ class Backend(BaseBackend):
                         f"{int(config.recompute_min_elements)} "
                         f"transpose-block-bytes={staging} "
                         f"interp-enable-banded-gather={banded} "
-                        f"fft-stage-group={int(config.fft_stage_group)}")
+                        f"fft-stage-group={int(config.fft_stage_group)} "
+                        f"fft-parallel-rows={int(config.fft_parallel_rows)}")
             command = [find_tool("sar-opt")]
             if config.precision != "native":
                 command.append(
@@ -471,11 +512,8 @@ class Backend(BaseBackend):
             # derived from the config.
             lutram_max = int(config.lutram_max_bytes)
 
-            def schedule(threshold: int) -> tuple:
-                """Runs the HLS pipeline; returns (ir, over_budget). An
-                over-budget working set is the one tool failure the caller
-                can fix (stream more planes), so it comes back as a flag
-                rather than an exception."""
+            def schedule(threshold: int, partition_factor: int) -> tuple:
+                """Runs the HLS pipeline, returning (IR, retry reason)."""
                 hls_arg = (f"-hls-pipeline=top-func={top_func} "
                            f"loop-tile-size={int(config.loop_tile_size)} "
                            f"{axi} " +
@@ -484,6 +522,7 @@ class Backend(BaseBackend):
                            f"uram-bytes={int(config.uram_bytes)} "
                            f"lutram-bytes={int(config.lutram_bytes)} "
                            f"lutram-max-bytes={lutram_max} "
+                           f"array-partition-max-factor={partition_factor} "
                            f"external-buffer-threshold={threshold}")
                 try:
                     out = run_tool("sar-hls",
@@ -491,9 +530,22 @@ class Backend(BaseBackend):
                                    input_text=lowered)
                 except CompilationError as err:
                     if _RETRYABLE_MEMORY_OVERFLOW in str(err):
-                        return None, True
+                        return None, "memory"
+                    if _RETRYABLE_PARTITION_OVERFLOW in str(err):
+                        return None, "partition"
                     raise
-                return out, False
+                return out, None
+
+            def schedule_with_banking(threshold: int) -> tuple:
+                factor = int(config.array_partition_max_factor)
+                derived = config.provenance.get(
+                    "array_partition_max_factor") == config.DERIVED
+                while True:
+                    out, reason = schedule(threshold, factor)
+                    if reason != "partition" or not derived or factor == 1:
+                        return out, reason
+                    factor //= 2
+                    config.repin("array_partition_max_factor", factor)
 
             # When the resident working set cannot fit the caps, retry once
             # with every full-size plane streamed: the threshold drops to
@@ -505,21 +557,21 @@ class Backend(BaseBackend):
             # over-budget design would be permanently invalid on the
             # device, so none is emitted.
             threshold = int(config.external_buffer_threshold)
-            scheduled, over_budget = schedule(threshold)
-            if over_budget and config.provenance.get(
+            scheduled, retry_reason = schedule_with_banking(threshold)
+            if retry_reason and config.provenance.get(
                     "external_buffer_threshold") == config.DERIVED:
                 facts = metadata.extra["hls_facts"]
                 streamed = autotune.streaming_threshold(facts)
                 if streamed < threshold:
-                    retried, still_over = schedule(streamed)
-                    if not still_over:
+                    retried, retry_reason = schedule_with_banking(streamed)
+                    if not retry_reason:
                         scheduled = retried
                         config.repin("external_buffer_threshold", streamed)
-                        over_budget = False
-            if over_budget:
+            if retry_reason:
                 raise HLSConfigError(
                     f"{metadata.name}: the on-chip working set exceeds the "
-                    "resource caps even with full-size planes streamed; "
+                    "resource caps after reducing automatic banking and "
+                    "streaming full-size planes; "
                     "raise bram_bytes/uram_bytes to match a larger device, "
                     "or shrink the kernel's resident tables")
             cache.write_text("kernel.hls.mlir", scheduled)
@@ -532,7 +584,9 @@ class Backend(BaseBackend):
                 "kernel.hls.decisions.json",
                 json.dumps({
                     "external_buffer_threshold":
-                    int(config.external_buffer_threshold)
+                    int(config.external_buffer_threshold),
+                    "array_partition_max_factor":
+                    int(config.array_partition_max_factor),
                 }))
 
             # The bus width is a board property, so the shaping of the AXI
@@ -550,18 +604,32 @@ class Backend(BaseBackend):
             ],
                             input_text=scheduled)
 
+        decisions = cache.read_if_cached("kernel.hls.decisions.json")
+        if decisions is not None:
+            try:
+                json.loads(decisions)
+            except (json.JSONDecodeError, TypeError):
+                cache.path("kernel.hls.cpp").unlink(missing_ok=True)
+                cache.path("kernel.hls.decisions.json").unlink(missing_ok=True)
         cached_stage(cache, "kernel.hls.cpp", build)
         # A cache hit skips `build` and with it the retry ladder; replay
         # the persisted decision so cold and warm compiles report the
         # same configuration.
         decisions = cache.read_if_cached("kernel.hls.decisions.json")
         if decisions is not None:
-            threshold = json.loads(decisions).get("external_buffer_threshold")
+            values = json.loads(decisions)
+            threshold = values.get("external_buffer_threshold")
             if (threshold is not None
                     and int(config.external_buffer_threshold) != threshold
                     and config.provenance.get("external_buffer_threshold")
                     == config.DERIVED):
                 config.repin("external_buffer_threshold", threshold)
+            factor = values.get("array_partition_max_factor")
+            if (factor is not None
+                    and int(config.array_partition_max_factor) != factor
+                    and config.provenance.get("array_partition_max_factor")
+                    == config.DERIVED):
+                config.repin("array_partition_max_factor", factor)
         return str(cache.path("kernel.hls.cpp"))
 
     # ------------------------------------------------------------------ #

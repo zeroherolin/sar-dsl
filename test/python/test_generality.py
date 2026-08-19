@@ -56,8 +56,8 @@ def _emit(name, spec, body):
     return kernel.specialize(spec).compile(backend="hls",
                                            options={
                                                "interface": "axi",
-                                               "bram_bytes": 1 << 22,
-                                               "uram_bytes": 1 << 22,
+                                               "bram_bytes": 1 << 24,
+                                               "uram_bytes": 1 << 25,
                                                "lutram_bytes": 0
                                            }).source()
 

@@ -13,6 +13,7 @@ left at null.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -22,11 +23,11 @@ from .config import OPTIONS
 from ...compiler.toolchain import find_tool, run_tool
 
 __all__ = [
-    "AUTO_OPTIONS", "KernelFacts", "buffer_extents", "derive",
-    "external_buffer_threshold", "fft_stage_group", "interp_banded_gather",
-    "kernel_facts_from_json", "loop_tile_size", "lutram_max_bytes",
-    "measure_kernel", "storage_min_elements", "streaming_threshold",
-    "transpose_block_bytes"
+    "AUTO_OPTIONS", "KernelFacts", "array_partition_max_factor",
+    "buffer_extents", "derive", "external_buffer_threshold", "fft_stage_group",
+    "interp_banded_gather", "fft_parallel_rows", "kernel_facts_from_json",
+    "loop_tile_size", "lutram_max_bytes", "measure_kernel",
+    "storage_min_elements", "streaming_threshold", "transpose_block_bytes"
 ]
 
 #: The options this module decides -- exactly the schema's `advanced`
@@ -168,11 +169,13 @@ def _scratch_slots(stages: int, group: int) -> int:
 
 
 def _transform_stages(length: int) -> Tuple[int, int, bool]:
-    """(butterfly stages, line length, whether Bluestein carries it)."""
+    """(mixed-radix stages, line length, whether Bluestein carries it)."""
     if length > 0 and not length & (length - 1):
-        return length.bit_length() - 1, length, False
+        exponent = length.bit_length() - 1
+        return (exponent + 1) // 2, length, False
     padded = 1 << (2 * length - 1).bit_length()
-    return padded.bit_length() - 1, padded, True
+    exponent = padded.bit_length() - 1
+    return (exponent + 1) // 2, padded, True
 
 
 def _fft_scratch_bytes(transforms, group: int) -> int:
@@ -240,11 +243,47 @@ def loop_tile_size(facts: KernelFacts, axi_bus_bits: int) -> int:
     return max(_MIN_TILE, min(_MAX_TILE, tile))
 
 
+def fft_parallel_rows(facts: KernelFacts,
+                      axi_bus_bits: int,
+                      dsp_budget: int,
+                      interface: str = "ap_memory") -> int:
+    """Power-of-two parallelism supported by both memory and arithmetic.
+
+    The square root of the elements in one AXI beat balances independent
+    rows against banks within each row; the DSP bound reserves 512 slices per
+    lane for mixed-precision phase, interpolation, and FFT operators. A
+    result of one is represented as zero because the pass uses zero to mean
+    "do not run the parallelizer".
+    """
+    # Separate AXI rows are separate bursts on one master. Without an
+    # explicit load/compute/store engine, unrolling raises the port-limited II.
+    if interface != "ap_memory":
+        return 0
+
+    # A complex row consumes matching real and imaginary lanes. Budget the
+    # parallel rows against complete samples even though lowering stores the
+    # planes separately.
+    sample_bits = max(16, facts.element_bytes * 16)
+    beat_lanes = max(1, axi_bus_bits // sample_bits)
+    bandwidth = 1 << (math.isqrt(beat_lanes).bit_length() - 1)
+    dsp_lanes = max(1, dsp_budget // 512)
+    arithmetic = 1 << (dsp_lanes.bit_length() - 1)
+    factor = min(bandwidth, arithmetic)
+    return factor if factor > 1 else 0
+
+
 def lutram_max_bytes(axi_bus_bits: int) -> int:
     """Bank size below which distributed RAM is the right tier: one bus
     beat, since a bank that cannot fill one transfer is not worth a
     dedicated block RAM primitive."""
     return max(1, axi_bus_bits // 8)
+
+
+def array_partition_max_factor(facts: KernelFacts, axi_bus_bits: int) -> int:
+    """Maximum useful bank count before it exceeds one external bus beat."""
+    lanes = max(1, axi_bus_bits // max(8, facts.element_bytes * 8))
+    factor = 1 << (lanes.bit_length() - 1)
+    return min(32, factor)
 
 
 def interp_banded_gather() -> bool:
@@ -328,12 +367,23 @@ def derive(config,
         "the placement decision needs the metadata and the lowered IR together"
     budget = config.on_chip_bytes()
     values = {
-        "fft_stage_group": fft_stage_group(facts, budget),
-        "loop_tile_size": loop_tile_size(facts, int(config.axi_bus_bits)),
-        "interp_banded_gather": interp_banded_gather(),
-        "reuse_buffer_min_elements": storage_min_elements(facts, budget),
-        "recompute_min_elements": storage_min_elements(facts, budget),
-        "lutram_max_bytes": lutram_max_bytes(int(config.axi_bus_bits)),
+        "fft_stage_group":
+        fft_stage_group(facts, budget),
+        "loop_tile_size":
+        loop_tile_size(facts, int(config.axi_bus_bits)),
+        "fft_parallel_rows":
+        fft_parallel_rows(facts, int(config.axi_bus_bits), int(config.dsp),
+                          str(config.interface)),
+        "interp_banded_gather":
+        interp_banded_gather(),
+        "reuse_buffer_min_elements":
+        storage_min_elements(facts, budget),
+        "recompute_min_elements":
+        storage_min_elements(facts, budget),
+        "lutram_max_bytes":
+        lutram_max_bytes(int(config.axi_bus_bits)),
+        "array_partition_max_factor":
+        array_partition_max_factor(facts, int(config.axi_bus_bits)),
     }
     if lowered_facts is not None:
         values["external_buffer_threshold"] = external_buffer_threshold(

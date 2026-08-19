@@ -1,9 +1,8 @@
 // RUN: sar-opt %s --split-input-file --hls-create-axi-interface --verify-diagnostics | FileCheck %s
 
 // The top function's ports are the design's contract with its host: the
-// kernel's own arrays, then one scratch pointer. Internal DRAM buffers are
-// carved out of that one allocation at compile-time offsets -- the scratch
-// port's own extent (128 x f32 here) is what the caller must allocate --
+// kernel's own arrays, then two scratch pointers. Internal DRAM buffers are
+// distributed between those allocations and carved at compile-time offsets
 // instead of becoming more ports. Every port takes its own AXI bundle:
 // ports sharing one serialize their bus requests. A buffer that cannot be
 // redirected to the scratch allocation is rejected instead of silently
@@ -12,7 +11,10 @@
 // CHECK-LABEL: func.func @carved(
 // CHECK-SAME: %arg0: !hls.axi<memref<64xf32, #hls.mem<dram>>>
 // CHECK-SAME: %arg1: !hls.axi<memref<64xf32, #hls.mem<dram>>>
-// CHECK-SAME: %arg2: !hls.axi<memref<128xf32, #hls.mem<dram>>>
+// CHECK-SAME: %arg2: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-SAME: %arg3: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK: hls.axi.bundle
+// CHECK-NEXT: hls.axi.port
 // CHECK: hls.axi.bundle
 // CHECK-NEXT: hls.axi.port
 // CHECK: hls.axi.bundle
@@ -48,8 +50,7 @@ module {
     }
     return
   }
-  // Two 64-element DRAM intermediates, each starting on a beat boundary:
-  // 128 f32 elements of scratch = 512 bytes, one extra port in total.
+  // Two 64-element DRAM intermediates occupy separate physical masters.
   func.func @carved(%arg0: memref<64xf32, #hls.mem<dram>>, %arg1: memref<64xf32, #hls.mem<dram>>) attributes {top_func} {
     %mid = hls.dataflow.buffer {depth = 1 : i32} : memref<64xf32, #hls.mem<dram>>
     %mid2 = hls.dataflow.buffer {depth = 1 : i32} : memref<64xf32, #hls.mem<dram>>

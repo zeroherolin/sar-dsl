@@ -7,9 +7,7 @@
 // and a reader can skip over it. Its name says what the values are: this one
 // is a constant-step ramp, i.e. a sampling axis.
 // CHECK:      Constant tables
-// CHECK:      static const double kAxis0_4[4] = {
-// CHECK-NEXT:   0, 1, 2, 3
-// CHECK-NEXT: };
+// CHECK:      static constexpr LinearTable<double, 4> kAxis0_4(0, 1);
 
 // A table only ever read through a callee makes that parameter const.
 // CHECK:      void named_s00(
@@ -19,7 +17,7 @@
 // CHECK:      void named(
 // CHECK:        double in0[4][4]
 // CHECK:        double out0[4][4]
-// CHECK:        named_s00(kAxis0_4,
+// CHECK:        named_s00(kAxis0_4.values,
 
 // CHECK:      void named_s00(
 // CHECK:        = (int64_t)

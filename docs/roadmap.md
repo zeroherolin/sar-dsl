@@ -19,9 +19,11 @@ records its validation boundary and open compiler work.
   rejected rather than overcommitted.
 - Complete N=32 designs for all four algorithms pass Vitis HLS 2022.2
   C-simulation and synthesis at the 4 ns target.
-- A 4096 × 4096 RDA design and a 16384 × 16384 c64 omega-K design complete
-  synthesis. The latter fits the resource caps but estimates 5.698 ns against
-  the 4 ns target; it is a synthesizability result, not timing closure.
+- 16384 × 16384 c64 omega-K, Range-Doppler, and Chirp Scaling designs complete
+  synthesis. WKA estimates 3.187 ns against the 4 ns target; RDA and CSA miss
+  it. Implementation timing remains outside this scope.
+- A Polar Format c64 design completes N=8192 synthesis within resource
+  budgets; its 6.067 ns estimate remains open timing work.
 - Shapes are static and specialize per geometry. The CPU backend is validated
   on Linux x86-64; Vitis is optional unless synthesis artifacts are being
   validated.
@@ -31,16 +33,12 @@ Measured accuracy, performance, and resource data are in
 
 ## Open compiler work
 
-- Derive a mixed-radix, multi-line FFT engine and instance-reuse plan from
-  bandwidth and DSP constraints.
-- Split spilled buffers across a fixed number of AXI scratch masters using
-  lifetime and concurrent-access analysis.
+- Reuse one parameterized FFT engine across compatible transform call sites.
 - Externalize large axis/window tables and deduplicate size-specialized copy
   loops to reduce extreme-raster source and synthesis time.
-- Add a target-legality verifier before HLS emission and extend nested
-  fan-out/fan-in, view/subview, and multi-block topology coverage.
-- Allow `sar.iterate` indices to drive dynamic slice offsets for sub-aperture
-  and block processing.
+- Close remaining external-load and interpolation/gather initiation-interval
+  bottlenecks so Range-Doppler, Chirp Scaling, and Polar Format meet 4 ns at
+  production rasters.
 - Gate reassociating phase rewrites behind an explicit numerical-error budget.
 
 ## Non-goals

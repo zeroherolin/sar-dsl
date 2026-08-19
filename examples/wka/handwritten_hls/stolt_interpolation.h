@@ -9,7 +9,7 @@
 
 #include "wka_common.h"
 
-void load_bulk_stolt_block(bus_t *__restrict in, data_t fft_input[WKA_FFT_PAR_ROWS][N],
-                           int base_row);
+void load_bulk_stolt_block(bus_t *__restrict in,
+                           data_t fft_input[WKA_FFT_PAR_ROWS][N], int base_row);
 
 #endif

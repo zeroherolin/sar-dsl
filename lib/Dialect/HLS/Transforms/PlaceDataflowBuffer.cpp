@@ -51,8 +51,10 @@ static uint64_t roundUpTo(uint64_t bytes, uint64_t grain) {
 /// same decisions until the iteration limit.
 class Placer {
 public:
-  Placer(unsigned threshold, TierBudget budget, bool rebalanceOnly)
-      : threshold(threshold), budget(budget), rebalanceOnly(rebalanceOnly) {}
+  Placer(unsigned threshold, TierBudget budget, bool rebalanceOnly,
+         bool allowDram)
+      : threshold(threshold), budget(budget), rebalanceOnly(rebalanceOnly),
+        allowDram(allowDram) {}
 
   LogicalResult run(func::FuncOp func) {
     // A declaration has no entry block to read arguments or a terminator
@@ -251,7 +253,8 @@ private:
     if (rebalanceOnly) {
       if (getMemoryKind(type) == MemoryKind::DRAM)
         return type;
-    } else if (!isConstBuffer && type.getNumElements() >= threshold) {
+    } else if (allowDram && !isConstBuffer &&
+               type.getNumElements() >= threshold) {
       return withKind(type, MemoryKind::DRAM);
     }
 
@@ -268,12 +271,18 @@ private:
         uint64_t bankBytes = (bytes + banks - 1) / banks;
         overflowBytes += (isConstBuffer ? 1 : 2) * banks *
                          roundUpTo(bankBytes, kBramBlockBytes);
-      } else if (kind == MemoryKind::DRAM && isConstBuffer) {
-        // A constant table or per-iteration scratch cannot stream; a tier
-        // set that cannot hold it cannot hold the design.
+      } else if (kind == MemoryKind::DRAM && (isConstBuffer || !allowDram)) {
+        // Constant tables and per-iteration scratch cannot stream. The local
+        // ap_memory protocol also has no external master through which any
+        // ordinary buffer could spill.
         uint64_t banks = std::max<int64_t>(1, getPartitionFactors(type));
         uint64_t bankBytes = (bytes + banks - 1) / banks;
-        constOverflowBytes += banks * roundUpTo(bankBytes, kBramBlockBytes);
+        uint64_t cost = (isConstBuffer ? 1 : 2) * banks *
+                        roundUpTo(bankBytes, kBramBlockBytes);
+        if (isConstBuffer)
+          constOverflowBytes += cost;
+        else
+          externalOverflowBytes += cost;
         kind = MemoryKind::BRAM_T2P;
       }
     }
@@ -289,6 +298,7 @@ private:
   unsigned threshold;
   TierBudget budget;
   bool rebalanceOnly;
+  bool allowDram;
 
 public:
   /// Bytes a rebalance could not fit into any tier budget and left at the
@@ -296,12 +306,14 @@ public:
   /// included).
   uint64_t overflowBytesUsed() const { return overflowBytes; }
   uint64_t constOverflowBytesUsed() const { return constOverflowBytes; }
+  uint64_t externalOverflowBytesUsed() const { return externalOverflowBytes; }
   uint64_t lutramBytesUsed() const { return lastUse.lutram; }
 
 private:
   TierUse lastUse;
   uint64_t overflowBytes = 0;
   uint64_t constOverflowBytes = 0;
+  uint64_t externalOverflowBytes = 0;
 };
 } // namespace
 
@@ -335,19 +347,21 @@ struct PlaceDataflowBuffer
   PlaceDataflowBuffer() = default;
   PlaceDataflowBuffer(unsigned argThreshold, unsigned argBramBytes,
                       unsigned argUramBytes, unsigned argLutramBytes,
-                      unsigned argLutramMaxBytes, bool argRebalanceOnly) {
+                      unsigned argLutramMaxBytes, bool argRebalanceOnly,
+                      bool argAllowDram) {
     threshold = argThreshold;
     bramBytes = argBramBytes;
     uramBytes = argUramBytes;
     lutramBytes = argLutramBytes;
     lutramMaxBytes = argLutramMaxBytes;
     rebalanceOnly = argRebalanceOnly;
+    allowDram = argAllowDram;
   }
 
   void runOnOperation() override {
     auto func = getOperation();
     TierBudget budget{bramBytes, uramBytes, lutramBytes, lutramMaxBytes};
-    Placer placer(threshold, budget, rebalanceOnly);
+    Placer placer(threshold, budget, rebalanceOnly, allowDram);
     if (failed(placer.run(func)))
       return signalPassFailure();
 
@@ -370,6 +384,15 @@ struct PlaceDataflowBuffer
              "cannot stream -- raise the budgets or shrink the tables";
       return signalPassFailure();
     }
+    if (placer.externalOverflowBytesUsed()) {
+      func.emitError()
+          << "off-chip DRAM spill is disabled for this interface, but the "
+             "working set needs "
+          << placer.externalOverflowBytesUsed()
+          << " bytes of on-chip storage; raise the memory budgets or use an "
+             "AXI interface";
+      return signalPassFailure();
+    }
     if (rebalanceOnly && placer.overflowBytesUsed()) {
       func.emitError()
           << "SAR_HLS_RETRYABLE_MEMORY_OVERFLOW: on-chip working set "
@@ -387,10 +410,12 @@ struct PlaceDataflowBuffer
 };
 } // namespace
 
-std::unique_ptr<Pass> sar::createPlaceDataflowBufferPass(
-    unsigned threshold, unsigned bramBytes, unsigned uramBytes,
-    unsigned lutramBytes, unsigned lutramMaxBytes, bool rebalanceOnly) {
+std::unique_ptr<Pass>
+sar::createPlaceDataflowBufferPass(unsigned threshold, unsigned bramBytes,
+                                   unsigned uramBytes, unsigned lutramBytes,
+                                   unsigned lutramMaxBytes, bool rebalanceOnly,
+                                   bool allowDram) {
   return std::make_unique<PlaceDataflowBuffer>(threshold, bramBytes, uramBytes,
                                                lutramBytes, lutramMaxBytes,
-                                               rebalanceOnly);
+                                               rebalanceOnly, allowDram);
 }

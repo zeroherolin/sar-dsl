@@ -79,6 +79,10 @@ struct HLSPipelineOptions : public PassPipelineOptions<HLSPipelineOptions> {
       llvm::cl::desc("Whether to consider node correlation when parallelizing "
                      "(only effective with loop-unroll-factor > 0)")};
 
+  Option<unsigned> arrayPartitionMaxFactor{
+      *this, "array-partition-max-factor", llvm::cl::init(32),
+      llvm::cl::desc("Largest factor automatic array banking may apply")};
+
   Option<unsigned> externalBufferThreshold{
       *this, "external-buffer-threshold", llvm::cl::init(1024),
       llvm::cl::desc("Element count at or above which a buffer moves to "
@@ -120,12 +124,16 @@ void sar::registerHLSPipeline() {
         pm.addPass(sar::createSimplifyCopyPass());
         pm.addPass(sar::createLowerCopyToAffinePass());
         pm.addPass(memref::createFoldMemRefAliasOpsPass());
+        pm.addPass(sar::createFuseSiblingLoopsPass());
+        pm.addPass(mlir::createCSEPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
         // Place dataflow buffers.
         pm.addPass(sar::createPlaceDataflowBufferPass(
             opts.externalBufferThreshold, opts.bramBytes, opts.uramBytes,
-            opts.lutramBytes, opts.lutramMaxBytes));
+            opts.lutramBytes, opts.lutramMaxBytes,
+            /*rebalanceOnly=*/false,
+            /*allowDram=*/opts.axiInterface || opts.streamInterface));
 
         // Affine loop tiling.
         pm.addPass(sar::createFuncPreprocessPass(opts.hlsTopFunc));
@@ -191,7 +199,8 @@ void sar::registerHLSPipeline() {
         pm.addPass(sar::createPlaceDataflowBufferPass(
             opts.externalBufferThreshold, opts.bramBytes, opts.uramBytes,
             opts.lutramBytes, opts.lutramMaxBytes,
-            /*rebalanceOnly=*/true));
+            /*rebalanceOnly=*/true,
+            /*allowDram=*/opts.axiInterface || opts.streamInterface));
 
         // Memory optimization.
         pm.addPass(sar::createSimplifyAffineIfPass());
@@ -214,7 +223,8 @@ void sar::registerHLSPipeline() {
         // bank's cost is its bit count. Converting here keeps the single
         // derived value (one bus beat) authoritative for both.
         pm.addPass(sar::createArrayPartitionPass(
-            /*lutramMaxBits=*/opts.lutramMaxBytes * 8, opts.lutramBytes));
+            /*lutramMaxBits=*/opts.lutramMaxBytes * 8, opts.lutramBytes,
+            opts.bramBytes, opts.uramBytes, opts.arrayPartitionMaxFactor));
         pm.addPass(mlir::createCanonicalizerPass());
       });
 }

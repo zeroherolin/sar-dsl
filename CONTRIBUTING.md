@@ -11,8 +11,9 @@ make test        # lit + pytest, everything must pass
 ```
 
 `make build` writes `build/python/sar/_build_config.py`, which points the
-Python package at the active build. For a non-default build directory set
-`SAR_DSL_BUILD_DIR`; individual tools can be overridden with
+Python package at the active build. For a non-default directory, build with
+`make BUILD_DIR=build-local` and set `SAR_DSL_BUILD_DIR=build-local` when
+running Python. Individual tools can be overridden with
 `SAR_DSL_TOOL_<NAME>`. See [docs/backends.md](docs/backends.md) for the
 discovery order.
 
@@ -44,9 +45,10 @@ CI runs the same hooks on pull requests and the main branch.
 
 - **C++** follows the LLVM style (2-space indent, 80 columns,
   `lowerCamelCase` functions; enforced by clang-format). New passes are
-  declared in tablegen -- conversions in `include/sar/Conversion/Passes.td`,
-  dialect transforms in `include/sar/Dialect/SAR/Transforms/Passes.td` --
-  and registered in `sar-opt`.
+  declared in TableGen: conversions in `include/sar/Conversion/Passes.td`,
+  SAR transforms in `include/sar/Dialect/SAR/Transforms/Passes.td`, and HLS
+  transforms in `include/sar/Dialect/HLS/Transforms/Passes.td`. Register them
+  in `sar-opt`.
 - **Python** is PEP 8 with 79-column lines (enforced by yapf + ruff);
   keep the frontend dependency-free beyond NumPy.
 - **Tests are mandatory.** Dialect/lowering changes need lit coverage under

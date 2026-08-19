@@ -8,6 +8,7 @@
 // schedule alone.
 
 // CHECK-LABEL: func.func @unfusable_multi_consumer
+// CHECK-NOT: hls.dataflow.schedule legal
 // CHECK-COUNT-3: hls.dataflow.node
 // CHECK-NOT: hls.dataflow.node
 func.func @unfusable_multi_consumer(%arg0: memref<8xf32>) attributes {top_func} {

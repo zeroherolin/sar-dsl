@@ -1,5 +1,6 @@
 """HLS backend tests: HLS C++ emission and subset diagnostics."""
 
+import json
 import re
 from pathlib import Path
 
@@ -87,11 +88,34 @@ def test_hls_design_survives_cache_artifact_eviction(tmp_path):
     synthesis_dir = tmp_path / "synthesis"
     design.write_synthesis_script(synthesis_dir)
     assert (synthesis_dir / "scale.cpp").read_text() == source
+    manifest = json.loads((synthesis_dir / "design_manifest.json").read_text())
+    assert manifest["top"] == "scale"
+    assert manifest["config"]["interface"] == "ap_memory"
 
     x = np.arange(n, dtype=np.float32)
     testbench_dir = tmp_path / "testbench"
     design.write_testbench([x], [x * 2.0], testbench_dir)
     assert (testbench_dir / "scale.cpp").read_text() == source
+
+
+@pytest.mark.parametrize("name,value", [
+    ("rtol", -1.0),
+    ("rtol", float("nan")),
+    ("atol", float("inf")),
+    ("atol", "small"),
+])
+def test_testbench_rejects_invalid_tolerances(tmp_path, name, value):
+
+    @sar.func
+    def scale(x: sar.f32[4]) -> sar.f32[4]:
+        return x * 2.0
+
+    values = np.ones(4, dtype=np.float32)
+    kwargs = {name: value}
+    design = scale.compile(backend="hls")
+    with pytest.raises(sar.LaunchError, match="finite non-negative"):
+        design.write_testbench([values], [values * 2.0], tmp_path, **kwargs)
+    assert not list(tmp_path.iterdir())
 
 
 def test_fft_kernel_emits_via_affine_flow():
@@ -337,6 +361,7 @@ def test_mixed_precision_axi_uses_typed_scratch_arenas():
                    for t in kernel.arg_types + kernel.declared_result_types)
     scratch = args[io_ports:]
     assert {arg.split(" ", 1)[0] for arg in scratch} == {"float", "double"}
+    assert len(scratch) == 4
     assert all(re.search(r"\[\d+\]$", arg) for arg in scratch)
 
 
@@ -550,14 +575,14 @@ def test_broadcast_does_not_materialize_a_plane():
                             }).source()
     # One plane in, one out: a materialized broadcast would be a third
     # DRAM buffer. It would land in the scratch allocation, so the check
-    # is that the scratch stayed at its 1-element placeholder size while
-    # exactly two full planes hold pragmas.
+    # is that both scratch masters stayed at their 1-element placeholder
+    # size while exactly two full planes hold pragmas.
     maxi_ports = re.findall(r"m_axi.*port=(\w+)", source)
     placeholder = {
         name
         for name in maxi_ports if re.search(rf"double {name}\[1\]", source)
     }
-    assert len(placeholder) == 1, source
+    assert len(placeholder) == 2, source
     assert len(set(maxi_ports) - placeholder) == 2, maxi_ports
 
 
@@ -700,6 +725,25 @@ def test_local_interface_emits_memory_ports():
     assert "m_axi" not in source
 
 
+def test_local_interface_rejects_off_chip_spill():
+    """ap_memory has no external master for an intermediate or argument."""
+    n = 64
+
+    @sar.func
+    def scale(x: sar.f32[n, n]) -> sar.f32[n, n]:
+        return x * 2.0
+
+    scale.name = "iface_local_overflow"
+    with pytest.raises(sar.CompilationError, match="DRAM spill is disabled"):
+        scale.compile(backend="hls",
+                      options={
+                          "interface": "ap_memory",
+                          "bram_bytes": 4608,
+                          "uram_bytes": 0,
+                          "lutram_bytes": 0,
+                      })
+
+
 def test_stream_interface_emits_axis_pragmas():
     """The stream interface reaches the emitter as AXI4-Stream pragmas."""
     n = 64
@@ -713,13 +757,14 @@ def test_stream_interface_emits_axis_pragmas():
         "interface": "stream"
     }).source()
     # The kernel's inputs and outputs stream. The only memory-mapped port
-    # is the fixed DRAM scratch, sitting at its 1-element placeholder size
+    # are the two fixed DRAM scratch masters, sitting at placeholder size
     # since nothing spilled here.
     axis_ports = set(re.findall(r"interface axis port=(\w+)", source))
     assert {"x_re", "x_im"} <= axis_ports, axis_ports
     maxi_ports = re.findall(r"m_axi.*port=(\w+)", source)
-    assert len(maxi_ports) == 1, maxi_ports
-    assert re.search(rf"\w+ {maxi_ports[0]}\[1\]", source), maxi_ports
+    assert len(maxi_ports) == 2, maxi_ports
+    assert all(re.search(rf"\w+ {port}\[1\]", source)
+               for port in maxi_ports), maxi_ports
     # A stream port carries no burst shaping: that describes addressed
     # access to DRAM, which a FIFO does not perform. The placeholder moves
     # no bulk data, so it is not shaped either.

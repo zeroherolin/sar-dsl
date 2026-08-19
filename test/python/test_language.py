@@ -156,6 +156,44 @@ def test_numpy_scalars_preserve_shape_and_dtype():
     assert "tensor<4xf32>" in text
 
 
+def test_scalar_operations_do_not_allocate_full_tensors(monkeypatch):
+
+    def reject_full(*args, **kwargs):
+        raise AssertionError("scalar tracing allocated a host tensor")
+
+    monkeypatch.setattr(np, "full", reject_full)
+
+    @sar.func
+    def k(x: sar.f32[1024, 1024]) -> sar.f32[1024, 1024]:
+        divided = x / 0.0 + 2.0 / x
+        return sar.where(divided > 1.0, divided, 0.0)
+
+    text = k.to_mlir()
+    assert text.count('"sar.div"') == 2
+    assert '"sar.cmp"' in text
+    assert '"sar.where"' in text
+
+
+def test_dense_splat_preserves_signed_zero():
+    values = np.array([0.0, -0.0], dtype=np.float32)
+
+    @sar.func
+    def k(x: sar.f32[2]) -> sar.f32[2]:
+        return x + sar.constant(values)
+
+    assert "dense<[" in k.to_mlir()
+
+
+def test_array_constant_rejects_a_conflicting_shape():
+
+    @sar.func
+    def k(x: sar.f32[2]) -> sar.f32[2]:
+        return x + sar.constant(np.ones(2, dtype=np.float32), shape=(1, 2))
+
+    with pytest.raises(TraceError, match="does not match array shape"):
+        k.to_mlir()
+
+
 def test_ops_outside_kernel_rejected():
     with pytest.raises(TraceError, match="traced"):
         sar.Tensor.__add__  # attribute exists

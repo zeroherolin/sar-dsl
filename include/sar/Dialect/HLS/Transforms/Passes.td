@@ -195,6 +195,9 @@ def PlaceDataflowBuffer :
            /*default=*/"64",
            "Buffer size, in bytes, at or below which distributed RAM is "
            "preferred (one bus beat at the default 512-bit bus)">,
+    Option<"allowDram", "allow-dram", "bool", /*default=*/"true",
+           "Permit buffers that do not fit on chip to spill to external "
+           "DRAM; disable for ap_memory interfaces">,
     Option<"rebalanceOnly", "rebalance-only", "bool", /*default=*/"false",
            "Re-place an already-scheduled graph: recharge tiers, demote "
            "URAM overflow to BRAM, never newly move a buffer to DRAM">
@@ -313,6 +316,21 @@ def AffineStoreForward : Pass<"hls-affine-store-forward", "func::FuncOp"> {
   let constructor = "mlir::sar::createAffineStoreForwardPass()";
 }
 
+def FuseSiblingLoops :
+      Pass<"hls-fuse-sibling-loops", "func::FuncOp"> {
+  let summary = "Fuse independent affine sweeps with identical iteration";
+  let description = [{
+    Merges adjacent perfect affine loop nests when they have identical bounds
+    and no cross-loop memory dependence. Shared read-only expressions then
+    become common subexpressions, allowing split real/imaginary phase outputs
+    to share trigonometric and coordinate arithmetic.
+  }];
+  let dependentDialects = [
+    "mlir::affine::AffineDialect", "mlir::arith::ArithDialect",
+    "mlir::func::FuncDialect", "mlir::memref::MemRefDialect"];
+  let constructor = "mlir::sar::createFuseSiblingLoopsPass()";
+}
+
 def CollapseMemrefUnitDims :
       Pass<"hls-collapse-memref-unit-dims", "func::FuncOp"> {
   let summary = "Collapse memref's unit dimensions";
@@ -418,10 +436,14 @@ def ArrayPartition : Pass<"hls-array-partition", "ModuleOp"> {
            "Bank size, in bits, at or below which distributed RAM is used "
            "(one bus beat at the default 512-bit bus)">,
     Option<"lutramBytes", "lutram-bytes", "unsigned", /*default=*/"0",
-           "Distributed RAM the design may occupy, in bytes (0 is "
-           "unbounded). Banking stops promoting into it once spent, so a "
+           "Distributed RAM the design may occupy, in bytes (0 forbids the "
+           "tier). Banking stops promoting into it once spent, so a "
            "bank that would overrun the budget keeps the tier placement "
            "already chose for it">,
+    Option<"bramBytes", "bram-bytes", "unsigned", /*default=*/"9907200",
+           "Final block RAM budget in bytes, checked after banking">,
+    Option<"uramBytes", "uram-bytes", "unsigned", /*default=*/"37748736",
+           "Final UltraRAM budget in bytes, checked after banking">,
     Option<"maxFactor", "max-factor", "unsigned", /*default=*/"32",
            "Positive number: the largest array partition factor to apply">
   ];
