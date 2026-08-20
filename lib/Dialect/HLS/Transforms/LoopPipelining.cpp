@@ -4,8 +4,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
+#include "mlir/Dialect/Affine/LoopUtils.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
+#include "sar/Support/HLSHints.h"
 
 namespace mlir {
 namespace sar {
@@ -18,6 +21,28 @@ using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
 using namespace hls;
+
+/// Fully unroll all loops inside a block. Loops carrying an unroll directive
+/// stay standing: they are compact stand-ins the emitter unrolls through a
+/// pragma, and cloning them here is exactly what the directive exists to
+/// avoid.
+static bool applyFullyLoopUnrolling(Block &block, unsigned maxIterNum = 10) {
+  for (unsigned i = 0; i < maxIterNum; ++i) {
+    bool hasFullyUnrolled = true;
+    block.walk<WalkOrder::PreOrder>([&](AffineForOp loop) {
+      if (loop->hasAttr(kUnrollFactorAttr))
+        return WalkResult::skip();
+      if (failed(loopUnrollFull(loop)))
+        hasFullyUnrolled = false;
+      return WalkResult::advance();
+    });
+
+    if (hasFullyUnrolled)
+      return true;
+  }
+  // The iteration budget ran out with loops still standing.
+  return false;
+}
 
 /// Apply loop pipelining to the input loop, all inner loops are automatically
 /// fully unrolled.

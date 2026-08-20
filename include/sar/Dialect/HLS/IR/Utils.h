@@ -26,14 +26,12 @@ using FactorList = SmallVector<unsigned, 8>;
 //===----------------------------------------------------------------------===//
 
 hls::MemoryKind getMemoryKind(MemRefType type);
-bool isDram(MemRefType type);
 
 //===----------------------------------------------------------------------===//
 // Dataflow utils
 //===----------------------------------------------------------------------===//
 
 /// Get the root affine loop contained by the node.
-affine::AffineForOp getNodeRootLoop(hls::NodeOp currentNode);
 
 /// Get the affine loop band contained by the node.
 AffineLoopBand getNodeLoopBand(hls::NodeOp currentNode);
@@ -46,24 +44,21 @@ hls::DispatchOp dispatchBlock(Block *block);
 /// inserted in order. This method always succeeds even if the resulting IR is
 /// invalid.
 hls::TaskOp fuseOpsIntoTask(ArrayRef<Operation *> ops,
-                            PatternRewriter &rewriter,
-                            bool insertToLastOp = false);
+                            PatternRewriter &rewriter);
 
 /// Fuse multiple nodes into a new node.
 hls::NodeOp fuseNodeOps(ArrayRef<hls::NodeOp> nodes, PatternRewriter &rewriter);
 
-/// Get the consumer/producer nodes of the given buffer expect the given op.
+/// Get the consumer/producer nodes of the given buffer except the given op.
 SmallVector<hls::NodeOp> getConsumersExcept(Value buffer, hls::NodeOp except);
 SmallVector<hls::NodeOp> getProducersExcept(Value buffer, hls::NodeOp except);
 SmallVector<hls::NodeOp> getProducers(Value buffer);
 SmallVector<hls::NodeOp> getDependentConsumers(Value buffer, hls::NodeOp node);
 
-/// Get the nested consumer/producer nodes of the given buffer expect the given
+/// Get the nested consumer/producer nodes of the given buffer except the given
 /// node. The corresponding buffer values are also returned.
 SmallVector<std::pair<hls::NodeOp, Value>>
 getNestedConsumersExcept(Value buffer, hls::NodeOp except);
-SmallVector<std::pair<hls::NodeOp, Value>>
-getNestedProducersExcept(Value buffer, hls::NodeOp except);
 SmallVector<std::pair<hls::NodeOp, Value>> getNestedProducers(Value buffer);
 
 /// Get the depth of a buffer or stream channel. Note that only if the defining
@@ -73,15 +68,12 @@ unsigned getBufferDepth(Value memref);
 
 /// Find buffer value or buffer op across the dataflow hierarchy.
 Value findBuffer(Value memref);
-hls::BufferLikeInterface findBufferOp(Value memref);
 
 bool isExtBuffer(Value memref);
 
 /// Check whether the given use has read/write semantics.
 bool isRead(OpOperand &use);
 bool isWritten(OpOperand &use);
-
-void populateBufferConversionPatterns(RewritePatternSet &patterns);
 
 //===----------------------------------------------------------------------===//
 // Linalg analysis utils
@@ -101,14 +93,8 @@ void adjustToDivisorsOfTripCounts(ArrayRef<affine::AffineForOp> band,
 /// The current op or contained ops have effect on external buffers.
 bool hasEffectOnExternalBuffer(Operation *op);
 
-/// Distribute the given factor from the innermost loop of the given loop band,
-/// so that we can apply vectorize, unroll and jam, etc.
-FactorList
-getDistributedFactors(unsigned factor,
-                      const SmallVectorImpl<mlir::affine::AffineForOp> &band);
-
 /// Distribute the given factor evenly on all loop levels. The generated factors
-/// are garanteed to be divisors of the factors in given "costrFactorsList".
+/// are guaranteed to be divisors of the factors in given "constrFactors".
 /// This method can fail due to non-constant loop bounds.
 LogicalResult getEvenlyDistributedFactors(
     unsigned maxFactor, FactorList &factors,
@@ -139,12 +125,6 @@ void getMemAccessesMap(Block &block, MemAccessesMap &map,
 
 bool crossRegionDominates(Operation *a, Operation *b);
 
-/// Check if the lhsOp and rhsOp are in the same block. If so, return their
-/// ancestors that are located at the same block. Note that in this check,
-/// affine::AffineIfOp is transparent.
-std::optional<std::pair<Operation *, Operation *>>
-checkSameLevel(Operation *lhsOp, Operation *rhsOp);
-
 /// Calculate the upper and lower bound of the affine map if possible.
 std::optional<std::pair<int64_t, int64_t>>
 getBoundOfAffineMap(AffineMap map, ValueRange operands);
@@ -157,19 +137,14 @@ int64_t getPartitionFactors(MemRefType memrefType,
 
 bool isFullyPartitioned(MemRefType memrefType);
 
-/// This is method for finding the number of child loops which immediatedly
+/// This is method for finding the number of child loops which immediately
 /// contained by the input operation.
-unsigned getChildLoopNum(Operation *op);
 
 /// Given a tiled loop band, return true and get the tile (tile-space) loop
 /// band and the point (intra-tile) loop band. If failed, return false.
 bool getTileAndPointLoopBand(const AffineLoopBand &band,
                              AffineLoopBand &tileBand,
                              AffineLoopBand &pointBand);
-
-bool getParallelAndReductionLoopBand(const AffineLoopBand &band,
-                                     AffineLoopBand &parallelBand,
-                                     AffineLoopBand &reductionBand);
 
 /// Get the whole loop band given the outermost or innermost loop and return it
 /// in "band". Meanwhile, the return value is the innermost or outermost loop of
@@ -211,7 +186,7 @@ bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref,
 
   // Check whether the effect on memOp can be caused by a given operation op.
   std::function<void(Operation *)> checkOperation = [&](Operation *op) {
-    // If the effect has alreay been found, early exit,
+    // If the effect has already been found, early exit,
     if (hasSideEffect)
       return;
 
@@ -260,12 +235,10 @@ bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref,
           // `start` and `memOp`.
           unsigned nsLoops = affine::getNumCommonSurroundingLoops(*op, *memOp);
 
-          // For ease, let's consider the case that `op` is a store and we're
-          // looking for other potential stores (e.g `op`) that overwrite memory
-          // after `start`, and before being read in `memOp`. In this case, we
-          // only need to consider other potential stores with depth >
-          // minSurrounding loops since `start` would overwrite any store with a
-          // smaller number of surrounding loops before.
+          // Take `op` to be a store, sought as one that overwrites memory
+          // after `start` and before `memOp` reads it. Only depths above
+          // `minSurroundingLoops` matter: `start` would already have
+          // overwritten any store surrounded by fewer loops.
           unsigned d;
           affine::FlatAffineValueConstraints dependenceConstraints;
           for (d = nsLoops + 1; d > minSurroundingLoops; d--) {

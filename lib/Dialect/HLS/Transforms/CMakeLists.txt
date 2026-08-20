@@ -10,7 +10,6 @@ add_mlir_library(HLSTransforms
   ConvertDataflowToFunc.cpp
   CreateAxiInterface.cpp
   CreateDataflowFromAffine.cpp
-  CreateMemrefSubview.cpp
   CreateTokenStream.cpp
   EliminateMultiConsumer.cpp
   EliminateMultiProducer.cpp
@@ -18,19 +17,19 @@ add_mlir_library(HLSTransforms
   FuseSiblingLoops.cpp
   LegalizeDataflow.cpp
   LoopPipelining.cpp
-  LoopUnrolling.cpp
   LowerCopyToAffine.cpp
   LowerDataflow.cpp
-  ParallelizeDataflowNode.cpp
   Passes.cpp
   PlaceDataflowBuffer.cpp
   RaiseAffineToCopy.cpp
-  ReduceInitialInterval.cpp
+  ReduceInitiationInterval.cpp
   RemoveVariableBound.cpp
   ScheduleDataflowNode.cpp
+  ShareEquivalentFunctions.cpp
   SimplifyAffineIf.cpp
   SimplifyCopy.cpp
   StreamDataflowTask.cpp
+  WidenExternalMemory.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/sar/Dialect/HLS/Transforms

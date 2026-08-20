@@ -9,6 +9,12 @@
 // CHECK:      Directives   : vitis
 // CHECK:      Sub-functions: 2
 
+// This design has no top-level bus ports, so the header must claim none --
+// an `ap_memory` package that advertises an AXI width describes a bus it
+// does not have.
+// CHECK-NOT:  Interface    :
+// CHECK-NOT:  AXI bus      :
+
 // Only the headers the design needs. This one has no stream, no vector and
 // no wide integer, so none of those may appear.
 // CHECK:      #include <cmath>

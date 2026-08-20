@@ -324,7 +324,10 @@ struct Analyzer {
 /// pass over a plane the compiler already knows.
 struct ConstantFolder {
   /// Bounds the work: a field wider than this is left to the affine path.
-  static constexpr int64_t kMaxElements = 1 << 22;
+  // Keep the worst-case memoized plane to 2 MiB. Larger fields use interval
+  // analysis; materializing several 2048-square SSA intermediates here can
+  // otherwise consume hundreds of MiB during compilation.
+  static constexpr int64_t kMaxElements = 1 << 18;
 
   DenseMap<Value, std::optional<SmallVector<double>>> memo;
 
@@ -708,7 +711,7 @@ AffineInterval Analyzer::analyze(Value v, int64_t rampAxis) {
 namespace mlir {
 namespace sar {
 
-AffineInterval analyzePositions(Value positions, int64_t dim) {
+static AffineInterval analyzePositions(Value positions, int64_t dim) {
   Analyzer analyzer;
   return analyzer.analyze(positions, dim);
 }

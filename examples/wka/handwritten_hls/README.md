@@ -3,9 +3,9 @@
 This directory contains a self-contained FP32 omega-K implementation written
 directly for Vitis HLS 2022.2. It follows the same WKA semantics and ALOS
 parameters as the parent SAR-DSL example, but it is not compiler output and is
-not a dependency of SAR-DSL. Its purpose is to make high-quality HLS
-implementation patterns concrete and to provide an internal optimization
-reference.
+not a dependency of SAR-DSL. It serves as an independent baseline: a
+hand-tuned design at the same geometry, constraints and device that the
+generated one can be measured against.
 
 The production contract is fixed at:
 
@@ -28,8 +28,7 @@ range FFT → transpose → azimuth FFT → transpose
 → transpose → azimuth window + azimuth IFFT → magnitude transpose
 ```
 
-The implementation demonstrates several patterns that are useful to compiler
-lowering:
+The design rests on:
 
 - 512-bit packed complex I/O with contiguous bursts and explicit outstanding
   transaction limits;
@@ -73,7 +72,6 @@ make reports          # collect XML summaries
 
 `make luts` regenerates `generated/wka_luts.h`. Build products go under
 `work/`; generated test vectors and report collections go under `reports/`.
-Neither directory is used by the normal SAR-DSL build.
 
 The production testbench can read
 `data/alos_raw_16384x16384.bin`. The dataset is intentionally not included;

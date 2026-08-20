@@ -169,7 +169,10 @@ struct EliminateMultiConsumer
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<InsertForkNode>(context);
-    (void)applyPatternsGreedily(func, std::move(patterns));
+    if (failed(applyPatternsGreedily(func, std::move(patterns)))) {
+      signalPassFailure();
+      return;
+    }
 
     func.walk([&](ScheduleOp schedule) {
       forkWideArgFanOut(schedule.getBody().front());

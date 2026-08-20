@@ -11,9 +11,10 @@ import pytest
 from sar.backends.base import KernelMetadata
 from sar.backends.hls.autotune import (
     AUTO_OPTIONS, KernelFacts, array_partition_max_factor, derive,
-    fft_parallel_rows, fft_stage_group, interp_banded_gather,
-    kernel_facts_from_json, loop_tile_size, lutram_max_bytes, measure_kernel,
-    storage_min_elements, transpose_block_bytes, _scratch_slots)
+    external_vector_max_lanes, external_vector_min_elements, fft_parallel_rows,
+    fft_stage_group, interp_banded_gather, kernel_facts_from_json,
+    loop_tile_size, lutram_max_bytes, measure_kernel, storage_min_elements,
+    transpose_block_bytes, _scratch_slots)
 from sar.backends.hls.config import HLSConfig
 
 from conftest import requires_hls
@@ -36,8 +37,9 @@ def _cfg(**opts):
 def test_structured_kernel_facts_parser():
     facts = kernel_facts_from_json(
         '{"plane_elements":64,"element_bytes":4,"transposes":2,'
+        '"element_bytes_set":[4,8],'
         '"transforms":[[8,4]],"buffers":[[64,256]]}')
-    assert facts == KernelFacts(64, 4, ((8, 4), ), 2, ((64, 256), ))
+    assert facts == KernelFacts(64, 4, ((8, 4), ), 2, ((64, 256), ), (4, 8), 0)
 
 
 # ---------------------------------------------------------------------- #
@@ -147,6 +149,11 @@ def test_parallelism_needs_a_transform():
     assert fft_parallel_rows(_facts(), 9830, 1 << 30) == 0
 
 
+def test_multiple_data_dependent_regrids_keep_one_fft_engine():
+    facts = KernelFacts(1 << 28, 4, ((16384, 4), (16384, 4)), gather_ops=2)
+    assert fft_parallel_rows(facts, 9830, 1 << 30) == 0
+
+
 def test_parallelism_respects_the_dsp_budget():
     facts = _facts(transforms=((1024, 4), ))
     plenty = 1 << 30
@@ -154,21 +161,21 @@ def test_parallelism_respects_the_dsp_budget():
     # slices per stage. One lane's worth means serial lines.
     assert fft_parallel_rows(facts, 30, plenty) == 0
     assert fft_parallel_rows(facts, 60, plenty) == 2
-    # The VU13P budget affords the full 16 lanes, even across the four
-    # transform sites of a complete chain.
-    assert fft_parallel_rows(facts, 9830, plenty) == 16
+    # Sixty-four independent lines amortize eight engines; wider hardware
+    # would mostly increase synthesis work at this validation scale.
+    assert fft_parallel_rows(facts, 9830, plenty) == 8
     four_sites = _facts(transforms=((1024, 4), ) * 4)
-    assert fft_parallel_rows(four_sites, 9830, plenty) == 16
+    assert fft_parallel_rows(four_sites, 9830, plenty) == 8
 
 
 def test_parallelism_respects_the_memory_budget():
     facts = _facts(transforms=((1024, 4), ))
     # A tight on-chip budget pulls the lane count down before the DSP
     # budget would.
-    assert fft_parallel_rows(facts, 9830, 1 << 22) < 16
+    assert fft_parallel_rows(facts, 9830, 1 << 20) < 16
 
 
-def test_io_unroll_is_half_a_beat_per_plane():
+def test_io_unroll_uses_the_synthesis_validated_vector_width():
     from sar.backends.hls.autotune import fft_io_unroll
     assert fft_io_unroll(_facts(transforms=((1024, 4), )), 512) == 8
     assert fft_io_unroll(_facts(transforms=((1024, 8), )), 512) == 4
@@ -179,6 +186,13 @@ def test_partition_factor_is_bounded_by_one_bus_beat():
     assert array_partition_max_factor(_facts(element_bytes=4), 512) == 16
     assert array_partition_max_factor(_facts(element_bytes=8), 512) == 8
     assert array_partition_max_factor(_facts(element_bytes=4), 1024) == 32
+
+
+def test_mixed_width_strategy_uses_a_common_physical_lane_count():
+    facts = KernelFacts(65536, 4, (), element_bytes_set=(4, 8))
+    assert external_vector_max_lanes(facts, 512) == 8
+    assert external_vector_min_elements(facts, 8) == 4096
+    assert array_partition_max_factor(facts, 512) == 8
 
 
 # ---------------------------------------------------------------------- #
@@ -368,13 +382,14 @@ class TestMeasureKernel:
         n = 16
 
         @sar.func
-        def mixed(x: sar.f32[n, n]) -> sar.f32[n, n]:
-            return x * 2.0
+        def mixed(x: sar.f32[n, n], y: sar.f64[n, n]) -> sar.f32[n, n]:
+            return x * sar.cast(y, sar.f32)
 
         md = KernelMetadata("mixed", list(mixed.arg_types),
                             list(mixed.declared_result_types))
         f = measure_kernel(mixed.to_mlir(), md)
         assert f.element_bytes == 4
+        assert f.element_bytes_set == (4, 8)
 
 
 # ---------------------------------------------------------------------- #
@@ -615,3 +630,7 @@ def test_axis0_interp_counts_its_hidden_transposes():
 
 def test_zero_bram_disables_transpose_staging():
     assert transpose_block_bytes(_facts(), bram_bytes=0) == 0
+
+
+def test_sub_block_bram_budget_disables_transpose_staging():
+    assert transpose_block_bytes(_facts(), bram_bytes=4095) == 0

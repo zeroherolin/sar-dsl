@@ -125,7 +125,8 @@ struct StreamDataflowTask
     patterns.add<ConvertToStreamRead>(context);
     patterns.add<HoistStream<DispatchOp>>(context);
     patterns.add<HoistStream<TaskOp>>(context);
-    (void)applyPatternsGreedily(func, std::move(patterns));
+    if (failed(applyPatternsGreedily(func, std::move(patterns))))
+      signalPassFailure();
   }
 };
 } // namespace

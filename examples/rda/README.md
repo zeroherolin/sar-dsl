@@ -1,9 +1,10 @@
 # Range-Doppler Algorithm (RDA) with SAR-DSL
 
-RDA exists here to prove the dialect generalizes: it introduces **no new
-compiler operation** -- range cell migration correction (RCMC) is composed
-from the orthogonal `sar.interp1d` primitive plus element-wise position
-arithmetic.
+The Range-Doppler algorithm as a single SAR-DSL kernel: range compression,
+then range cell migration correction (RCMC) and azimuth compression in the
+range-Doppler domain. RCMC is composed from the `sar.interp1d` primitive
+plus element-wise position arithmetic -- the chain needs no operation the
+other examples do not already use.
 
 | File | Purpose |
 |------|---------|
@@ -70,8 +71,9 @@ python examples/rda/run_alos_cpu.py
 python examples/rda/run_alos_hls.py
 ```
 
-The runner reports wall time and urban-area contrast. Real-data output is
-not tracked because the source product is not redistributed.
+The runner reports wall time and urban-area contrast. The focused image is
+committed as `assets/san_francisco_rda.png`; the raw product it is made from
+is not redistributed here.
 
 `run_alos_hls.py` writes `hls_project/rda_alos/`: `rda_alos_axi.cpp` is
 the 16384x16384 design with AXI ports for synthesis, and

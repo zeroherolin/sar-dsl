@@ -32,7 +32,7 @@ bool sar::applyAffineLoopPerfection(AffineLoopBand &band) {
     auto loop = band[i - 1];
     auto childLoop = band[i];
 
-    // If any prefix operation is consumed by users in the child loop, we need
+    // A prefix operation consumed inside the child loop needs
     // to buffer the result in a memory on stack such that the users can fetch
     // the correct data from the stack.
     for (auto &op : llvm::make_early_inc_range(loop.getOps())) {

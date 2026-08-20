@@ -982,6 +982,23 @@ static Value emitFloorToI64(OpBuilder &b, Location loc, Value x) {
   return arith::SelectOp::create(b, loc, negFrac, fixed, truncI);
 }
 
+static std::pair<Value, Value> sanitizeGatherPosition(OpBuilder &b,
+                                                      Location loc, Value x) {
+  Value finite = math::IsFiniteOp::create(b, loc, x);
+  Value lo = arith::CmpFOp::create(
+      b, loc, arith::CmpFPredicate::OGT, x,
+      arith::ConstantOp::create(b, loc, b.getF64FloatAttr(-0x1p62)));
+  Value hi = arith::CmpFOp::create(
+      b, loc, arith::CmpFPredicate::OLT, x,
+      arith::ConstantOp::create(b, loc, b.getF64FloatAttr(0x1p62)));
+  Value valid = arith::AndIOp::create(b, loc, finite,
+                                      arith::AndIOp::create(b, loc, lo, hi));
+  Value safe = arith::SelectOp::create(
+      b, loc, valid, x,
+      arith::ConstantOp::create(b, loc, b.getF64FloatAttr(0.0)));
+  return {safe, valid};
+}
+
 /// Emits the tap arithmetic of a 2-D gather at (rowPos, colPos), f64.
 /// `loadAt` supplies the sample at *clamped* index values as an (re, im)
 /// pair already widened to f64; taps outside [0, rows) x [0, cols) are
@@ -1002,6 +1019,16 @@ static std::pair<Value, Value> emitGather2DTaps(
   Value rowMax = i64(rows - 1), colMax = i64(cols - 1);
   Value rowsI = i64(rows), colsI = i64(cols);
   Value zeroF = f64(0.0), oneF = f64(1.0);
+  auto [safeRow, validRow] = sanitizeGatherPosition(b, loc, rowPos);
+  auto [safeCol, validCol] = sanitizeGatherPosition(b, loc, colPos);
+  rowPos = safeRow;
+  colPos = safeCol;
+  Value validPosition = arith::AndIOp::create(b, loc, validRow, validCol);
+  auto finish = [&](Value re, Value im) {
+    return std::pair<Value, Value>{
+        arith::SelectOp::create(b, loc, validPosition, re, zeroF),
+        arith::SelectOp::create(b, loc, validPosition, im, zeroF)};
+  };
 
   auto clampToIndex = [&](Value idx, Value max) {
     Value clamped = arith::MinSIOp::create(
@@ -1041,7 +1068,7 @@ static std::pair<Value, Value> emitGather2DTaps(
     Value colIdx =
         emitFloorToI64(b, loc, arith::AddFOp::create(b, loc, colPos, half));
     tap(rowIdx, colIdx, oneF);
-    return {accRe, accIm};
+    return finish(accRe, accIm);
   }
 
   // Bilinear: fractional parts weight the four surrounding samples.
@@ -1059,7 +1086,7 @@ static std::pair<Value, Value> emitGather2DTaps(
   tap(row0, col1, arith::MulFOp::create(b, loc, frInv, fc));
   tap(row1, col0, arith::MulFOp::create(b, loc, fr, fcInv));
   tap(row1, col1, arith::MulFOp::create(b, loc, fr, fc));
-  return {accRe, accIm};
+  return finish(accRe, accIm);
 }
 
 /// `sar.gather2d` on complex tensors (the execution path, where complex

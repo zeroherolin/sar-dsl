@@ -27,7 +27,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install build numpy pytest pre-commit
+      - run: pip install build matplotlib numpy pytest pre-commit
       - name: Lint and format checks
         run: pre-commit run --all-files --show-diff-on-failure
       - name: Frontend tests
@@ -79,7 +79,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install numpy pytest
+      - run: pip install matplotlib numpy pytest
       - run: sudo apt-get install -y ninja-build
 
       # Sources are always needed: the cached build tree carries CMake configs

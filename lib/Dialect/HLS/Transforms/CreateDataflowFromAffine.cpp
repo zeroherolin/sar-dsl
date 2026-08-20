@@ -37,8 +37,7 @@ struct TaskPartition : public OpRewritePattern<DispatchOp> {
     auto isTaskSeed = [](Operation &op) {
       // Compact unrolled lane loops are body, not tasks (see the band
       // filter in the pass entry).
-      return isa<AffineForOp, scf::ForOp>(op) &&
-             !op.hasAttr(kUnrollFactorAttr);
+      return isa<AffineForOp, scf::ForOp>(op) && !op.hasAttr(kUnrollFactorAttr);
     };
     if (llvm::none_of(block, isTaskSeed))
       return failure();
@@ -71,7 +70,6 @@ struct TaskPartition : public OpRewritePattern<DispatchOp> {
         taskIdx++;
 
       } else {
-        // Otherwise, we push back the current operation to the list.
         opsToFuse.push_back(&op);
       }
     }

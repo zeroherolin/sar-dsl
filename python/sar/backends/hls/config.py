@@ -120,12 +120,12 @@ OPTIONS: Dict[str, _Spec] = {
           power_of_two=True),
     "axi_max_burst_length":
     _Spec("int",
-          "Beats per AXI burst at full bus width (AXI4 caps it at 256)",
+          "Maximum beats per AXI burst (also capped at the 4 KiB boundary)",
           minimum=1,
           maximum=256),
     "axi_max_outstanding":
     _Spec("int",
-          "Full-length bursts in flight per direction (Vitis caps it at 32)",
+          "Maximum bursts in flight per direction (Vitis caps it at 32)",
           minimum=1,
           maximum=32),
     "precision":
@@ -173,6 +173,21 @@ OPTIONS: Dict[str, _Spec] = {
           maximum=1024,
           nullable=True,
           power_of_two=True,
+          advanced=True),
+    "external_vector_max_lanes":
+    _Spec("int", "Maximum lanes packed into a proven contiguous AXI access "
+          "(null = the compiler decides)",
+          minimum=1,
+          maximum=32,
+          nullable=True,
+          power_of_two=True,
+          advanced=True),
+    "external_vector_min_elements":
+    _Spec("int", "Smallest AXI array worth changing to a packed ABI "
+          "(null = the compiler decides)",
+          minimum=1,
+          maximum=_UINT32_MAX,
+          nullable=True,
           advanced=True),
     "interp_banded_gather":
     _Spec("bool", "Gather interpolation taps from an on-chip band (null = the "

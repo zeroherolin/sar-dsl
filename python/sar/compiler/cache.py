@@ -161,6 +161,18 @@ def _toolchain_fingerprint() -> str:
         runtime = None
     digest.update(b"libsar_runtime:")
     digest.update(stamp(runtime))
+    omp = os.environ.get("SAR_DSL_OMP_LIB")
+    if not omp:
+        try:
+            clang = find_tool("clang", required=False)
+        except Exception:
+            clang = None
+        if clang:
+            candidate = (Path(clang).resolve().parent.parent / "lib" /
+                         "libomp.so")
+            omp = str(candidate) if candidate.is_file() else None
+    digest.update(b"openmp:")
+    digest.update(stamp(omp))
     # Host codegen identity: `-march=native` bakes the build machine's ISA
     # into the artifact, so a shared cache must not hand it to a different
     # CPU. platform.machine() alone is too coarse; the CPU model and flag
@@ -258,9 +270,8 @@ class KernelCache:
         self._lock = (self.dir / ".lock").open("a+")
         if fcntl is not None:
             fcntl.flock(self._lock, fcntl.LOCK_SH)
-        if self.enabled:
-            _prune_lru(root, _max_cache_size())
-            self._touch()
+        _prune_lru(root, _max_cache_size())
+        self._touch()
         self._root = root
 
     def _touch(self) -> None:
@@ -305,8 +316,7 @@ class KernelCache:
             # A failed write or rename must not litter the entry with .tmp
             # files; after a successful rename there is nothing to unlink.
             tmp.unlink(missing_ok=True)
-        if self.enabled:
-            _prune_lru(self._root, _max_cache_size())
+        _prune_lru(self._root, _max_cache_size())
         return p
 
     def scratch_path(self, filename: str) -> Path:
@@ -317,6 +327,5 @@ class KernelCache:
     def publish(self, scratch: Path, filename: str) -> Path:
         p = self.path(filename)
         os.replace(scratch, p)
-        if self.enabled:
-            _prune_lru(self._root, _max_cache_size())
+        _prune_lru(self._root, _max_cache_size())
         return p

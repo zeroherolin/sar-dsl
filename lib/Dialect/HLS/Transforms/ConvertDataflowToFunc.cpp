@@ -80,8 +80,6 @@ struct SplitNodeExternalBufferAccess : public OpRewritePattern<NodeOp> {
     SmallVector<BlockArgument, 16> inputArgs(node.getInputArgs());
     SmallVector<BlockArgument, 16> outputArgs(node.getOutputArgs());
     for (auto arg : inputArgs) {
-      // If the buffer is not an external buffer or has zero or one schedule
-      // users, we have nothing to do.
       auto uses = llvm::make_filter_range(arg.getUses(), [&](auto &use) {
         return isa<ScheduleOp>(use.getOwner());
       });
@@ -99,8 +97,6 @@ struct SplitNodeExternalBufferAccess : public OpRewritePattern<NodeOp> {
     }
 
     for (auto arg : llvm::enumerate(outputArgs)) {
-      // If the buffer is not an external buffer or has zero or one schedule
-      // users, we have nothing to do.
       auto uses =
           llvm::make_filter_range(arg.value().getUses(), [&](auto &use) {
             return isa<ScheduleOp>(use.getOwner());
@@ -202,7 +198,14 @@ struct ConvertNodeToFunc : public OpRewritePattern<NodeOp> {
     // in csim and another hierarchy level in the reports; mark it for the
     // emitter to inline. Nodes with hierarchy (nested schedules) stay
     // functions -- their region structure is what the pragma attaches to.
-    if (!node.hasHierarchy() &&
+    bool hasCallsOrTokens =
+        node.walk([&](Operation *operation) {
+              return isa<func::CallOp, StreamReadOp, StreamWriteOp>(operation)
+                         ? WalkResult::interrupt()
+                         : WalkResult::advance();
+            })
+            .wasInterrupted();
+    if (!node.hasHierarchy() && !hasCallsOrTokens &&
         llvm::hasSingleElement(node.getOps<AffineForOp>()))
       subFunc->setAttr("inline", rewriter.getUnitAttr());
 
@@ -241,16 +244,20 @@ struct ConvertDataflowToFunc
       mlir::RewritePatternSet patterns(context);
       patterns.add<SplitScheduleExternalBufferAccess>(context);
       patterns.add<SplitNodeExternalBufferAccess>(context);
-      (void)applyPatternsGreedily(module, std::move(patterns));
+      if (failed(applyPatternsGreedily(module, std::move(patterns))))
+        return signalPassFailure();
     }
 
     // Converting a node creates a new function holding its body, and a
     // nested schedule waits in that body for its turn (the deferral
     // above). One sweep over the module therefore may leave work in the
     // functions it created; sweep until the dataflow ops are gone.
-    bool changed = true;
-    while (changed) {
-      changed = false;
+    auto countWork = [&] {
+      unsigned count = 0;
+      module.walk([&](Operation *op) { count += isa<ScheduleOp, NodeOp>(op); });
+      return count;
+    };
+    while (unsigned before = countWork()) {
       for (auto func :
            llvm::make_early_inc_range(module.getOps<func::FuncOp>())) {
         bool hasWork = false;
@@ -264,8 +271,13 @@ struct ConvertDataflowToFunc
         mlir::RewritePatternSet patterns(context);
         patterns.add<InlineSchedule>(context);
         patterns.add<ConvertNodeToFunc>(context, func.getName(), nodeIdx);
-        (void)applyPatternsGreedily(func, std::move(patterns));
-        changed = true;
+        if (failed(applyPatternsGreedily(func, std::move(patterns))))
+          return signalPassFailure();
+      }
+      unsigned after = countWork();
+      if (after >= before) {
+        module.emitError("dataflow-to-function conversion made no progress");
+        return signalPassFailure();
       }
     }
 

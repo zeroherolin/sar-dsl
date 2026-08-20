@@ -398,9 +398,9 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
     assert "interp-enable-banded-gather=false" in lower
     assert "fft-stage-group=2" in lower
     assert "fft-parallel-rows=8" in lower
-    # No corner turn in the kernel, so a quarter of the block RAM cap
-    # is offered to a staging block -- floored at one 4 KiB burst.
-    assert "transpose-block-bytes=4096" in lower
+    # The cap cannot fund one 4 KiB staging block after reserving room for
+    # concurrent buffers, so transpose staging is disabled.
+    assert "transpose-block-bytes=0" in lower
 
     assert "top-func=renamed_top" in hls
     assert "loop-tile-size=4" in hls
@@ -408,6 +408,8 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
     assert "uram-bytes=4096" in hls
     assert "lutram-bytes=0" in hls
     assert "axi-interface=true" in hls
+    assert "external-vector-max-lanes=8" in hls
+    assert "external-vector-min-elements=4096" in hls
     assert "external-buffer-threshold=11" in hls
     # The LUT-bank threshold is derived rather than frozen as a pass
     # default, and arrives in bytes: one bus beat (512/8).
@@ -415,8 +417,8 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
     assert "array-partition-max-factor=8" in hls
 
     assert "-axi-bus-bits=512" in emit
-    # Buffering is both directions' worth of full-length bursts.
-    assert f"-axi-buffer-bits={2 * 256 * 16 * 512}" in emit
+    assert "-axi-max-burst-length=64" in emit
+    assert "-axi-max-outstanding=16" in emit
 
 
 @requires_hls
@@ -493,8 +495,8 @@ def test_configured_bus_width_reaches_the_pragmas(bus_bits):
                            }).source()
     widen, burst, _ = _axi_shape(source)
     assert widen == {bus_bits}
-    # A row is 512 doubles, so the burst is however many beats that spans.
-    assert burst == {n * 64 // bus_bits}
+    # The configured maximum and the AXI 4 KiB boundary cap a long row.
+    assert burst == {min(64, 32768 // bus_bits, n * 64 // bus_bits)}
 
 
 @requires_hls

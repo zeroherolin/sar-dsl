@@ -11,9 +11,10 @@
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
 
-#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/MapVector.h"
 
-#include <array>
+#include <algorithm>
+#include <numeric>
 
 namespace mlir {
 namespace sar {
@@ -30,18 +31,29 @@ using namespace hls;
 //===----------------------------------------------------------------------===//
 // Internal DRAM scratch
 //
-// The top function's signature is the design's contract with its caller, so it
-// is fixed: the kernel's declared arguments/results and two scratch arenas per
-// scalar element type in the lowered design. Buffers the compiler decides to
-// keep off chip are internal, so they may not appear as ports of their own.
-// Successive buffers are distributed between the two physical masters and
-// carved at compile-time offsets. Placeholder arenas remain in the signature
-// when their type has no spill, so placement decisions change extents but never
-// the number or order of ports.
+// A design's port list is its algorithm's I/O: the kernel's declared arguments
+// and results, and nothing the compiler added for its own convenience. Ports
+// are the contract a board integrator has to wire to physical memory channels,
+// so a compiler that mints extra masters spends a platform resource to buy
+// itself scheduling freedom.
 //
-// Serialization within one scratch port is not a new cost: the carved
-// buffers already take turns on the port's data bus, whether or not each
-// of them had a port of its own.
+// Buffers the compiler decides to keep off chip are internal. They are carved
+// at compile-time offsets out of scratch allocations, one per element type
+// and per group of buffers that can share a pointer -- an arena is `float *`
+// or `double *`, and one pointer cannot be both. A type with no spill
+// contributes no port at all.
+//
+// Buffers a single node reads and writes may not share an arena. Merging them
+// would hand that node one pointer it both loads from and stores to, and HLS
+// must then assume every load may alias a store still in flight: the node's
+// bus requests serialize behind their own responses and its initiation
+// interval collapses. Splitting on that conflict is what a hand-written design
+// does when it ping-pongs between a scratch plane and its output plane, and it
+// is the smallest split that keeps the arithmetic pipelined.
+//
+// Sharing within one arena costs nothing extra: buffers that no node pairs up
+// already take turns on that port's data bus, whether or not each of them had
+// a port of its own.
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -56,8 +68,8 @@ struct ScratchSlot {
 };
 
 /// Accesses to redirect once a buffer has been accepted for carving. Collected
-/// before anything is rewritten so that a buffer reaching a use we cannot
-/// redirect is left alone rather than half-carved.
+/// before anything is rewritten, so a buffer reaching a use that cannot be
+/// redirected is left alone rather than half-carved.
 struct ScratchUses {
   SmallVector<AffineLoadOp> loads;
   SmallVector<AffineStoreOp> stores;
@@ -122,7 +134,7 @@ static Value flattenIndices(Operation *op, ValueRange indices, MemRefType type,
 
 /// Walks everything reached by `buffer` -- accesses in this function, and the
 /// dataflow node calls it is handed to -- collecting what a rewrite would have
-/// to touch. Fails, without recording anything, on a use we cannot redirect or
+/// to touch. Fails, without recording anything, on an unredirectable use or
 /// a callee shared by several call sites (which would need one offset to serve
 /// two buffers).
 static LogicalResult
@@ -201,9 +213,131 @@ static void redirectToScratch(const ScratchUses &uses, Value buffer,
   buffer.replaceAllUsesWith(scratch);
 }
 
-/// Replaces the top function's internal DRAM buffers with slices of a single
-/// scratch buffer, and returns that buffer for the caller to turn into the one
-/// extra port.
+/// What a dataflow node does with a buffer it was handed.
+struct AccessRole {
+  bool reads = false;
+  bool writes = false;
+};
+
+/// Records how `value` is used, following into the callees it is passed to.
+/// A use this walk does not model counts as both a read and a write, which
+/// keeps the conflict graph below conservative.
+static void classifyAccess(Value value, AccessRole &role,
+                           DenseSet<Value> &visited) {
+  if (!visited.insert(value).second)
+    return;
+
+  for (auto &use : value.getUses()) {
+    auto *owner = use.getOwner();
+    if (isa<AffineLoadOp, memref::LoadOp>(owner)) {
+      role.reads = true;
+    } else if (isa<AffineStoreOp, memref::StoreOp>(owner)) {
+      role.writes = true;
+    } else if (auto call = dyn_cast<func::CallOp>(owner)) {
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (!callee || callee.isExternal()) {
+        role.reads = role.writes = true;
+        continue;
+      }
+      classifyAccess(callee.getArgument(use.getOperandNumber()), role, visited);
+    } else {
+      role.reads = role.writes = true;
+    }
+  }
+}
+
+/// Arenas one element type may claim. A split-complex chain ping-pongs two
+/// planes -- real and imaginary -- and each needs a side to read and a side
+/// to write, so four pointers cover the aliasing a deliverable design
+/// actually has. A denser conflict graph than that comes from chain depth
+/// rather than data layout, and buying it more ports would let a longer
+/// kernel spend memory channels its algorithm never asked for. Past the cap
+/// the extra buffers share, and the traffic they serialize is traffic one
+/// pointer would have serialized anyway.
+constexpr unsigned kMaxScratchArenasPerType = 4;
+
+/// Partitions `candidates` into arenas, returning each one's arena index.
+///
+/// Two buffers conflict when one node reads one and writes the other: giving
+/// them the same pointer would make that node's loads and stores alias. The
+/// arena count is that conflict graph's coloring, so a chain alternating
+/// between a working plane and a result plane gets two arenas and buffers no
+/// node ever pairs up keep sharing one.
+///
+/// Colors most-constrained-first. The order matters for the count, not just
+/// the assignment: taking buffers in declaration order makes a graph two
+/// arenas cover ask for three, because a buffer conflicting with everything
+/// claims a color before the pair it separates has been placed.
+static SmallVector<unsigned>
+colorScratchBanks(ArrayRef<hls::BufferLikeInterface> candidates) {
+  unsigned count = candidates.size();
+  SmallVector<unsigned> colors(count, 0);
+  if (count < 2)
+    return colors;
+
+  llvm::MapVector<Operation *, SmallVector<unsigned>> readers, writers;
+  for (auto [index, entry] : llvm::enumerate(candidates)) {
+    hls::BufferLikeInterface buffer = entry;
+    for (auto &use : buffer.getMemref().getUses()) {
+      auto call = dyn_cast<func::CallOp>(use.getOwner());
+      if (!call)
+        continue;
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      AccessRole role;
+      if (!callee || callee.isExternal()) {
+        role.reads = role.writes = true;
+      } else {
+        DenseSet<Value> visited;
+        classifyAccess(callee.getArgument(use.getOperandNumber()), role,
+                       visited);
+      }
+      if (role.reads)
+        readers[call].push_back(index);
+      if (role.writes)
+        writers[call].push_back(index);
+    }
+  }
+
+  SmallVector<DenseSet<unsigned>> conflicts(count);
+  for (auto &[call, read] : readers) {
+    auto written = writers.find(call);
+    if (written == writers.end())
+      continue;
+    for (unsigned source : read)
+      for (unsigned target : written->second)
+        if (source != target) {
+          conflicts[source].insert(target);
+          conflicts[target].insert(source);
+        }
+  }
+
+  SmallVector<unsigned> order(count);
+  std::iota(order.begin(), order.end(), 0u);
+  llvm::stable_sort(order, [&](unsigned lhs, unsigned rhs) {
+    return conflicts[lhs].size() > conflicts[rhs].size();
+  });
+
+  SmallVector<bool> assigned(count, false);
+  for (unsigned index : order) {
+    SmallVector<bool> taken(kMaxScratchArenasPerType, false);
+    for (unsigned neighbor : conflicts[index])
+      if (assigned[neighbor])
+        taken[colors[neighbor]] = true;
+    unsigned color = 0;
+    while (color < kMaxScratchArenasPerType && taken[color])
+      ++color;
+    // Every arena already conflicts with this buffer. Share the first one
+    // rather than mint a port beyond the cap.
+    colors[index] = color < kMaxScratchArenasPerType ? color : 0;
+    assigned[index] = true;
+  }
+  return colors;
+}
+
+/// Replaces one group of internal DRAM buffers with slices of a single scratch
+/// allocation, and returns that allocation for the caller to turn into a port.
 static FailureOr<Value>
 createScratchBuffer(func::FuncOp func, ModuleOp module, OpBuilder &builder,
                     Type elementType,
@@ -261,15 +395,14 @@ createScratchBuffer(func::FuncOp func, ModuleOp module, OpBuilder &builder,
     return failure();
   }
 
-  // The port exists even when nothing spills, so a caller binds the same
-  // interfaces whatever the compiler decided this time round.
+  // Only spilled buffers reach here, so the arena always has content; the
+  // guard keeps a degenerate zero-element buffer from declaring `T arena[0]`.
   auto scratchType = MemRefType::get(
       {std::max<int64_t>(1, elements)}, elementType, AffineMap(),
       MemoryKindAttr::get(func.getContext(), MemoryKind::DRAM));
   builder.setInsertionPointToStart(&func.front());
-  Value scratch =
-      BufferOp::create(builder, func.getLoc(), scratchType, /*depth=*/1,
-                       slots.empty() ? TypedAttr() : initValue);
+  Value scratch = BufferOp::create(builder, func.getLoc(), scratchType,
+                                   /*depth=*/1, initValue);
 
   for (auto [slot, uses] : llvm::zip(slots, slotUses)) {
     redirectToScratch(uses, slot.buffer.getMemref(), scratch,
@@ -313,104 +446,41 @@ struct CreateAxiInterface
     if (streamInterface)
       func->setAttr("stream_interface", builder.getUnitAttr());
 
-    // Fold internal DRAM buffers into stable typed arenas before ports are
-    // created. Scan all non-constant buffers, not only current spills, so a
-    // budget change cannot add or remove an arena type from the signature.
-    llvm::SetVector<Type> scratchTypes;
-    for (auto buffer : func.getOps<hls::BufferLikeInterface>())
-      if (!isa<ConstBufferOp>(*buffer))
-        if (Type elementType = buffer.getMemrefType().getElementType();
-            elementType.isIntOrFloat())
-          scratchTypes.insert(elementType);
-    if (scratchTypes.empty())
-      scratchTypes.insert(builder.getF64Type());
-    DenseMap<Operation *, unsigned> operationOrder;
-    unsigned nextOrder = 0;
-    for (Operation &op : func.front())
-      operationOrder[&op] = nextOrder++;
-    auto interval = [&](hls::BufferLikeInterface buffer) {
-      unsigned first = operationOrder.lookup(buffer.getOperation());
-      unsigned last = first;
-      for (OpOperand &use : buffer.getMemref().getUses()) {
-        Operation *owner = use.getOwner();
-        while (owner->getParentOp() != func && owner->getParentOp())
-          owner = owner->getParentOp();
-        if (owner->getParentOp() == func) {
-          unsigned position = operationOrder.lookup(owner);
-          first = std::min(first, position);
-          last = std::max(last, position);
-        }
+    // Carve the internal DRAM buffers into arenas: one per element type that
+    // actually spills, split again wherever a node would end up reading and
+    // writing the same pointer. A type with no spill contributes no arena, so
+    // the port list stays the algorithm's own I/O plus the scratch the design
+    // needs to keep its nodes pipelined.
+    llvm::MapVector<Type, SmallVector<hls::BufferLikeInterface>> scratchBanks;
+    for (auto buffer : func.getOps<hls::BufferLikeInterface>()) {
+      if (isa<ConstBufferOp>(*buffer) || !isExtBuffer(buffer.getMemref()))
+        continue;
+      Type elementType = buffer.getMemrefType().getElementType();
+      if (!elementType.isIntOrFloat()) {
+        // Carving computes byte offsets from a scalar width. An aggregate
+        // element type has none, and letting the buffer through here would
+        // leave it to become a port of its own further down.
+        buffer->emitError("internal DRAM buffer of non-scalar element type "
+                          "cannot be carved into a scratch arena");
+        return signalPassFailure();
       }
-      return std::pair(first, last);
-    };
-    for (Type elementType : scratchTypes) {
-      using UserDirs = DenseMap<Operation *, unsigned>; // 1=read, 2=written
-      std::array<SmallVector<hls::BufferLikeInterface>, 2> banks;
-      std::array<SmallVector<std::pair<unsigned, unsigned>>, 2> lifetimes;
-      std::array<SmallVector<UserDirs>, 2> bankUsers;
-      std::array<uint64_t, 2> payload = {0, 0};
-      for (auto buffer : func.getOps<hls::BufferLikeInterface>()) {
-        if (isExtBuffer(buffer.getMemref()) && !isa<ConstBufferOp>(*buffer) &&
-            buffer.getMemrefType().getElementType() == elementType) {
-          auto live = interval(buffer);
-          // How each top-level operation touches this buffer. Two buffers
-          // under one loop contend for the master every iteration, and the
-          // direction decides how badly: a read stream and a write stream
-          // interlock their requests and responses (II in the tens), while
-          // two same-direction streams merely halve the issue rate. The
-          // split-complex sweeps this backend emits read re/im pairs and
-          // write re/im pairs in one loop, so the coloring keeps opposing
-          // directions apart first and splits same-direction pairs second.
-          UserDirs users;
-          for (OpOperand &use : buffer.getMemref().getUses()) {
-            Operation *owner = use.getOwner();
-            Operation *leaf = owner;
-            while (owner->getParentOp() != func && owner->getParentOp())
-              owner = owner->getParentOp();
-            if (owner->getParentOp() != func)
-              continue;
-            unsigned dir = isWritten(use) ? 2 : 1;
-            // A call reads and writes through its own body; be pessimistic
-            // only when the operand is genuinely written there.
-            (void)leaf;
-            users[owner] |= dir;
-          }
-          auto cost = [&](unsigned bank) {
-            uint64_t total = 0;
-            for (const auto &other : bankUsers[bank])
-              for (auto [op, dir] : users) {
-                auto it = other.find(op);
-                if (it == other.end())
-                  continue;
-                unsigned both = dir | it->second;
-                total += both == 3 ? 16 : 1;
-              }
-            return total;
-          };
-          auto conflicts = [&](unsigned bank) {
-            return llvm::count_if(lifetimes[bank], [&](auto other) {
-              return !(live.second < other.first || other.second < live.first);
-            });
-          };
-          unsigned bank = 0;
-          auto leftCost = cost(0), rightCost = cost(1);
-          auto leftConflicts = conflicts(0), rightConflicts = conflicts(1);
-          if (rightCost < leftCost)
-            bank = 1;
-          else if (rightCost == leftCost && (rightConflicts < leftConflicts ||
-                                             (rightConflicts == leftConflicts &&
-                                              payload[1] < payload[0])))
-            bank = 1;
-          banks[bank].push_back(buffer);
-          lifetimes[bank].push_back(live);
-          bankUsers[bank].push_back(std::move(users));
-          payload[bank] += buffer.getMemrefType().getNumElements();
-        }
-      }
-      for (auto &candidates : banks)
-        if (failed(createScratchBuffer(func, module, builder, elementType,
-                                       candidates)))
+      scratchBanks[elementType].push_back(buffer);
+    }
+
+    for (auto &[elementType, candidates] : scratchBanks) {
+      auto colors = colorScratchBanks(candidates);
+      unsigned arenas = 0;
+      for (unsigned color : colors)
+        arenas = std::max(arenas, color + 1);
+      for (unsigned arena = 0; arena < arenas; ++arena) {
+        SmallVector<hls::BufferLikeInterface> group;
+        for (auto [index, buffer] : llvm::enumerate(candidates))
+          if (colors[index] == arena)
+            group.push_back(buffer);
+        if (failed(
+                createScratchBuffer(func, module, builder, elementType, group)))
           return signalPassFailure();
+      }
     }
 
     // Preserve `main` for the interface wrapper when the implementation itself
@@ -449,7 +519,7 @@ struct CreateAxiInterface
 
     // Move buffer arguments of the top function to the main function. Collect
     // all buffers to be converted to AXI interfaces into "buffers". At the same
-    // time, we also directly collect all scalar arguments into "funcPorts".
+    // time, scalar arguments go straight into "funcPorts".
     SmallVector<Value, 32> buffers;
     SmallVector<Value, 32> funcPorts;
     for (auto arg : mainBlock->getArguments())
@@ -494,9 +564,12 @@ struct CreateAxiInterface
     };
 
     // Convert collected buffers to AXI ports and collect them in "funcPorts".
-    // Every port gets its own AXI master bundle so concurrent plane accesses
-    // are not serialized by bundle arbitration. The system interconnect may
-    // still concentrate those masters onto fewer memory controllers.
+    // The list is now exactly the algorithm's I/O plus the carved scratch, and
+    // each of those gets its own master: a port that exists because the
+    // algorithm reads or writes it is one an integrator has to wire anyway,
+    // and sharing a bundle between two of them would serialize their bus
+    // requests. The system interconnect still concentrates these masters onto
+    // however many memory controllers the board has.
     unsigned bundleIndex = 0;
     for (auto buffer : buffers) {
       auto bundleType = getBundleType(buffer);

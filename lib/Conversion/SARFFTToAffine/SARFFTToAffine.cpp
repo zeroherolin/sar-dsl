@@ -317,8 +317,7 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
                                 qLoop.getInductionVar()};
     if (lanes > 1) {
       auto laneLoop = affine::AffineForOp::create(rewriter, loc, 0, lanes);
-      laneLoop->setAttr(kUnrollFactorAttr,
-                        rewriter.getI64IntegerAttr(lanes));
+      laneLoop->setAttr(kUnrollFactorAttr, rewriter.getI64IntegerAttr(lanes));
       rewriter.setInsertionPointToStart(laneLoop.getBody());
       operands.push_back(laneLoop.getInductionVar());
     }
@@ -571,8 +570,7 @@ private:
       elemExpr = getAffineDimExpr(numDims++, ctx);
       if (lanes > 1) {
         auto laneLoop = affine::AffineForOp::create(rewriter, loc, 0, lanes);
-        laneLoop->setAttr(kUnrollFactorAttr,
-                          rewriter.getI64IntegerAttr(lanes));
+        laneLoop->setAttr(kUnrollFactorAttr, rewriter.getI64IntegerAttr(lanes));
         rewriter.setInsertionPointToStart(laneLoop.getBody());
         operands.push_back(laneLoop.getInductionVar());
         laneExpr = getAffineDimExpr(numDims++, ctx);
@@ -588,8 +586,7 @@ private:
       operands.push_back(laneLoop.getInductionVar());
       laneExpr = getAffineDimExpr(numDims++, ctx);
     }
-    auto elemLoop =
-        affine::AffineForOp::create(rewriter, loc, 0, length, io);
+    auto elemLoop = affine::AffineForOp::create(rewriter, loc, 0, length, io);
     rewriter.setInsertionPointToStart(elemLoop.getBody());
     operands.push_back(elemLoop.getInductionVar());
     elemExpr = getAffineDimExpr(numDims++, ctx);
@@ -636,15 +633,18 @@ private:
     int stages = static_cast<int>(radixSchedule(length).size());
     int slots = scratchSlots(stages, stageGroup);
     auto allocBlock = [&](int64_t elemFactor) -> PlanePair {
-      return {allocLineBuffer(rewriter, loc, lanes, length, elemType,
-                              elemFactor),
-              allocLineBuffer(rewriter, loc, lanes, length, elemType,
-                              elemFactor)};
+      return {
+          allocLineBuffer(rewriter, loc, lanes, length, elemType, elemFactor),
+          allocLineBuffer(rewriter, loc, lanes, length, elemType, elemFactor)};
     };
     // Only the transfer blocks bank their element dimension: the io-wide
-    // sweeps store io consecutive elements per cycle. The butterfly
-    // scratch keeps one bank per lane -- radix taps conflict under any
-    // static banking, and the lanes absorb the II they cost.
+    // sweeps store io consecutive elements per cycle. The butterfly scratch
+    // keeps one bank per lane. Its taps sit a stride apart, and that stride
+    // is a power of the radix at every stage but the last, so a cyclic
+    // factor separating one stage's taps collapses another stage's onto one
+    // bank and a block factor separates only the first stage. No static
+    // banking of a shared line buffer serves every stage; the lanes absorb
+    // the II instead.
     PlanePair srcBlock = allocBlock(io);
     PlanePair dstBlock = allocBlock(io);
     SmallVector<PlanePair> scratch;
@@ -657,10 +657,10 @@ private:
     rewriter.setInsertionPointToStart(blockLoop.getBody());
     Value blockIV = blockLoop.getInductionVar();
 
-    emitTransfer(rewriter, loc, ctx, /*toLocal=*/true, rank, dim, length,
-                 lanes, io, blockIV, in, srcBlock);
-    emitStockham(rewriter, loc, ctx, length, lanes, srcBlock, scratch,
-                 dstBlock, cosBuf, sinBuf, inverse, scale, stageGroup);
+    emitTransfer(rewriter, loc, ctx, /*toLocal=*/true, rank, dim, length, lanes,
+                 io, blockIV, in, srcBlock);
+    emitStockham(rewriter, loc, ctx, length, lanes, srcBlock, scratch, dstBlock,
+                 cosBuf, sinBuf, inverse, scale, stageGroup);
     emitTransfer(rewriter, loc, ctx, /*toLocal=*/false, rank, dim, length,
                  lanes, io, blockIV, out, dstBlock);
   }
@@ -670,14 +670,13 @@ private:
   /// The inverse transform reuses the forward path through the conjugate
   /// identity ifft(x) = conj(fft(conj(x))) / n, so only one chirp table and
   /// one kernel spectrum are needed per size.
-  static void emitBluestein(PatternRewriter &rewriter, Location loc,
-                            MLIRContext *ctx, ModuleOp module, int64_t length,
-                            int64_t dim, int64_t lines, FloatType elemType,
-                            RankedTensorType tensorType, Value inRe, Value inIm,
-                            Value outBufRe, Value outBufIm, bool inverse,
-                            llvm::function_ref<AffineMap(AffineExpr)>
-                                storageMap,
-                            unsigned stageGroup) {
+  static void
+  emitBluestein(PatternRewriter &rewriter, Location loc, MLIRContext *ctx,
+                ModuleOp module, int64_t length, int64_t dim, int64_t lines,
+                FloatType elemType, RankedTensorType tensorType, Value inRe,
+                Value inIm, Value outBufRe, Value outBufIm, bool inverse,
+                llvm::function_ref<AffineMap(AffineExpr)> storageMap,
+                unsigned stageGroup) {
     auto pDim = getAffineDimExpr(1, ctx);
 
     // Bluestein convolves two length-n sequences, so the circular

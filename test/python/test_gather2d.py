@@ -71,6 +71,20 @@ def test_matches_the_reference(kernel, boundary):
     assert np.abs(got - want).max() < 1e-12
 
 
+@requires_cpu
+@pytest.mark.parametrize("kernel", ["nearest", "linear"])
+@pytest.mark.parametrize("boundary", ["zero", "edge"])
+def test_nonfinite_or_unrepresentable_positions_are_zero(kernel, boundary):
+    data, _, _ = _inputs()
+    rows = np.full(OUT_SHAPE, np.nan)
+    cols = np.full(OUT_SHAPE, np.inf)
+    rows.flat[0] = 1e300
+    cols.flat[0] = -1e300
+    got = _kernel(kernel, boundary,
+                  f"g2d_invalid_{kernel}_{boundary}")(data, rows, cols)
+    np.testing.assert_array_equal(got, np.zeros(OUT_SHAPE, dtype=complex))
+
+
 @requires_hls
 def test_emits_on_hls():
     design = _kernel("linear", "zero", "g2d_hls").compile(backend="hls")

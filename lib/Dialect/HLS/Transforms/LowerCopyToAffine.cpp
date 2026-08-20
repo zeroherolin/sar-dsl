@@ -4,7 +4,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
@@ -23,10 +22,8 @@ using namespace hls;
 
 namespace {
 struct LowerCopy : public OpRewritePattern<memref::CopyOp> {
-  LowerCopy(MLIRContext *context, bool internalCopyOnly = true)
+  LowerCopy(MLIRContext *context, bool internalCopyOnly)
       : OpRewritePattern(context), internalCopyOnly(internalCopyOnly) {}
-
-  using OpRewritePattern<memref::CopyOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(memref::CopyOp copy,
                                 PatternRewriter &rewriter) const override {
@@ -34,7 +31,6 @@ struct LowerCopy : public OpRewritePattern<memref::CopyOp> {
     auto isExternalCopy =
         isExtBuffer(copy.getSource()) || isExtBuffer(copy.getTarget());
 
-    // Return failure if we don't need to lower external copies.
     if (internalCopyOnly && isExternalCopy)
       return failure();
 
@@ -52,8 +48,7 @@ struct LowerCopy : public OpRewritePattern<memref::CopyOp> {
       }
       auto loop = mlir::affine::AffineForOp::create(rewriter, loc, 0, dimSize);
       setParallelAttr(loop);
-      // If the copy op is not external, we consider the loop as point loop
-      // that needs to be optimized later.
+      // An internal copy becomes a point loop, which later passes tile.
       if (!isExternalCopy)
         setPointAttr(loop);
       rewriter.setInsertionPointToStart(loop.getBody());
@@ -71,7 +66,7 @@ struct LowerCopy : public OpRewritePattern<memref::CopyOp> {
   }
 
 private:
-  bool internalCopyOnly = true;
+  bool internalCopyOnly;
 };
 } // namespace
 
@@ -84,14 +79,11 @@ struct LowerCopyToAffine
   }
 
   void runOnOperation() override {
-    auto module = getOperation();
-    auto context = module.getContext();
-    auto DT = DominanceInfo(module);
-
-    // Lower copy operation.
-    mlir::RewritePatternSet patterns(context);
-    patterns.add<LowerCopy>(context, internalCopyOnly);
-    (void)applyPatternsGreedily(module, std::move(patterns));
+    auto func = getOperation();
+    mlir::RewritePatternSet patterns(func.getContext());
+    patterns.add<LowerCopy>(func.getContext(), internalCopyOnly);
+    if (failed(applyPatternsGreedily(func, std::move(patterns))))
+      signalPassFailure();
   }
 };
 } // namespace

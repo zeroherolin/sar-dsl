@@ -32,7 +32,6 @@ struct RaiseAffineToCopy
     getLoopBands(func.front(), targetBands);
 
     for (auto &band : targetBands) {
-      // Make sure we only have a pair of load and store in the loop body.
       auto &bodyOps = band.back().getBody()->getOperations();
       if (!isPerfectlyNested(band) || bodyOps.size() != 3)
         continue;

@@ -30,7 +30,7 @@ dynamic = ["version"]
 Repository = "https://github.com/zeroherolin/sar-dsl"
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "matplotlib>=3.7"]
 examples = ["matplotlib>=3.7"]
 
 [tool.setuptools]

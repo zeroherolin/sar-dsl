@@ -69,16 +69,16 @@ are AXI master pointers, each on its own bundle:
 
 | Algorithm | ports | external footprint | on-chip |
 |-----------|------:|-----:|--------:|
-| omega-K | 6 | 11.0 MiB | 240.5 KiB |
-| Range-Doppler | 9 | 13.0 MiB | 88.0 KiB |
-| Chirp Scaling | 9 | 11.0 MiB | 104.0 KiB |
-| PFA | 5 | 101.9 MiB | 336.0 KiB |
+| omega-K | 7 | 11.0 MiB | 448.5 KiB |
+| Range-Doppler | 12 | 13.0 MiB | 528.0 KiB |
+| Chirp Scaling | 10 | 11.0 MiB | 532.0 KiB |
+| PFA | 8 | 101.9 MiB | 428.0 KiB |
 
 PFA resamples onto a 2x oversampled polar grid, so its planes are four
 times the size of its arguments and more of them have to stream. Its
 collection axes bake into the design as constants (they are fixed by the
 geometry the kernel was built for), so its ports are the phase-history
-planes, the two images, and its typed scratch arena.
+planes, the two images, and its scratch arenas.
 
 ### On-chip budget sweep
 
@@ -90,15 +90,23 @@ equal steps, and reports ports, external buffer footprint and on-chip usage at e
 feasible point. The caps are hard, so points below the resident-table
 minimum are omitted rather than emitted over budget. The upper bound is
 the full working set, measured by compiling once at device-scale caps;
-past it, raising the caps cannot move anything.
+past it, raising the caps cannot move anything. Chains whose planes are
+oversampled need a larger probe to reach that point, so the probe climbs
+until nothing spills.
 
-At N=1024 the AXI master port count is flat across the entire budget
-ladder (omega-K: 6, RDA/CSA: 9, PFA: 5). The ports are the algorithm's
-I/O plus a fixed set of typed scratch arenas, so raising or lowering the
-budget cannot change them. The on-chip usage is non-monotone:
-the buffer-placement heuristic moves whole planes (each 8 MiB at 1024)
-in a binary on/off decision, so usage can jump up or down at a budget
-boundary. That behavior is a property of the emitter, not a flaw.
+At N=1024 the port count stays within a two-port band over the whole
+ladder: RDA holds 12 and CSA 10 throughout, PFA 8, and omega-K moves
+between 7 and 9. It moves because the budget decides *which* planes spill,
+and the arenas are a coloring of the read/write conflicts among exactly
+those planes -- a budget that keeps one plane resident can remove the
+conflict that split an arena, or introduce one. What the budget cannot do
+is add a port per plane or per pass; that is the invariant, not a fixed
+number.
+
+The on-chip usage is non-monotone: the buffer-placement heuristic moves
+whole planes (each 8 MiB at 1024) in a binary on/off decision, so usage
+can jump up or down at a budget boundary. That behavior is a property of
+the emitter, not a flaw.
 
 ### Vitis HLS synthesis baselines
 
@@ -124,37 +132,42 @@ separately.
 
 Additional synthesis coverage includes AXI4-Stream interfaces, compiled
 `sar.iterate` loops, f32 data paths and RTL co-simulation of the
-copy-elision path. Spilled lifetimes are colored across two fixed scratch
-masters per scalar type so a single arena does not serialize independent
-accesses.
+external-scratch dataflow path. Spilled lifetimes are carved into one
+scratch arena per scalar type that spills, so a design's ports are the
+algorithm's own I/O and nothing the compiler added for itself.
 
-Production-scale c64 AXI designs, measured with the same device, 4 ns
-target, and 80% resource budgets. Latency time is cycles multiplied by the
-estimated clock. The hand-written WKA row is the worst-case latency; Vitis
-reports a range because that design reuses transform and corner-turn
-instances across runtime modes.
+Production-scale c64 AXI designs, measured with the same device and 80%
+resource budgets. Latency time is cycles at the target period, which is what
+the design is constrained to and what a board would clock it at; the
+estimated period is the margin synthesis found, not a second clock rate. The
+hand-written WKA row is the worst-case latency; Vitis reports a range because
+that design reuses transform and corner-turn instances across runtime modes.
 
-| Design | Grid | Clock | Latency cycles | Latency time | csynth |
-|---|---:|---:|---:|---:|---:|
-| WKA, generated | 16384² | 3.187 ns | 13,185,679,397 | 42.023 s | 216.21 s |
-| WKA, hand-written | 16384² | 3.500 ns | 2,033,373,247 | 7.117 s | 201.24 s |
-| RDA, generated | 16384² | 5.840 ns | 42,162,307,154 | 246.228 s | 199.44 s |
-| CSA, generated | 16384² | 5.698 ns | 25,257,394,240 | 143.917 s | 187.00 s |
-| PFA, generated | 8192² | 6.067 ns | 41,145,090,789 | 249.627 s | 168 s |
+| Design | Grid | Target clock | Estimated clock | Latency cycles | Latency time | C-synth time |
+|---|---:|---:|---:|---:|---:|---:|
+| WKA, generated | 16384² | 4.000 ns | 2.920 ns | 9,345,019,968 | 37.380 s | 315 s |
+| WKA, hand-written | 16384² | 4.000 ns | 3.500 ns | 2,033,373,247 | 8.133 s | 201 s |
+| RDA, generated | 16384² | 4.000 ns | 3.187 ns | 6,211,947,741 | 24.848 s | 327 s |
+| CSA, generated | 16384² | 4.000 ns | 3.048 ns | 6,724,960,352 | 26.900 s | 304 s |
+| PFA, generated | 8192² | 4.000 ns | 3.187 ns | 9,807,479,633 | 39.230 s | 181 s |
 
 | Design | BRAM18K | URAM | DSP | FF | LUT |
 |---|---:|---:|---:|---:|---:|
-| WKA, generated | 162 | 296 | 539 | 153,845 | 252,020 |
+| WKA, generated | 800 | 616 | 1,394 | 420,141 | 587,883 |
 | WKA, hand-written | 384 | 296 | 1,135 | 210,325 | 373,962 |
-| RDA, generated | 96 | 260 | 173 | 111,871 | 223,167 |
-| CSA, generated | 64 | 288 | 269 | 111,795 | 217,079 |
-| PFA, generated | 160 | 216 | 391 | 163,127 | 258,089 |
+| RDA, generated | 800 | 772 | 471 | 404,717 | 562,545 |
+| CSA, generated | 768 | 800 | 317 | 376,572 | 544,839 |
+| PFA, generated | 672 | 216 | 394 | 303,030 | 508,243 |
 
-Generated WKA meets 4 ns. RDA, CSA, and PFA fit the resource budgets and
-miss 4 ns; remaining bottlenecks are external-load paths and
-interpolation/gather throughput. These are HLS estimates, not
-place-and-route closure. Generated WKA constraints and provenance are in
-[`results/hls_wka_c64_16384_vitis_2022_2.json`](results/hls_wka_c64_16384_vitis_2022_2.json).
+All four meet 4 ns and the resource budgets. The result comes from explicit
+packed read ports, scratch arenas split where a node would otherwise read and
+write one pointer, reusable equivalent helper engines, and a synthesis-cost
+guard that keeps FFT row replication serial around graphs with multiple
+data-dependent regrids. The Stockham butterfly nests run at II=2 by
+construction -- no static banking of one line buffer separates every stage's
+radix taps -- and the lane parallelism absorbs it. These are HLS estimates, not place-and-route closure.
+Constraints and provenance are in the
+[`machine-readable summary`](results/hls_algorithms_c64_production_vitis_2022_2.json).
 
 ## Throughput
 
@@ -177,9 +190,9 @@ sidelobe reference, not a bound on the complete imaging chain:
 
 | Algorithm | axis | IRW (samples) | PSLR | ISLR | peak error |
 |-----------|------|--------------:|-----:|-----:|:----------:|
-| omega-K | range / azimuth | 2.12 / 2.12 | -38.4 / -38.4 dB | -29.0 / -31.8 dB | (0, 0) |
-| Range-Doppler | range / azimuth | 2.09 / 2.12 | -38.8 / -38.4 dB | -26.5 / -31.8 dB | (0, 0) |
-| Chirp Scaling | range / azimuth | 2.12 / 2.12 | -38.5 / -38.4 dB | -29.0 / -31.8 dB | (0, 0) |
+| omega-K | range / azimuth | 2.06 / 2.06 | -38.4 / -38.4 dB | -29.0 / -31.8 dB | (0, 0) |
+| Range-Doppler | range / azimuth | 2.06 / 2.07 | -38.8 / -38.4 dB | -26.5 / -31.8 dB | (0, 0) |
+| Chirp Scaling | range / azimuth | 2.06 / 2.07 | -38.5 / -38.4 dB | -29.0 / -31.8 dB | (0, 0) |
 
 Far-sidelobe floor: at deep display ranges (-60 dB) the images show
 faint sidelobe arms at ~-50 dB. This floor is the Fresnel ripple of

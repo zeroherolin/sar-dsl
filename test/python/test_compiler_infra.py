@@ -75,6 +75,24 @@ def test_cache_writes_when_lookups_disabled(tmp_path, monkeypatch):
     assert cache.read_text("artifact.txt") == "hello"
 
 
+def test_disabled_cache_still_honours_lru_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("SAR_DSL_CACHE_MAX_SIZE", "4096")
+    monkeypatch.setenv("SAR_DSL_DISABLE_CACHE", "1")
+    entries = []
+    for i in range(3):
+        cache_module._pruned_roots.clear()
+        entry = KernelCache(f"disabled-{i}", "cpu", {})
+        entry.write_text("blob.bin", "x" * 3072)
+        os.utime(entry.dir / cache_module._ACCESS_MARKER,
+                 (1_000_000 + i, 1_000_000 + i))
+        entry._lock.close()
+        entries.append(entry)
+    cache_module._pruned_roots.clear()
+    KernelCache("disabled-trigger", "cpu", {})
+    assert sum(path.is_dir() for path in tmp_path.iterdir()) < len(entries) + 1
+
+
 def test_cache_evicts_least_recently_used(tmp_path, monkeypatch):
     """Entries are dropped oldest-first once the cache exceeds its budget."""
     monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
@@ -174,6 +192,16 @@ def test_cache_fingerprint_tracks_cpu_identity(monkeypatch):
     on_b = cache_module._toolchain_fingerprint()
     assert on_a != on_b
     assert cache_module._cpu_identity()  # non-empty on this platform
+
+
+def test_cache_fingerprint_tracks_openmp_runtime(tmp_path, monkeypatch):
+    omp = tmp_path / "libomp.so"
+    omp.write_bytes(b"one")
+    monkeypatch.setenv("SAR_DSL_OMP_LIB", str(omp))
+    before = cache_module._toolchain_fingerprint()
+    omp.write_bytes(b"different-runtime")
+    after = cache_module._toolchain_fingerprint()
+    assert before != after
 
 
 @requires_cpu

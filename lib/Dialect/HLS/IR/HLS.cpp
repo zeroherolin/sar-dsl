@@ -4,7 +4,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/DialectImplementation.h"
@@ -153,36 +152,6 @@ DispatchOp TaskOp::getDispatchOp() {
 /// Get the terminator yield op.
 YieldOp TaskOp::getYieldOp() {
   return cast<YieldOp>(getBody().front().getTerminator());
-}
-
-bool TaskOp::isLivein(Value value) {
-  auto liveins = Liveness(*this).getLiveIn(&(*this).getBody().front());
-  return liveins.count(value);
-}
-
-SmallVector<Value> TaskOp::getLiveins() {
-  auto liveins = Liveness(*this).getLiveIn(&(*this).getBody().front());
-  // The liveness set iterates by pointer, which varies from run to run;
-  // order by first use inside the body so callers see a stable sequence.
-  SmallVector<Value> ordered;
-  llvm::SmallPtrSet<Value, 16> seen;
-  (*this).getBody().front().walk([&](Operation *op) {
-    for (Value operand : op->getOperands())
-      if (liveins.contains(operand) && seen.insert(operand).second)
-        ordered.push_back(operand);
-  });
-  for (Value livein : liveins)
-    if (!seen.contains(livein))
-      ordered.push_back(livein);
-  return ordered;
-}
-
-SmallVector<Operation *> TaskOp::getLiveinUsers(Value livein) {
-  assert(isLivein(livein) && "invalid livein");
-  auto users = llvm::make_filter_range(livein.getUsers(), [&](Operation *user) {
-    return (*this)->isAncestor(user);
-  });
-  return {users.begin(), users.end()};
 }
 
 //===----------------------------------------------------------------------===//
@@ -534,22 +503,6 @@ iterator_range<Block::args_iterator> NodeOp::getParamArgs() {
   auto range = getODSOperandIndexAndLength(2);
   return {std::next(getBody().args_begin(), range.first),
           std::next(getBody().args_begin(), range.first + range.second)};
-}
-
-bool NodeOp::isLivein(Value value) {
-  return isa<BlockArgument>(value) &&
-         value.getParentRegion() == &(*this).getBody();
-}
-
-SmallVector<Value> NodeOp::getLiveins() {
-  auto args = (*this).getBody().getArguments();
-  return {args.begin(), args.end()};
-}
-
-SmallVector<Operation *> NodeOp::getLiveinUsers(Value livein) {
-  assert(isLivein(livein) && "invalid livein");
-  auto users = livein.getUsers();
-  return {users.begin(), users.end()};
 }
 
 /// Update the signature of the node op recursively.
@@ -1143,7 +1096,7 @@ PartitionLayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 /// example, if the partition factor is [2] and the shape of the array is [16],
 /// the affine map should be (d0) -> (d0 / 8, d0 % 8), where 8 is equal to 16
 /// / 2. However, as the shape information is not known at the time of attribute
-/// construction, we can only encode factor [8] in the attribute instead of the
+/// construction, only factor [8] can be encoded in the attribute rather than
 /// actual factor [2]. This method returns the actual partition factor with the
 /// given array shape.
 SmallVector<int64_t>

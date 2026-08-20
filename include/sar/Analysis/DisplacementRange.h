@@ -32,8 +32,6 @@ struct Interval {
   static Interval point(double v) { return Interval{v, v, true}; }
   static Interval range(double lo, double hi) { return Interval{lo, hi, true}; }
 
-  bool isBounded() const { return bounded; }
-
   /// Union hull, used to merge the arms of a select.
   Interval join(const Interval &other) const;
 
@@ -57,15 +55,11 @@ struct AffineInterval {
   static AffineInterval constant(const Interval &v) {
     return AffineInterval{0.0, v};
   }
-  /// The identity ramp `j` itself: coefficient 1, no offset.
-  static AffineInterval identityRamp() {
-    return AffineInterval{1.0, Interval::point(0.0)};
-  }
   static AffineInterval unbounded() {
     return AffineInterval{0.0, Interval::unbounded()};
   }
 
-  bool isBounded() const { return offset.isBounded(); }
+  bool isBounded() const { return offset.bounded; }
 };
 
 /// Computes a conservative interval on `positions[i, j] - j`, the
@@ -75,11 +69,6 @@ struct AffineInterval {
 /// unrecognized producer, a kernel argument, or a position field that is not
 /// an identity ramp plus a bounded perturbation.
 std::optional<Interval> computeDisplacementRange(Value positions, int64_t dim);
-
-/// The affine-plus-interval form of `positions` along `dim`. Exposed for
-/// testing and diagnostics; `computeDisplacementRange` is the intended entry
-/// point.
-AffineInterval analyzePositions(Value positions, int64_t dim);
 
 } // namespace sar
 } // namespace mlir

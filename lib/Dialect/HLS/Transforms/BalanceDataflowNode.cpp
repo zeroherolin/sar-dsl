@@ -28,6 +28,7 @@ struct InsertCopyNode : public OpRewritePattern<NodeOp> {
     if (!node.getLevel())
       return failure();
 
+    bool changed = false;
     for (auto output : node.getOutputs()) {
       if (isa<BlockArgument>(output) && node.getScheduleOp().isDependenceFree())
         continue;
@@ -58,18 +59,6 @@ struct InsertCopyNode : public OpRewritePattern<NodeOp> {
       // Sort all consumers in a descending order of level difference.
       llvm::sort(worklist, [](auto a, auto b) { return a.first > b.first; });
       auto maxDiff = worklist.front().first;
-
-      // A DRAM buffer could carry the pipeline balancing itself: giving it a
-      // depth and letting each consumer read through a tap implements the
-      // ping-pong in DRAM, saving interfaces and logic. That path is left
-      // unfinished upstream -- ConvertDataflowToFunc drops the taps when it
-      // turns nodes into functions, and the C++ emitter rejects any buffer
-      // with a depth above one -- so balancing always goes through the
-      // explicit buffer chain below, which is correct for on-chip and
-      // external buffers alike.
-      //
-      // Reviving it means preserving the taps across the function conversion
-      // and emitting `buf[depth][...]` with the tap folded into the index.
 
       // Construct a chain of buffers to hold data at each level and
       // construct explicit copies to pass data between different dataflow
@@ -106,12 +95,12 @@ struct InsertCopyNode : public OpRewritePattern<NodeOp> {
           return consumers.count(use.getOwner());
         });
 
-        // Finally, we can update current buffer and current node.
         currentBuf = newBuf;
         currentNode = newNode;
+        changed = true;
       }
     }
-    return success();
+    return success(changed);
   }
 };
 } // namespace
@@ -125,7 +114,8 @@ struct BalanceDataflowNode
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<InsertCopyNode>(context);
-    (void)applyPatternsGreedily(func, std::move(patterns));
+    if (failed(applyPatternsGreedily(func, std::move(patterns))))
+      signalPassFailure();
   }
 };
 } // namespace

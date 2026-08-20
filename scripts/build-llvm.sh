@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLVM_DIR="$ROOT/externals/llvm-project"
-JOBS="${JOBS:-$(nproc)}"
+JOBS="${JOBS:-16}"
 
 if [[ ! -f "$LLVM_DIR/llvm/CMakeLists.txt" ]]; then
   echo "llvm-project submodule missing; run: git submodule update --init externals/llvm-project"

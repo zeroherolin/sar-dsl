@@ -70,7 +70,8 @@ struct ScheduleDataflowNode
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<ALAPScheduleNode>(context, ignoreViolations.getValue());
-    (void)applyPatternsGreedily(func, std::move(patterns));
+    if (failed(applyPatternsGreedily(func, std::move(patterns))))
+      signalPassFailure();
   }
 };
 } // namespace

@@ -68,8 +68,8 @@ forwardStoreToLoad(mlir::affine::AffineReadOpInterface loadOp,
     if (srcAccess != destAccess)
       continue;
 
-    // Here, we cover a special case that the store is the sole operation
-    // insides of an if statement. If this is the case, we set the if statement
+    // A store that is the sole operation inside an `affine.if` is the
+    // special case: the if statement then stands in
     // as start for intervening effect searching.
     Operation *startOp = storeOp;
     if (startOp->getParentRegion() != loadOp->getParentRegion()) {
@@ -170,7 +170,7 @@ static void findUnusedStore(mlir::affine::AffineWriteOpInterface writeA,
     if (srcAccess != destAccess)
       continue;
 
-    // Both operations must lie in the same region. Similarly, we consider a
+    // Both operations must lie in the same region. Likewise a
     // special case that when write A is the sole operation in an if statement,
     // where write B is possible to be unused.
     Operation *targetA = writeA;
@@ -360,7 +360,7 @@ static bool applyAffineStoreForward(func::FuncOp func) {
 
   // Check if the store fwd'ed memrefs are now left with only stores and
   // deallocs and can thus be completely deleted. Note: the canonicalize pass
-  // should be able to do this as well, but we'll do it here since we collected
+  // could do this as well; it happens here because the pass already collected
   // these anyway.
   for (auto memref : memrefsToErase) {
     // If the memref hasn't been locally alloc'ed, skip. (A memref returned

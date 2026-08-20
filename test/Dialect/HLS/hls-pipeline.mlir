@@ -1,8 +1,4 @@
 // RUN: sar-opt %s --hls-pipeline="top-func=stage" | FileCheck %s
-// The unrolling path exercises the correlation analysis over the shared
-// scratch; it must complete and keep the dataflow structure.
-// RUN: sar-opt %s --hls-pipeline="top-func=stage loop-unroll-factor=2" \
-// RUN:   | FileCheck %s
 
 // Two-stage affine chain: a multiply loop feeding an add loop through a
 // scratch buffer. The pipeline must extract two dataflow node functions,

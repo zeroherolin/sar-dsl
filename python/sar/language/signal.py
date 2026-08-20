@@ -15,8 +15,8 @@ import numpy as np
 
 from . import (Tensor, TraceError, _require_tensor, _resolve_axis, _tracing,
                absolute, broadcast, cast, concatenate, conj, constant, exp,
-               expj, f32, fft, ifft, interp1d, log, maximum, op, sin, sqrt,
-               where)
+               expj, f32, fft, ifft, interp1d, log, maximum, minimum, op, sin,
+               sqrt, where)
 from . import sum as _sum
 
 __all__ = [
@@ -210,8 +210,14 @@ def sinc(x):
 
 @op
 def hypot(a, b):
-    """`sqrt(a^2 + b^2)` element-wise (Matlab/numpy `hypot`)."""
-    return sqrt(a * a + b * b)
+    """Overflow/underflow-stable Euclidean norm (Matlab/numpy `hypot`)."""
+    ax, ay = absolute(a), absolute(b)
+    hi, lo = maximum(ax, ay), minimum(ax, ay)
+    safe = where(hi == 0.0, 1.0, hi)
+    ratio = lo / safe
+    scaled = hi * sqrt(1.0 + ratio * ratio)
+    nonfinite_probe = hi * 0.0
+    return where(nonfinite_probe != nonfinite_probe, hi, scaled)
 
 
 @op
@@ -267,7 +273,41 @@ def stolt_interp(data: Tensor,
         raise TraceError(
             f"stolt_interp axis lengths {fa.shape}/{fr.shape} do not "
             f"match data shape {data.shape}")
-    df = float(fr[1] - fr[0])
+    if fa.size < 2 or fr.size < 2:
+        raise TraceError("stolt_interp frequency axes need at least 2 samples")
+    if not np.isfinite(fa).all() or not np.isfinite(fr).all():
+        raise TraceError("stolt_interp frequency axes must be finite")
+
+    def uniform_step(name, values):
+        diffs = np.diff(values)
+        step = float(diffs[0])
+        tolerance = max(
+            abs(step) * 1e-10,
+            np.finfo(np.float64).eps * max(1.0, float(np.abs(values).max())) *
+            8)
+        if (step == 0.0 or not np.all(np.signbit(diffs) == np.signbit(step))
+                or not np.allclose(diffs, step, rtol=1e-10, atol=tolerance)):
+            raise TraceError(
+                f"stolt_interp {name} axis must be strictly monotonic and "
+                "uniformly spaced")
+        return step
+
+    uniform_step("fa", fa)
+    df = uniform_step("fr", fr)
+    scalars = {"c": c, "fc": fc, "vr": vr, "t_shift": t_shift}
+    try:
+        scalars = {name: float(value) for name, value in scalars.items()}
+    except (TypeError, ValueError):
+        raise TraceError("stolt_interp scalar parameters must be finite "
+                         "numbers") from None
+    if not all(np.isfinite(value) for value in scalars.values()):
+        raise TraceError("stolt_interp scalar parameters must be finite")
+    c, fc, vr, t_shift = (scalars[name]
+                          for name in ("c", "fc", "vr", "t_shift"))
+    if c <= 0.0:
+        raise TraceError("stolt_interp c must be positive")
+    if vr == 0.0:
+        raise TraceError("stolt_interp vr must be nonzero")
 
     shape = data.shape
     fa2 = broadcast(constant(fa), shape, dim=0)

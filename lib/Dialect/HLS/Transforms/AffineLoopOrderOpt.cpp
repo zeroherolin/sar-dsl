@@ -18,7 +18,7 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-#define DEBUG_TYPE "hls"
+#define DEBUG_TYPE "hls-affine-loop-order-opt"
 
 using namespace mlir;
 using namespace mlir::affine;

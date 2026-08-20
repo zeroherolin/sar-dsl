@@ -203,7 +203,7 @@ bool sar::applyLoopTiling(AffineLoopBand &band, FactorList tileList,
   if (!isPerfectlyNested(band))
     return false;
 
-  // If all tile sizes are one, we don't need to do anything but annotating all
+  // All-ones tiling changes nothing but the annotation on
   // loops as point loop.
   if (llvm::all_of(tileList, [](unsigned size) { return size == 1; })) {
     for (auto loop : band)

@@ -294,6 +294,50 @@ def test_where_rejects_integer_branches():
         k.to_mlir()
 
 
+def test_integer_division_rejects_fractional_and_zero_scalars():
+
+    @sar.func
+    def valid(x: sar.i32[4]) -> sar.i32[4]:
+        return x / 2
+
+    assert '"sar.div"' in valid.to_mlir()
+
+    @sar.func
+    def fractional(x: sar.i32[4]) -> sar.i32[4]:
+        return x / 2.5
+
+    with pytest.raises(TraceError, match="integer scalar"):
+        fractional.to_mlir()
+
+    @sar.func
+    def zero(x: sar.i32[4]) -> sar.i32[4]:
+        return x / 0
+
+    with pytest.raises(TraceError, match="nonzero"):
+        zero.to_mlir()
+
+
+@pytest.mark.parametrize("axis", [True, 1.5, "1"])
+def test_axis_must_be_an_integer(axis):
+
+    @sar.func
+    def kernel(x: sar.f32[4, 4]) -> sar.f32[4]:
+        return sar.sum(x, axis=axis)
+
+    with pytest.raises(TraceError, match="must be an integer"):
+        kernel.to_mlir()
+
+
+def test_argmax_rejects_rank2_axis_out_of_range():
+
+    @sar.func
+    def kernel(x: sar.f32[4, 4]) -> sar.i64[4]:
+        return sar.argmax(x, axis=2)
+
+    with pytest.raises(TraceError, match="out of range for rank 2"):
+        kernel.to_mlir()
+
+
 def test_unresolvable_annotation_reports_kernel_and_text():
     """A string annotation that fails to evaluate must name the kernel
     and the annotation, not surface as a bare NameError."""

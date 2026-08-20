@@ -61,11 +61,13 @@ like MATLAB, `axis` like NumPy) -- passing both is an error.
 - **`var` / `std` match NumPy, not MATLAB**: they normalize by `N`, not
   `N-1`.
 
-## Compiled loops
+## Loops unroll unless you ask otherwise
 
-A Python `for` unrolls at trace time. Use `sar.iterate(n, body, *carries)`
-when the loop must remain one loop in the design. With `index=True` the
-body can drive `dynamic_slice` / `dynamic_update_slice`.
+A MATLAB `for` runs at execution time; a Python `for` in a kernel runs at
+*trace* time, so it is unrolled into the graph. That is usually what you
+want for a handful of stages, and never what you want for thousands. Use
+`sar.iterate(n, body, *carries)` to keep one loop in the compiled design
+([python-api.md](python-api.md#compiled-loops)).
 
 ## No in-place edits; masking replaces logical indexing
 

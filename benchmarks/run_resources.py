@@ -28,15 +28,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from algorithms import ALL, LABELS, load  # noqa: E402
-from hls_reports import parse_csynth_xml, validate_constraints  # noqa: E402
+from hls_reports import parse_csynth_bundle, validate_constraints  # noqa: E402
 from provenance import environment  # noqa: E402
 
 from sar.backends.hls.config import HLSConfig, HLSConfigError  # noqa: E402
 
 _ELEMENT_BYTES = {"float": 4, "double": 8}
+_TYPE = r"(?:float|double|hls::vector<(?:float|double),\s*\d+>)"
 
 ASSETS = Path(__file__).resolve().parent / "assets"
 _DEFAULT_LUTRAM_BYTES = HLSConfig.resolve().lutram_bytes
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
 
 
 def _top_signature(source: str, top: str) -> str:
@@ -46,20 +54,72 @@ def _top_signature(source: str, top: str) -> str:
     return match.group(1)
 
 
-def _array_declarations(signature: str) -> list[tuple[str, str, int]]:
+def _type_bytes(type_name: str) -> int:
+    if type_name in _ELEMENT_BYTES:
+        return _ELEMENT_BYTES[type_name]
+    match = re.fullmatch(r"hls::vector<(float|double),\s*(\d+)>", type_name)
+    if not match:
+        raise ValueError(f"unsupported HLS element type: {type_name!r}")
+    return _ELEMENT_BYTES[match.group(1)] * int(match.group(2))
+
+
+def _parameters(signature: str) -> list[str]:
+    """Splits a C++ parameter list without splitting template arguments."""
+    parameters = []
+    start = 0
+    angle_depth = 0
+    for index, char in enumerate(signature):
+        if char == "<":
+            angle_depth += 1
+        elif char == ">":
+            angle_depth -= 1
+        elif char == "," and angle_depth == 0:
+            parameters.append(signature[start:index])
+            start = index + 1
+    parameters.append(signature[start:])
+    return parameters
+
+
+def _array_declarations(signature: str) -> list[tuple[str, str, int, int]]:
     arrays = []
-    for line in signature.split(","):
+    for line in _parameters(signature):
         if not line.strip():
             continue
-        decl = re.fullmatch(r"\s*(float|double)\s+(\w+)((?:\[\d+\])+)\s*",
-                            line)
+        decl = re.fullmatch(rf"\s*({_TYPE})\s+(\w+)((?:\[\d+\])+)\s*", line)
         if not decl:
             raise ValueError(f"cannot parse top-level declaration: {line!r}")
         elements = 1
         for dim in re.findall(r"\[(\d+)\]", decl.group(3)):
             elements *= int(dim)
-        arrays.append((decl.group(1), decl.group(2), elements))
+        arrays.append((decl.group(1), decl.group(2), elements,
+                       _type_bytes(decl.group(1))))
     return arrays
+
+
+def _on_chip_storage(source: str) -> tuple[int, int]:
+    """Logical mutable storage and constant ROM bytes in emitted C++."""
+    mutable = 0
+    constant = 0
+    declarations = re.finditer(
+        rf"^(?P<indent>\s*)(?P<qual>(?:(?:static|const|constexpr)\s+)*)"
+        rf"(?P<type>{_TYPE})\s+\w+"
+        rf"(?P<dims>(?:\[\d+\])+)\s*(?:=|;)", source, re.M)
+    for declaration in declarations:
+        elements = 1
+        for dim in re.findall(r"\[(\d+)\]", declaration.group("dims")):
+            elements *= int(dim)
+        size = elements * _type_bytes(declaration.group("type"))
+        qualifiers = declaration.group("qual").split()
+        if "const" in qualifiers or "constexpr" in qualifiers:
+            constant += size
+        else:
+            mutable += size
+
+    for table in re.finditer(
+            r"^static constexpr LinearTable<(float|double),\s*(\d+)>\s+\w+\(",
+            source, re.M):
+        constant += _ELEMENT_BYTES[table.group(1)] * int(table.group(2))
+    return mutable, constant
 
 
 def measure(source: str, top: str) -> dict:
@@ -67,16 +127,10 @@ def measure(source: str, top: str) -> dict:
     signature = _top_signature(source, top)
 
     external_bytes = 0
-    for dtype, _, elements in _array_declarations(signature):
-        external_bytes += elements * _ELEMENT_BYTES[dtype]
+    for _, _, elements, element_bytes in _array_declarations(signature):
+        external_bytes += elements * element_bytes
 
-    on_chip_bytes = 0
-    for decl in re.finditer(r"^\s+(float|double) \w+((?:\[\d+\])+);", source,
-                            re.M):
-        elements = 1
-        for dim in re.findall(r"\[(\d+)\]", decl.group(2)):
-            elements *= int(dim)
-        on_chip_bytes += elements * _ELEMENT_BYTES[decl.group(1)]
+    mutable_bytes, constant_bytes = _on_chip_storage(source)
 
     # Every port takes its own bundle (shared ones serialize their bus
     # requests); a design that broke the invariant would misreport here.
@@ -89,7 +143,9 @@ def measure(source: str, top: str) -> dict:
     return {
         "ports": ports,
         "external_footprint_mib": external_bytes / 2**20,
-        "on_chip_kib": on_chip_bytes / 2**10,
+        "on_chip_kib": (mutable_bytes + constant_bytes) / 2**10,
+        "mutable_on_chip_kib": mutable_bytes / 2**10,
+        "constant_rom_kib": constant_bytes / 2**10,
         "dataflow": source.count("#pragma HLS dataflow"),
         "lines": source.count("\n"),
     }
@@ -106,31 +162,40 @@ def _tier_caps(budget: int) -> dict:
     }
 
 
+#: Caps to probe for the fully-resident build, smallest first. A chain
+#: whose planes are oversampled needs far more than the others -- PFA at
+#: N=1024 works on a 2x grid in both axes -- so the probe climbs rather
+#: than assuming one number covers every chain.
+_RESIDENT_PROBE_BYTES = (1 << 30, (1 << 33) - 2)
+
+
 def working_set_bytes(name: str, size: int) -> int:
     """Full working set of a chain, measured rather than assumed.
 
-    Compiled with device-scale caps nothing at these sizes can exhaust,
-    every buffer stays resident; the emitted arrays plus the I/O ports
-    then add up to the footprint the design would need to hold
-    everything internally. This is the upper bound of the budget sweep
-    -- past it, raising the caps cannot move anything.
+    Compiled with caps large enough that nothing spills, every buffer
+    stays resident; the emitted arrays plus the I/O ports then add up to
+    the footprint the design would need to hold everything internally.
+    This is the upper bound of the budget sweep -- past it, raising the
+    caps cannot move anything.
     """
     chain = load(name, size)
-    design = chain.compile_kernel(backend="hls",
-                                  interface="axi",
-                                  **_tier_caps(1 << 30))
-    source = design.source()
-    declarations = _array_declarations(_top_signature(source, design.name))
     io_ports = sum(2 if tensor.dtype.is_complex else 1
                    for tensor in chain.kernel.arg_types +
                    chain.kernel.declared_result_types)
-    if any(elements > 1 for _, _, elements in declarations[io_ports:]):
-        raise RuntimeError(
-            f"{name} at N={size} still spills with device-scale caps; "
-            "cannot establish the full working set")
-    stats = measure(source, design.name)
-    return int(stats["on_chip_kib"] * 2**10 +
-               stats["external_footprint_mib"] * 2**20)
+    for probe in _RESIDENT_PROBE_BYTES:
+        design = chain.compile_kernel(backend="hls",
+                                      interface="axi",
+                                      **_tier_caps(probe))
+        source = design.source()
+        declarations = _array_declarations(_top_signature(source, design.name))
+        if all(elements == 1 for _, _, elements, _ in declarations[io_ports:]):
+            stats = measure(source, design.name)
+            return int(stats["on_chip_kib"] * 2**10 +
+                       stats["external_footprint_mib"] * 2**20)
+    raise RuntimeError(
+        f"{name} at N={size} still spills at "
+        f"{_RESIDENT_PROBE_BYTES[-1] >> 30} GiB of tier caps; cannot "
+        "establish the full working set")
 
 
 def sweep(names, size: int, steps: int) -> list:
@@ -216,18 +281,21 @@ def budget_figure(results: list, size: int, out_dir=None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--algs", nargs="+", default=list(ALL), choices=ALL)
-    parser.add_argument("--sizes", nargs="+", type=int, default=[512, 4096])
+    parser.add_argument("--sizes",
+                        nargs="+",
+                        type=_positive_int,
+                        default=[512, 4096])
     parser.add_argument("--budgets",
                         nargs="+",
-                        type=int,
+                        type=_positive_int,
                         default=[4 * 1024 * 1024],
                         help="on-chip budgets, in bytes")
     parser.add_argument("--budget-sweep",
                         action="store_true",
                         help="sweep the on-chip budget from 0 to the full "
                         "working set and write budget_sweep.png")
-    parser.add_argument("--sweep-size", type=int, default=512)
-    parser.add_argument("--sweep-steps", type=int, default=8)
+    parser.add_argument("--sweep-size", type=_positive_int, default=512)
+    parser.add_argument("--sweep-steps", type=_positive_int, default=8)
     parser.add_argument("--no-figure", action="store_true")
     parser.add_argument("--reports",
                         nargs="+",
@@ -240,17 +308,27 @@ def main() -> None:
         reports = []
         failed = False
         for path in args.reports:
-            report = parse_csynth_xml(path)
+            bundle = parse_csynth_bundle(path)
+            report = bundle["top"]
             violations = validate_constraints(report, config)
             report["violations"] = violations
-            reports.append(report)
+            reports.append(bundle)
             failed |= bool(violations)
             status = "PASS" if not violations else "FAIL"
             top = report["top"]
+            target = report["target_clock_ns"]
             clock = report["estimated_clock_ns"]
             latency = report["latency_cycles"]
-            print(f"{top:<14} {clock:>7.3f} ns "
-                  f"{latency:>12} cycles {status}")
+            # Wall-clock latency is quoted at the target period: that is the
+            # constraint the design closed against and the rate a board
+            # clocks it at. The estimated period is timing margin, and
+            # dividing by it instead would credit a design for slack the
+            # deployed clock never converts into throughput. Both are shown
+            # so the margin is visible next to the rate it does not set.
+            seconds = latency * target * 1e-9
+            print(f"{top:<14} target {target:>6.3f} ns "
+                  f"est {clock:>6.3f} ns "
+                  f"{latency:>12} cycles {seconds:>9.3f} s {status}")
             for violation in violations:
                 print(f"  {violation}", file=sys.stderr)
         if args.json:
@@ -259,6 +337,7 @@ def main() -> None:
                     {
                         "environment": environment(),
                         "benchmark": "vitis_csynth",
+                        "command": [sys.executable, *sys.argv],
                         "reports": reports,
                     },
                     indent=2) + "\n")
@@ -287,6 +366,7 @@ def main() -> None:
                     {
                         "environment": environment(),
                         "benchmark": "hls_budget_sweep",
+                        "command": [sys.executable, *sys.argv],
                         "results": results,
                     },
                     indent=2) + "\n")
@@ -317,6 +397,7 @@ def main() -> None:
                 {
                     "environment": environment(),
                     "benchmark": "hls_resources",
+                    "command": [sys.executable, *sys.argv],
                     "results": results,
                 },
                 indent=2) + "\n")

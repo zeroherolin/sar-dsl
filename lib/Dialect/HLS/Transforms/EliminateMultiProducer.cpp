@@ -165,7 +165,7 @@ struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
             }
           }
 
-        // Otherwise, we need to create explicit data copy from the original
+        // Otherwise an explicit copy is created from the original
         // buffer to new buffer if the new buffer is ever read.
         if (!readUses.empty())
           memref::CopyOp::create(rewriter, loc, bufferArg, newBufferArg);
@@ -224,7 +224,8 @@ struct EliminateMultiProducer
     mlir::RewritePatternSet patterns(context);
     patterns.add<BufferMultiProducer>(context);
     patterns.add<MergeMultiProducer>(context);
-    (void)applyPatternsGreedily(func, std::move(patterns));
+    if (failed(applyPatternsGreedily(func, std::move(patterns))))
+      signalPassFailure();
   }
 };
 } // namespace

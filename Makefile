@@ -2,7 +2,7 @@
 
 BUILD_DIR ?= build
 ARTIFACT_DIR ?= $(BUILD_DIR)/artifacts
-JOBS ?= $(shell nproc)
+JOBS ?= 16
 
 .PHONY: all llvm build test test-lit test-python examples bench clean
 
@@ -25,7 +25,7 @@ test-lit:                 ## MLIR FileCheck tests
 	ninja -C "$(BUILD_DIR)" check-sar-lit
 
 test-python:              ## Python frontend + backend tests
-	PYTHONPATH=python python3 -m pytest test/python -q
+	PYTHONPATH=python:examples python3 -m pytest test/python -q
 
 examples:                 ## Focus every synthetic example end-to-end
 	cmake -E make_directory "$(ARTIFACT_DIR)/examples"

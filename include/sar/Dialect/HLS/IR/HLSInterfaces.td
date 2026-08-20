@@ -46,13 +46,6 @@ def StageLikeInterface : OpInterface<"StageLikeInterface"> {
           return WalkResult::advance();
         }).wasInterrupted();
       }]>,
-    InterfaceMethod<"Returns whether the value is a stage live-in",
-                    "bool", "isLivein", (ins "mlir::Value":$value)>,
-    InterfaceMethod<"Returns the live-ins of the stage",
-                    "llvm::SmallVector<mlir::Value>", "getLiveins">,
-    InterfaceMethod<"Returns the internal users of a stage live-in",
-                    "llvm::SmallVector<mlir::Operation *>", "getLiveinUsers",
-                    (ins "mlir::Value":$livein)>,
   ];
 }
 

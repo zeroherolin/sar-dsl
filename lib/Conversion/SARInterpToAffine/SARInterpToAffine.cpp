@@ -114,6 +114,23 @@ static Value emitFloorI64(ScalarBuilder &s, Value posF64) {
   return arith::SelectOp::create(b, loc, hasNegFrac, truncMinusOne, truncI);
 }
 
+/// Replaces values that cannot be converted to i64 without poison. Invalid
+/// positions have a defined zero result on every backend.
+static std::pair<Value, Value> sanitizePosition(ScalarBuilder &s,
+                                                Value position) {
+  OpBuilder &b = s.b;
+  Location loc = s.loc;
+  Value finite = math::IsFiniteOp::create(b, loc, position);
+  Value above = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OGT,
+                                      position, s.cst(-0x1p62));
+  Value below = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OLT,
+                                      position, s.cst(0x1p62));
+  Value valid = arith::AndIOp::create(
+      b, loc, finite, arith::AndIOp::create(b, loc, above, below));
+  Value safe = arith::SelectOp::create(b, loc, valid, position, s.cst(0.0));
+  return {safe, valid};
+}
+
 /// Emits the window taper at t = d / (taps/2) for the sinc kernel.
 /// Kaiser uses an unrolled power series for I0 (straight-line, no loops):
 /// with u = (beta^2 / 4) (1 - t^2), I0 = sum_m u^m / (m!)^2.
@@ -159,6 +176,8 @@ static std::pair<Value, Value> emitInterpGather(ScalarBuilder &s,
                                                 SourceLoader loadAt) {
   OpBuilder &b = s.b;
   Location loc = s.loc;
+  auto [safePosition, validPosition] = sanitizePosition(s, posF64);
+  posF64 = safePosition;
 
   // Tap range relative to floor(position), and the rounding base:
   // nearest uses floor(position + 0.5) with a single tap.
@@ -271,6 +290,8 @@ static std::pair<Value, Value> emitInterpGather(ScalarBuilder &s,
     accRe = s.add(accRe, s.mul(vRe, weight));
     accIm = s.add(accIm, s.mul(vIm, weight));
   }
+  accRe = arith::SelectOp::create(b, loc, validPosition, accRe, zero);
+  accIm = arith::SelectOp::create(b, loc, validPosition, accIm, zero);
   return {accRe, accIm};
 }
 
@@ -938,7 +959,8 @@ struct ConvertSARInterpToAffinePass
       RewritePatternSet banded(context);
       banded.add<Gather2DSplitBandedLowering>(context, enableBandedGather,
                                               bandedProfitThreshold);
-      (void)applyPatternsGreedily(getOperation(), std::move(banded));
+      if (failed(applyPatternsGreedily(getOperation(), std::move(banded))))
+        return signalPassFailure();
     }
 
     ConversionTarget target(*context);

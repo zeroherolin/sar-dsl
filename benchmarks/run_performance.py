@@ -48,6 +48,13 @@ _SLOW_POINT_S = 120.0
 ASSETS = Path(__file__).resolve().parent / "assets"
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
+
+
 def _timed(fn, repeats: int):
     """Returns (best, mean, samples) for back-to-back calls."""
     times = []
@@ -129,8 +136,11 @@ def throughput_figure(results: list, out_dir=None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--algs", nargs="+", choices=ALL, default=list(ALL))
-    parser.add_argument("--sizes", type=int, nargs="+", default=_DEFAULT_SIZES)
-    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--sizes",
+                        type=_positive_int,
+                        nargs="+",
+                        default=_DEFAULT_SIZES)
+    parser.add_argument("--repeats", type=_positive_int, default=5)
     parser.add_argument("--numpy",
                         action="store_true",
                         help="also time the NumPy reference implementation")

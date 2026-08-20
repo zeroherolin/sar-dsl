@@ -23,28 +23,6 @@ using namespace mlir;
 using namespace sar;
 using namespace hls;
 
-namespace {
-struct SplitElementwiseGenericOp : public OpRewritePattern<linalg::GenericOp> {
-  using OpRewritePattern<linalg::GenericOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(linalg::GenericOp op,
-                                PatternRewriter &rewriter) const override {
-    if (isElementwiseGenericOp(op) && op.getNumDpsInputs() == 1 &&
-        op.getNumDpsInits() == 1) {
-      auto &input = op->getOpOperand(0);
-      auto &output = op->getOpOperand(1);
-      if (input.get() == output.get())
-        return failure();
-
-      memref::CopyOp::create(rewriter, op.getLoc(), input.get(), output.get());
-      input.set(output.get());
-      return success();
-    }
-    return failure();
-  }
-};
-} // namespace
-
 static void findBufferUsers(Value memref, SmallVector<Operation *> &users) {
   for (auto user : memref.getUsers()) {
     if (auto viewOp = dyn_cast<ViewLikeOpInterface>(user))
@@ -172,7 +150,7 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
       return success();
     }
 
-    // Similarly, we need the same conditions to replace the source buffer.
+    // Replacing the source buffer needs the same conditions.
     // One more screen first: when the target is a top-function port,
     // replacing a source that several operations write would hand the
     // port several writing processes -- exactly the multi-writer port
@@ -192,7 +170,7 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
           return domInfo.dominates(targetView, user);
         }))) {
       // If the source buffer has initial value, the value must be pertained
-      // by the target buffer after the replacement. Therefore, we have some
+      // by the target buffer after the replacement, so there are some
       // additional conditions here to check.
       if (sourceBuf.getInitValue()) {
         if (!targetBuf || (targetBuf.getInitValue() && targetBuf != targetView))
@@ -217,9 +195,9 @@ struct SimplifyCopy : public sar::impl::SimplifyCopyBase<SimplifyCopy> {
     auto context = func.getContext();
 
     mlir::RewritePatternSet patterns(context);
-    patterns.add<SplitElementwiseGenericOp>(context);
     patterns.add<SimplifyBufferCopy>(context);
-    (void)applyPatternsGreedily(func, std::move(patterns));
+    if (failed(applyPatternsGreedily(func, std::move(patterns))))
+      signalPassFailure();
   }
 };
 } // namespace

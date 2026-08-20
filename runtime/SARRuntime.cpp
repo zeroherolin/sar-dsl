@@ -620,6 +620,10 @@ inline std::complex<double> sampleInterp(const std::complex<double> *row,
                                          int64_t kernel, int64_t taps,
                                          int64_t window, double beta,
                                          double invI0Beta, int64_t boundary) {
+  constexpr double safeIndexLimit = 0x1p62;
+  if (!std::isfinite(position) || position <= -safeIndexLimit ||
+      position >= safeIndexLimit)
+    return {0.0, 0.0};
   if (kernel == kNearest) {
     int64_t idx = static_cast<int64_t>(std::floor(position + 0.5));
     idx = applyBoundary(idx, cols, boundary);

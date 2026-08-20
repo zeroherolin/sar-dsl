@@ -74,8 +74,9 @@ python examples/wka/run_alos_hls.py   # emit the artifacts at that geometry
 The runner reports wall time and urban-area contrast
 (`benchmarks/metrics.py:urban_contrast`, higher is sharper). The
 effective radar velocity in `ALOS_PARAMS` is autofocus-calibrated by
-image-contrast maximization over the urban area. Real-data output is not
-tracked because the source product is not redistributed.
+image-contrast maximization over the urban area. The focused image is
+committed as `assets/san_francisco_wka.png`; the raw product it is made from
+is not redistributed here.
 
 `run_alos_hls.py` writes a production AXI design and a reduced
 C-simulation package under `hls_project/wka_alos/`:

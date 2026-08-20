@@ -21,8 +21,8 @@
 
 // CHECK:      void named_s00(
 // CHECK:        = (int64_t)
-// CHECK:        for (int i0 = 0
-// CHECK:          for (int i1 = 0
+// CHECK:        for (int64_t i0 = 0
+// CHECK:          for (int64_t i1 = 0
 
 // No line-number comments pointing into an MLIR file the reader never sees.
 // CHECK-NOT:  // L{{[0-9]}}

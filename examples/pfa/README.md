@@ -24,18 +24,18 @@ two pieces that go beyond straight op chaining:
 ## Why there is no ALOS runner
 
 The stripmap examples ([wka](../wka/), [rda](../rda/), [csa](../csa/)) each
-carry `run_alos_cpu.py` and `run_alos_hls.py`; PFA carries neither, and
-that is a property of the algorithm, not a gap.
+carry `run_alos_cpu.py` and `run_alos_hls.py`; PFA carries neither,
+because ALOS-1 is a stripmap sensor.
 
 PFA assumes a **spotlight** collection: the antenna stares at one fixed
 scene center, so every pulse samples the 2-D wavenumber support of the
 *same* patch along a radial arc, and the collection is a polar sector
 that two 1-D interpolations reformat onto a rectangular grid. The ALOS-1
-PALSAR product here is Fine Beam Single stripmap -- a continuous 16.4 s
-strip of 35344 pulses (`data/.../workreport`) with the beam fixed
-relative to the platform, so each pulse illuminates a different patch.
-There is no common scene center for the strip and therefore no polar
-sector to reformat.
+PALSAR product here is a Fine Beam Single stripmap acquisition -- a
+continuous strip of 35344 pulses (`Pdi_NoOfLines` in the product's
+`workreport`) with the beam fixed relative to the platform, so each pulse
+illuminates a different patch. There is no common scene center for the
+strip and therefore no polar sector to reformat.
 
 Running PFA on it would first require cutting the strip into
 sub-apertures short enough for the beam to count as staring and
@@ -81,6 +81,10 @@ mainlobe broadening -- the property no amplitude window has. At
 uniform: range PSLR  -13.3 dB, IRW 0.90 cells
     SVA: range PSLR  -23.3 dB, IRW 0.89 cells
 ```
+
+The IRW is in resolution cells, which on PFA's 2x oversampled output grid
+are two samples each -- the same width the sample-based tables in
+[examples/README.md](../README.md) report as 1.80.
 
 ![uniform vs SVA impulse response](../../benchmarks/assets/sva_response.png)
 

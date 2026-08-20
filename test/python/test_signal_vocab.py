@@ -76,6 +76,17 @@ def test_sinc_and_hypot():
     np.testing.assert_allclose(h, np.hypot(a, b), rtol=1e-12)
 
 
+def test_hypot_preserves_extreme_dynamic_range():
+    a = np.array([1e308, 1e-308, np.inf], dtype=np.float64)
+    b = np.array([1e308, 1e-308, np.inf], dtype=np.float64)
+
+    @sar.func
+    def kernel(a, b):
+        return sar.hypot(a, b)
+
+    np.testing.assert_allclose(kernel(a, b), np.hypot(a, b), rtol=1e-12)
+
+
 def test_mean():
     x = RNG.standard_normal((N, M))
 

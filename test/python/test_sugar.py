@@ -141,6 +141,16 @@ def test_numeric_vocabulary_matches_numpy():
     np.testing.assert_allclose(got_round, want_round, atol=0)
 
 
+def test_sign_propagates_nan():
+    values = np.array([np.nan, -0.0, 0.0, -2.0, 3.0])
+
+    @sar.func
+    def kernel(x):
+        return sar.sign(x)
+
+    np.testing.assert_allclose(kernel(values), np.sign(values), equal_nan=True)
+
+
 def test_fft_norm_conventions():
     """fft/ifft norm= matches numpy for all three conventions."""
     z = _complex(N, M)

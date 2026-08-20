@@ -154,13 +154,13 @@ struct MulIRaisePattern : public OpRewritePattern<arith::MulIOp> {
 };
 } // namespace
 
-bool sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
+LogicalResult sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
   auto context = func.getContext();
 
   // HLS preprocessing requires a single-block function.
   if (!llvm::hasSingleElement(func)) {
     func.emitError("requires a single basic block");
-    return false;
+    return failure();
   }
 
   // Set top function attribute.
@@ -184,19 +184,7 @@ bool sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
   patterns.add<AllocaDemotePattern>(context);
   sar::populateBufferConversionPatterns(patterns);
   vector::populateVectorTransferLoweringPatterns(patterns);
-  (void)applyPatternsGreedily(func, std::move(patterns));
-
-  // Report whether scf or memref ops remain. Not a hard failure: the pass
-  // runs again mid-pipeline where views and copies legitimately still
-  // exist, and the emitter is the authoritative rejector of anything that
-  // survives to the end.
-  return !func.walk([&](Operation *op) {
-                if (isa<scf::SCFDialect, memref::MemRefDialect>(
-                        op->getDialect()))
-                  return WalkResult::interrupt();
-                return WalkResult::advance();
-              })
-              .wasInterrupted();
+  return applyPatternsGreedily(func, std::move(patterns));
 }
 
 namespace {
@@ -207,13 +195,8 @@ struct FuncPreprocess : public sar::impl::FuncPreprocessBase<FuncPreprocess> {
   void runOnOperation() override {
     auto func = getOperation();
     auto isTop = func.getName() == topFunc;
-    // The residue report is advisory (see applyFuncPreprocess); only a
-    // malformed function is a failure.
-    if (!llvm::hasSingleElement(func)) {
-      applyFuncPreprocess(func, isTop);
-      return signalPassFailure();
-    }
-    (void)applyFuncPreprocess(func, isTop);
+    if (failed(applyFuncPreprocess(func, isTop)))
+      signalPassFailure();
   }
 };
 } // namespace

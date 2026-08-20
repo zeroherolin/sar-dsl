@@ -10,11 +10,9 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -49,18 +47,19 @@ public:
             affine::AffineYieldOp,
 
             // Vector statements.
-            vector::InsertOp, vector::ExtractOp, vector::TransferReadOp,
-            vector::TransferWriteOp, vector::BroadcastOp,
+            vector::InsertOp, vector::ExtractOp, vector::FromElementsOp,
+            vector::TransferReadOp, vector::TransferWriteOp,
+            vector::BroadcastOp,
 
             // Memref statements.
             memref::AllocOp, memref::AllocaOp, memref::LoadOp, memref::StoreOp,
             memref::DeallocOp, memref::CopyOp,
 
             // Unary expressions.
-            math::AbsIOp, math::AbsFOp, math::CeilOp, math::CosOp, math::SinOp,
-            math::TanhOp, math::SqrtOp, math::RsqrtOp, math::ExpOp,
-            math::Exp2Op, math::LogOp, math::Log2Op, math::Log10Op,
-            arith::NegFOp,
+            math::AbsIOp, math::AbsFOp, math::CeilOp, math::CosOp,
+            math::IsFiniteOp, math::SinOp, math::TanhOp, math::SqrtOp,
+            math::RsqrtOp, math::ExpOp, math::Exp2Op, math::LogOp, math::Log2Op,
+            math::Log10Op, arith::NegFOp,
 
             // Float binary expressions.
             arith::CmpFOp, arith::AddFOp, arith::SubFOp, arith::MulFOp,
@@ -82,20 +81,15 @@ public:
           return thisCast->visitOp(opNode, args...);
         })
         .Default([&](auto opNode) -> ResultType {
-          return thisCast->visitInvalidOp(op, args...);
+          return thisCast->visitUnhandledOp(op, args...);
         });
   }
 
-  /// This callback is invoked on operations no visitor lists at all. It
-  /// reports "not mine" like visitUnhandledOp does: the dispatcher that
-  /// tried every visitor is the one that knows the op is unsupported, and
-  /// its diagnostic is the one that carries a failure state.
-  ResultType visitInvalidOp(Operation *op, ExtraArgs... args) {
-    return ResultType();
-  }
-
-  /// This callback is invoked on any operations that are not handled by the
-  /// concrete visitor.
+  /// Invoked both on operations the switch above does not list and on ones
+  /// it lists but the concrete visitor declines. Either way the answer is
+  /// "not mine": the dispatcher that tried every visitor is the one that
+  /// knows the op is unsupported, and its diagnostic is the one that
+  /// carries a failure state.
   ResultType visitUnhandledOp(Operation *op, ExtraArgs... args) {
     return ResultType();
   }
@@ -144,6 +138,7 @@ public:
   // Vector statements.
   HANDLE(vector::InsertOp);
   HANDLE(vector::ExtractOp);
+  HANDLE(vector::FromElementsOp);
   HANDLE(vector::TransferReadOp);
   HANDLE(vector::TransferWriteOp);
   HANDLE(vector::BroadcastOp);
@@ -161,6 +156,7 @@ public:
   HANDLE(math::AbsFOp);
   HANDLE(math::CeilOp);
   HANDLE(math::CosOp);
+  HANDLE(math::IsFiniteOp);
   HANDLE(math::SinOp);
   HANDLE(math::TanhOp);
   HANDLE(math::SqrtOp);

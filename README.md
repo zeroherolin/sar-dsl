@@ -206,39 +206,44 @@ first-touch allocation are excluded. Polar Format is a spotlight chain with a
 ### HLS synthesis
 
 The reference HLS target is `xcvu13p-fhgb2104-2-i`, with a 4 ns clock,
-512-bit AXI, and 80% device resource budgets. Vitis HLS 2022.2 is used for
-validation but is optional for building and using the compiler.
+512-bit AXI, and 80% device resource budgets.
 
-Generated C++ is checked against NumPy golden outputs in plain-C++ and Vitis
-C-simulation at regression sizes. The following rows are complete 16384² c64
-`csynth` reports; time is latency multiplied by the estimated clock period:
+Generated C++ is checked against NumPy golden outputs in plain-C++, Vitis
+C-simulation, and reduced RTL co-simulation. The production c64 rows below use
+16384² for the stripmap chains and an 8192² input / 16384² output for PFA.
+Latency time is cycles at the target period, which is what the design is
+constrained to and what a board would clock it at. The estimated period is
+the margin synthesis found, not a second clock rate: a design that closes
+below the target still runs at the target.
 
-| Design | Clock | Latency cycles | Latency time | csynth time |
-|---|---:|---:|---:|---:|
-| WKA, generated | 2.920 ns | 10,623,107,115 | 31.020 s | 320.40 s |
-| WKA, hand-written | 3.500 ns | 2,033,373,247 | 7.117 s | 201.24 s |
-| RDA, generated | 5.840 ns | 42,162,307,154 | 246.228 s | 199.44 s |
-| CSA, generated | 5.698 ns | 25,257,394,240 | 143.917 s | 187.00 s |
+| Design | Target clock | Estimated clock | Latency cycles | Latency time | C-synth time |
+|---|---:|---:|---:|---:|---:|
+| WKA, generated | 4.000 ns | 2.920 ns | 9,345,019,968 | 37.380 s | 315 s |
+| WKA, hand-written | 4.000 ns | 3.500 ns | 2,033,373,247 | 8.133 s | 201 s |
+| RDA, generated | 4.000 ns | 3.187 ns | 6,211,947,741 | 24.848 s | 327 s |
+| CSA, generated | 4.000 ns | 3.048 ns | 6,724,960,352 | 26.900 s | 304 s |
+| PFA, generated | 4.000 ns | 3.187 ns | 9,807,479,633 | 39.230 s | 181 s |
 
-Resource counts and percentages of the full default VU13P device:
+Resource counts on the reference VU13P device:
 
 | Design | BRAM18K | URAM | DSP | FF | LUT |
 |---|---:|---:|---:|---:|---:|
-| WKA, generated | 128 (2.38%) | 808 (63.12%) | 1,202 (9.78%) | 359,742 (10.41%) | 386,544 (22.37%) |
-| WKA, hand-written | 384 (7.14%) | 296 (23.12%) | 1,135 (9.24%) | 210,325 (6.09%) | 373,962 (21.64%) |
-| RDA, generated | 96 (1.79%) | 260 (20.31%) | 173 (1.41%) | 111,871 (3.24%) | 223,167 (12.91%) |
-| CSA, generated | 64 (1.19%) | 288 (22.50%) | 269 (2.19%) | 111,795 (3.23%) | 217,079 (12.56%) |
+| WKA, generated | 800 | 616 | 1,394 | 420,141 | 587,883 |
+| WKA, hand-written | 384 | 296 | 1,135 | 210,325 | 373,962 |
+| RDA, generated | 800 | 772 | 471 | 404,717 | 562,545 |
+| CSA, generated | 768 | 800 | 317 | 376,572 | 544,839 |
+| PFA, generated | 672 | 216 | 394 | 303,030 | 508,243 |
 
-Generated WKA meets the 4 ns target. Its estimated latency is 5.22× the
-worst-case cycles of the independent hand-written baseline (4.36× in
-estimated time). The baseline uses
-packed AXI and a different microarchitecture, so the comparison is directional
-rather than like-for-like. Vitis reports a latency range for the hand-written
-design because it reuses transform and corner-turn instances across runtime
-modes; the table records the worst case. RDA and CSA fit the resource budgets
-but miss 4 ns. All timing values are HLS estimates, not post-place-and-route
-closure. Constraints and provenance for generated WKA are in the
-[machine-readable summary](benchmarks/results/hls_wka_c64_16384_vitis_2022_2.json).
+All four generated designs meet the 4 ns target and the configured resource
+budgets. WKA's latency is 4.60× the worst-case cycles of the independent
+hand-written baseline. The baseline uses packed AXI and a different
+microarchitecture, so the comparison is directional rather than like-for-like.
+Vitis reports a latency range for the hand-written design because it reuses
+transform and corner-turn instances across runtime modes; the table records
+the worst case. All timing values are HLS estimates, not post-place-and-route
+closure. Constraints, source/report hashes, and
+derived strategies are in the
+[machine-readable summary](benchmarks/results/hls_algorithms_c64_production_vitis_2022_2.json).
 
 ## Documentation
 
@@ -264,6 +269,8 @@ python/sar/          Python language, compiler driver, and backends
 examples/            complete WKA, RDA, CSA, and PFA programs
 benchmarks/          accuracy, quality, performance, and HLS report tools
 test/                MLIR lit tests and Python tests
+docs/                architecture, backend, dialect, and API references
+cmake/, scripts/     build configuration and the LLVM bootstrap script
 externals/           pinned llvm-project submodule
 ```
 

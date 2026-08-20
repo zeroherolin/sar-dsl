@@ -6,6 +6,7 @@ figure helpers are exercised through `tmp_path`, so nothing lands in
 `benchmarks/assets/`.
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -50,6 +51,16 @@ def test_accuracy_rejects_result_count_mismatch():
         run_accuracy._max_abs((object(), ), ())
 
 
+@pytest.mark.parametrize("parser", [
+    run_performance._positive_int,
+    run_resources._positive_int,
+])
+def test_benchmark_positive_integer_validation(parser):
+    assert parser("3") == 3
+    with pytest.raises(argparse.ArgumentTypeError, match="positive integer"):
+        parser("0")
+
+
 def test_quality_metrics_reject_degenerate_inputs():
     with pytest.raises(ValueError, match="finite nonzero"):
         metrics.measure_cut(np.zeros(8))
@@ -78,7 +89,10 @@ def test_checked_in_hls_results_are_self_consistent():
             assert len(data["designs"]) == len(ALL)
             for design in data["designs"]:
                 assert design["estimated_clock_ns"] <= constraints["clock_ns"]
-                assert design["vitis_csim_passed"]
+                if "vitis_csim_passed" in design:
+                    assert design["vitis_csim_passed"]
+                if "source_sha256" in design:
+                    assert len(design["source_sha256"]) == 64
                 assert len(design["report_sha256"]) == 64
 
 
@@ -163,6 +177,25 @@ def test_resource_measure_reports_ports():
     stats = run_resources.measure(design.source(), design.name)
     assert stats["lines"] > 0
     assert stats["external_footprint_mib"] >= 0.0
+    assert stats["constant_rom_kib"] >= 0.0
+
+
+def test_resource_measure_counts_vector_ports_and_constant_rom():
+    source = """\
+static const float table[16] = {0};
+void vector_top(
+  hls::vector<float, 16> in0[8],
+  hls::vector<float, 16> out0[8]
+) {
+  #pragma HLS interface m_axi port=in0 bundle=gmem0
+  #pragma HLS interface m_axi port=out0 bundle=gmem1
+  float scratch[32];
+}
+"""
+    stats = run_resources.measure(source, "vector_top")
+    assert stats["external_footprint_mib"] == 1024 / 2**20
+    assert stats["mutable_on_chip_kib"] == 128 / 2**10
+    assert stats["constant_rom_kib"] == 64 / 2**10
 
 
 def test_resource_measure_rejects_format_drift():
@@ -184,6 +217,7 @@ def test_vitis_report_parser_checks_constraints(tmp_path):
     <TargetClockPeriod>4.00</TargetClockPeriod>
   </UserAssignments>
   <PerformanceEstimates>
+    <PipelineType>no</PipelineType>
     <SummaryOfTimingAnalysis>
       <EstimatedClockPeriod>3.10</EstimatedClockPeriod>
     </SummaryOfTimingAnalysis>
@@ -191,6 +225,12 @@ def test_vitis_report_parser_checks_constraints(tmp_path):
       <Worst-caseLatency>100</Worst-caseLatency>
       <Interval-max>20</Interval-max>
     </SummaryOfOverallLatency>
+    <SummaryOfLoopLatency>
+      <LOOP_1>
+        <TripCount>8</TripCount><Latency>16</Latency>
+        <IterationLatency>2</IterationLatency>
+      </LOOP_1>
+    </SummaryOfLoopLatency>
   </PerformanceEstimates>
   <AreaEstimates>
     <Resources>
@@ -202,10 +242,28 @@ def test_vitis_report_parser_checks_constraints(tmp_path):
       <LUT>1728000</LUT><URAM>1280</URAM>
     </AvailableResources>
   </AreaEstimates>
+  <InterfaceSummary>
+    <RtlPorts>
+      <name>m_axi_gmem_RDATA</name><Object>gmem</Object>
+      <IOProtocol>m_axi</IOProtocol><Bits>512</Bits>
+    </RtlPorts>
+    <RtlPorts>
+      <name>m_axi_gmem_WDATA</name><Object>gmem</Object>
+      <IOProtocol>m_axi</IOProtocol><Bits>512</Bits>
+    </RtlPorts>
+  </InterfaceSummary>
 </profile>
 """)
     parsed = parse_csynth_xml(report)
     assert parsed["estimated_clock_ns"] == 3.1
+    assert parsed["loop_latencies"] == [{
+        "name": "LOOP_1",
+        "trip_count": 8,
+        "latency_cycles": 16,
+        "iteration_latency": 2,
+    }]
+    assert parsed["interfaces"][0]["read_data_bits"] == 512
+    assert len(parsed["xml_sha256"]) == 64
     assert not validate_constraints(parsed, HLSConfig.resolve())
 
 

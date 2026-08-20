@@ -119,14 +119,16 @@ static bool applySimplifyAffineIf(func::FuncOp func) {
   mlir::RewritePatternSet patterns(context);
   patterns.add<RemoveRedundantIf>(context);
   patterns.add<MergeSameIf>(context);
-  (void)applyPatternsGreedily(func, std::move(patterns));
-  return true;
+  return succeeded(applyPatternsGreedily(func, std::move(patterns)));
 }
 
 namespace {
 struct SimplifyAffineIf
     : public sar::impl::SimplifyAffineIfBase<SimplifyAffineIf> {
-  void runOnOperation() override { applySimplifyAffineIf(getOperation()); }
+  void runOnOperation() override {
+    if (!applySimplifyAffineIf(getOperation()))
+      signalPassFailure();
+  }
 };
 } // namespace
 

@@ -89,13 +89,35 @@ def test_hls_design_survives_cache_artifact_eviction(tmp_path):
     design.write_synthesis_script(synthesis_dir)
     assert (synthesis_dir / "scale.cpp").read_text() == source
     manifest = json.loads((synthesis_dir / "design_manifest.json").read_text())
+    assert manifest["schema_version"] == 2
     assert manifest["top"] == "scale"
+    assert manifest["generator"]["backend"] == "hls"
+    assert manifest["kernel"]["arguments"][0]["dtype"] == "f32"
     assert manifest["config"]["interface"] == "ap_memory"
+    assert manifest["interfaces"][0]["logical_elements"] == n
+    assert manifest["interfaces"][0]["vector_lanes"] == 1
 
     x = np.arange(n, dtype=np.float32)
     testbench_dir = tmp_path / "testbench"
     design.write_testbench([x], [x * 2.0], testbench_dir)
     assert (testbench_dir / "scale.cpp").read_text() == source
+
+
+def test_manifest_records_the_physical_vector_interface(tmp_path):
+    n = 64
+
+    @sar.func
+    def scale(x: sar.f64[n, n]) -> sar.f64[n, n]:
+        return x * 2.0
+
+    design = scale.compile(backend="hls", options={"interface": "axi"})
+    design.write_synthesis_script(tmp_path)
+    manifest = json.loads((tmp_path / "design_manifest.json").read_text())
+    port = next(item for item in manifest["interfaces"] if item["name"] == "x")
+    assert port["vector_lanes"] == 8
+    assert port["data_bits"] == 512
+    assert port["physical_shape"] == [n, n // 8]
+    assert port["logical_elements"] == n * n
 
 
 @pytest.mark.parametrize("name,value", [
@@ -115,6 +137,34 @@ def test_testbench_rejects_invalid_tolerances(tmp_path, name, value):
     design = scale.compile(backend="hls")
     with pytest.raises(sar.LaunchError, match="finite non-negative"):
         design.write_testbench([values], [values * 2.0], tmp_path, **kwargs)
+    assert not list(tmp_path.iterdir())
+
+
+def test_testbench_preserves_high_precision_golden_data(tmp_path):
+
+    @sar.func
+    def identity(x: sar.f32[2]) -> sar.f32[2]:
+        return x
+
+    values = np.ones(2, dtype=np.float32)
+    reference = np.array([1.00000006, 0.99999997], dtype=np.float64)
+    identity.compile(backend="hls").write_testbench([values], [reference],
+                                                    tmp_path)
+    stored = np.loadtxt(tmp_path / "identity_tb_data" / "out0.dat")
+    np.testing.assert_array_equal(stored, reference)
+
+
+def test_testbench_rejects_unbounded_static_memory(tmp_path, monkeypatch):
+
+    @sar.func
+    def identity(x: sar.f32[16]) -> sar.f32[16]:
+        return x
+
+    values = np.ones(16, dtype=np.float32)
+    monkeypatch.setenv("SAR_DSL_HLS_TESTBENCH_MAX_BYTES", "32")
+    with pytest.raises(sar.LaunchError, match="static arrays"):
+        identity.compile(backend="hls").write_testbench([values], [values],
+                                                        tmp_path)
     assert not list(tmp_path.iterdir())
 
 
@@ -338,6 +388,14 @@ def test_f32_chain_csim_matches_the_cpu_backend(tmp_path):
 
 
 def test_mixed_precision_axi_uses_typed_scratch_arenas():
+    """Spilled planes cost one port per element type, not one per plane.
+
+    A port is a platform resource an integrator wires to a memory channel,
+    so the signature is the algorithm's own I/O plus the scratch the design
+    genuinely needs. Two element types spill here, and a typed C++ signature
+    cannot express both through one pointer, so two arenas is the floor --
+    not two per plane, and nothing at all for a type that never spills.
+    """
     n = 64
 
     @sar.func
@@ -361,7 +419,7 @@ def test_mixed_precision_axi_uses_typed_scratch_arenas():
                    for t in kernel.arg_types + kernel.declared_result_types)
     scratch = args[io_ports:]
     assert {arg.split(" ", 1)[0] for arg in scratch} == {"float", "double"}
-    assert len(scratch) == 4
+    assert len(scratch) == 2
     assert all(re.search(r"\[\d+\]$", arg) for arg in scratch)
 
 
@@ -415,6 +473,9 @@ def test_synthesis_script_covers_every_interface(tmp_path):
         assert "csynth_design" in tcl
         assert "set_part xczu9eg-ffvb1156-2-e" in tcl
         assert "create_clock -period 4" in tcl
+        assert "config_interface -m_axi_alignment_byte_size=64" in tcl
+        assert "config_interface -m_axi_max_read_burst_length=64" in tcl
+        assert "scale_csynth_elapsed_s.txt" in tcl
 
 
 def test_scratch_is_one_line_wide():
@@ -491,18 +552,24 @@ def test_partition_factors_stay_synthesizable():
     assert max(factors) <= 32, sorted(set(factors))
 
 
-def test_testbench_rejects_axi_with_a_reason():
-    """The csim testbench cannot drive the promoted scratch ports, and the
-    error has to say so rather than just refusing."""
+def test_axi_testbench_drives_scalar_scratch_and_emits_cosim(tmp_path):
+    """A scalar AXI package allocates compiler scratch in the harness and
+    carries a ready-to-run RTL co-simulation script."""
     N = 32
 
     @sar.func
     def spectrum(x: sar.c64[N, N]) -> sar.c64[N, N]:
         return sar.fft(x, axis=1)
 
+    rng = np.random.default_rng(8)
+    values = (rng.standard_normal((N, N)) + 1j * rng.standard_normal(
+        (N, N))).astype(np.complex64)
+    golden = spectrum.compile("cpu")(values)
     design = spectrum.compile(backend="hls", options={"interface": "axi"})
-    with pytest.raises(sar.LaunchError, match="AXI port"):
-        design.write_testbench([], [])
+    design.write_testbench([values], [golden], tmp_path)
+    assert (tmp_path / "spectrum_cosim.tcl").is_file()
+    testbench = (tmp_path / "spectrum_tb.cpp").read_text()
+    assert "inout" in testbench
 
 
 def test_streamed_planes_are_shared_across_lifetimes():
@@ -573,17 +640,12 @@ def test_broadcast_does_not_materialize_a_plane():
                                 "uram_bytes": 0,
                                 "lutram_bytes": 0
                             }).source()
-    # One plane in, one out: a materialized broadcast would be a third
-    # DRAM buffer. It would land in the scratch allocation, so the check
-    # is that both scratch masters stayed at their 1-element placeholder
-    # size while exactly two full planes hold pragmas.
+    # One plane in, one out: a materialized broadcast would be a third DRAM
+    # buffer, and with no port of its own to hide in it would have to open a
+    # scratch arena. So the check is that the design's masters are exactly
+    # the kernel's two planes -- no arena, hence nothing was materialized.
     maxi_ports = re.findall(r"m_axi.*port=(\w+)", source)
-    placeholder = {
-        name
-        for name in maxi_ports if re.search(rf"double {name}\[1\]", source)
-    }
-    assert len(placeholder) == 2, source
-    assert len(set(maxi_ports) - placeholder) == 2, maxi_ports
+    assert len(maxi_ports) == 2, maxi_ports
 
 
 def test_streaming_passes_keep_full_rows():
@@ -610,7 +672,8 @@ def test_streaming_passes_keep_full_rows():
                                "lutram_bytes": 0
                            }).source()
     trips = [
-        int(t) for t in re.findall(r"for \(int \w+ = 0; \w+ < (\d+);", source)
+        int(t) for t in re.findall(r"for \(int(?:64_t)? \w+ = 0; \w+ < (\d+);",
+                                   source)
     ]
     assert N in trips, sorted(set(trips))
 
@@ -756,18 +819,15 @@ def test_stream_interface_emits_axis_pragmas():
     source = spectrum.compile(backend="hls", options={
         "interface": "stream"
     }).source()
-    # The kernel's inputs and outputs stream. The only memory-mapped port
-    # are the two fixed DRAM scratch masters, sitting at placeholder size
-    # since nothing spilled here.
+    # The kernel's inputs and outputs stream, and nothing spilled here, so
+    # there is no scratch arena to keep memory-mapped: a design that needs
+    # no DRAM declares no AXI master at all.
     axis_ports = set(re.findall(r"interface axis port=(\w+)", source))
     assert {"x_re", "x_im"} <= axis_ports, axis_ports
     maxi_ports = re.findall(r"m_axi.*port=(\w+)", source)
-    assert len(maxi_ports) == 2, maxi_ports
-    assert all(re.search(rf"\w+ {port}\[1\]", source)
-               for port in maxi_ports), maxi_ports
+    assert not maxi_ports, maxi_ports
     # A stream port carries no burst shaping: that describes addressed
-    # access to DRAM, which a FIFO does not perform. The placeholder moves
-    # no bulk data, so it is not shaped either.
+    # access to DRAM, which a FIFO does not perform.
     assert "max_read_burst_length" not in source
 
 
@@ -775,7 +835,7 @@ def test_stream_interface_keeps_spilled_scratch_memory_mapped():
     """A buffer that spills to DRAM is read and written by the design, and
     an AXI4-Stream is unidirectional and consumed once -- `axis` on such a
     port cannot synthesize. In stream mode only the pure inputs and outputs
-    stream; the scratch stays an AXI master (PFA hit this for real)."""
+    stream; scratch remains an AXI master."""
     n = 32
 
     @sar.func

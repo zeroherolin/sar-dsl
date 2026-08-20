@@ -1,4 +1,4 @@
-//===- ReduceInitialInterval.cpp - reduce initial interval ----------------===//
+//===- ReduceInitiationInterval.cpp - shorten loop-carried chains --------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -13,12 +13,12 @@
 
 namespace mlir {
 namespace sar {
-#define GEN_PASS_DEF_REDUCEINITIALINTERVAL
+#define GEN_PASS_DEF_REDUCEINITIATIONINTERVAL
 #include "sar/Dialect/HLS/Transforms/Passes.h.inc"
 } // namespace sar
 } // namespace mlir
 
-#define DEBUG_TYPE "hls-reduce-initial-interval"
+#define DEBUG_TYPE "hls-reduce-initiation-interval"
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -33,12 +33,18 @@ static bool findCommutativeChain(Operation *op, AffineWriteOpInterface store,
                                  SmallVectorImpl<Operation *> &chainOps) {
   assert((chainOps.empty() || op == chainOps.back()) && "invalid chaining");
 
-  // Return true if we found the store op.
   if (llvm::any_of(op->getUsers(), [&](auto user) { return user == store; }))
     return true;
 
   for (auto user : op->getUsers()) {
-    if (user->hasTrait<OpTrait::IsCommutative>() &&
+    // Reordering floating-point operations changes rounding, signed-zero and
+    // NaN behavior. Only exact integer/index arithmetic is legal here; an
+    // explicitly budgeted floating-point reassociation belongs in a separate
+    // numerical optimization.
+    bool exactType = llvm::all_of(user->getResultTypes(), [](Type type) {
+      return isa<IntegerType, IndexType>(type);
+    });
+    if (exactType && user->hasTrait<OpTrait::IsCommutative>() &&
         (chainOps.empty() || op->getName() == user->getName())) {
       LLVM_DEBUG(llvm::dbgs() << "Chain op: " << *user << "\n");
 
@@ -70,7 +76,7 @@ static bool findCommutativeChain(Operation *op, AffineWriteOpInterface store,
 ///        |
 ///       src
 ///
-/// To:
+/// To (for exact integer/index arithmetic):
 ///  1   2
 ///   \ /
 ///    +   3
@@ -101,7 +107,7 @@ static bool optimizeCommutativeChain(SmallVectorImpl<Operation *> &headOps,
           ? firstOp->getOpOperand(1)
           : firstOp->getOpOperand(0);
 
-  // Get the target operator the chain before which we can optimize.
+  // The operator the chain can be rebalanced ahead of.
   Operation *targetOp = chainOps.back();
   for (auto op : chainOps)
     if (!op->getResult(0).hasOneUse()) {
@@ -128,7 +134,7 @@ static bool optimizeCommutativeChain(SmallVectorImpl<Operation *> &headOps,
 }
 
 namespace {
-struct ReduceInitialIntervalPattern : public OpRewritePattern<AffineForOp> {
+struct ReduceInitiationIntervalPattern : public OpRewritePattern<AffineForOp> {
   using OpRewritePattern<AffineForOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(AffineForOp loop,
@@ -150,7 +156,7 @@ struct ReduceInitialIntervalPattern : public OpRewritePattern<AffineForOp> {
         auto dstLoad = dyn_cast<AffineReadOpInterface>(accesses[i]);
         if (!dstLoad)
           continue;
-        // To move the load op, we make a conservative assumption here that the
+        // Moving the load rests on the conservative assumption that the
         // load op only has one use.
         if (!dstLoad->hasOneUse())
           break;
@@ -181,20 +187,21 @@ struct ReduceInitialIntervalPattern : public OpRewritePattern<AffineForOp> {
 } // namespace
 
 namespace {
-struct ReduceInitialInterval
-    : public sar::impl::ReduceInitialIntervalBase<ReduceInitialInterval> {
+struct ReduceInitiationInterval
+    : public sar::impl::ReduceInitiationIntervalBase<ReduceInitiationInterval> {
   void runOnOperation() override {
     auto func = getOperation();
     mlir::RewritePatternSet patterns(func.getContext());
-    patterns.add<ReduceInitialIntervalPattern>(func.getContext());
-    (void)applyPatternsGreedily(
-        func, std::move(patterns),
-        GreedyRewriteConfig().setUseTopDownTraversal(false).setMaxIterations(
-            1));
+    patterns.add<ReduceInitiationIntervalPattern>(func.getContext());
+    if (failed(applyPatternsGreedily(func, std::move(patterns),
+                                     GreedyRewriteConfig()
+                                         .setUseTopDownTraversal(false)
+                                         .setMaxIterations(2))))
+      signalPassFailure();
   }
 };
 } // namespace
 
-std::unique_ptr<Pass> sar::createReduceInitialIntervalPass() {
-  return std::make_unique<ReduceInitialInterval>();
+std::unique_ptr<Pass> sar::createReduceInitiationIntervalPass() {
+  return std::make_unique<ReduceInitiationInterval>();
 }

@@ -13,6 +13,7 @@
 #include "sar/Target/KernelFacts.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -35,8 +36,8 @@ static std::optional<unsigned> planeBytes(Type elementType) {
   return std::nullopt;
 }
 
-static void updateShapeFacts(Type type, uint64_t &largest,
-                             unsigned &narrowest) {
+static void updateShapeFacts(Type type, uint64_t &largest, unsigned &narrowest,
+                             llvm::SetVector<unsigned> &widths) {
   auto shapedType = dyn_cast<ShapedType>(type);
   if (!shapedType || !shapedType.hasStaticShape())
     return;
@@ -45,6 +46,7 @@ static void updateShapeFacts(Type type, uint64_t &largest,
     return;
   largest = std::max<uint64_t>(largest, shapedType.getNumElements());
   narrowest = std::min(narrowest, *bytes);
+  widths.insert(*bytes);
 }
 
 static LogicalResult emitKernelFacts(Operation *root, llvm::raw_ostream &os) {
@@ -57,18 +59,20 @@ static LogicalResult emitKernelFacts(Operation *root, llvm::raw_ostream &os) {
   uint64_t largest = 0;
   unsigned narrowest = std::numeric_limits<unsigned>::max();
   unsigned transposes = 0;
+  unsigned gathers = 0;
+  llvm::SetVector<unsigned> widths;
   SmallVector<std::pair<int64_t, unsigned>> transforms;
   SmallVector<std::pair<uint64_t, uint64_t>> buffers;
 
   module.walk([&](Operation *op) {
     for (Type type : op->getOperandTypes())
-      updateShapeFacts(type, largest, narrowest);
+      updateShapeFacts(type, largest, narrowest, widths);
     for (Type type : op->getResultTypes())
-      updateShapeFacts(type, largest, narrowest);
+      updateShapeFacts(type, largest, narrowest, widths);
     for (Region &region : op->getRegions())
       for (Block &block : region)
         for (BlockArgument argument : block.getArguments())
-          updateShapeFacts(argument.getType(), largest, narrowest);
+          updateShapeFacts(argument.getType(), largest, narrowest, widths);
 
     auto recordTransform = [&](ShapedType type, int64_t dim) {
       auto bytes = planeBytes(type.getElementType());
@@ -84,6 +88,8 @@ static LogicalResult emitKernelFacts(Operation *root, llvm::raw_ostream &os) {
 
     if (isa<TransposeOp>(op))
       ++transposes;
+    if (isa<Interp1DOp, Gather2DOp>(op))
+      ++gathers;
     if (auto interp = dyn_cast<Interp1DOp>(op); interp && interp.getDim() == 0)
       transposes += 3;
 
@@ -100,8 +106,17 @@ static LogicalResult emitKernelFacts(Operation *root, llvm::raw_ostream &os) {
   if (narrowest == std::numeric_limits<unsigned>::max())
     narrowest = 8;
 
+  SmallVector<unsigned> sortedWidths(widths.begin(), widths.end());
+  llvm::sort(sortedWidths);
   os << "{\"plane_elements\":" << largest << ",\"element_bytes\":" << narrowest
-     << ",\"transposes\":" << transposes << ",\"transforms\":[";
+     << ",\"element_bytes_set\":[";
+  for (auto [index, width] : llvm::enumerate(sortedWidths)) {
+    if (index)
+      os << ',';
+    os << width;
+  }
+  os << "],\"transposes\":" << transposes << ",\"gathers\":" << gathers
+     << ",\"transforms\":[";
   for (auto [index, transform] : llvm::enumerate(transforms)) {
     if (index)
       os << ',';

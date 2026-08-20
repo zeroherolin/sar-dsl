@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-08-20",
+  "source": {
+    "base_commit": "1e331ff7b560c340f0ced05af8dd6b17d4d624c7",
+    "working_tree_modified": true,
+    "generation": "build_kernel(size, geometry, name=<top>, dtype=sar.c64).compile('hls', options={'interface': 'axi'}).write_synthesis_script(<dir>)",
+    "synthesis": "vitis_hls -f <top>_csynth.tcl"
+  },
+  "constraints": {
+    "part": "xcvu13p-fhgb2104-2-i",
+    "clock_ns": 4.0,
+    "axi_bus_bits": 512,
+    "bram18k_budget": 4300,
+    "uram_budget": 1024,
+    "dsp_budget": 9830,
+    "ff_budget": 2764800,
+    "lut_budget": 1382400
+  },
+  "tool": {
+    "name": "Vitis HLS",
+    "version": "2022.2",
+    "flow_target": "vivado"
+  },
+  "designs": [
+    {
+      "algorithm": "omega-K",
+      "top": "wka_final",
+      "shape": [
+        16384,
+        16384
+      ],
+      "dtype": "c64",
+      "interface": "axi",
+      "fft_parallel_rows": 4,
+      "fft_stage_group": 3,
+      "fft_io_unroll": 8,
+      "array_partition_max_factor": 8,
+      "axi_ports": 8,
+      "estimated_clock_ns": 2.92,
+      "latency_cycles": 9345019968,
+      "interval_cycles": 9345019969,
+      "bram18k": 800,
+      "uram": 616,
+      "dsp": 1394,
+      "ff": 420141,
+      "lut": 587883,
+      "csynth_elapsed_s": 315,
+      "source_sha256": "ac04a64291dc213f5eee39a83a0abbd6c2aaf759fc92c3c3bad7ca9e7cbe7b86",
+      "report_sha256": "f015fbd75890c258ad3c19df6414d3bbd323ab6e5ee266838ab728d9f15183b8"
+    },
+    {
+      "algorithm": "Range-Doppler",
+      "top": "rda_final",
+      "shape": [
+        16384,
+        16384
+      ],
+      "dtype": "c64",
+      "interface": "axi",
+      "fft_parallel_rows": 4,
+      "fft_stage_group": 3,
+      "fft_io_unroll": 8,
+      "array_partition_max_factor": 8,
+      "axi_ports": 12,
+      "estimated_clock_ns": 3.187,
+      "latency_cycles": 6211947741,
+      "interval_cycles": 6211947742,
+      "bram18k": 800,
+      "uram": 772,
+      "dsp": 471,
+      "ff": 404717,
+      "lut": 562545,
+      "csynth_elapsed_s": 327,
+      "source_sha256": "a1e1b0e26665c4de3b24a7677a2c79e50385b9af36122c37d0049b32c3c6c2be",
+      "report_sha256": "071de24f826b1413cdb8b36823bb72ccf4a521b73d3d447cc59d54ba7f28a15d"
+    },
+    {
+      "algorithm": "Chirp Scaling",
+      "top": "csa_final",
+      "shape": [
+        16384,
+        16384
+      ],
+      "dtype": "c64",
+      "interface": "axi",
+      "fft_parallel_rows": 4,
+      "fft_stage_group": 3,
+      "fft_io_unroll": 8,
+      "array_partition_max_factor": 8,
+      "axi_ports": 10,
+      "estimated_clock_ns": 3.048,
+      "latency_cycles": 6724960352,
+      "interval_cycles": 6724960353,
+      "bram18k": 768,
+      "uram": 800,
+      "dsp": 317,
+      "ff": 376572,
+      "lut": 544839,
+      "csynth_elapsed_s": 304,
+      "source_sha256": "9edbe248b435b780e86f80cd0cfbd80ddd976445403c9f2c5553d051a7c305ec",
+      "report_sha256": "3646113f9d915bd0d8b3f131bd80b57d9a79b8193b6ffa1f77a55d5691971aeb"
+    },
+    {
+      "algorithm": "Polar Format",
+      "top": "pfa_final",
+      "shape": [
+        8192,
+        8192
+      ],
+      "output_shape": [
+        16384,
+        16384
+      ],
+      "dtype": "c64",
+      "interface": "axi",
+      "fft_parallel_rows": 0,
+      "fft_stage_group": 3,
+      "fft_io_unroll": 8,
+      "array_partition_max_factor": 8,
+      "axi_ports": 9,
+      "estimated_clock_ns": 3.187,
+      "latency_cycles": 9807479633,
+      "interval_cycles": 9807479634,
+      "bram18k": 672,
+      "uram": 216,
+      "dsp": 394,
+      "ff": 303030,
+      "lut": 508243,
+      "csynth_elapsed_s": 181,
+      "source_sha256": "4e09c202a6218fcf11414db8a9d5ea4e511548e34ed0f00169a328c4e9d9a115",
+      "report_sha256": "e9fd8838b31c9daf2197be58139b9e9e49fd697c77642f10375df0670815e8cd"
+    }
+  ]
+}

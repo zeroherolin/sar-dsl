@@ -16,6 +16,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "sar/Dialect/SAR/Transforms/Passes.h"
 
@@ -153,6 +154,10 @@ static std::optional<TransposeNest> matchTranspose(affine::AffineForOp outer) {
       // control flow too: the replay clones such an op whole, so an access
       // inside it would keep naming the erased band.
       retargetable = false;
+    } else if (!isMemoryEffectFree(op) && !isa<affine::AffineYieldOp>(op)) {
+      // Reordering an unknown side effect across tile fill/drain changes the
+      // program even when none of its operands are induction variables.
+      retargetable = false;
     }
   });
   if (!retargetable || stores.empty())
@@ -223,6 +228,12 @@ static std::optional<TransposeNest> matchTranspose(affine::AffineForOp outer) {
     transposing.push_back(load);
   }
   if (transposing.empty())
+    return std::nullopt;
+  if (llvm::any_of(loads, [&](affine::AffineLoadOp load) {
+        return llvm::any_of(stores, [&](affine::AffineStoreOp store) {
+          return load.getMemRef() == store.getMemRef();
+        });
+      }))
     return std::nullopt;
 
   return TransposeNest{band, transposing, *sourceLevel, *destLevel};
@@ -385,7 +396,7 @@ struct SARStageTransposes
     // map, the inner band also matches on its own. Staging rewrites a nest
     // by erasing its entire band, so attempting to stage the inner nest
     // afterward would be a use-after-free. Pre-order guarantees a container
-    // precedes what it holds, so we just track which outer loops were kept
+    // precedes what it holds, so tracking which outer loops were kept
     // and skip any nest whose outer loop is a descendant of one of them.
     DenseSet<Operation *> outermost;
     SmallVector<TransposeNest> toStage;

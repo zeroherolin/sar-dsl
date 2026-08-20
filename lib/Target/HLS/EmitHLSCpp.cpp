@@ -30,10 +30,14 @@ static llvm::cl::opt<unsigned>
     axiBusBits("axi-bus-bits",
                llvm::cl::desc("Data width, in bits, of the AXI master ports"),
                llvm::cl::init(512));
-static llvm::cl::opt<unsigned> axiBufferBits(
-    "axi-buffer-bits",
-    llvm::cl::desc("Bits of read/write buffering an AXI port may occupy"),
-    llvm::cl::init(4 * 1024 * 1024));
+static llvm::cl::opt<unsigned>
+    axiMaxBurstLength("axi-max-burst-length",
+                      llvm::cl::desc("Maximum beats in one AXI burst"),
+                      llvm::cl::init(64));
+static llvm::cl::opt<unsigned> axiMaxOutstanding(
+    "axi-max-outstanding",
+    llvm::cl::desc("Maximum AXI bursts in flight per direction"),
+    llvm::cl::init(16));
 
 //===----------------------------------------------------------------------===//
 // Utils
@@ -49,20 +53,26 @@ struct AxiShape {
 
 /// Derives the shaping from the buffer itself.
 ///
-/// A design pays for an interface twice: once in bandwidth, where a beat
-/// narrower than the bus wastes the rest of it, and once in area, where
-/// every outstanding burst has to be buffered. The innermost dimension is
-/// what the loops walk contiguously, so it bounds both how far a beat can
-/// widen and how long a burst can usefully run; the buffer budget then
-/// decides how many of those bursts can be in flight.
+/// The innermost dimension is what the loops walk contiguously, so it bounds
+/// both how far a beat can widen and how long a burst can usefully run. AXI4
+/// bursts may not cross a 4 KiB boundary, so the physical beat width also
+/// bounds their useful length.
 static AxiShape getAxiShape(MemRefType type) {
-  unsigned elementBits = type.getElementTypeBitWidth();
+  Type elementType = type.getElementType();
+  unsigned elementBits = 0;
+  if (elementType.isIntOrFloat()) {
+    elementBits = elementType.getIntOrFloatBitWidth();
+  } else if (auto vectorType = dyn_cast<VectorType>(elementType)) {
+    Type scalarType = vectorType.getElementType();
+    if (scalarType.isIntOrFloat())
+      elementBits =
+          vectorType.getNumElements() * scalarType.getIntOrFloatBitWidth();
+  }
   if (elementBits == 0 || !type.hasStaticShape())
     return {0, 0, 0};
 
-  // A single-element buffer -- the DRAM scratch placeholder when nothing
-  // spilled -- moves no bulk data, so shaping it is noise; the Vitis
-  // defaults serve. Real buffers always have a contiguous run to shape.
+  // A single-element buffer moves no bulk data, so shaping it is noise; the
+  // Vitis defaults serve. Real buffers always have a contiguous run to shape.
   if (type.getNumElements() == 1)
     return {0, 0, 0};
 
@@ -70,18 +80,19 @@ static AxiShape getAxiShape(MemRefType type) {
   // at the end of every row would cost more than the widening gains.
   int64_t contiguous = type.getShape().back();
   unsigned widenBits = elementBits;
-  while (widenBits < axiBusBits &&
+  while (!isa<VectorType>(elementType) && widenBits < axiBusBits &&
          (contiguous * elementBits) % (2 * widenBits) == 0)
     widenBits *= 2;
 
-  // Vitis caps a burst at 256 beats; a row shorter than that caps it first.
+  // Vitis caps a burst at 256 beats. The 4 KiB boundary can be tighter for
+  // wide ports, and a row shorter than either cap ends the burst first.
   auto beatsPerRow = (unsigned)(contiguous * elementBits / widenBits);
+  unsigned boundaryBeats = std::max<unsigned>(1, 32768 / widenBits);
   unsigned burstBeats =
-      std::min<unsigned>(256, std::max<unsigned>(1, beatsPerRow));
-
-  // Buffering is outstanding * burst * width bits, in each direction.
-  unsigned outstanding = axiBufferBits / (2 * burstBeats * widenBits);
-  outstanding = std::min<unsigned>(32, std::max<unsigned>(1, outstanding));
+      std::min({256u, std::max(1u, axiMaxBurstLength.getValue()), boundaryBeats,
+                std::max(1u, beatsPerRow)});
+  unsigned outstanding =
+      std::min(32u, std::max(1u, axiMaxOutstanding.getValue()));
   return {widenBits, burstBeats, outstanding};
 }
 
@@ -115,7 +126,7 @@ static std::string getDataTypeName(Type type) {
   else if (isa<Float64Type>(valType))
     return "double";
   else if (isa<IndexType>(valType))
-    return "int";
+    return "int64_t";
   else if (auto intType = dyn_cast<IntegerType>(valType)) {
     if (intType.getWidth() == 1)
       return "bool";
@@ -337,7 +348,7 @@ public:
   void addIndent() { state.currentIndent += 2; }
   void reduceIndent() { state.currentIndent -= 2; }
 
-  // All of the mutable state we are maintaining.
+  // Mutable emitter state.
   HLSEmitterState &state;
 
   // The stream to emit to.
@@ -425,7 +436,7 @@ static SmallString<8> getConstantString(Type type, Attribute attr) {
     string.append(value ? "true" : "false");
 
   } else if (type.isIndex()) {
-    string.append("(int)");
+    string.append("(int64_t)");
     auto value = cast<IntegerAttr>(attr).getInt();
     string.append(std::to_string(value));
 
@@ -526,6 +537,7 @@ public:
   /// Vector-related statement emitters.
   void emitInsert(vector::InsertOp op);
   void emitExtract(vector::ExtractOp op);
+  void emitFromElements(vector::FromElementsOp op);
   void emitTransferRead(vector::TransferReadOp op);
   void emitTransferWrite(vector::TransferWriteOp op);
   void emitBroadcast(vector::BroadcastOp);
@@ -616,19 +628,14 @@ public:
 
   void visitAddExpr(AffineBinaryOpExpr expr) { emitAffineBinary(expr, "+"); }
   void visitMulExpr(AffineBinaryOpExpr expr) { emitAffineBinary(expr, "*"); }
-  void visitModExpr(AffineBinaryOpExpr expr) { emitAffineBinary(expr, "%"); }
+  void visitModExpr(AffineBinaryOpExpr expr) {
+    emitAffineCall(expr, "sar_hls_mod");
+  }
   void visitFloorDivExpr(AffineBinaryOpExpr expr) {
-    emitAffineBinary(expr, "/");
+    emitAffineCall(expr, "sar_hls_floor_div");
   }
   void visitCeilDivExpr(AffineBinaryOpExpr expr) {
-    // Positive affine bounds use the standard integer ceil-division form.
-    os << "(";
-    visit(expr.getLHS());
-    os << " + ";
-    visit(expr.getRHS());
-    os << " - 1) / ";
-    visit(expr.getRHS());
-    os << ")";
+    emitAffineCall(expr, "sar_hls_ceil_div");
   }
 
   void visitConstantExpr(AffineConstantExpr expr) { os << expr.getValue(); }
@@ -641,6 +648,14 @@ public:
   }
 
   /// Affine expression emitters.
+  void emitAffineCall(AffineBinaryOpExpr expr, const char *function) {
+    os << function << "(";
+    visit(expr.getLHS());
+    os << ", ";
+    visit(expr.getRHS());
+    os << ")";
+  }
+
   void emitAffineBinary(AffineBinaryOpExpr expr, const char *syntax) {
     os << "(";
     if (auto constRHS = dyn_cast<AffineConstantExpr>(expr.getRHS())) {
@@ -745,6 +760,9 @@ public:
   /// Vector statements.
   bool visitOp(vector::InsertOp op) { return emitter.emitInsert(op), true; };
   bool visitOp(vector::ExtractOp op) { return emitter.emitExtract(op), true; };
+  bool visitOp(vector::FromElementsOp op) {
+    return emitter.emitFromElements(op), true;
+  };
   bool visitOp(vector::TransferReadOp op) {
     return emitter.emitTransferRead(op), true;
   };
@@ -786,6 +804,9 @@ public:
   }
   bool visitOp(math::CosOp op) {
     return emitter.emitUnary(op, "std::cos"), true;
+  }
+  bool visitOp(math::IsFiniteOp op) {
+    return emitter.emitUnary(op, "std::isfinite"), true;
   }
   bool visitOp(math::SinOp op) {
     return emitter.emitUnary(op, "std::sin"), true;
@@ -1001,9 +1022,9 @@ void ModuleEmitter::emitAxiPort(AxiPortOp op) {
   // A port the design both reads and writes is a scratch buffer that spilled
   // to DRAM, not a data stream: an AXI4-Stream is unidirectional and consumed
   // once, so `axis` on such a port cannot synthesize. Neither can a port the
-  // design never touches (the placeholder scratch when nothing spilled) -- a
-  // stream nobody drains would stall the host. Only pure inputs and pure
-  // outputs stream; everything else stays memory-mapped.
+  // design never touches -- a stream nobody drains would stall the host.
+  // Only pure inputs and pure outputs stream; everything else stays
+  // memory-mapped.
   auto role = getPortRole(op.getElement());
   bool streaming =
       op.getBundleType().getKind() == AxiKind::STREAM ||
@@ -1021,8 +1042,9 @@ void ModuleEmitter::emitAxiPort(AxiPortOp op) {
     // chip. Downgrading it to `bram` because the buffer happened to fit
     // would emit `bundle=` on a mode that does not take one -- a pragma
     // Vitis rejects -- and would make the signature depend on placement.
-    os << " m_axi offset=slave";
-    emitAxiShape(cast<MemRefType>(op.getElement().getType()));
+    auto type = cast<MemRefType>(op.getElement().getType());
+    os << " m_axi offset=slave depth=" << type.getNumElements();
+    emitAxiShape(type);
   } else
     llvm_unreachable("AXI element type must be a memref or stream");
 
@@ -1764,6 +1786,19 @@ void ModuleEmitter::emitExtract(vector::ExtractOp op) {
   os << "\n";
 }
 
+void ModuleEmitter::emitFromElements(vector::FromElementsOp op) {
+  indent();
+  emitValue(op.getResult());
+  os << ";\n";
+  for (auto [index, element] : llvm::enumerate(op.getElements())) {
+    indent();
+    emitValue(op.getResult());
+    os << "[" << index << "] = ";
+    emitValue(element);
+    os << ";\n";
+  }
+}
+
 void ModuleEmitter::emitTransferRead(vector::TransferReadOp op) {
   auto rank = emitNestedLoopHeader(op.getVector());
   auto indices = getTransferIndices(op);
@@ -2135,9 +2170,12 @@ void ModuleEmitter::emitArrayDirectives(Value memref, bool isInterface) {
         os << " variable=";
         emitValue(memref);
 
-        // Emit partition type.
+        // Emit partition type. A complete partition splits every element
+        // into its own register, so it takes no factor -- Vitis 2022.2
+        // warns and ignores one that is given (HLS 207-5529).
         os << " " << stringifyPartitionKind(kind);
-        os << " factor=" << factor;
+        if (kind != hls::PartitionKind::COMPLETE)
+          os << " factor=" << factor;
 
         // Vitis HLS automatically collapses the first dimension when its
         // size is one, so the directive dimension shifts to match.
@@ -2183,6 +2221,12 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
                                            ArrayRef<Value> portList) {
   // Only top function should emit interface pragmas.
   if (hasTopFuncAttr(func)) {
+    if (auto module = func->getParentOfType<ModuleOp>())
+      for (auto helper : module.getOps<func::FuncOp>())
+        if (helper->hasAttr("hls.shared_instance"))
+          indent() << "#pragma HLS allocation function instances="
+                   << getEmittedFuncName(helper.getName()) << " limit=1\n";
+
     // Inside a dataflow region every array is checked as a channel: one
     // writer, one reader. A read-only port is not a channel -- its value
     // is a run-long constant -- and several nodes reading it is the
@@ -2203,7 +2247,8 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
 
         if (auto memrefPortType = dyn_cast<MemRefType>(port.getType())) {
           if (getMemoryKind(memrefPortType) == MemoryKind::DRAM) {
-            os << " m_axi offset=slave";
+            os << " m_axi offset=slave depth="
+               << memrefPortType.getNumElements();
             emitAxiShape(memrefPortType);
           } else
             os << " bram";
@@ -2222,7 +2267,7 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
         }
 
       } else {
-        // For scalar types, we always emit them as AXI-Lite ports.
+        // Scalar arguments are always AXI-Lite ports.
         auto name = getName(port);
         if (name.front() == "*"[0])
           name.erase(name.begin());
@@ -2264,6 +2309,9 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
 /// classifications that follow directly from the operations present are
 /// used; everything else falls back to the bare stage index.
 static StringRef classifyStage(func::FuncOp func) {
+  if (func->hasAttr("hls.shared_instance"))
+    return "engine";
+
   bool hasArith = false, hasExt = false, hasTrunc = false;
   bool hasSin = false, hasCos = false;
 
@@ -2873,6 +2921,7 @@ void ModuleEmitter::emitModule(ModuleOp module) {
       peeled = memref.getElementType();
     if (auto streamType = dyn_cast<StreamType>(peeled))
       peeled = streamType.getElementType();
+    usesVector |= isa<VectorType>(peeled);
     if (auto intType = dyn_cast<IntegerType>(peeled))
       usesApInt |= intType.getWidth() != 1;
   };
@@ -2901,26 +2950,57 @@ void ModuleEmitter::emitModule(ModuleOp module) {
   if (topFunc)
     os << "// Top function : " << topFunc.getName() << "\n";
   os << "// Directives   : " << (emitVitisDirectives ? "vitis" : "vivado")
-     << "\n"
-     << "// AXI bus      : " << axiBusBits << "-bit\n"
-     << "// Sub-functions: " << (funcs.empty() ? 0 : funcs.size() - 1) << "\n"
+     << "\n";
+  // What a board integrator has to wire: how many top-level ports there are
+  // and what protocol they speak. Only a design that has such ports reports
+  // them, so an `ap_memory` package says nothing about a bus it does not use.
+  if (topFunc) {
+    unsigned ports = 0;
+    topFunc.walk([&](AxiPortOp port) {
+      if (isa<MemRefType>(port.getElement().getType()))
+        ++ports;
+    });
+    if (ports) {
+      bool isStream = topFunc->hasAttr("stream_interface");
+      os << "// Interface    : " << ports
+         << (isStream ? " AXI4-Stream port" : " AXI master")
+         << (ports == 1 ? "" : "s") << "\n";
+      if (!isStream)
+        os << "// AXI bus      : " << axiBusBits << "-bit\n";
+    }
+  }
+  os << "// Sub-functions: " << (funcs.empty() ? 0 : funcs.size() - 1) << "\n"
      << "//\n"
         "//===------------------------------------------------------------"
         "----------===//\n\n";
 
   os << "#include <cmath>\n";
   os << "#include <algorithm>\n";
+  os << "#include <cstdint>\n";
   if (usesMemCpy)
     os << "#include <cstring>\n";
   if (usesApInt) {
-    os << "#include <cstdint>\n";
     os << "#include <ap_int.h>\n";
   }
   if (usesStream)
     os << "#include <hls_stream.h>\n";
   if (usesVector)
     os << "#include <hls_vector.h>\n";
-  os << "\n";
+  os << "\n"
+        "static int64_t sar_hls_floor_div(int64_t lhs, int64_t rhs) {\n"
+        "  int64_t quotient = lhs / rhs;\n"
+        "  int64_t remainder = lhs % rhs;\n"
+        "  return quotient - (remainder < 0);\n"
+        "}\n\n"
+        "static int64_t sar_hls_ceil_div(int64_t lhs, int64_t rhs) {\n"
+        "  int64_t quotient = lhs / rhs;\n"
+        "  int64_t remainder = lhs % rhs;\n"
+        "  return quotient + (remainder > 0);\n"
+        "}\n\n"
+        "static int64_t sar_hls_mod(int64_t lhs, int64_t rhs) {\n"
+        "  int64_t remainder = lhs % rhs;\n"
+        "  return remainder < 0 ? remainder + rhs : remainder;\n"
+        "}\n\n";
 
   assignFuncNames(funcs, topFunc);
   collectGlobalTables(module, funcs);

@@ -69,7 +69,7 @@ struct Slot {
 /// Whether this use keeps the buffer's contents to itself.
 ///
 /// An op that hands out a memref or a tensor may create an alias that
-/// outlives the uses we can see -- `bufferization.to_tensor` is the case
+/// outlives the visible uses -- `bufferization.to_tensor` is the case
 /// that does not return a memref, and an unranked `memref.cast` is why the
 /// check reads BaseMemRefType -- and a call or return lets the buffer
 /// escape the function entirely. So does a terminator forwarding it to its

@@ -107,9 +107,9 @@ The Python launcher allocates result arrays with NumPy and invokes
 Binding FFT/interpolation to a runtime library mirrors how production
 compilers bind vendor libraries (cuFFT, FFTW): the *pipeline structure*
 is the compiler's job; leaf transforms with decades of optimization
-behind them are not re-derived from loops. The runtime is a few hundred
-lines of dependency-free C++ (radix-2/Bluestein FFT in double
-precision, kernel-selectable resampling, simple std::thread
+behind them are not re-derived from loops. The runtime is one file of
+dependency-free C++ (radix-2/Bluestein FFT in double precision,
+kernel-selectable resampling, simple std::thread
 parallelism).
 
 ### 4. DSL vocabulary above IR primitives
@@ -126,8 +126,8 @@ computations with irreducible semantics (FFT kernels, gathers,
 selection) become IR ops with verifiers and per-backend lowerings.
 The rule is applied without exceptions: even Stolt remapping -- the
 heart of omega-K -- is a Python composition of a position computation,
-`interp1d` and phase ramps, and element-wise fusion keeps the composed
-form within a few percent of a hand-fused kernel on the 16384^2 scene.
+`interp1d` and phase ramps, which element-wise fusion collapses back into
+single loop nests.
 
 ### 5. Backend plugin model
 
@@ -166,12 +166,12 @@ All kernels follow the split-complex affine path (`sar-to-affine-pipeline`):
    an affine function of loop indices -- which is what HLS loop analysis,
    pipelining and array partitioning require. Twiddle factors are
    precomputed into constant memref globals, padded so the three radix-4
-   reads of one butterfly bank apart. Radix-4 halves the stage count where
-   possible. Lines are transformed in blocks: a prefetch sweep copies each
-   block into on-chip line buffers with unit-stride external accesses, the
-   butterfly stages run on chip with a compact DSP-budgeted lane loop
-   innermost (each twiddle fetch shared across lanes, the stage chain
-   drawing scratch blocks from a reusable pool), and a mirrored sweep
+   reads of one butterfly land in separate banks. Radix-4 halves the stage
+   count where possible. Lines are transformed in blocks: a prefetch sweep
+   copies each block into on-chip line buffers with unit-stride external
+   accesses, the butterfly stages run on chip with a compact DSP-budgeted
+   lane loop innermost (each twiddle fetch shared across lanes, the stage
+   chain drawing scratch blocks from a reusable pool), and a mirrored sweep
    writes the block back -- so the external planes only ever see
    burst-friendly transfers. The buffers carry banking hints
    (`hls.partition_*`) the backend's partition pass applies verbatim.
@@ -234,7 +234,5 @@ buffer lives (`#hls.mem<dram>`, `bram_t2p`, ...), how an array is banked
 
 Keeping it in-tree means one LLVM build and one set of tools:
 `sar-opt` runs every pass from SAR down to scheduled HLS IR, and
-`sar-translate` writes the C++. A second emission target registers itself
-in `include/sar/Target/InitAllTranslations.h` and needs no new tool.
-Memory placement, AXI shaping, and the configuration schema are in
-[backends.md](backends.md).
+`sar-translate` writes the C++. Memory placement, AXI shaping, and the
+configuration schema are in [backends.md](backends.md).

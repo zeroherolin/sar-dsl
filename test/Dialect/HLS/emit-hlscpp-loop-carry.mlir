@@ -41,8 +41,8 @@ func.func @carries(%buf: memref<8xf64, #hls.mem<dram>>,
     affine.yield %b, %s : f64, f64
   }
 
-  // CHECK: out0[(int)0] = [[ACC]];
-  // CHECK: out0[(int)1] = [[A]];
+  // CHECK: out0[(int64_t)0] = [[ACC]];
+  // CHECK: out0[(int64_t)1] = [[A]];
   memref.store %sum, %out[%c0] : memref<2xf64, #hls.mem<dram>>
   memref.store %fib#0, %out[%c1] : memref<2xf64, #hls.mem<dram>>
   return

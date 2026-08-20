@@ -24,10 +24,11 @@ from ...compiler.toolchain import find_tool, run_tool
 __all__ = [
     "AUTO_OPTIONS", "KernelFacts", "array_partition_max_factor",
     "buffer_extents", "derive", "external_buffer_threshold", "fft_stage_group",
+    "external_vector_max_lanes", "external_vector_min_elements",
     "fft_io_unroll", "fft_parallel_rows", "interp_banded_gather",
-    "kernel_facts_from_json",
-    "loop_tile_size", "lutram_max_bytes", "measure_kernel",
-    "storage_min_elements", "streaming_threshold", "transpose_block_bytes"
+    "kernel_facts_from_json", "loop_tile_size", "lutram_max_bytes",
+    "measure_kernel", "storage_min_elements", "streaming_threshold",
+    "transpose_block_bytes"
 ]
 
 #: The options this module decides -- exactly the schema's `advanced`
@@ -54,6 +55,11 @@ _PLANE_TOLERANCE = 4
 #: side the per-band local buffer has stopped being a bank and become a
 #: plane, which is what `external_buffer_threshold` is for.
 _MIN_TILE, _MAX_TILE = 2, 64
+
+# Vitis 2022.2 synthesis establishes eight scalar lanes as the profitable
+# portable point: it fills a 512-bit f64 beat and a 256-bit f32 beat without
+# the routing and compile-time growth of wider first-class vectors.
+_MAX_VECTOR_LANES = 8
 
 # ---------------------------------------------------------------------- #
 # What the compiler can measure about a kernel
@@ -83,6 +89,10 @@ class KernelFacts:
     transposes: int = 0
     #: (elements, bytes) for every explicit allocation in lowered IR.
     buffers: Tuple[Tuple[int, int], ...] = ()
+    #: Every scalar plane width present in the kernel, in bytes.
+    element_bytes_set: Tuple[int, ...] = ()
+    #: Data-dependent interpolation/gather operations in the traced graph.
+    gather_ops: int = 0
 
 
 def kernel_facts_from_json(text: str) -> KernelFacts:
@@ -96,6 +106,10 @@ def kernel_facts_from_json(text: str) -> KernelFacts:
         transposes=int(values["transposes"]),
         buffers=tuple((int(elements), int(size))
                       for elements, size in values["buffers"]),
+        element_bytes_set=tuple(
+            int(width) for width in values.get("element_bytes_set",
+                                               [values["element_bytes"]])),
+        gather_ops=int(values.get("gathers", 0)),
     )
 
 
@@ -178,7 +192,9 @@ def _transform_stages(length: int) -> Tuple[int, int, bool]:
     return (exponent + 1) // 2, padded, True
 
 
-def _fft_scratch_bytes(transforms, group: int, lanes: int = 1,
+def _fft_scratch_bytes(transforms,
+                       group: int,
+                       lanes: int = 1,
                        io: int = 1) -> int:
     """Primitive-aware bytes for transform storage at `group`/`lanes`/`io`.
 
@@ -226,7 +242,9 @@ def _fft_groups(transforms) -> Tuple[int, ...]:
     return (0, ) + tuple(range(2, max(longest, 2) + 1))
 
 
-def fft_stage_group(facts: KernelFacts, budget: int, lanes: int = 1,
+def fft_stage_group(facts: KernelFacts,
+                    budget: int,
+                    lanes: int = 1,
                     io: int = 1) -> int:
     """Stockham stages per scratch slot: the least grouping whose scratch
     fits the working share of the budget (the tightest available when none
@@ -237,16 +255,16 @@ def fft_stage_group(facts: KernelFacts, budget: int, lanes: int = 1,
         return 0
     groups = _fft_groups(facts.transforms)
     if budget <= 0:
-        return min(groups,
-                   key=lambda g: _fft_scratch_bytes(facts.transforms, g,
-                                                    lanes, io))
+        return min(
+            groups,
+            key=lambda g: _fft_scratch_bytes(facts.transforms, g, lanes, io))
     share = max(1, budget // _WORKING_SHARE)
     for group in groups:
         if _fft_scratch_bytes(facts.transforms, group, lanes, io) <= share:
             return group
-    return min(groups,
-               key=lambda g: _fft_scratch_bytes(facts.transforms, g,
-                                                lanes, io))
+    return min(
+        groups,
+        key=lambda g: _fft_scratch_bytes(facts.transforms, g, lanes, io))
 
 
 def loop_tile_size(facts: KernelFacts, axi_bus_bits: int) -> int:
@@ -258,7 +276,9 @@ def loop_tile_size(facts: KernelFacts, axi_bus_bits: int) -> int:
     return max(_MIN_TILE, min(_MAX_TILE, tile))
 
 
-def fft_parallel_rows(facts: KernelFacts, dsp_budget: int, budget: int,
+def fft_parallel_rows(facts: KernelFacts,
+                      dsp_budget: int,
+                      budget: int,
                       io: int = 1) -> int:
     """Power-of-two FFT lane count the arithmetic and memory afford.
 
@@ -276,10 +296,23 @@ def fft_parallel_rows(facts: KernelFacts, dsp_budget: int, budget: int,
     """
     if not facts.transforms:
         return 0
+    # Multiple data-dependent regrids already dominate scheduling and source
+    # complexity. Replicating every FFT lane around such a graph made Vitis
+    # 2022.2 spend hours in binding at production scale; keep one reusable
+    # transform engine and spend parallelism on the memory-conflict graph.
+    if facts.gather_ops > 1:
+        return 0
     stage_lanes = sum(6 * _transform_stages(length)[0]
                       for length, _ in facts.transforms)
     dsp_lanes = max(1, dsp_budget // max(1, stage_lanes))
     lanes = 1 << (min(dsp_lanes, 16).bit_length() - 1)
+    longest = max(length for length, _ in facts.transforms)
+    independent_lines = max(1, facts.plane_elements // max(1, longest))
+    # A lane is only worthwhile when it has several line blocks to process;
+    # otherwise it multiplies RTL and synthesis work to shave a handful of
+    # iterations from validation-size designs.
+    amortized = max(1, independent_lines // 8)
+    lanes = min(lanes, 1 << (min(amortized, 16).bit_length() - 1))
     # Feasibility is checked at the saturated stage grouping (the two-slot
     # floor), because that is what the grouping decision itself falls back
     # to under the same pressure; checking at full unroll would give up
@@ -291,15 +324,37 @@ def fft_parallel_rows(facts: KernelFacts, dsp_budget: int, budget: int,
 
 
 def fft_io_unroll(facts: KernelFacts, axi_bus_bits: int) -> int:
-    """Elements one FFT transfer access moves. Half a beat per plane: the
-    real and imaginary sweeps run in one loop, so together they fill the
-    bus; wider unrolls only multiply the line-buffer banks each lane pays
-    a memory primitive for."""
+    """Elements one FFT transfer access moves.
+
+    Each real/imaginary plane owns an independent AXI bundle, so the physical
+    limit is a full beat per plane. Synthesis feedback caps f32 at eight lanes
+    and scales the cap by scalar width: f64 line-buffer banks otherwise consume
+    enough whole memory primitives to make production transforms infeasible.
+    """
     if not facts.transforms:
         return 1
     element_bytes = min(width for _, width in facts.transforms)
-    beat = max(1, axi_bus_bits // 16) // max(1, element_bytes)
-    return max(1, 1 << (min(beat, 8).bit_length() - 1))
+    beat = max(1, axi_bus_bits // 8) // max(1, element_bytes)
+    width_cap = max(1, _MAX_VECTOR_LANES * 4 // element_bytes)
+    lanes = min(beat, width_cap)
+    return max(1, 1 << (lanes.bit_length() - 1))
+
+
+def _element_widths(facts: KernelFacts) -> Tuple[int, ...]:
+    return facts.element_bytes_set or (facts.element_bytes, )
+
+
+def external_vector_max_lanes(facts: KernelFacts, axi_bus_bits: int) -> int:
+    """Common packed lane count supported by every scalar plane width."""
+    widest = max(_element_widths(facts))
+    lanes = max(1, axi_bus_bits // max(8, widest * 8))
+    lanes = min(lanes, _MAX_VECTOR_LANES)
+    return 1 << (lanes.bit_length() - 1)
+
+
+def external_vector_min_elements(facts: KernelFacts, lanes: int) -> int:
+    """Amortization floor for changing a public array to a packed ABI."""
+    return max(4096, lanes * lanes * 8)
 
 
 def lutram_max_bytes(axi_bus_bits: int) -> int:
@@ -311,7 +366,8 @@ def lutram_max_bytes(axi_bus_bits: int) -> int:
 
 def array_partition_max_factor(facts: KernelFacts, axi_bus_bits: int) -> int:
     """Maximum useful bank count before it exceeds one external bus beat."""
-    lanes = max(1, axi_bus_bits // max(8, facts.element_bytes * 8))
+    widest = max(_element_widths(facts))
+    lanes = max(1, axi_bus_bits // max(8, widest * 8))
     factor = 1 << (lanes.bit_length() - 1)
     return min(32, factor)
 
@@ -346,7 +402,8 @@ def transpose_block_bytes(facts: KernelFacts, bram_bytes: int) -> int:
     if bram_bytes <= 0:
         return 0
     slots = max(1, 2 * facts.transposes)
-    return max(4096, bram_bytes // (4 * slots))
+    block = bram_bytes // (4 * slots)
+    return block if block >= 4096 else 0
 
 
 def external_buffer_threshold(facts: KernelFacts, budget: int, metadata,
@@ -397,9 +454,10 @@ def derive(config,
         "the placement decision needs the metadata and the lowered IR together"
     budget = config.on_chip_bytes()
     io = fft_io_unroll(facts, int(config.axi_bus_bits))
-    lanes = fft_parallel_rows(
-        facts, int(config.dsp),
-        int(config.bram_bytes) + int(config.uram_bytes), io)
+    vector_lanes = external_vector_max_lanes(facts, int(config.axi_bus_bits))
+    lanes = fft_parallel_rows(facts, int(config.dsp),
+                              int(config.bram_bytes) + int(config.uram_bytes),
+                              io)
     values = {
         "fft_stage_group":
         fft_stage_group(facts, budget, max(1, lanes), io),
@@ -409,6 +467,10 @@ def derive(config,
         lanes,
         "fft_io_unroll":
         io,
+        "external_vector_max_lanes":
+        vector_lanes,
+        "external_vector_min_elements":
+        external_vector_min_elements(facts, vector_lanes),
         "interp_banded_gather":
         interp_banded_gather(),
         "reuse_buffer_min_elements":

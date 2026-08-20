@@ -123,31 +123,46 @@ streamed buffers reach the top function:
 | | top signature | use |
 |---|---|---|
 | `interface='ap_memory'` | the kernel's own inputs and results | csim packages: the testbench can drive every port |
-| `interface='axi'` | one AXI master per I/O plane, plus compiler-managed typed scratch arenas | memory-mapped designs handed to Vitis |
+| `interface='axi'` | one AXI master per I/O plane, plus the scratch arenas the spilled buffers need | memory-mapped designs handed to Vitis |
 | `interface='stream'` | AXI4-Stream ports for pure inputs and outputs; scratch arenas remain AXI masters | streaming radar front ends |
 
-Internal buffers that spill to DRAM never surface as ports of their own:
-they are distributed between two fixed arenas for their element type and
-carved at aligned offsets. Each arena's array bound is the storage size the
-host must bind. One-element placeholders preserve both masters when nothing
-spills, so placement decisions do not change the interface.
+A port is a platform resource: it is what a board integrator wires to a
+physical memory channel, and a channel spent on a compiler convenience is
+one the algorithm cannot use. So the port list is the algorithm's own I/O
+and nothing more. Internal buffers that spill to DRAM never surface as
+ports of their own: they are carved at aligned offsets out of scratch
+arenas, and an element type that never spills contributes no port. Each
+arena's array bound is the storage size the host must bind.
+
+Two things set the arena count, both about aliasing rather than
+convenience. A typed C++ signature needs one pointer per element type,
+since an arena is `float *` or `double *` and one pointer cannot be
+both. And buffers that a single dataflow node both reads and writes need
+separate pointers: given one, HLS must assume each load may alias a store
+still in flight, and that node's bus requests serialize behind their own
+responses -- an initiation interval of tens of cycles where the
+arithmetic wanted one. Splitting on exactly those conflicts is the
+ping-pong a hand-written design allocates by hand, and it is what the
+compiler allocates too.
 
 An imaging chain is a sequence of whole-raster passes, so a plane dies
 as soon as the next pass has read it and the ones whose lifetimes do not
 overlap share an allocation. That is what keeps the streamed set a
 property of the algorithm rather than of the chain's length: adding
 passes to a kernel does not add ports. At `16384 x 16384` the omega-K
-chain streams its full-size working planes through typed arenas and holds
-only tables and line scratch on chip. Every port drives its own AXI master
-bundle: ports sharing a bundle serialize their bus requests, starving
+chain streams its full-size working planes through three f32 arenas -- the
+depth of its read/write ping-pong, not of its pass list -- and holds only
+tables and line scratch on chip. Every remaining port drives its own
+AXI master bundle: those ports all belong to the algorithm, and sharing a
+bundle between two of them would serialize their bus requests, starving
 loops that read two planes concurrently.
 
-Testbench generation rejects `interface='axi'` -- the compiler-managed
-scratch allocation has no golden input data to drive it -- and
-`interface='stream'`, whose `hls::stream<>` ports need a FIFO-feeding
-harness the array testbench is not. Emit the csim package with
-`interface='ap_memory'` (the default; the numerics are identical), and
-compile with `'axi'` or `'stream'` for the design you synthesize.
+Testbench generation supports scalar `interface='axi'` designs: scratch arrays
+are allocated and zero-initialized by the harness, and the package includes
+both C-simulation and Verilog RTL co-simulation scripts. A packed-vector AXI
+design can be checked by pinning `external_vector_min_elements` above its array
+sizes for the reduced co-simulation build. `interface='stream'` still requires
+a FIFO-feeding system harness; use `ap_memory` for its numerical oracle.
 
 ### Validating a design in Vitis HLS
 
@@ -161,29 +176,40 @@ design.write_synthesis_script("hls_project/mykernel")
 #   cd hls_project/mykernel && vitis_hls -f mykernel_csynth.tcl
 ```
 
-`write_synthesis_script` works for every interface -- synthesis needs no
-golden data, so the AXI and stream designs that cannot be csim'd are
-exactly the ones it exists for. The csim package carries the same script
+`write_synthesis_script` works for every interface and needs no golden data.
+The simulation package carries the same script
 for its own raster, and the ALOS example runners emit one next to each
 `_axi.cpp` design. The script names the `part` and `clock_ns` from the
 configuration, so the budgets the compiler placed against and the device
 the tool builds for stay the same device.
-Each package includes `design_manifest.json` with the resolved configuration,
-its provenance, and the generated source SHA-256.
+Each package includes `design_manifest.json` with logical and physical port
+shapes, the resolved configuration and provenance, and the generated source
+SHA-256.
 
 Reports land in `<top>_csynth_proj/sol1/syn/report/`; the checklist,
 in the order failures usually appear:
 
 1. **Synthesis completes.** The emitter's output is affine loops, static
    arrays and straight-line arithmetic, all synthesizable by
-   construction; a failure here is a compiler bug and worth a report.
+   construction, so a failure here is a compiler bug.
 2. **Timing.** The estimated clock in `<top>_csynth.rpt` must meet
    `clock_ns`. The shipped target is 4 ns; a miss is reported as a failed
    constraint rather than being hidden by the emitter.
 3. **Initiation intervals.** Pipelined loops should report the II the
-   pragma asked for (`II=1` throughout the element-wise and FFT nests;
-   the interpolation gather may settle at II=2 on a dual-port band).
-   A large II names the loop that needs attention.
+   pragma asked for (`II=1` throughout the element-wise nests; the
+   interpolation gather may settle at II=2 on a dual-port band). A large
+   II names the loop that needs attention.
+
+   The Stockham butterfly nests are the documented exception, at II=2. A
+   radix-4 stage reads four taps a stride apart, and that stride is a power
+   of the radix at every stage but the last -- so a cyclic banking that
+   separates one stage's taps maps another stage's onto a single bank, and a
+   block banking separates only the first. No static partitioning of one
+   line buffer serves every stage, which is why the butterfly scratch is
+   hinted one bank per lane and takes the II. The lane parallelism absorbs
+   it: `fft_parallel_rows` lines are in flight per iteration, so the II
+   costs throughput only against a design that banked every stage at once,
+   which is not a design HLS can express.
 4. **Memory utilization.** BRAM/URAM usage must sit within the
    `bram_bytes`/`uram_bytes` caps. The caps are hard: the compiler
    charges dataflow buffers at primitive granularity, rechecks the final
@@ -198,23 +224,22 @@ in the order failures usually appear:
    no memory primitives at all. Only dynamically-indexed tables (the
    axis ROMs) should appear as memories, at one or two BRAM primitives
    per reading process -- dozens means the tool replicated ROMs that
-   ought to be shared, which is worth a report.
+   ought to be shared.
    Exactly linear axes use a compact `constexpr` generator; non-exact ramps
    remain explicit arrays so source compaction cannot change a floating-point
    value.
-5. **Interfaces.** One `m_axi` port per I/O plane plus the typed scratch
-   arenas, on the bundles the design declared; burst length and outstanding
-   depths as configured (see the header comment of the emitted C++).
+5. **Interfaces.** One `m_axi` port per I/O plane plus one per scratch
+   arena, on the bundles the design declared; burst length and outstanding
+   depths as configured (see the header comment of the emitted C++). Scalar
+   arguments are `s_axilite` on the control bundle, so they never cost a
+   master. An arena count that tracks how many passes the kernel has --
+   rather than how its planes alias -- is a compiler bug.
 
 `benchmarks/run_resources.py` estimates memory from the emitted C++
-without Vitis; the synthesis report is the measured truth, and a large
-gap between the two is itself a finding worth recording.
+without Vitis; the synthesis report is the measured figure.
 
-Two things csim cannot decide and only this flow can: whether the tool
-shares the twiddle ROMs (step 4), and whether the pass-pipeline option
-`balance-dataflow=false` -- which saves copy nodes and on-chip bytes --
-is safe under hardware dataflow concurrency, which needs co-simulation
-(`cosim_design`) rather than the sequential csim.
+One thing csim cannot decide and only this flow can: whether the tool
+shares the twiddle ROMs (step 4).
 
 ### HLS memory access patterns
 
@@ -246,7 +271,8 @@ Two design choices uphold the invariant:
   interpreting it, so a corner turn with a fused shift stages exactly
   like a bare one.
 
-What remains strided in the omega-K chain at `512 x 512`:
+What remains strided in the omega-K chain, counted by the `128 x 128`
+audit in `test/python/test_hls_access_patterns.py`:
 
 | Access | Count | Why it is inherent |
 |---|---|---|
@@ -285,8 +311,8 @@ the banked line blocks cost the block-RAM tiers. Each lane owns its banks --
 the line buffers are hinted complete over the lane dimension, which no local
 access analysis could recover from the compact lane loop -- and the generated
 C++ keeps one lane loop with an HLS unroll directive instead of cloning every
-stage in source. `fft_io_unroll` is half a bus beat per plane, since the real
-and imaginary sweeps run in one loop. Values may be pinned for synthesis
+stage in source. `fft_io_unroll` is bounded by a full beat on each independent
+real/imaginary master and by the synthesis-validated lane cap. Values may be pinned for synthesis
 experiments, but they are compiler strategy rather than required user
 constraints.
 
@@ -445,8 +471,8 @@ operator binding happens inside Vitis.
 | `lut` | `1382400` | 80% lookup-table synthesis-report budget |
 | `interface` | `ap_memory` | Protocol the top-function ports speak: `ap_memory` (plain arrays), `axi` (AXI4 memory-mapped masters), or `stream` (AXI4-Stream) |
 | `axi_bus_bits` | `512` | Data width of the AXI masters, in bits |
-| `axi_max_burst_length` | `256` | Beats per burst at full bus width (the AXI4 maximum) |
-| `axi_max_outstanding` | `16` | Full-length bursts in flight per direction (Vitis caps it at 32) |
+| `axi_max_burst_length` | `64` | Maximum beats per burst, also capped at the AXI 4 KiB boundary |
+| `axi_max_outstanding` | `16` | Maximum bursts in flight per direction (Vitis caps it at 32) |
 | `precision` | `native` | Data path the kernel must carry: `native`, `f32` or `f64` |
 | `part` | `xcvu13p-fhgb2104-2-i` | Device part the generated Vitis scripts name |
 | `clock_ns` | `4.0` | Target clock period of the generated scripts |
@@ -480,19 +506,19 @@ loop tiling, banking, banded gathers, and buffer thresholds
 are derived from the constraints above and from what the compiler measures
 in the kernel: plane sizes, transform lengths, element widths, buffer
 lifetimes. They are absent from `hls_config.yaml` because no value written
-there would be a better guess than the computed one, and because knowing
-what `fft_stage_group=2` trades away is a compiler-team question, not a
-user's.
+there would be a better guess than the computed one.
 
 `design.config` reports what was chosen and `design.config.provenance`
 marks those keys `derived`. The policy lives in
-`python/sar/backends/hls/autotune.py`, one function per parameter:
+`python/sar/backends/hls/autotune.py`:
 
 | Derived | From |
 |---------|------|
 | `fft_stage_group` | the least grouping whose Stockham scratch fits the working share of the on-chip budget; full unroll where it fits |
 | `fft_parallel_rows` | lanes per prefetched line block, bounded by the DSP budget across all transform sites and by the banked line buffers' block-RAM cost |
-| `fft_io_unroll` | elements per external access in the FFT transfer sweeps: half a bus beat per plane |
+| `fft_io_unroll` | elements per FFT transfer, bounded by one full per-plane beat and the validated vector-lane cap |
+| `external_vector_max_lanes` | common packed width supported by every scalar plane type, capped by synthesis cost |
+| `external_vector_min_elements` | minimum array size that amortizes changing the physical AXI ABI |
 | `loop_tile_size` | the element count in one bus beat, bounded by the pass limits |
 | `lutram_max_bytes` | one bus beat: a bank no larger than one transfer does not earn a block RAM primitive |
 | `array_partition_max_factor` | the largest power-of-two bank count no wider than one AXI beat; reduced automatically if final primitive accounting exceeds a cap |

@@ -1,11 +1,26 @@
-"""The AXI top-level signature is fixed by the algorithm.
+"""The AXI top-level signature is the algorithm's own I/O.
 
-A deliverable design's ports are its contract with the host. Buffers the
-compiler decides to keep off chip are internal, so they must not surface as
-ports: otherwise a host binds a different number of AXI interfaces every
-time a budget, a scene size or a fusion decision moves a buffer across the
-on-chip line. These tests pin that invariant on the four imaging chains --
-across scene sizes, interfaces, and memory budgets.
+A deliverable design's ports are its contract with the host, and each one
+is a platform resource: an integrator wires it to a physical memory
+channel, so a master the compiler minted for its own convenience spends a
+channel the algorithm cannot use. Buffers the compiler keeps off chip are
+internal and must not surface as ports of their own; they are carved out
+of scratch arenas.
+
+What sets the arena count is aliasing, not convenience. A typed C++
+signature needs one pointer per element type, since an arena is `float *`
+or `double *` and one pointer cannot be both. Beyond that, buffers a
+single node reads and writes need separate pointers: one pointer both
+loaded from and stored to forces HLS to assume the loads alias the
+in-flight stores, and that node's bus traffic serializes. The arenas are
+a coloring of exactly those conflicts -- the same ping-pong a hand-written
+design allocates by hand, and no more.
+
+What stays variable is the arena itself: a design that spills nothing
+declares no arena, and the scratch extent tracks what went off chip. The
+algorithm's own ports do not move, and no placeholder is invented to pad
+the list. These tests pin that on the four imaging chains -- across scene
+sizes, interfaces, and memory budgets.
 """
 
 import importlib
@@ -32,6 +47,7 @@ RESIDENT = {
     "lutram_bytes": 1 << 20
 }
 PLACEMENTS = [SPILLING, RESIDENT]
+CTYPE = r"(?:float|double|hls::vector<(?:float|double),\s*\d+>)"
 
 
 def build_kernel(chain: str, n: int):
@@ -80,16 +96,32 @@ def scratch_bytes(args, io_ports: int) -> int:
     return total
 
 
+def scratch_types(args, io_ports: int) -> set:
+    """Element types of the trailing scratch arenas."""
+    return {arg.split(" ", 1)[0] for arg in args[io_ports:]}
+
+
 @requires_hls
 @pytest.mark.parametrize("chain", CHAINS)
 @pytest.mark.parametrize("n", SIZES)
 @pytest.mark.parametrize("placement", PLACEMENTS, ids=["spilling", "resident"])
 def test_port_count_is_the_algorithm_io(chain, n, placement):
-    """Ports are algorithm I/O plus stable typed scratch arenas."""
+    """Ports are the algorithm's I/O plus the arenas aliasing forces.
+
+    The upper bound is what makes this a real check: the compiler may spill
+    any number of planes, and each one has to land in an arena some other
+    plane already conflicts it out of, rather than in a port of its own. A
+    design that spills nothing adds nothing.
+    """
     kernel = build_kernel(chain, n)
+    io_ports = io_port_count(kernel)
     args = signature(axi_design(kernel, placement))
-    scratch_count = len(args) - io_port_count(kernel)
-    assert 2 <= scratch_count <= 4 and scratch_count % 2 == 0, args
+    scratch = args[io_ports:]
+    # Four is the widest conflict graph these chains present. The bound is
+    # what rules out an arena per spilled plane, which is the failure this
+    # guards -- the chains spill far more planes than they declare arenas.
+    assert len(scratch) <= 4 * len(scratch_types(args, io_ports)), args
+    assert len(scratch) <= 4, args
 
 
 def port_shapes(args, io_ports: int) -> list:
@@ -97,8 +129,11 @@ def port_shapes(args, io_ports: int) -> list:
     and the scratch extent -- the one thing sizing legitimately moves."""
     shapes = []
     for index, arg in enumerate(args):
-        ctype, rest = arg.split(" ", 1)
-        dims = re.findall(r"\[(\d+)\]", rest)
+        declaration = re.fullmatch(
+            rf"(?P<ctype>{CTYPE})\s+\w+(?P<dims>(?:\[\d+\])+)", arg)
+        assert declaration, arg
+        ctype = declaration.group("ctype")
+        dims = re.findall(r"\[(\d+)\]", declaration.group("dims"))
         if index >= io_ports:
             dims = dims[:-1] + ["scratch"]
         shapes.append((ctype, tuple(dims)))
@@ -108,14 +143,19 @@ def port_shapes(args, io_ports: int) -> list:
 @requires_hls
 @pytest.mark.parametrize("chain", CHAINS)
 @pytest.mark.parametrize("n", SIZES)
-def test_port_count_does_not_follow_the_placement(chain, n):
-    """The invariant being established: the interface is a function of the
-    algorithm, not of what the optimizer decided to spill this time."""
+def test_public_ports_do_not_follow_the_placement(chain, n):
+    """The invariant being established: the algorithm's own ports are a
+    function of the algorithm, not of what the optimizer decided to spill.
+
+    Only the scratch arena answers to placement, and only by existing at
+    all: squeezed onto a small device the chain gains one, and no port the
+    kernel declared changes type, rank or position to pay for it.
+    """
     kernel = build_kernel(chain, n)
     signatures = [signature(axi_design(kernel, p)) for p in PLACEMENTS]
     io_ports = io_port_count(kernel)
-    assert port_shapes(signatures[0],
-                       io_ports) == port_shapes(signatures[1],
+    assert port_shapes(signatures[0][:io_ports],
+                       io_ports) == port_shapes(signatures[1][:io_ports],
                                                 io_ports), signatures
 
 
@@ -133,7 +173,7 @@ def test_scratch_arenas_are_trailing_and_flat(chain):
     # Every other port is one of the algorithm's own planes: 1-D arrays are
     # its vectors, 2-D its rasters, and none of them is the flat scratch.
     for arg in args[:io_ports]:
-        assert re.fullmatch(r"(?:float|double) \w+(?:\[\d+\])+", arg), arg
+        assert re.fullmatch(rf"{CTYPE} \w+(?:\[\d+\])+", arg), arg
 
 
 @requires_hls
@@ -141,8 +181,8 @@ def test_scratch_arenas_are_trailing_and_flat(chain):
 def test_every_port_carries_exactly_one_interface_pragma(interface):
     """A port with no pragma falls into whatever protocol the Vitis flow
     defaults to, which differs between the IP and the kernel flows -- the
-    signature stops being a contract. Every argument, including an unused
-    placeholder scratch arena, therefore needs one explicit pragma."""
+    signature stops being a contract. Every argument, the scratch arena
+    included, therefore needs exactly one explicit pragma."""
     kernel = build_kernel("wka", 64)
     kernel._compiled.clear()
     design = kernel.compile(backend="hls", options={"interface": interface})
@@ -154,6 +194,20 @@ def test_every_port_carries_exactly_one_interface_pragma(interface):
                          design.source())
     for port in ports:
         assert pragmas.count(port) == 1, (port, pragmas)
+
+
+@requires_hls
+def test_a_resident_design_declares_no_scratch_port():
+    """The other half of the contract: no spill, no port.
+
+    A placeholder arena would keep the signature constant across placements,
+    but it would also ask an integrator to wire a master the design never
+    drives -- so a chain that fits on chip must come out with the kernel's
+    own ports and nothing appended.
+    """
+    kernel = build_kernel("wka", 256)
+    args = signature(axi_design(kernel, RESIDENT))
+    assert len(args) == io_port_count(kernel), args
 
 
 @requires_hls

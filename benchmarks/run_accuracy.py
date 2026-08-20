@@ -85,16 +85,11 @@ def csim_error(chain, name: str, reference, work: Path, single: bool):
     from sar.compiler.toolchain import find_tool
 
     design = chain.compile_kernel(backend="hls")
-    # The golden files must carry the kernel's declared result dtypes; the
-    # reference itself is f64 NumPy whatever the build precision.
     if len(reference) != len(chain.kernel.declared_result_types):
         raise ValueError(
             f"{name}: expected {len(chain.kernel.declared_result_types)} "
             f"results, got {len(reference)}")
-    golden = [
-        np.asarray(r, dtype=t.dtype.to_numpy())
-        for r, t in zip(reference, chain.kernel.declared_result_types)
-    ]
+    golden = reference
     out = work / name
     # An f32 build measured against the f64 reference carries single-
     # precision rounding scaled by the signal, so its tolerance follows
@@ -226,6 +221,7 @@ def main() -> None:
         payload = {
             "environment": environment(),
             "benchmark": "cross_backend_accuracy",
+            "command": [sys.executable, *sys.argv],
             "scene_size": args.n,
             "dtype": args.dtype,
             "results": results,

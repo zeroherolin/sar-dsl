@@ -19,7 +19,8 @@ The body composes existing ops:
 - For emission backends (`hls`, and any backend whose `.compile()` produces an
   artifact rather than a callable), pin a signature first:
   `range_compress.specialize(sar.c64[512, 512], sar.c64[512, 512])`.
-  `@sar.func` and `@sar.op` use the same spelling.
+  Annotation-free `@sar.func` kernels and `@sar.op` operators use the same
+  spelling; an annotated `@sar.func` is already pinned and compiles directly.
 
 This form covers more than op chaining. With `sar.where` and tensor
 comparisons, data-dependent per-element logic is ordinary Python --

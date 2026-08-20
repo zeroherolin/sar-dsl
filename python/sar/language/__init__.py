@@ -299,6 +299,8 @@ class Tensor:
         if isinstance(scalar,
                       bool) or not isinstance(scalar, numbers.Integral):
             raise TraceError(f"integer tensor {op} requires an integer scalar")
+        if op == "div" and scalar == 0:
+            raise TraceError("integer tensor div requires a nonzero scalar")
         other = _constant_splat(scalar, self._value.type)
         return self._binary(op, other, reflected=reflected)
 
@@ -338,11 +340,15 @@ class Tensor:
 
     def __truediv__(self, other):
         if _is_real_scalar(other):
+            if self.dtype.is_int:
+                return self._integer_scalar("div", other)
             other = _constant_splat(other, self._value.type)
         return self._binary("div", other)
 
     def __rtruediv__(self, other):
         if _is_real_scalar(other):
+            if self.dtype.is_int:
+                return self._integer_scalar("div", other, reflected=True)
             other = _constant_splat(other, self._value.type)
         return self._binary("div", other, reflected=True)
 
@@ -556,6 +562,11 @@ def _resolve_axis(what: str,
     value = dim if dim is not None else axis
     if value is None and required:
         raise TraceError(f"{what} requires a dim (or axis) argument")
+    if value is not None:
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise TraceError(
+                f"{what}: dim/axis must be an integer, got {value!r}")
+        value = int(value)
     return value
 
 
@@ -891,6 +902,8 @@ def argmax(x: Tensor,
         raise TraceError("sar.argmax expects a rank-1 or rank-2 tensor")
     elif dim is None:
         raise TraceError("sar.argmax on a rank-2 tensor requires dim")
+    elif dim not in (0, 1):
+        raise TraceError(f"sar.argmax: dim {dim} out of range for rank 2")
     out = TensorType((x.shape[1 - dim], ), I64)
     return x._emit("argmax", [x], out, {"dim": dim})
 
@@ -911,7 +924,7 @@ def sign(x: Tensor) -> Tensor:
     x = _require_tensor(x, "sar.sign")
     if not x.dtype.is_float:
         raise TraceError("sar.sign expects a float tensor")
-    return where(x > 0.0, 1.0, where(x < 0.0, -1.0, 0.0))
+    return where(x != x, x, where(x > 0.0, 1.0, where(x < 0.0, -1.0, 0.0)))
 
 
 def _trunc(x: Tensor) -> Tensor:

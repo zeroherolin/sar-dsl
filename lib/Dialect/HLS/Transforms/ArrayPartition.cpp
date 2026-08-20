@@ -17,7 +17,7 @@ namespace sar {
 } // namespace sar
 } // namespace mlir
 
-#define DEBUG_TYPE "array-partition"
+#define DEBUG_TYPE "hls-array-partition"
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -256,7 +256,7 @@ getDimAccessMaps(Operation *op, AffineValueMap valueMap, int64_t dim) {
     auto dimExpr = dyn_cast<AffineDimExpr>(permuteMap.getResult(i));
 
     // If the permutation result of the current dimension is equal to the target
-    // dimension, we push back the access map of each element of the vector into
+    // dimension, the access map of each vector element goes into
     // the "maps" to be returned.
     if (dimExpr && dimExpr.getPosition() == dim) {
       for (int64_t offset = 0, size = vectorShape[i]; offset < size; ++offset) {
@@ -383,20 +383,18 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
             auto rhsExpr = rhsIndex.getResult(0);
 
             if (lhsIndex.getOperands() != rhsIndex.getOperands()) {
-              // Here, we try to find a permutation map to make the two index
+              // Look for a permutation map making the two indices
               // identical.
               auto possiblePermutation = createPermutationMap(
                   lhsIndex.getOperands(), rhsIndex.getOperands());
 
               if (possiblePermutation.empty()) {
-                // If no permutation map is found, we need to use a mux to
-                // select value from the partitioned array. Meanwhile, we cannot
-                // calculate the distance in this case, so continue.
+                // Without one, the array needs a mux to select the bank
+                // and the distance is not computable; skip the pair.
                 requireMux = true;
                 continue;
               } else {
-                // If a permutation map is found, we need to apply it to the
-                // rhsExpr.
+                // Otherwise apply it to the right-hand expression.
                 SmallVector<AffineExpr, 4> dimReplacements;
                 SmallVector<AffineExpr, 4> symReplacements;
                 for (auto i : possiblePermutation) {

@@ -47,13 +47,11 @@ interface: ap_memory
 # wastes the rest of it, so ports widen towards this number.
 axi_bus_bits: 512
 
-# Beats a burst may carry at full bus width; AXI4 caps it at 256, and a
-# port whose contiguous run is shorter bursts that run instead.
-axi_max_burst_length: 256
+# Beats a burst may carry. At the default 512-bit width, 64 beats fill the
+# AXI4 4 KiB boundary; narrower rows and wider ports are capped automatically.
+axi_max_burst_length: 64
 
-# Full-length bursts in flight per direction. This and the two keys above
-# are the read/write buffering a port may occupy: a port whose bursts come
-# out shorter gets proportionally more of them, up to the Vitis cap of 32.
+# Maximum bursts in flight per direction (Vitis caps it at 32).
 axi_max_outstanding: 16
 
 # --- Vitis scripts ----------------------------------------------------

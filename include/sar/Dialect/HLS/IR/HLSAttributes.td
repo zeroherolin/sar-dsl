@@ -21,7 +21,6 @@ class HLSAttr<string name, list<Trait> traits = []> :
 
 def AxiKind: I32EnumAttr<"AxiKind", "Kind of AXI port", [
     I32EnumAttrCase<"MM", 0, "mm">,
-    I32EnumAttrCase<"LITE", 1, "lite">,
     I32EnumAttrCase<"STREAM", 2, "stream">
 ]> {
   let cppNamespace = "mlir::sar::hls";

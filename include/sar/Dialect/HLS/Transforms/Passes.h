@@ -33,13 +33,10 @@ class FuncOp;
 namespace mlir {
 namespace sar {
 
-enum CreateSubviewMode { Point, Reduction };
-
 void registerHLSPipeline();
 void registerHLSPasses();
 
 void addSimplifyAffineLoopPasses(OpPassManager &pm);
-void addCreateSubviewPasses(OpPassManager &pm);
 
 std::unique_ptr<Pass> createFuncPreprocessPass(std::string hlsTopFunc = "main");
 
@@ -53,9 +50,6 @@ std::unique_ptr<Pass> createEliminateMultiConsumerPass();
 std::unique_ptr<Pass> createEliminateMultiProducerPass();
 std::unique_ptr<Pass> createLegalizeDataflowPass();
 std::unique_ptr<Pass> createLowerDataflowPass();
-std::unique_ptr<Pass> createParallelizeDataflowNodePass(
-    unsigned loopUnrollFactor = 1, bool unrollPointLoopOnly = false,
-    bool complexityAware = true, bool correlationAware = true);
 std::unique_ptr<Pass> createPlaceDataflowBufferPass(
     unsigned threshold = 1024, unsigned bramBytes = 9907200,
     unsigned uramBytes = 37748736, unsigned lutramBytes = 2883584,
@@ -77,12 +71,11 @@ std::unique_ptr<Pass> createRemoveVariableBoundPass();
 std::unique_ptr<Pass> createAffineStoreForwardPass();
 std::unique_ptr<Pass> createFuseSiblingLoopsPass();
 std::unique_ptr<Pass> createCollapseMemrefUnitDimsPass();
-std::unique_ptr<Pass> createCreateMemrefSubviewPass(
-    CreateSubviewMode createSubviewMode = CreateSubviewMode::Point);
 std::unique_ptr<Pass>
 createLowerCopyToAffinePass(bool internalCopyOnly = false);
 std::unique_ptr<Pass> createRaiseAffineToCopyPass();
-std::unique_ptr<Pass> createReduceInitialIntervalPass();
+std::unique_ptr<Pass> createReduceInitiationIntervalPass();
+std::unique_ptr<Pass> createShareEquivalentFunctionsPass();
 std::unique_ptr<Pass> createSimplifyAffineIfPass();
 std::unique_ptr<Pass> createSimplifyCopyPass();
 
@@ -95,6 +88,9 @@ std::unique_ptr<Pass> createArrayPartitionPass(unsigned lutramMaxBits = 512,
 std::unique_ptr<Pass>
 createCreateAxiInterfacePass(std::string hlsTopFunc = "main",
                              bool streamInterface = false);
+std::unique_ptr<Pass>
+createWidenExternalMemoryPass(unsigned busBits = 512, unsigned maxLanes = 8,
+                              unsigned minElements = 4096);
 std::unique_ptr<Pass> createLoopPipeliningPass();
 
 #define GEN_PASS_DECL

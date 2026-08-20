@@ -405,7 +405,8 @@ struct PlaceDataflowBuffer
 
     mlir::RewritePatternSet patterns(func.getContext());
     patterns.add<HoistDramBuffer>(func.getContext());
-    (void)applyPatternsGreedily(func, std::move(patterns));
+    if (failed(applyPatternsGreedily(func, std::move(patterns))))
+      signalPassFailure();
   }
 };
 } // namespace

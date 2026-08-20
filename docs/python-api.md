@@ -22,10 +22,10 @@ element dtypes; indexing builds a tensor type annotation
 |------|---------|
 | `@sar.func` | traces a Python function into a compiled kernel; annotation-free kernels specialize per call signature |
 | `@sar.op` | defines an operator as a composition: inlines into kernels, runs eagerly on NumPy arrays ([defining-ops.md](defining-ops.md)) |
-| `sar.Kernel` | compiled kernel handle after tracing or specialization |
+| `sar.Kernel` | compiled kernel handle: what an annotated `@sar.func` is, and what specializing an annotation-free one yields |
 | `Kernel.compile(backend=, options=)` | compiles for a backend; returns a callable (cpu) or a design handle (hls) |
-| `Kernel.specialize(*types)` | pins an annotation-free kernel to explicit types |
 | `Kernel.to_mlir()` | the traced MLIR module text |
+| `GenericKernel.specialize(*types)` | pins an annotation-free `@sar.func` to explicit types, returning a `Kernel` |
 | `sar.constant(value, dtype=, shape=)` | materializes a NumPy array or scalar as a tensor constant |
 
 Inside a kernel, tensors carry NumPy-style sugar: operators (`+`, `*`,

@@ -52,6 +52,8 @@ def _openmp_link_flags() -> list:
     and returns the flags linking the OpenMP runtime the generated code's
     `__kmpc_*` calls resolve against."""
     override = os.environ.get("SAR_DSL_OMP_LIB")
+    if override and not os.path.isfile(override):
+        raise ToolchainError(f"SAR_DSL_OMP_LIB={override} does not exist")
     candidates = [override] if override else []
     clang = find_tool("clang")
     lib_dir = os.path.join(os.path.dirname(os.path.dirname(clang)), "lib")
@@ -69,6 +71,20 @@ def _openmp_link_flags() -> list:
     return ["-fopenmp"]
 
 
+def _openmp_is_available() -> bool:
+    """Whether clang can link the OpenMP runtime used by generated code."""
+    try:
+        clang = find_tool("clang")
+        flags = _openmp_link_flags()
+    except ToolchainError:
+        return False
+    probe = subprocess.run([clang, "-x", "c", "-", "-o", os.devnull, *flags],
+                           input="int main(void){return 0;}",
+                           capture_output=True,
+                           text=True)
+    return probe.returncode == 0
+
+
 class Backend(BaseBackend):
     name = "cpu"
 
@@ -79,7 +95,7 @@ class Backend(BaseBackend):
             find_tool("mlir-translate")
             find_tool("clang")
             find_runtime_library()
-            return True
+            return _openmp_is_available()
         except ToolchainError:
             return False
 

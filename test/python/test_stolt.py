@@ -3,6 +3,7 @@ in-kernel position computation, `sar.interp1d` and the re-referencing
 ramps -- against a direct numpy port of the fused formula."""
 
 import numpy as np
+import pytest
 
 import sar
 
@@ -50,3 +51,31 @@ def test_stolt_matches_reference():
     out = k(data)
     ref = _stolt_reference(data, fa, fr, c, fc, vr, t_shift)
     np.testing.assert_allclose(out, ref, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("case,match", [
+    ("nonuniform", "uniformly spaced"),
+    ("nonfinite", "must be finite"),
+    ("zero_vr", "vr must be nonzero"),
+    ("bad_c", "c must be positive"),
+])
+def test_stolt_rejects_invalid_geometry(case, match):
+    n, m = 4, 8
+    fa = np.linspace(-1.0, 1.0, n)
+    fr = np.linspace(-2.0, 2.0, m)
+    kwargs = dict(c=3.0e8, fc=1.27e9, vr=7100.0, t_shift=0.0)
+    if case == "nonuniform":
+        fr[3] += 0.25
+    elif case == "nonfinite":
+        fa[0] = np.nan
+    elif case == "zero_vr":
+        kwargs["vr"] = 0.0
+    else:
+        kwargs["c"] = -1.0
+
+    @sar.func
+    def kernel(data: sar.c128[n, m]) -> sar.c128[n, m]:
+        return sar.stolt_interp(data, fa, fr, **kwargs)
+
+    with pytest.raises(sar.TraceError, match=match):
+        kernel.to_mlir()

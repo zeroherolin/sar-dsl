@@ -7,10 +7,9 @@ runner stays a short script.
 Two designs come out of one geometry because no single design can be
 both. At the full 16384 x 16384 raster the planes have to stream from
 DRAM, which means `interface="axi"`: kernel I/O becomes AXI masters and
-internal spilled planes share a scratch port. A golden testbench has no
-input data for compiler-managed scratch, so that design is emitted for
-synthesis. Simulation uses a smaller `ap_memory` design whose complete
-signature the testbench can drive.
+internal spilled planes use compiler-managed scratch arenas. The full-raster
+arrays are too large for a practical host simulation, so that design is
+emitted for synthesis. Simulation uses a smaller `ap_memory` design.
 
 The reduced design is not a different radar: `alos_params` keeps `fc`,
 `fs`, PRF, `Vr`, `R0`, `Kr` and `Tp`, and the frequency axes span
@@ -53,9 +52,10 @@ def _annotate_csim_script(path: Path, algorithm: str, csim_n: int,
         "#\n"
         f"# The design emitted for the {n} x {n} scene is\n"
         f"# {algorithm}_alos_axi.cpp, and it is not this one: it compiles\n"
-        "# with interface='axi', where internal off-chip buffers share a\n"
-        "# compiler-managed scratch port. No golden input exists for it, so\n"
-        "# that design is synthesized rather than simulated. This raster\n"
+        "# with interface='axi', where internal off-chip buffers use\n"
+        "# compiler-managed scratch arenas. Its host arrays are too large\n"
+        "# for practical simulation, so it is synthesized instead.\n"
+        "# This raster\n"
         "# keeps the planes on chip, so the top function is the kernel's\n"
         "# own signature and the testbench can drive every port. The radar\n"
         "# parameters are identical at both sizes; the sampled window and\n"

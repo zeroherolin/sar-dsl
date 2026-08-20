@@ -19,11 +19,13 @@ records its validation boundary and open compiler work.
   rejected rather than overcommitted.
 - Complete N=32 designs for all four algorithms pass Vitis HLS 2022.2
   C-simulation and synthesis at the 4 ns target.
-- 16384 × 16384 c64 omega-K, Range-Doppler, and Chirp Scaling designs complete
-  synthesis. WKA estimates 2.92 ns against the 4 ns target at 10.6G cycles;
-  RDA and CSA miss it. Implementation timing remains outside this scope.
-- A Polar Format c64 design completes N=8192 synthesis within resource
-  budgets; its 6.067 ns estimate remains open timing work.
+- Production c64 AXI designs -- the stripmap chains at 16384², PFA at 8192²
+  input and 16384² output -- complete synthesis within the 4 ns target and
+  the resource budgets.
+- Top-level ports are the algorithm's own I/O plus the scratch arenas its
+  dataflow needs; the compiler adds none of its own.
+- A reduced two-FFT AXI design with compiler-managed scratch passes Verilog RTL
+  co-simulation against the same golden output as C simulation.
 - Shapes are static and specialize per geometry. The CPU backend is validated
   on Linux x86-64; Vitis is optional unless synthesis artifacts are being
   validated.
@@ -31,19 +33,16 @@ records its validation boundary and open compiler work.
 Measured accuracy, performance, and resource data are in
 [benchmarks/](../benchmarks/).
 
-## Open compiler work
+## Open work
 
-- Vectorize external DRAM ports to wide beats: scalar `m_axi` ports cap
-  at one element per cycle whatever the loop shape, and the wide-port
-  transfers are the dominant remaining latency gap to the hand-written
-  design.
-- Reuse one parameterized FFT engine across compatible transform call sites.
-- Externalize large axis/window tables and deduplicate size-specialized copy
-  loops to reduce extreme-raster source and synthesis time.
-- Close remaining external-load and interpolation/gather initiation-interval
-  bottlenecks so Range-Doppler, Chirp Scaling, and Polar Format meet 4 ns at
-  production rasters.
-- Gate reassociating phase rewrites behind an explicit numerical-error budget.
+- Generated designs close timing and fit the budgets, but a generated omega-K
+  is several times the latency of the hand-written baseline in
+  [benchmarks/](../benchmarks/README.md). Arena traffic still moves one scalar
+  per beat where the kernel's read-only input ports already move full AXI
+  words.
+- Floating-point reassociation stays disabled: enabling it needs an
+  optimization that can prove an explicit error bound. Canonicalization itself
+  is bit-exact.
 
 ## Non-goals
 

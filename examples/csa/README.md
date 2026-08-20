@@ -68,8 +68,9 @@ python examples/csa/run_alos_cpu.py
 python examples/csa/run_alos_hls.py
 ```
 
-The runner reports wall time and urban-area contrast. Real-data output is
-not tracked because the source product is not redistributed.
+The runner reports wall time and urban-area contrast. The focused image is
+committed as `assets/san_francisco_csa.png`; the raw product it is made from
+is not redistributed here.
 
 `run_alos_hls.py` writes `hls_project/csa_alos/`: `csa_alos_axi.cpp` is
 the 16384x16384 design with AXI ports for synthesis, and

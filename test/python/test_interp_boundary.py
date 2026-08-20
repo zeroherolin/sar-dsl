@@ -200,6 +200,22 @@ def test_interp1d_default_boundary_is_zero():
                                atol=1e-12)
 
 
+@pytest.mark.parametrize("boundary", ["zero", "edge", "reflect"])
+@pytest.mark.parametrize("kernel", ["nearest", "linear", "cubic", "sinc"])
+def test_interp1d_nonfinite_or_unrepresentable_positions_are_zero(
+        boundary, kernel):
+    data = np.arange(8, dtype=np.complex128).reshape(1, 8)
+    positions = np.array(
+        [[np.nan, np.inf, -np.inf, 1e300, np.nan, np.inf, -np.inf, -1e300]])
+
+    @sar.func
+    def k(d: sar.c128[1, 8], p: sar.f64[1, 8]) -> sar.c128[1, 8]:
+        return sar.interp1d(d, p, kernel=kernel, boundary=boundary)
+
+    np.testing.assert_array_equal(k(data, positions),
+                                  np.zeros((1, 8), dtype=np.complex128))
+
+
 def test_interp1d_policies_agree_in_the_interior():
     """Away from the edges no tap leaves the row, so the policy cannot
     change the result."""

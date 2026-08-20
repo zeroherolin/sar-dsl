@@ -31,7 +31,7 @@ MemoryKind sar::getMemoryKind(MemRefType type) {
   return MemoryKind::UNKNOWN;
 }
 
-bool sar::isDram(MemRefType type) {
+static bool isDram(MemRefType type) {
   auto kind = getMemoryKind(type);
   return kind == MemoryKind::DRAM;
 }
@@ -40,7 +40,7 @@ bool sar::isDram(MemRefType type) {
 //===----------------------------------------------------------------------===//
 
 /// Get the root affine loop contained by the node.
-AffineForOp sar::getNodeRootLoop(NodeOp currentNode) {
+static AffineForOp getNodeRootLoop(NodeOp currentNode) {
   assert(llvm::hasSingleElement(currentNode.getOps<AffineForOp>()) &&
          "node must only contain one loop band");
   return *currentNode.getOps<AffineForOp>().begin();
@@ -76,12 +76,11 @@ DispatchOp sar::dispatchBlock(Block *block) {
   return dispatch;
 }
 
-/// Fuse the given operations into a new task. The new task will be created
-/// before the first operation or last operation and each operation will be
-/// inserted in order. This method always succeeds even if the resulting IR is
-/// invalid.
+/// Fuse the given operations into a new task, created before the first of
+/// them and holding them in order. Always succeeds, even when the resulting
+/// IR is invalid.
 TaskOp sar::fuseOpsIntoTask(ArrayRef<Operation *> ops,
-                            PatternRewriter &rewriter, bool insertToLastOp) {
+                            PatternRewriter &rewriter) {
   assert(!ops.empty() && "must fuse at least one op");
   llvm::SmallDenseSet<Operation *, 4> opsSet(ops.begin(), ops.end());
 
@@ -96,10 +95,7 @@ TaskOp sar::fuseOpsIntoTask(ArrayRef<Operation *> ops,
 
   // Create new graph task with all inputs and outputs.
   auto loc = rewriter.getUnknownLoc();
-  if (!insertToLastOp)
-    rewriter.setInsertionPoint(ops.front());
-  else
-    rewriter.setInsertionPoint(ops.back());
+  rewriter.setInsertionPoint(ops.front());
   auto task =
       TaskOp::create(rewriter, loc, ValueRange(outputValues.getArrayRef()));
   auto taskBlock = rewriter.createBlock(&task.getBody());
@@ -208,7 +204,7 @@ SmallVector<NodeOp> sar::getProducers(Value buffer) {
   return getProducersExcept(buffer, NodeOp());
 }
 SmallVector<NodeOp> sar::getDependentConsumers(Value buffer, NodeOp node) {
-  // If the buffer is defined outside of a dependence free schedule op, we can
+  // A buffer defined outside a dependence-free schedule op can
   // ignore back dependences.
   bool ignoreBackDependence =
       isa<BlockArgument>(buffer) && node.getScheduleOp().isDependenceFree();
@@ -245,7 +241,7 @@ getNestedUsersExcept(Value buffer, OperandKind kind, NodeOp except) {
     auto nodeBuffer = std::get<1>(current);
     auto nodeKind = std::get<2>(current);
 
-    // If the current node doesn't have hierarchy, we add it to results if the
+    // A node without hierarchy joins the results if the
     // node kind is aligned.
     if (!node.hasHierarchy()) {
       if (nodeKind == kind)
@@ -253,7 +249,7 @@ getNestedUsersExcept(Value buffer, OperandKind kind, NodeOp except) {
       continue;
     }
 
-    // Otherwise, we should delve into the hierarchy and traverse all contained
+    // Otherwise descend into the hierarchy and traverse all contained
     // schedules.
     auto index =
         llvm::find(node.getOperands(), nodeBuffer) - node.operand_begin();
@@ -267,18 +263,14 @@ getNestedUsersExcept(Value buffer, OperandKind kind, NodeOp except) {
   return nestedUsers;
 }
 
-/// Get the nested consumer/producer nodes of the given buffer expect the given
+/// Get the nested consumer/producer nodes of the given buffer except the given
 /// node.
 SmallVector<std::pair<NodeOp, Value>>
 sar::getNestedConsumersExcept(Value buffer, NodeOp except) {
   return getNestedUsersExcept(buffer, OperandKind::INPUT, except);
 }
-SmallVector<std::pair<NodeOp, Value>>
-sar::getNestedProducersExcept(Value buffer, NodeOp except) {
-  return getNestedUsersExcept(buffer, OperandKind::OUTPUT, except);
-}
 SmallVector<std::pair<NodeOp, Value>> sar::getNestedProducers(Value buffer) {
-  return getNestedProducersExcept(buffer, NodeOp());
+  return getNestedUsersExcept(buffer, OperandKind::OUTPUT, NodeOp());
 }
 
 /// Find buffer value or buffer op across the dataflow hierarchy.
@@ -296,7 +288,7 @@ Value sar::findBuffer(Value memref) {
     return buffer.getMemref();
   return Value();
 }
-hls::BufferLikeInterface sar::findBufferOp(Value memref) {
+static hls::BufferLikeInterface findBufferOp(Value memref) {
   if (auto buffer = findBuffer(memref))
     return buffer.getDefiningOp<hls::BufferLikeInterface>();
   return hls::BufferLikeInterface();
@@ -321,8 +313,8 @@ bool sar::isExtBuffer(Value memref) {
 
 /// Check whether the given use has read/write semantics.
 bool sar::isRead(OpOperand &use) {
-  // For NodeOp and ScheduleOp, we don't rely on memory effect interface.
-  // Instead, we delve into its region to figure out the effect.
+  // NodeOp and ScheduleOp carry no usable memory-effect interface; the
+  // effect comes from walking their region instead.
   if (auto node = dyn_cast<NodeOp>(use.getOwner()))
     return llvm::any_of(
         node.getBody().getArgument(use.getOperandNumber()).getUses(),
@@ -334,13 +326,20 @@ bool sar::isRead(OpOperand &use) {
   else if (auto view = dyn_cast<ViewLikeOpInterface>(use.getOwner()))
     return llvm::any_of(view->getUses(),
                         [](OpOperand &viewUse) { return isRead(viewUse); });
+  else if (auto call = dyn_cast<func::CallOp>(use.getOwner())) {
+    auto callee = dyn_cast_or_null<func::FuncOp>(
+        SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+    if (!callee || callee.isExternal())
+      return true;
+    return llvm::any_of(callee.getArgument(use.getOperandNumber()).getUses(),
+                        [](OpOperand &argUse) { return isRead(argUse); });
+  }
   return hasEffect<MemoryEffects::Read>(use.getOwner(), use.get()) ||
          isa<StreamReadOp>(use.getOwner());
 }
 bool sar::isWritten(OpOperand &use) {
-  // For ScheduleOp, we don't rely on memory effect interface. Instead, we delve
-  // into its region to figure out the effect. However, for NodeOp, we don't
-  // need this recursive approach any more.
+  // A NodeOp records the kind directly; a ScheduleOp carries no usable
+  // memory-effect interface, so its region is walked instead.
   if (auto node = dyn_cast<NodeOp>(use.getOwner()))
     return node.getOperandKind(use) == OperandKind::OUTPUT;
   else if (auto schedule = dyn_cast<ScheduleOp>(use.getOwner()))
@@ -377,7 +376,7 @@ bool sar::isElementwiseGenericOp(linalg::GenericOp op) {
     auto type = dyn_cast<ShapedType>(std::get<0>(valueMap).getType());
     auto map = std::get<1>(valueMap);
 
-    // If the operand doens't have static shape, the index map must be identity.
+    // If the operand doesn't have static shape, the index map must be identity.
     if (!type || !type.hasStaticShape()) {
       if (!map.isIdentity())
         return false;
@@ -414,38 +413,8 @@ bool sar::hasEffectOnExternalBuffer(Operation *op) {
   return result.wasInterrupted();
 }
 
-/// Distribute the given factor from the innermost loop of the given loop band,
-/// so that we can apply vectorize, unroll and jam, etc.
-FactorList sar::getDistributedFactors(
-    unsigned factor, const SmallVectorImpl<mlir::affine::AffineForOp> &band) {
-  FactorList factors;
-  unsigned remainFactor = factor;
-
-  for (auto it = band.rbegin(), e = band.rend(); it != e; ++it) {
-    if (auto optionalTripCount = getConstantTripCount(*it)) {
-      auto tripCount = optionalTripCount.value();
-      auto size = tripCount;
-
-      if (remainFactor >= tripCount)
-        remainFactor = (remainFactor + tripCount - 1) / tripCount;
-      else if (remainFactor > 1) {
-        size = 1;
-        while (size < remainFactor || tripCount % size != 0)
-          ++size;
-        remainFactor = 1;
-      } else
-        size = 1;
-
-      factors.push_back(size);
-    } else
-      factors.push_back(1);
-  }
-  std::reverse(factors.begin(), factors.end());
-  return factors;
-}
-
 /// Distribute the given factor evenly on all loop levels. The generated factors
-/// are garanteed to be divisors of the factors in given "costrFactorsList".
+/// are guaranteed to be divisors of the factors in given "constrFactors".
 /// This method can fail due to non-constant loop trip counts.
 LogicalResult sar::getEvenlyDistributedFactors(
     unsigned maxFactor, FactorList &factors,
@@ -457,8 +426,7 @@ LogicalResult sar::getEvenlyDistributedFactors(
   SmallVector<bool> reductionFlags;
   FactorList tripCounts;
   for (auto loop : llvm::enumerate(band)) {
-    // Collect the loop trip counts. If any trip count cannot be resolved, we
-    // return failure.
+    // Every trip count must resolve; an unresolved one fails the band.
     auto tripCount = getConstantTripCount(loop.value());
     if (!tripCount.has_value())
       return failure();
@@ -507,8 +475,8 @@ LogicalResult sar::getEvenlyDistributedFactors(
     }
 
     while (!factorMeetConstr() && factor < tripCount) {
-      // If we have the power of 2 constraint, then there's no chance to get a
-      // higher factor than the initial one.
+      // Under a power-of-two constraint no factor above the initial one
+      // can satisfy it.
       if (powerOf2Constr) {
         factor = initFactor;
         break;
@@ -731,46 +699,6 @@ bool sar::crossRegionDominates(Operation *a, Operation *b) {
   return DominanceInfo().dominates(a, b);
 }
 
-// Check if the lhsOp and rhsOp are in the same block. If so, return their
-// ancestors that are located at the same block. Note that in this check,
-// AffineIfOp is transparent.
-std::optional<std::pair<Operation *, Operation *>>
-sar::checkSameLevel(Operation *lhsOp, Operation *rhsOp) {
-  // If lhsOp and rhsOp are already at the same level, return true.
-  if (lhsOp->getBlock() == rhsOp->getBlock())
-    return std::pair<Operation *, Operation *>(lhsOp, rhsOp);
-
-  // Helper to get all surrounding AffineIfOps.
-  auto getSurroundIfs =
-      ([&](Operation *op, SmallVector<Operation *, 4> &nests) {
-        nests.push_back(op);
-        auto currentOp = op;
-        while (true) {
-          auto parentOp = currentOp->getParentOp();
-          if (isa<AffineIfOp, scf::IfOp>(parentOp)) {
-            nests.push_back(parentOp);
-            currentOp = parentOp;
-          } else
-            break;
-        }
-      });
-
-  SmallVector<Operation *, 4> lhsNests;
-  SmallVector<Operation *, 4> rhsNests;
-
-  getSurroundIfs(lhsOp, lhsNests);
-  getSurroundIfs(rhsOp, rhsNests);
-
-  // If any parent of lhsOp and any parent of rhsOp are at the same level,
-  // return true.
-  for (auto lhs : lhsNests)
-    for (auto rhs : rhsNests)
-      if (lhs->getBlock() == rhs->getBlock())
-        return std::pair<Operation *, Operation *>(lhs, rhs);
-
-  return std::optional<std::pair<Operation *, Operation *>>();
-}
-
 /// Calculate the lower and upper bound of the affine map if possible.
 std::optional<std::pair<int64_t, int64_t>>
 sar::getBoundOfAffineMap(AffineMap map, ValueRange operands) {
@@ -892,9 +820,9 @@ int64_t sar::getPartitionFactors(MemRefType memrefType,
   return accumFactor;
 }
 
-/// This is method for finding the number of child loops which immediatedly
+/// This is method for finding the number of child loops which immediately
 /// contained by the input operation.
-unsigned sar::getChildLoopNum(Operation *op) {
+static unsigned getChildLoopNum(Operation *op) {
   unsigned childNum = 0;
   for (auto &region : op->getRegions())
     for (auto &block : region)
@@ -928,37 +856,6 @@ bool sar::getTileAndPointLoopBand(const AffineLoopBand &band,
     } else {
       tileBand.clear();
       pointBand.clear();
-      return false;
-    }
-  }
-  return true;
-}
-
-/// Given a loop band, return true and get the parallel loop band outsides and
-/// the reduction loop band inside. If failed, return false.
-bool sar::getParallelAndReductionLoopBand(const AffineLoopBand &band,
-                                          AffineLoopBand &parallelBand,
-                                          AffineLoopBand &reductionBand) {
-  parallelBand.clear();
-  reductionBand.clear();
-  bool isReductionLoop = false;
-
-  for (auto loop : band) {
-    if (!isReductionLoop && (hasParallelAttr(loop) || isLoopParallel(loop)))
-      parallelBand.push_back(loop);
-
-    else if (isReductionLoop &&
-             !(hasParallelAttr(loop) || isLoopParallel(loop)))
-      reductionBand.push_back(loop);
-
-    else if (!isReductionLoop &&
-             !(hasParallelAttr(loop) || isLoopParallel(loop))) {
-      isReductionLoop = true;
-      reductionBand.push_back(loop);
-
-    } else {
-      parallelBand.clear();
-      reductionBand.clear();
       return false;
     }
   }

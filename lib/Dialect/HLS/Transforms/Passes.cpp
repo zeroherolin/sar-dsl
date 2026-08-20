@@ -23,12 +23,6 @@ namespace {
 #include "sar/Dialect/HLS/Transforms/Passes.h.inc"
 } // namespace
 
-void sar::addCreateSubviewPasses(OpPassManager &pm) {
-  pm.addPass(sar::createCreateMemrefSubviewPass());
-  pm.addPass(mlir::createCSEPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-}
-
 void sar::addSimplifyAffineLoopPasses(OpPassManager &pm) {
   pm.addPass(affine::createAffineLoopNormalizePass());
   pm.addPass(affine::createSimplifyAffineStructuresPass());
@@ -65,20 +59,6 @@ struct HLSPipelineOptions : public PassPipelineOptions<HLSPipelineOptions> {
       llvm::cl::desc("Bank size at or below which distributed RAM is used, "
                      "in bytes (one bus beat at the default 512-bit bus)")};
 
-  Option<unsigned> loopUnrollFactor{
-      *this, "loop-unroll-factor", llvm::cl::init(0),
-      llvm::cl::desc("The overall loop unrolling factor (set 0 to disable)")};
-
-  Option<bool> complexityAware{
-      *this, "complexity-aware", llvm::cl::init(true),
-      llvm::cl::desc("Whether to consider node complexity when parallelizing "
-                     "(only effective with loop-unroll-factor > 0)")};
-
-  Option<bool> correlationAware{
-      *this, "correlation-aware", llvm::cl::init(true),
-      llvm::cl::desc("Whether to consider node correlation when parallelizing "
-                     "(only effective with loop-unroll-factor > 0)")};
-
   Option<unsigned> arrayPartitionMaxFactor{
       *this, "array-partition-max-factor", llvm::cl::init(32),
       llvm::cl::desc("Largest factor automatic array banking may apply")};
@@ -99,6 +79,18 @@ struct HLSPipelineOptions : public PassPipelineOptions<HLSPipelineOptions> {
       *this, "stream-interface", llvm::cl::init(false),
       llvm::cl::desc("Emit axis (AXI4-Stream) pragmas on top-level ports "
                      "instead of m_axi ones; implies axi-interface=true")};
+
+  Option<unsigned> axiBusBits{
+      *this, "axi-bus-bits", llvm::cl::init(512),
+      llvm::cl::desc("Physical AXI data width used for external packing")};
+
+  Option<unsigned> externalVectorMaxLanes{
+      *this, "external-vector-max-lanes", llvm::cl::init(8),
+      llvm::cl::desc("Maximum lanes packed into one external word")};
+
+  Option<unsigned> externalVectorMinElements{
+      *this, "external-vector-min-elements", llvm::cl::init(4096),
+      llvm::cl::desc("Minimum logical elements before packing an AXI port")};
 };
 } // namespace
 
@@ -119,7 +111,6 @@ void sar::registerHLSPipeline() {
         // here requires gather-aware dependence analysis.
         pm.addPass(sar::createFuncPreprocessPass(opts.hlsTopFunc));
         sar::addSimplifyAffineLoopPasses(pm);
-        sar::addCreateSubviewPasses(pm);
         pm.addPass(sar::createRaiseAffineToCopyPass());
         pm.addPass(sar::createSimplifyCopyPass());
         pm.addPass(sar::createLowerCopyToAffinePass());
@@ -171,25 +162,8 @@ void sar::registerHLSPipeline() {
         pm.addPass(sar::createAffineStoreForwardPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // Parallelize dataflow nodes.
-        if (opts.loopUnrollFactor) {
-          pm.addPass(sar::createParallelizeDataflowNodePass(
-              opts.loopUnrollFactor, /*unrollPointLoopOnly=*/true,
-              opts.complexityAware, opts.correlationAware));
-          pm.addPass(affine::createSimplifyAffineStructuresPass());
-          pm.addPass(mlir::createCanonicalizerPass());
-          // Splitting a consumer widens its buffer's fan-out past what a
-          // dual-port memory can serve; the multi-consumer forks ran
-          // before the split, so run them again on the widened graph and
-          // re-schedule the nodes that were inserted.
-          pm.addPass(sar::createEliminateMultiConsumerPass());
-          pm.addPass(sar::createScheduleDataflowNodePass());
-        }
-
         // Mark schedules whose nodes are all scheduled as legal, which is
-        // what makes the emitter attach `#pragma HLS dataflow`. Unlike the
-        // unrolling above this does not depend on a factor being set: a
-        // schedule is legal or not regardless of how its loops are widened.
+        // what makes the emitter attach `#pragma HLS dataflow`.
         pm.addPass(sar::createLegalizeDataflowPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
@@ -205,7 +179,7 @@ void sar::registerHLSPipeline() {
         // Memory optimization.
         pm.addPass(sar::createSimplifyAffineIfPass());
         pm.addPass(sar::createAffineStoreForwardPass());
-        pm.addPass(sar::createReduceInitialIntervalPass());
+        pm.addPass(sar::createReduceInitiationIntervalPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
         // Outline dataflow nodes as functions.
@@ -218,6 +192,13 @@ void sar::registerHLSPipeline() {
           pm.addPass(sar::createCreateAxiInterfacePass(opts.hlsTopFunc,
                                                        opts.streamInterface));
         pm.addPass(sar::createLoopPipeliningPass());
+        // Pack only memory-mapped interfaces here. AXI4-Stream needs an
+        // explicit hls::stream<vector<...>> ABI rather than a vector array
+        // carrying an axis pragma, and is handled separately.
+        if (opts.axiInterface && !opts.streamInterface)
+          pm.addPass(sar::createWidenExternalMemoryPass(
+              opts.axiBusBits, opts.externalVectorMaxLanes,
+              opts.externalVectorMinElements));
         // The banking tier threshold is one number expressed in two units:
         // the placement pass reasons in bytes, this one in bits, because a
         // bank's cost is its bit count. Converting here keeps the single
@@ -225,6 +206,7 @@ void sar::registerHLSPipeline() {
         pm.addPass(sar::createArrayPartitionPass(
             /*lutramMaxBits=*/opts.lutramMaxBytes * 8, opts.lutramBytes,
             opts.bramBytes, opts.uramBytes, opts.arrayPartitionMaxFactor));
+        pm.addPass(sar::createShareEquivalentFunctionsPass());
         pm.addPass(mlir::createCanonicalizerPass());
       });
 }

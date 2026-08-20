@@ -97,24 +97,95 @@ def _plane_data(arrays, types):
             yield np.ascontiguousarray(arr)
 
 
+def _golden_plane_data(arrays, types):
+    """Reference planes kept at their supplied precision.
+
+    C-simulation compares generated float or double outputs in double
+    precision. Keeping an f64 oracle intact is what lets an f32 design report
+    its actual quantization error rather than its error against an already
+    rounded reference.
+    """
+    if len(arrays) != len(types):
+        raise LaunchError(f"expected {len(types)} array(s), got {len(arrays)}")
+    for i, (arr, t) in enumerate(zip(arrays, types)):
+        arr = np.asarray(arr)
+        if tuple(arr.shape) != t.shape:
+            raise LaunchError(
+                f"array shape {arr.shape} does not match {t.shape}")
+        if not (np.issubdtype(arr.dtype, np.floating)
+                or np.issubdtype(arr.dtype, np.complexfloating)):
+            raise LaunchError(
+                f"golden array #{i} must have a real or complex floating "
+                f"dtype, got {arr.dtype}")
+        if t.dtype.is_complex:
+            if not np.issubdtype(arr.dtype, np.complexfloating):
+                raise LaunchError(
+                    f"golden array #{i} must be complex for sar.{t.dtype.name}"
+                )
+            yield np.ascontiguousarray(arr.real, dtype=np.float64)
+            yield np.ascontiguousarray(arr.imag, dtype=np.float64)
+        else:
+            if np.issubdtype(arr.dtype, np.complexfloating):
+                raise LaunchError(
+                    f"golden array #{i} must be real for sar.{t.dtype.name}")
+            yield np.ascontiguousarray(arr, dtype=np.float64)
+
+
 def _c_decl(port) -> str:
     name, shape, dtype = port
     dims = "".join(f"[{d}]" for d in shape)
     return f"{_C_TYPES[dtype]} {name}{dims}"
 
 
-def _testbench_source(top, in_ports, out_ports, rtol, atol) -> str:
+def _testbench_source(top,
+                      in_ports,
+                      out_ports,
+                      rtol,
+                      atol,
+                      physical_ports=None) -> str:
     """C-simulation testbench: loads the .dat files, runs the design,
     compares each output plane against the golden data."""
-    proto = ",\n    ".join(_c_decl(p) for p in in_ports + out_ports)
-    decls = "\n".join(f"  static {_c_decl(p)};" for p in in_ports + out_ports)
-    loads = "\n".join(
-        f'  if (!load(dir, "{p[0]}.dat", &{p[0]}{"[0]" * len(p[1])}, '
-        f"{int(np.prod(p[1]))})) return 2;" for p in in_ports)
-    call_args = ", ".join(p[0] for p in in_ports + out_ports)
-    checks = "\n".join(f'  fail |= check(dir, "{p[0]}.dat", "{p[0]}", '
-                       f'&{p[0]}{"[0]" * len(p[1])}, {int(np.prod(p[1]))});'
-                       for p in out_ports)
+    if physical_ports is None:
+        proto = ",\n    ".join(_c_decl(p) for p in in_ports + out_ports)
+        decls = "\n".join(f"  static {_c_decl(p)};"
+                          for p in in_ports + out_ports)
+        loads = "\n".join(f'  if (!load(dir, "{p[0]}.dat", '
+                          f'&{p[0]}{"[0]" * len(p[1])}, '
+                          f"{int(np.prod(p[1]))})) return 2;"
+                          for p in in_ports)
+        call_args = ", ".join(p[0] for p in in_ports + out_ports)
+        checks = "\n".join(
+            f'  fail |= check(dir, "{p[0]}.dat", "{p[0]}", '
+            f'&{p[0]}{"[0]" * len(p[1])}, {int(np.prod(p[1]))});'
+            for p in out_ports)
+    else:
+
+        def physical_decl(port):
+            dims = "".join(f"[{extent}]" for extent in port["physical_shape"])
+            return f'{port["c_type"]} {port["name"]}{dims}'
+
+        public_count = len(in_ports) + len(out_ports)
+        if len(physical_ports) < public_count:
+            raise LaunchError(
+                f"generated top {top!r} has fewer ports than its public ABI")
+        proto = ",\n    ".join(physical_decl(p) for p in physical_ports)
+        decls = "\n".join(f"  static {physical_decl(p)};"
+                          for p in physical_ports)
+        input_physical = physical_ports[:len(in_ports)]
+        output_physical = physical_ports[len(in_ports):public_count]
+        loads = "\n".join(
+            f'  if (!load(dir, "{logical[0]}.dat", '
+            f'&{physical["name"]}{"[0]" * len(physical["physical_shape"])}, '
+            f"{int(np.prod(logical[1]))})) return 2;"
+            for logical, physical in zip(in_ports, input_physical))
+        call_args = ", ".join(p["name"] for p in physical_ports)
+        checks = "\n".join(
+            f'  fail |= check(dir, "{logical[0]}.dat", '
+            f'"{physical["name"]}", '
+            f'&{physical["name"]}'
+            f'{"[0]" * len(physical["physical_shape"])}, '
+            f"{int(np.prod(logical[1]))});"
+            for logical, physical in zip(out_ports, output_physical))
     return f"""\
 // Auto-generated C-simulation testbench for `{top}`.
 //
@@ -385,7 +456,7 @@ exit
 """
 
 
-def _csynth_script(top, part, clock_ns) -> str:
+def _csynth_script(top, part, clock_ns, config=None) -> str:
     """Vitis HLS synthesis script (written against Vitis HLS 2022.2).
 
     Synthesis is the validation csim cannot give: achieved II, timing at
@@ -393,6 +464,11 @@ def _csynth_script(top, part, clock_ns) -> str:
     budgets. The checklist for reading the reports is in
     docs/backends.md ("Validating a design in Vitis HLS").
     """
+    bus_bits = int(config.axi_bus_bits) if config is not None else 512
+    burst = int(config.axi_max_burst_length) if config is not None else 64
+    outstanding = int(config.axi_max_outstanding) if config is not None else 16
+    beat_bytes = max(1, bus_bits // 8)
+    burst = min(256, burst, max(1, 4096 // beat_bytes))
     return f"""\
 # Vitis HLS synthesis for `{top}`: vitis_hls -f {top}_csynth.tcl
 #
@@ -405,7 +481,51 @@ add_files {top}.cpp
 open_solution -reset sol1 -flow_target vivado
 set_part {part}
 create_clock -period {clock_ns:g}
+config_interface -m_axi_addr64=true
+config_interface -m_axi_alignment_byte_size={beat_bytes}
+config_interface -m_axi_max_widen_bitwidth={bus_bits}
+config_interface -m_axi_max_read_burst_length={burst}
+config_interface -m_axi_max_write_burst_length={burst}
+config_interface -m_axi_num_read_outstanding={outstanding}
+config_interface -m_axi_num_write_outstanding={outstanding}
+set _sar_started_ms [clock milliseconds]
 csynth_design
+set _sar_finished_ms [clock milliseconds]
+set _sar_elapsed_s [expr {{($_sar_finished_ms - $_sar_started_ms) / 1000.0}}]
+set _sar_elapsed_file [open "{top}_csynth_elapsed_s.txt" w]
+puts $_sar_elapsed_file $_sar_elapsed_s
+close $_sar_elapsed_file
+exit
+"""
+
+
+def _cosim_script(top, part, clock_ns, config=None) -> str:
+    """Vitis HLS Verilog co-simulation for a generated testbench package."""
+    bus_bits = int(config.axi_bus_bits) if config is not None else 512
+    burst = int(config.axi_max_burst_length) if config is not None else 64
+    outstanding = int(config.axi_max_outstanding) if config is not None else 16
+    beat_bytes = max(1, bus_bits // 8)
+    burst = min(256, burst, max(1, 4096 // beat_bytes))
+    return f"""\
+# Vitis HLS RTL co-simulation for `{top}`:
+#   vitis_hls -f {top}_cosim.tcl
+open_project -reset {top}_cosim_proj
+set_top {top}
+add_files {top}.cpp
+add_files -tb {top}_tb.cpp
+add_files -tb {top}_tb_data
+open_solution -reset sol1 -flow_target vivado
+set_part {part}
+create_clock -period {clock_ns:g}
+config_interface -m_axi_addr64=true
+config_interface -m_axi_alignment_byte_size={beat_bytes}
+config_interface -m_axi_max_widen_bitwidth={bus_bits}
+config_interface -m_axi_max_read_burst_length={burst}
+config_interface -m_axi_max_write_burst_length={burst}
+config_interface -m_axi_num_read_outstanding={outstanding}
+config_interface -m_axi_num_write_outstanding={outstanding}
+csynth_design
+cosim_design -rtl verilog -trace_level none -ldflags {{-lpthread}}
 exit
 """
 
@@ -427,9 +547,11 @@ class Backend(BaseBackend):
     # ------------------------------------------------------------------ #
 
     def add_stages(self, stages, metadata: KernelMetadata) -> None:
+        requested_options = dict(metadata.options)
         config = HLSConfig.resolve(metadata.options)
         check_precision(config, metadata.arg_types, metadata.result_types)
         metadata.extra["hls_config"] = config
+        metadata.extra["hls_requested_options"] = requested_options
         # The artifact cache keys on `options`, so the resolved values --
         # not the handful the user happened to pass -- are what has to be
         # in it: a design compiled against a different config file is a
@@ -519,6 +641,11 @@ class Backend(BaseBackend):
                            f"loop-tile-size={int(config.loop_tile_size)} "
                            f"{axi} " +
                            (f"{stream_flag} " if stream_flag else "") +
+                           f"axi-bus-bits={int(config.axi_bus_bits)} "
+                           f"external-vector-max-lanes="
+                           f"{int(config.external_vector_max_lanes)} "
+                           f"external-vector-min-elements="
+                           f"{int(config.external_vector_min_elements)} "
                            f"bram-bytes={int(config.bram_bytes)} "
                            f"uram-bytes={int(config.uram_bytes)} "
                            f"lutram-bytes={int(config.lutram_bytes)} "
@@ -590,18 +717,12 @@ class Backend(BaseBackend):
                     int(config.array_partition_max_factor),
                 }))
 
-            # The bus width is a board property, so the shaping of the AXI
-            # masters -- beat width, burst length, how many are in flight
-            # -- is derived from it rather than fixed. What the emitter is
-            # given is the buffering a port may occupy: one direction's
-            # worth of full-length bursts in each direction.
-            buffer_bits = (2 * config.axi_max_burst_length *
-                           config.axi_max_outstanding * config.axi_bus_bits)
             return run_tool("sar-emit-hls", [
                 find_tool("sar-translate"), "-hls-emit-hlscpp",
                 "-emit-vitis-directives",
                 f"-axi-bus-bits={config.axi_bus_bits}",
-                f"-axi-buffer-bits={buffer_bits}", "-"
+                f"-axi-max-burst-length={config.axi_max_burst_length}",
+                f"-axi-max-outstanding={config.axi_max_outstanding}", "-"
             ],
                             input_text=scheduled)
 

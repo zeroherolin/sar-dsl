@@ -12,6 +12,10 @@
 namespace mlir {
 namespace sar {
 
+/// Rewrites the buffer forms a dataflow node cannot carry across its
+/// boundary. Defined in this library, not the dialect one.
+void populateBufferConversionPatterns(RewritePatternSet &patterns);
+
 /// Apply loop perfection. Try to sink all operations between loop statements
 /// into the innermost loop of the input loop band.
 bool applyAffineLoopPerfection(AffineLoopBand &band);
@@ -36,15 +40,6 @@ bool applyLoopTiling(AffineLoopBand &band, FactorList tileList,
 bool applyLoopPipelining(AffineLoopBand &band, unsigned pipelineLoc,
                          unsigned targetII);
 
-/// Apply unroll and jam to the loop band with the given overall unroll factor.
-bool applyLoopUnrollJam(AffineLoopBand &band, unsigned unrollFactor);
-
-/// Apply unroll and jam to the loop band with the given unroll factors.
-bool applyLoopUnrollJam(AffineLoopBand &band, FactorList unrollFactors);
-
-/// Fully unroll all loops insides of a loop block.
-bool applyFullyLoopUnrolling(Block &block, unsigned maxIterNum = 10);
-
 /// Applies `factors`/`kinds` to `array`. A bank holding fewer than
 /// `lutramMaxBits` bits is placed in distributed RAM, so long as
 /// `lutramBitsBudget` (0 = unbounded) still has room; `lutramBitsUsed`
@@ -63,7 +58,7 @@ bool applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits = 1024,
                              uint64_t lutramBitsBudget = 0,
                              uint64_t *lutramBitsUsed = nullptr);
 
-bool applyFuncPreprocess(func::FuncOp func, bool topFunc);
+LogicalResult applyFuncPreprocess(func::FuncOp func, bool topFunc);
 
 } // namespace sar
 } // namespace mlir

@@ -49,7 +49,7 @@ struct CreateTokenStream
         auto outputIdx = llvm::find(producer.getOutputs(), buffer) -
                          producer.getOutputs().begin();
         SmallVector<Value, 8> outputs(producer.getOutputs());
-        SmallVector<StreamOp, 4> tokens;
+        SmallVector<std::pair<StreamOp, NodeOp>, 4> tokenConsumers;
 
         auto consumers = getDependentConsumers(buffer, producer);
         if (consumers.empty())
@@ -69,7 +69,7 @@ struct CreateTokenStream
           auto token = StreamOp::create(
               b, loc, StreamType::get(b.getContext(), b.getI1Type(), levelDiff),
               levelDiff);
-          tokens.push_back(token);
+          tokenConsumers.push_back({token, consumer});
 
           // Add the stream channel as a new output argument of the producer.
           outputs.insert(std::next(outputs.begin(), outputIdx),
@@ -83,6 +83,8 @@ struct CreateTokenStream
           auto value = arith::ConstantOp::create(b, loc, b.getBoolAttr(true));
           StreamWriteOp::create(b, loc, tokenArg, value);
         }
+        if (tokenConsumers.empty())
+          continue;
 
         // Construct a new producer node.
         b.setInsertionPoint(producer);
@@ -94,9 +96,7 @@ struct CreateTokenStream
             newProducer.getBody().end(), producer.getBody().getBlocks());
         producer.erase();
 
-        for (auto t : llvm::zip(tokens, consumers)) {
-          auto token = std::get<0>(t);
-          auto consumer = std::get<1>(t);
+        for (auto [token, consumer] : tokenConsumers) {
 
           // Add the stream channel as a new input argument of the consumer.
           auto inputIdx = llvm::find(consumer.getInputs(), buffer) -

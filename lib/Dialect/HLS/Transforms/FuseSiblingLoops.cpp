@@ -3,6 +3,18 @@
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
+//
+// Splitting complex values leaves the real and imaginary halves of one phase
+// expression in two adjacent sweeps over the same iteration space. Each
+// recomputes the geometry the phase is built from -- the same coordinates,
+// the same trigonometry. Merging the pair puts those expressions in one body,
+// where CSE removes the duplicate.
+//
+// Two nests fuse when they iterate identically and neither writes what the
+// other touches, which is what makes running them interleaved equivalent to
+// running them in sequence.
+//
+//===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -56,11 +68,12 @@ static Accesses collectAccesses(AffineForOp loop) {
   return accesses;
 }
 
-static bool intersects(const DenseSet<Value> &lhs,
-                       const DenseSet<Value> &rhs) {
+static bool intersects(const DenseSet<Value> &lhs, const DenseSet<Value> &rhs) {
   return llvm::any_of(lhs, [&](Value value) { return rhs.contains(value); });
 }
 
+/// The chain of loops under `root` that nest perfectly, outermost first.
+/// Empty when `root` holds anything beside a single child loop.
 static SmallVector<AffineForOp> getPerfectNest(AffineForOp root) {
   SmallVector<AffineForOp> nest{root};
   while (true) {
@@ -78,6 +91,7 @@ static SmallVector<AffineForOp> getPerfectNest(AffineForOp root) {
   }
 }
 
+/// Whether two nests have identical depth, bounds and steps at every level.
 static bool sameIterationSpace(ArrayRef<AffineForOp> lhs,
                                ArrayRef<AffineForOp> rhs) {
   if (lhs.size() != rhs.size())

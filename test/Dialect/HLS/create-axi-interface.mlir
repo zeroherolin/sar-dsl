@@ -1,18 +1,22 @@
 // RUN: sar-opt %s --split-input-file --hls-create-axi-interface --verify-diagnostics | FileCheck %s
 
-// The top function's ports are the design's contract with its host: the
-// kernel's own arrays, then two scratch pointers. Internal DRAM buffers are
-// distributed between those allocations and carved at compile-time offsets
-// instead of becoming more ports. Every port takes its own AXI bundle:
-// ports sharing one serialize their bus requests. A buffer that cannot be
-// redirected to the scratch allocation is rejected instead of silently
-// changing the host ABI.
+// The top function's ports are the design's contract with its host, so they
+// are the algorithm's own I/O and nothing else: the kernel's arrays, then the
+// scratch pointers the spilled buffers need. Internal DRAM buffers are carved
+// out of an arena at compile-time offsets instead of becoming ports of their
+// own, and a type with no spill contributes no port. Buffers a single node
+// reads and writes get separate arenas -- one pointer both loaded from and
+// stored to forces HLS to serialize that node's bus traffic. Every remaining
+// port takes its own AXI bundle: ports sharing one serialize their bus
+// requests. A buffer that cannot be redirected to a scratch allocation is
+// rejected instead of silently changing the host ABI.
 
 // CHECK-LABEL: func.func @carved(
 // CHECK-SAME: %arg0: !hls.axi<memref<64xf32, #hls.mem<dram>>>
 // CHECK-SAME: %arg1: !hls.axi<memref<64xf32, #hls.mem<dram>>>
 // CHECK-SAME: %arg2: !hls.axi<memref<64xf32, #hls.mem<dram>>>
 // CHECK-SAME: %arg3: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-NOT: %arg4
 // CHECK: hls.axi.bundle
 // CHECK-NEXT: hls.axi.port
 // CHECK: hls.axi.bundle
@@ -50,7 +54,9 @@ module {
     }
     return
   }
-  // Two 64-element DRAM intermediates occupy separate physical masters.
+  // The middle node reads one intermediate and writes the other, so the two
+  // cannot share a pointer: they get an arena each. Neither becomes a port in
+  // its own right -- the ports are the two arenas, carved at aligned offsets.
   func.func @carved(%arg0: memref<64xf32, #hls.mem<dram>>, %arg1: memref<64xf32, #hls.mem<dram>>) attributes {top_func} {
     %mid = hls.dataflow.buffer {depth = 1 : i32} : memref<64xf32, #hls.mem<dram>>
     %mid2 = hls.dataflow.buffer {depth = 1 : i32} : memref<64xf32, #hls.mem<dram>>
@@ -100,6 +106,43 @@ module {
     %mid = hls.dataflow.buffer {depth = 1 : i32} : memref<64xf32, #hls.mem<dram>>
     call @shared_callee_node0(%arg0, %mid) : (memref<64xf32, #hls.mem<dram>>, memref<64xf32, #hls.mem<dram>>) -> ()
     call @shared_callee_node0(%mid, %arg1) : (memref<64xf32, #hls.mem<dram>>, memref<64xf32, #hls.mem<dram>>) -> ()
+    return
+  }
+}
+
+// -----
+
+// One arena per element type that spills, and none for a type that does not.
+// The f64 kernel array is an argument, not an internal buffer, so it stays a
+// port of its own and contributes no f64 arena: the design gets a single f32
+// scratch port, not one per type in the signature.
+
+// CHECK-LABEL: func.func @typed_arenas(
+// CHECK-SAME: %arg0: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-SAME: %arg1: !hls.axi<memref<64xf64, #hls.mem<dram>>>
+// CHECK-SAME: %arg2: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-NOT: %arg3
+module {
+  func.func @typed_arenas_node0(%arg0: memref<64xf32, #hls.mem<dram>>, %arg1: memref<64xf32, #hls.mem<dram>>) {
+    affine.for %i = 0 to 64 {
+      %v = affine.load %arg0[%i] : memref<64xf32, #hls.mem<dram>>
+      %w = arith.mulf %v, %v : f32
+      affine.store %w, %arg1[%i] : memref<64xf32, #hls.mem<dram>>
+    }
+    return
+  }
+  func.func @typed_arenas_node1(%arg0: memref<64xf32, #hls.mem<dram>>, %arg1: memref<64xf64, #hls.mem<dram>>) {
+    affine.for %i = 0 to 64 {
+      %v = affine.load %arg0[%i] : memref<64xf32, #hls.mem<dram>>
+      %w = arith.extf %v : f32 to f64
+      affine.store %w, %arg1[%i] : memref<64xf64, #hls.mem<dram>>
+    }
+    return
+  }
+  func.func @typed_arenas(%arg0: memref<64xf32, #hls.mem<dram>>, %arg1: memref<64xf64, #hls.mem<dram>>) attributes {top_func} {
+    %mid = hls.dataflow.buffer {depth = 1 : i32} : memref<64xf32, #hls.mem<dram>>
+    call @typed_arenas_node0(%arg0, %mid) : (memref<64xf32, #hls.mem<dram>>, memref<64xf32, #hls.mem<dram>>) -> ()
+    call @typed_arenas_node1(%mid, %arg1) : (memref<64xf32, #hls.mem<dram>>, memref<64xf64, #hls.mem<dram>>) -> ()
     return
   }
 }

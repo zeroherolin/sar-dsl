@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -16,9 +18,70 @@ def _text(root, path: str) -> str:
     return node.text.strip()
 
 
+def _optional_text(root, path: str):
+    node = root.find(path)
+    if node is None or node.text is None:
+        return None
+    return node.text.strip()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _loop_latencies(root) -> list:
+    summary = root.find("./PerformanceEstimates/SummaryOfLoopLatency")
+    if summary is None:
+        return []
+    loops = []
+    for node in summary:
+        entry = {"name": node.tag}
+        for xml_name, key in (
+            ("TripCount", "trip_count"),
+            ("Latency", "latency_cycles"),
+            ("IterationLatency", "iteration_latency"),
+        ):
+            value = _optional_text(node, xml_name)
+            if value not in (None, ""):
+                entry[key] = int(value)
+        loops.append(entry)
+    return loops
+
+
+def _interfaces(root) -> list:
+    interfaces = {}
+    for port in root.findall("./InterfaceSummary/RtlPorts"):
+        protocol = _optional_text(port, "IOProtocol")
+        obj = _optional_text(port, "Object")
+        name = _optional_text(port, "name")
+        bits = _optional_text(port, "Bits")
+        if not protocol or not obj or not name or not bits:
+            continue
+        key = (obj, protocol)
+        entry = interfaces.setdefault(
+            key, {
+                "object": obj,
+                "protocol": protocol,
+                "read_data_bits": 0,
+                "write_data_bits": 0,
+            })
+        width = int(bits)
+        if name.endswith(("_RDATA", "_TDATA")):
+            entry["read_data_bits"] = max(entry["read_data_bits"], width)
+        if name.endswith(("_WDATA", "_TDATA")):
+            entry["write_data_bits"] = max(entry["write_data_bits"], width)
+    return sorted(interfaces.values(),
+                  key=lambda entry: (entry["protocol"], entry["object"]))
+
+
 def parse_csynth_xml(path) -> dict:
     """Returns the stable summary fields from a Vitis `*_csynth.xml`."""
-    root = ET.parse(Path(path)).getroot()
+    path = Path(path)
+    root = ET.parse(path).getroot()
     resources = {
         name.lower(): int(_text(root, f"./AreaEstimates/Resources/{name}"))
         for name in ("BRAM_18K", "DSP", "FF", "LUT", "URAM")
@@ -52,10 +115,55 @@ def parse_csynth_xml(path) -> dict:
             _text(
                 root, "./PerformanceEstimates/SummaryOfOverallLatency/"
                 "Interval-max")),
+        "pipeline_type":
+        _text(root, "./PerformanceEstimates/PipelineType"),
+        "loop_latencies":
+        _loop_latencies(root),
+        "interfaces":
+        _interfaces(root),
         "resources":
         resources,
         "available":
         available,
+        "xml_sha256":
+        _sha256(path),
+    }
+
+
+def parse_csynth_bundle(path) -> dict:
+    """Parses a top report and the per-module reports beside it."""
+    path = Path(path)
+    top = parse_csynth_xml(path)
+    modules = []
+    for candidate in sorted(path.parent.glob("*_csynth.xml")):
+        if candidate == path:
+            continue
+        report = parse_csynth_xml(candidate)
+        modules.append({
+            "top": report["top"],
+            "estimated_clock_ns": report["estimated_clock_ns"],
+            "latency_cycles": report["latency_cycles"],
+            "interval_cycles": report["interval_cycles"],
+            "pipeline_type": report["pipeline_type"],
+            "loop_latencies": report["loop_latencies"],
+            "resources": report["resources"],
+            "xml_sha256": report["xml_sha256"],
+        })
+
+    elapsed = None
+    manifest = None
+    for parent in list(path.parents)[:6]:
+        elapsed_path = parent / f"{top['top']}_csynth_elapsed_s.txt"
+        if elapsed is None and elapsed_path.is_file():
+            elapsed = float(elapsed_path.read_text().strip())
+        manifest_path = parent / "design_manifest.json"
+        if manifest is None and manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text())
+    return {
+        "top": top,
+        "modules": modules,
+        "csynth_elapsed_s": elapsed,
+        "manifest": manifest,
     }
 
 
