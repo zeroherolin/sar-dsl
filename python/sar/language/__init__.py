@@ -814,6 +814,10 @@ def maximum(x: Tensor, scalar: float) -> Tensor:
     if not x.dtype.is_float:
         raise TraceError("sar.maximum expects a float tensor")
     selected = where(x > scalar, x, scalar)
+    # Comparisons consider +0 and -0 equal. IEEE maximum chooses +0 unless
+    # both operands are -0; addition has exactly that tie behavior.
+    if isinstance(scalar, numbers.Real) and scalar == 0.0:
+        selected = where(x == scalar, x + scalar, selected)
     return where(x != x, x, selected)
 
 
@@ -823,6 +827,11 @@ def minimum(x: Tensor, scalar: float) -> Tensor:
     if not x.dtype.is_float:
         raise TraceError("sar.minimum expects a float tensor")
     selected = where(x < scalar, x, scalar)
+    # With a +0 scalar, subtraction preserves a -0 input on a zero tie. A -0
+    # scalar is already selected by the comparison expression above.
+    if (isinstance(scalar, numbers.Real) and scalar == 0.0
+            and math.copysign(1.0, float(scalar)) > 0.0):
+        selected = where(x == scalar, x - scalar, selected)
     return where(x != x, x, selected)
 
 
@@ -1439,7 +1448,11 @@ def sort(x: Tensor,
     (numpy `sort`).
 
     Rank-1 or rank-2 float tensors only -- ordering is undefined for
-    complex.
+    complex. The lowering is Batcher's odd-even mergesort: an exact
+    compare-exchange network over the static extent, so a line of `n` costs
+    O(n log^2 n) compare-exchanges in O(log^2 n) parallel sweeps, and every
+    line advances through a sweep at once. Prefer `rank_filter` when a
+    single order statistic is what the algorithm needs.
     """
     dim = _resolve_axis("sort", dim, axis, required=False)
     x = _require_tensor(x, "sar.sort")

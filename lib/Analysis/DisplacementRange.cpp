@@ -4,57 +4,30 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Conservative interval analysis over the SSA graph of a `positions` tensor.
+// Conservative bounds on `|positions[i, j] - j|`, the displacement a
+// resampling stage applies. A bounded displacement is what lets the gather
+// read a sliding band instead of the resident plane; why SAR geometry makes
+// the bound exist is in docs/architecture.md.
 //
-// WHY BOUNDED DISPLACEMENT EXISTS (the one place this argument is stated).
-//   A SAR resampling stage moves each sample by an amount set by acquisition
-//   geometry, not by the scene: Stolt remapping displaces a range bin by the
-//   ratio of Doppler to carrier frequency, RCMC by the range curvature over
-//   the synthetic aperture, polar regridding by the aperture's angular
-//   extent. All three are small fractions of the swath for any physically
-//   realizable stripmap geometry. So if the compiler can pin a compile-time
-//   bound D on |positions[i,j] - j|, output column j only ever reads source
-//   columns [j-D-taps/2, j+D+taps/2] -- a band that fits on-chip, rather than
-//   the full source row that a data-dependent gather would demand.
+// Two analyses, tried in order:
 //
-// ANALYSIS MODEL.
-//   Each value is abstracted as `coeff * k + offset`, where `k` is the index
-//   along the axis being resampled and `offset` is an interval covering
-//   everything that does not vary as that ramp. The displacement is
-//   `positions - j = (coeff - 1) * j + offset`, so it is bounded exactly when
-//   `coeff == 1` and `offset` is finite -- then the displacement interval is
-//   `offset` itself.
+//   1. An affine domain. Each value is abstracted as `coeff * k + offset`,
+//      where `k` indexes the resampled axis and `offset` is an interval over
+//      everything that does not vary with it. The displacement is then
+//      `(coeff - 1) * j + offset`, bounded exactly when `coeff == 1`. This is
+//      symbolic, so it holds for fields built from kernel arguments -- but
+//      any nonlinearity over the ramp (`sqrt`, a product of two ramps) forces
+//      `coeff` to zero and an unbounded verdict, and `sqrt(f^2 + g^2)` is
+//      exactly the shape a frequency-domain remapping takes.
 //
-//   The ramp enters the graph through constants: a dense vector whose values
-//   form an exact arithmetic progression along the resampled axis IS a ramp,
-//   and that is how `positions = arange(N) + shift` is recognized without
-//   naming any algorithm. Progression detection is the only place a non-zero
-//   `coeff` is ever produced.
+//   2. Element-wise constant folding. Such a field is nonetheless usually
+//      constant: the frequency axes are acquisition metadata the frontend
+//      bakes in, so every leaf is a `sar.constant`. Folding the plane reads
+//      the displacement off exactly, which is tighter than any interval and
+//      covers Stolt and RCMC.
 //
-// WHY `coeff != 1` IS REPORTED UNBOUNDED.
-//   A scaled ramp `c*j + b` with `c != 1` has displacement `(c-1)*j + b`,
-//   which grows without bound as j sweeps the axis: over an N-column raster
-//   it spans `|c-1| * N`, so there is no compile-time band width independent
-//   of the scene. Rather than emit a band that silently depends on N, the
-//   analysis declines. This also covers `c == 0` -- a position field with no
-//   ramp at all resamples arbitrarily far and genuinely needs the full row.
-//
-// TWO ANALYSES, TRIED IN ORDER.
-//   The affine domain above is symbolic, so it holds for position fields
-//   built from kernel arguments -- but any nonlinearity over the ramp
-//   destroys it: `sqrt`, and products of two ramps, force `coeff` to 0 and
-//   hence an unbounded verdict. That is exactly the shape a frequency-domain
-//   remapping `sqrt(f^2 + g^2)` takes.
-//
-//   Such a field is nonetheless usually constant: the frequency axes are
-//   acquisition metadata the frontend bakes in, so every leaf is a
-//   `sar.constant`. When that holds, the plane is folded element-wise and the
-//   displacement read off exactly -- tighter than any interval reasoning, and
-//   the case that matters, since Stolt and RCMC both land here.
-//
-//   A field that is neither affine nor constant (a position plane computed
-//   from a kernel argument) stays unbounded, and the lowering falls back to
-//   the full-plane gather. That is a false negative, never an unsoundness.
+// A field that is neither affine nor constant stays unbounded and the
+// lowering falls back to the full-plane gather.
 //
 //===----------------------------------------------------------------------===//
 
@@ -129,6 +102,14 @@ constexpr double kInf = std::numeric_limits<double>::infinity();
 /// Ramp axis sentinel: the value is not tracked along any ramp axis, only
 /// its interval matters.
 constexpr int64_t kNoRamp = -1;
+
+struct Slice {
+  int64_t axis = -1;
+  int64_t begin = 0;
+  int64_t end = 0;
+
+  bool active() const { return axis >= 0; }
+};
 
 static bool finite(double v) { return std::isfinite(v); }
 
@@ -208,11 +189,32 @@ static AffineInterval divAI(const AffineInterval &a, const AffineInterval &b) {
 //===----------------------------------------------------------------------===//
 
 /// Plain min/max over every element of a dense attribute.
-static Interval hullOfDenseAttr(ElementsAttr attr) {
+static int64_t coordinateAt(int64_t linear, ArrayRef<int64_t> shape,
+                            int64_t axis) {
+  int64_t stride = 1;
+  for (int64_t d = axis + 1; d < (int64_t)shape.size(); ++d)
+    stride *= shape[d];
+  return (linear / stride) % shape[axis];
+}
+
+static bool inSlice(int64_t linear, ArrayRef<int64_t> shape, Slice slice) {
+  if (!slice.active())
+    return true;
+  if (slice.axis >= (int64_t)shape.size())
+    return false;
+  int64_t coordinate = coordinateAt(linear, shape, slice.axis);
+  return coordinate >= slice.begin && coordinate < slice.end;
+}
+
+static Interval hullOfDenseAttr(ElementsAttr attr, Slice slice) {
   if (!isa<FloatType>(attr.getShapedType().getElementType()))
     return Interval::unbounded();
   double lo = kInf, hi = -kInf;
+  int64_t linear = 0;
+  ArrayRef<int64_t> shape = attr.getShapedType().getShape();
   for (APFloat v : attr.getValues<APFloat>()) {
+    if (!inSlice(linear++, shape, slice))
+      continue;
     double d = v.convertToDouble();
     if (!finite(d))
       return Interval::unbounded();
@@ -224,15 +226,12 @@ static Interval hullOfDenseAttr(ElementsAttr attr) {
   return Interval::range(lo, hi);
 }
 
-/// Recognizes a dense constant as an arithmetic progression along
-/// `rampAxis`: every line along that axis must step by the same slope.
-/// Intercepts may differ between lines; they become the offset interval.
-///
-/// This is the sole source of a non-zero ramp coefficient, and it is what
-/// makes `positions = arange(N) + shift` analyzable without pattern matching
-/// on any particular algorithm.
-static std::optional<AffineInterval> progressionOfDenseAttr(ElementsAttr attr,
-                                                            int64_t rampAxis) {
+/// Decomposes a dense constant into one common slope along `rampAxis` plus an
+/// interval enclosing every residual. Intercepts and floating-point step
+/// roundoff are absorbed by the residual, so the result is conservative for
+/// arbitrary finite values rather than relying on a tolerance test.
+static std::optional<AffineInterval>
+progressionOfDenseAttr(ElementsAttr attr, int64_t rampAxis, Slice slice) {
   auto shaped = attr.getShapedType();
   if (!isa<FloatType>(shaped.getElementType()))
     return std::nullopt;
@@ -264,37 +263,41 @@ static std::optional<AffineInterval> progressionOfDenseAttr(ElementsAttr attr,
   for (int64_t d = 0; d < rampAxis; ++d)
     outer *= shape[d];
 
-  double slope = 0.0;
-  bool slopeSet = false;
-  double interLo = kInf, interHi = -kInf;
+  int64_t slopeBase = -1;
+  for (int64_t o = 0; o < outer && slopeBase < 0; ++o)
+    for (int64_t s = 0; s < stride; ++s) {
+      int64_t base = o * n * stride + s;
+      if (inSlice(base, shape, slice) && inSlice(base + stride, shape, slice)) {
+        slopeBase = base;
+        break;
+      }
+    }
+  if (slopeBase < 0)
+    return std::nullopt;
+  double slope = vals[slopeBase + stride] - vals[slopeBase];
+  if (!finite(slope))
+    return std::nullopt;
+  double residualLo = kInf, residualHi = -kInf;
 
   for (int64_t o = 0; o < outer; ++o) {
     for (int64_t s = 0; s < stride; ++s) {
       int64_t base = o * n * stride + s;
-      double first = vals[base];
-      double step = vals[base + stride] - first;
-      // Every consecutive difference along the line must equal `step`.
-      for (int64_t k = 1; k < n; ++k) {
-        double got = vals[base + k * stride];
-        double want = first + step * static_cast<double>(k);
-        // Exact progressions only: a tolerance here would silently widen
-        // the band for a field that merely looks like a ramp.
-        if (got != want)
+      for (int64_t k = 0; k < n; ++k) {
+        int64_t linear = base + k * stride;
+        if (!inSlice(linear, shape, slice))
+          continue;
+        double got = vals[linear];
+        double residual = got - slope * static_cast<double>(k);
+        if (!finite(residual))
           return std::nullopt;
+        residualLo = std::min(residualLo, residual);
+        residualHi = std::max(residualHi, residual);
       }
-      if (!slopeSet) {
-        slope = step;
-        slopeSet = true;
-      } else if (step != slope) {
-        return std::nullopt;
-      }
-      interLo = std::min(interLo, first);
-      interHi = std::max(interHi, first);
     }
   }
-  if (!slopeSet || !finite(slope) || !finite(interLo) || !finite(interHi))
+  if (!finite(residualLo) || !finite(residualHi))
     return std::nullopt;
-  return AffineInterval{slope, Interval::range(interLo, interHi)};
+  return AffineInterval{slope, Interval::range(residualLo, residualHi)};
 }
 
 //===----------------------------------------------------------------------===//
@@ -302,14 +305,13 @@ static std::optional<AffineInterval> progressionOfDenseAttr(ElementsAttr attr,
 //===----------------------------------------------------------------------===//
 
 struct Analyzer {
-  /// Memoized per (value, ramp axis): the same value can be visited under
-  /// different ramp axes.
-  DenseMap<std::pair<Value, int64_t>, AffineInterval> memo;
+  using Key = std::tuple<Value, int64_t, int64_t, int64_t, int64_t>;
+  DenseMap<Key, AffineInterval> memo;
   /// Guards against cycles (SSA in a region can be cyclic through blocks).
-  DenseSet<std::pair<Value, int64_t>> inFlight;
+  DenseSet<Key> inFlight;
 
-  AffineInterval analyze(Value v, int64_t rampAxis);
-  AffineInterval analyzeOp(Operation *op, int64_t rampAxis);
+  AffineInterval analyze(Value v, int64_t rampAxis, Slice slice = {});
+  AffineInterval analyzeOp(Operation *op, int64_t rampAxis, Slice slice);
 };
 
 /// Evaluates a position field numerically when every leaf it depends on is a
@@ -528,23 +530,27 @@ static std::optional<Interval> foldedDisplacement(Value positions,
   return Interval::range(lo, hi);
 }
 
-AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis) {
+AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis,
+                                   Slice slice) {
   // sar.constant -- the only producer of a ramp coefficient.
   if (auto cst = dyn_cast<ConstantOp>(op)) {
     if (rampAxis != kNoRamp) {
-      if (auto prog = progressionOfDenseAttr(cst.getValue(), rampAxis))
+      if (auto prog = progressionOfDenseAttr(cst.getValue(), rampAxis, slice))
         return *prog;
       // Not a progression: sound to fall back to the plain hull, which
       // simply reports no ramp.
     }
-    return AffineInterval::constant(hullOfDenseAttr(cst.getValue()));
+    return AffineInterval::constant(hullOfDenseAttr(cst.getValue(), slice));
   }
 
   // sar.broadcast -- result axis `dim` is the source's only axis.
   if (auto bc = dyn_cast<BroadcastOp>(op)) {
     int64_t srcAxis =
         (rampAxis == static_cast<int64_t>(bc.getDim())) ? 0 : kNoRamp;
-    AffineInterval src = analyze(bc.getInput(), srcAxis);
+    Slice srcSlice;
+    if (slice.active() && slice.axis == (int64_t)bc.getDim())
+      srcSlice = Slice{0, slice.begin, slice.end};
+    AffineInterval src = analyze(bc.getInput(), srcAxis, srcSlice);
     if (srcAxis == kNoRamp && !isPlain(src))
       return unbounded(); // defensive: no ramp may survive replication
     return src;
@@ -562,28 +568,32 @@ AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis) {
 
   // Element-wise binaries: shapes match, so the ramp axis passes through.
   if (auto o = dyn_cast<AddOp>(op))
-    return addAI(analyze(o.getLhs(), rampAxis), analyze(o.getRhs(), rampAxis));
+    return addAI(analyze(o.getLhs(), rampAxis, slice),
+                 analyze(o.getRhs(), rampAxis, slice));
   if (auto o = dyn_cast<SubOp>(op))
-    return subAI(analyze(o.getLhs(), rampAxis), analyze(o.getRhs(), rampAxis));
+    return subAI(analyze(o.getLhs(), rampAxis, slice),
+                 analyze(o.getRhs(), rampAxis, slice));
   if (auto o = dyn_cast<MulOp>(op)) {
     if (o.getLhs() == o.getRhs()) {
-      AffineInterval value = analyze(o.getLhs(), rampAxis);
+      AffineInterval value = analyze(o.getLhs(), rampAxis, slice);
       if (isPlain(value))
         return AffineInterval::constant(squareInterval(value.offset));
     }
-    return mulAI(analyze(o.getLhs(), rampAxis), analyze(o.getRhs(), rampAxis));
+    return mulAI(analyze(o.getLhs(), rampAxis, slice),
+                 analyze(o.getRhs(), rampAxis, slice));
   }
   if (auto o = dyn_cast<DivOp>(op))
-    return divAI(analyze(o.getLhs(), rampAxis), analyze(o.getRhs(), rampAxis));
+    return divAI(analyze(o.getLhs(), rampAxis, slice),
+                 analyze(o.getRhs(), rampAxis, slice));
 
   // Scalar shift / scale.
   if (auto o = dyn_cast<AddScalarOp>(op)) {
-    AffineInterval src = analyze(o.getInput(), rampAxis);
+    AffineInterval src = analyze(o.getInput(), rampAxis, slice);
     double s = o.getScalar().convertToDouble();
     return AffineInterval{src.coeff, src.offset + Interval::point(s)};
   }
   if (auto o = dyn_cast<MulScalarOp>(op))
-    return scaleBy(analyze(o.getInput(), rampAxis),
+    return scaleBy(analyze(o.getInput(), rampAxis, slice),
                    o.getScalar().convertToDouble());
 
   // sar.sqrt -- monotone, so endpoints map, but a ramp does not survive it.
@@ -601,9 +611,9 @@ AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis) {
         if (!mul || mul.getLhs() != mul.getRhs())
           return std::nullopt;
         Value baseValue = mul.getLhs();
-        AffineInterval base = analyze(baseValue, rampAxis);
-        AffineInterval q = analyze(orthogonal, rampAxis);
-        AffineInterval baseHull = analyze(baseValue, kNoRamp);
+        AffineInterval base = analyze(baseValue, rampAxis, slice);
+        AffineInterval q = analyze(orthogonal, rampAxis, slice);
+        AffineInterval baseHull = analyze(baseValue, kNoRamp, slice);
         if (base.coeff == 0.0 || !isPlain(q) || !isPlain(baseHull) ||
             !intervalFinite(q.offset) || !intervalFinite(baseHull.offset) ||
             q.offset.lo < 0.0 || baseHull.offset.lo <= 0.0)
@@ -642,7 +652,7 @@ AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis) {
       if (auto result = trySum(candidate))
         return *result;
 
-    AffineInterval src = analyze(o.getInput(), rampAxis);
+    AffineInterval src = analyze(o.getInput(), rampAxis, slice);
     if (!isPlain(src) || !intervalFinite(src.offset))
       return unbounded();
     // A wholly negative domain yields NaN; refuse rather than invent a value.
@@ -661,7 +671,7 @@ AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis) {
     if (!inTy || !outTy || !isa<FloatType>(inTy.getElementType()) ||
         !isa<FloatType>(outTy.getElementType()))
       return unbounded();
-    AffineInterval src = analyze(o.getInput(), rampAxis);
+    AffineInterval src = analyze(o.getInput(), rampAxis, slice);
     // Narrowing rounds; a ramp is no longer exact, but the interval still
     // holds to within the rounding the hardware itself performs.
     return src;
@@ -672,8 +682,8 @@ AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis) {
   // arms element-wise, hence contained in their hull. Hulling is only valid
   // in the ramp domain when both arms share a coefficient.
   if (auto o = dyn_cast<WhereOp>(op)) {
-    AffineInterval l = analyze(o.getLhs(), rampAxis);
-    AffineInterval r = analyze(o.getRhs(), rampAxis);
+    AffineInterval l = analyze(o.getLhs(), rampAxis, slice);
+    AffineInterval r = analyze(o.getRhs(), rampAxis, slice);
     if (l.coeff != r.coeff)
       return unbounded();
     return AffineInterval{l.coeff, l.offset.join(r.offset)};
@@ -684,8 +694,8 @@ AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis) {
   return unbounded();
 }
 
-AffineInterval Analyzer::analyze(Value v, int64_t rampAxis) {
-  auto key = std::make_pair(v, rampAxis);
+AffineInterval Analyzer::analyze(Value v, int64_t rampAxis, Slice slice) {
+  auto key = std::make_tuple(v, rampAxis, slice.axis, slice.begin, slice.end);
   auto it = memo.find(key);
   if (it != memo.end())
     return it->second;
@@ -696,7 +706,7 @@ AffineInterval Analyzer::analyze(Value v, int64_t rampAxis) {
   AffineInterval result = unbounded();
   if (!isa<BlockArgument>(v)) {
     if (Operation *def = v.getDefiningOp())
-      result = analyzeOp(def, rampAxis);
+      result = analyzeOp(def, rampAxis, slice);
   }
   // Block arguments -- kernel inputs above all -- carry no compile-time
   // range, so they keep the unbounded default.
@@ -711,16 +721,30 @@ AffineInterval Analyzer::analyze(Value v, int64_t rampAxis) {
 namespace mlir {
 namespace sar {
 
-static AffineInterval analyzePositions(Value positions, int64_t dim) {
+static AffineInterval analyzePositions(Value positions, int64_t dim,
+                                       Slice slice = {}) {
   Analyzer analyzer;
-  return analyzer.analyze(positions, dim);
+  return analyzer.analyze(positions, dim, slice);
+}
+
+static std::optional<Interval>
+displacementFromAffineInterval(AffineInterval ai, RankedTensorType type,
+                               int64_t dim) {
+  if (!type || !type.hasStaticShape() || dim < 0 || dim >= type.getRank() ||
+      !intervalFinite(ai.offset))
+    return std::nullopt;
+  double end = (ai.coeff - 1.0) * (type.getDimSize(dim) - 1);
+  return ai.offset + Interval::range(std::min(0.0, end), std::max(0.0, end));
 }
 
 std::optional<Interval> computeDisplacementRange(Value positions, int64_t dim) {
   AffineInterval ai = analyzePositions(positions, dim);
-  // displacement = positions - j = (coeff - 1) * j + offset.
-  if (ai.coeff == 1.0 && intervalFinite(ai.offset))
-    return ai.offset;
+  // displacement = positions - j = (coeff - 1) * j + offset. Kernel shapes
+  // are static on this path, so include the finite ramp contribution rather
+  // than requiring an exactly unit coefficient.
+  auto type = dyn_cast<RankedTensorType>(positions.getType());
+  if (auto range = displacementFromAffineInterval(ai, type, dim))
+    return range;
   // The symbolic form gives up on any nonlinearity over the ramp. When the
   // field is nonetheless fully determined at compile time, evaluating it
   // gives the exact bound.

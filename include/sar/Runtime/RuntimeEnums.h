@@ -1,4 +1,4 @@
-//===- RuntimeEnums.h - Interpolation enums shared with the runtime ------===//
+//===- RuntimeEnums.h - Interpolation enums shared with the runtime -------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

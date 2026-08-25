@@ -74,6 +74,127 @@ module {
 
 // -----
 
+// Two outputs written by one pipelined node need independent masters even
+// though neither is read in that node.
+// CHECK-LABEL: func.func @parallel_writes(
+// CHECK-SAME: %arg0: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-SAME: %arg1: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-SAME: %arg2: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-SAME: %arg3: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-NOT: %arg4
+module {
+  func.func @parallel_writes_produce(
+      %arg0: memref<64xf32, #hls.mem<dram>>,
+      %arg1: memref<64xf32, #hls.mem<dram>>) {
+    affine.for %i = 0 to 64 {
+      %zero = arith.constant 0.0 : f32
+      affine.store %zero, %arg0[%i] : memref<64xf32, #hls.mem<dram>>
+      affine.store %zero, %arg1[%i] : memref<64xf32, #hls.mem<dram>>
+    }
+    return
+  }
+  func.func @parallel_writes_consume0(
+      %arg0: memref<64xf32, #hls.mem<dram>>,
+      %arg1: memref<64xf32, #hls.mem<dram>>) {
+    affine.for %i = 0 to 64 {
+      %value = affine.load %arg0[%i] : memref<64xf32, #hls.mem<dram>>
+      affine.store %value, %arg1[%i] : memref<64xf32, #hls.mem<dram>>
+    }
+    return
+  }
+  func.func @parallel_writes_consume1(
+      %arg0: memref<64xf32, #hls.mem<dram>>,
+      %arg1: memref<64xf32, #hls.mem<dram>>) {
+    affine.for %i = 0 to 64 {
+      %value = affine.load %arg0[%i] : memref<64xf32, #hls.mem<dram>>
+      affine.store %value, %arg1[%i] : memref<64xf32, #hls.mem<dram>>
+    }
+    return
+  }
+  func.func @parallel_writes(
+      %arg0: memref<64xf32, #hls.mem<dram>>,
+      %arg1: memref<64xf32, #hls.mem<dram>>) attributes {top_func} {
+    %a = hls.dataflow.buffer {depth = 1 : i32}
+        : memref<64xf32, #hls.mem<dram>>
+    %b = hls.dataflow.buffer {depth = 1 : i32}
+        : memref<64xf32, #hls.mem<dram>>
+    call @parallel_writes_produce(%a, %b)
+        : (memref<64xf32, #hls.mem<dram>>,
+           memref<64xf32, #hls.mem<dram>>) -> ()
+    call @parallel_writes_consume0(%a, %arg0)
+        : (memref<64xf32, #hls.mem<dram>>,
+           memref<64xf32, #hls.mem<dram>>) -> ()
+    call @parallel_writes_consume1(%b, %arg1)
+        : (memref<64xf32, #hls.mem<dram>>,
+           memref<64xf32, #hls.mem<dram>>) -> ()
+    return
+  }
+}
+
+// -----
+
+// Pure read fan-in shares one scratch master. The consumer never writes either
+// intermediate, so separating them would only split a common prefetch and add
+// a platform port without removing a read/write alias.
+// CHECK-LABEL: func.func @read_fanin(
+// CHECK-SAME: %arg0: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-SAME: %arg1: !hls.axi<memref<64xf32, #hls.mem<dram>>>
+// CHECK-SAME: %arg2: !hls.axi<memref<128xf32, #hls.mem<dram>>>
+// CHECK-NOT: %arg3
+module {
+  func.func @read_fanin_produce0(
+      %input: memref<64xf32, #hls.mem<dram>>,
+      %output: memref<64xf32, #hls.mem<dram>>) {
+    affine.for %i = 0 to 64 {
+      %value = affine.load %input[%i] : memref<64xf32, #hls.mem<dram>>
+      affine.store %value, %output[%i] : memref<64xf32, #hls.mem<dram>>
+    }
+    return
+  }
+  func.func @read_fanin_produce1(
+      %input: memref<64xf32, #hls.mem<dram>>,
+      %output: memref<64xf32, #hls.mem<dram>>) {
+    affine.for %i = 0 to 64 {
+      %value = affine.load %input[%i] : memref<64xf32, #hls.mem<dram>>
+      affine.store %value, %output[%i] : memref<64xf32, #hls.mem<dram>>
+    }
+    return
+  }
+  func.func @read_fanin_consume(
+      %lhs: memref<64xf32, #hls.mem<dram>>,
+      %rhs: memref<64xf32, #hls.mem<dram>>,
+      %output: memref<64xf32, #hls.mem<dram>>) {
+    affine.for %i = 0 to 64 {
+      %a = affine.load %lhs[%i] : memref<64xf32, #hls.mem<dram>>
+      %b = affine.load %rhs[%i] : memref<64xf32, #hls.mem<dram>>
+      %sum = arith.addf %a, %b : f32
+      affine.store %sum, %output[%i] : memref<64xf32, #hls.mem<dram>>
+    }
+    return
+  }
+  func.func @read_fanin(
+      %input: memref<64xf32, #hls.mem<dram>>,
+      %output: memref<64xf32, #hls.mem<dram>>) attributes {top_func} {
+    %a = hls.dataflow.buffer {depth = 1 : i32}
+        : memref<64xf32, #hls.mem<dram>>
+    %b = hls.dataflow.buffer {depth = 1 : i32}
+        : memref<64xf32, #hls.mem<dram>>
+    call @read_fanin_produce0(%input, %a)
+        : (memref<64xf32, #hls.mem<dram>>,
+           memref<64xf32, #hls.mem<dram>>) -> ()
+    call @read_fanin_produce1(%input, %b)
+        : (memref<64xf32, #hls.mem<dram>>,
+           memref<64xf32, #hls.mem<dram>>) -> ()
+    call @read_fanin_consume(%a, %b, %output)
+        : (memref<64xf32, #hls.mem<dram>>,
+           memref<64xf32, #hls.mem<dram>>,
+           memref<64xf32, #hls.mem<dram>>) -> ()
+    return
+  }
+}
+
+// -----
+
 // The default top name is also the wrapper name. Rename the implementation
 // before creating the wrapper rather than rejecting a default invocation.
 module {

@@ -86,10 +86,16 @@ def _openmp_is_available() -> bool:
 
 
 class Backend(BaseBackend):
+    """Native-code backend: MLIR to LLVM IR to a shared library.
+
+    Reference implementation of the plugin contract in `backends/base.py`.
+    """
+
     name = "cpu"
 
     @classmethod
     def is_available(cls) -> bool:
+        """Whether the MLIR tools and the runtime library can be found."""
         try:
             find_tool("sar-opt")
             find_tool("mlir-translate")
@@ -109,6 +115,7 @@ class Backend(BaseBackend):
     OPTIONS = ("opt_level", "native_codegen")
 
     def add_stages(self, stages, metadata: KernelMetadata) -> None:
+        """Registers the lower/translate/link stages the driver runs."""
         unknown = sorted(set(metadata.options) - set(self.OPTIONS))
         if unknown:
             names = ", ".join(map(repr, unknown))
@@ -186,5 +193,6 @@ class Backend(BaseBackend):
     # ------------------------------------------------------------------ #
 
     def make_launcher(self, artifact: str, metadata: KernelMetadata):
+        """Wraps the built library in a callable with the kernel's types."""
         return CompiledKernel(artifact, metadata.name, metadata.arg_types,
                               metadata.result_types)

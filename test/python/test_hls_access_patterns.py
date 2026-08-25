@@ -42,7 +42,7 @@ _PLANE_ELEMENTS = N * N // 4
 
 #: Bytes a staged transpose block may occupy: exactly what the fixture
 #: passes as `transpose-block-bytes` below, so the assertion checks the
-#: configured cap rather than a historic default.
+#: configured cap rather than an implicit pass default.
 _BLOCK_BUDGET = (N * N * 8) // 8
 
 #: Multi-dimensional reads that stay on the non-affine `memref` path. All

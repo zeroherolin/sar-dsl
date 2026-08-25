@@ -1,6 +1,6 @@
 """Point-target image-quality gates for every imaging algorithm.
 
-Locks in the focusing quality measured by `benchmarks/run_quality.py` so a
+Locks in the focusing quality measured by `benchmarks/run_cpu_quality.py` so a
 lowering or numerics regression shows up as a failing bound rather than a
 slightly blurrier picture.
 

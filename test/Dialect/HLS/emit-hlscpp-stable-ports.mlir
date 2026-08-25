@@ -12,6 +12,7 @@
 // CHECK-NEXT:   #pragma HLS interface bram port=in0
 // CHECK-NEXT:   #pragma HLS stable variable=in0
 // CHECK-NEXT:   #pragma HLS interface m_axi offset=slave{{.*}} port=in1
+// CHECK-NEXT:   #pragma HLS interface s_axilite port=in1 bundle=ctrl
 // CHECK-NEXT:   #pragma HLS stable variable=in1
 // CHECK-NEXT:   #pragma HLS interface bram port=out0
 // CHECK-NOT:    #pragma HLS stable variable=out0

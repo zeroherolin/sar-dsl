@@ -1,4 +1,4 @@
-//===- FuncPreprocess.cpp - func preprocess -------------------------------===//
+//===- FuncPreprocess.cpp - normalize a function for the HLS passes -------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -154,7 +154,8 @@ struct MulIRaisePattern : public OpRewritePattern<arith::MulIOp> {
 };
 } // namespace
 
-LogicalResult sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
+LogicalResult sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc,
+                                       bool rewriteOps) {
   auto context = func.getContext();
 
   // HLS preprocessing requires a single-block function.
@@ -163,17 +164,19 @@ LogicalResult sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
     return failure();
   }
 
-  // Set top function attribute.
   if (isTopFunc)
     setTopFuncAttr(func);
 
-  // Set parallel attribute to each loop that is applicable. Meanwhile, strip
-  // all loop directives.
+  // Recompute parallelism after preprocessing; inherited loop directives may
+  // refer to a loop shape that the rewrites below replace.
   func.walk([&](AffineForOp loop) {
     loop->removeAttr("loop_directive");
     if (isLoopParallel(loop))
       setParallelAttr(loop);
   });
+
+  if (!rewriteOps)
+    return success();
 
   mlir::RewritePatternSet patterns(context);
   patterns.add<MemrefLoadRaisePattern>(context);
@@ -190,17 +193,21 @@ LogicalResult sar::applyFuncPreprocess(func::FuncOp func, bool isTopFunc) {
 namespace {
 struct FuncPreprocess : public sar::impl::FuncPreprocessBase<FuncPreprocess> {
   FuncPreprocess() = default;
-  FuncPreprocess(std::string hlsTopFunc) { topFunc = hlsTopFunc; }
+  FuncPreprocess(std::string hlsTopFunc, bool argRewriteOps) {
+    topFunc = hlsTopFunc;
+    rewriteOps = argRewriteOps;
+  }
 
   void runOnOperation() override {
     auto func = getOperation();
     auto isTop = func.getName() == topFunc;
-    if (failed(applyFuncPreprocess(func, isTop)))
+    if (failed(applyFuncPreprocess(func, isTop, rewriteOps)))
       signalPassFailure();
   }
 };
 } // namespace
 
-std::unique_ptr<Pass> sar::createFuncPreprocessPass(std::string hlsTopFunc) {
-  return std::make_unique<FuncPreprocess>(hlsTopFunc);
+std::unique_ptr<Pass> sar::createFuncPreprocessPass(std::string hlsTopFunc,
+                                                    bool rewriteOps) {
+  return std::make_unique<FuncPreprocess>(hlsTopFunc, rewriteOps);
 }

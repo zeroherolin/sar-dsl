@@ -20,6 +20,8 @@
 
 #include "sar/Dialect/SAR/Transforms/Passes.h"
 
+#include <iterator>
+
 namespace mlir {
 namespace sar {
 #define GEN_PASS_DEF_SARSTAGETRANSPOSES
@@ -111,6 +113,13 @@ static SmallVector<affine::AffineForOp> collectBand(affine::AffineForOp outer) {
   while (true) {
     if (!loop.hasConstantLowerBound() || !loop.hasConstantUpperBound() ||
         loop.getConstantLowerBound() != 0 || loop.getStep() != 1)
+      return {};
+    // Staging rebuilds the band around a block buffer and erases the
+    // original. A loop carrying values yields results the rewrite has no
+    // place for, so the erased loop would still have uses -- leave such a
+    // nest alone rather than reconstruct it wrongly. A corner turn fused
+    // with a reduction is the ordinary case.
+    if (loop.getNumIterOperands())
       return {};
     band.push_back(loop);
     auto &ops = loop.getBody()->getOperations();
@@ -229,12 +238,26 @@ static std::optional<TransposeNest> matchTranspose(affine::AffineForOp outer) {
   }
   if (transposing.empty())
     return std::nullopt;
-  if (llvm::any_of(loads, [&](affine::AffineLoadOp load) {
-        return llvm::any_of(stores, [&](affine::AffineStoreOp store) {
-          return load.getMemRef() == store.getMemRef();
-        });
-      }))
-    return std::nullopt;
+  // A pointwise temporary written and immediately read at the same address
+  // is safe to replay inside the drain half. Reject every other feedback
+  // edge: reordering tile iterations could otherwise change which write a
+  // load observes.
+  for (auto load : loads) {
+    SmallVector<affine::AffineStoreOp> sameBuffer;
+    llvm::copy_if(stores, std::back_inserter(sameBuffer), [&](auto store) {
+      return load.getMemRef() == store.getMemRef();
+    });
+    if (sameBuffer.empty())
+      continue;
+    if (!llvm::hasSingleElement(sameBuffer))
+      return std::nullopt;
+    auto store = sameBuffer.front();
+    if (store->getBlock() != load->getBlock() ||
+        !store->isBeforeInBlock(load) ||
+        store.getAffineMap() != load.getAffineMap() ||
+        store.getMapOperands() != load.getMapOperands())
+      return std::nullopt;
+  }
 
   return TransposeNest{band, transposing, *sourceLevel, *destLevel};
 }

@@ -1,4 +1,4 @@
-//===- Pipelines.h - SAR compilation pipelines -------------------*- C++-*-===//
+//===- Pipelines.h - SAR pipelines ------------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -50,6 +50,27 @@ struct SARBufferPipelineOptions
       llvm::cl::desc("Allow the banded interpolation gather"),
       llvm::cl::init(true)};
 
+  /// Byte budget for staging a complete split-complex interpolation row when
+  /// displacement analysis cannot prove a narrower sliding band. Zero keeps
+  /// the direct full-plane gather.
+  Option<uint64_t> interpFullRowMaxBytes{
+      *this, "interp-full-row-max-bytes",
+      llvm::cl::desc("Maximum bytes for a staged interpolation source row"),
+      llvm::cl::init(0)};
+
+  /// Replicated interpolation caches used to isolate packed compute lanes.
+  Option<uint64_t> interpCacheCopies{
+      *this, "interp-cache-copies",
+      llvm::cl::desc("Replicas of an interpolation cache"), llvm::cl::init(1)};
+
+  /// Maximum interpolation-band width that may be completely partitioned.
+  /// The HLS backend derives it from LUT/FF budgets; wider bands retain cyclic
+  /// tap banking.
+  Option<uint64_t> interpCompleteBankMaxElements{
+      *this, "interp-complete-bank-max-elements",
+      llvm::cl::desc("Maximum completely partitioned interpolation band"),
+      llvm::cl::init(16)};
+
   /// How many consecutive Stockham stages share a scratch slot. Zero keeps
   /// the full unroll, where each stage owns its line and the transform is a
   /// chain a dataflow backend can overlap; k > 0 trades that overlap for
@@ -73,10 +94,20 @@ struct SARBufferPipelineOptions
       *this, "fft-io-unroll",
       llvm::cl::desc("FFT transfer elements per external access"),
       llvm::cl::init(1)};
+
+  /// Fuse identical affine sweeps before allocation reuse. This exposes
+  /// shared phase/corner-turn work, but can enlarge live ranges in graphs with
+  /// several data-dependent regrids.
+  Option<bool> fuseSiblingSweeps{
+      *this, "fuse-sibling-sweeps",
+      llvm::cl::desc("Fuse identical affine sweeps before buffer reuse"),
+      llvm::cl::init(true)};
 };
 
 /// Lowers SAR kernels to linalg-on-tensors: the hand-off level for external
 /// backends that run their own bufferization and loop transformations.
+/// Transforms and interpolation have no linalg form and become calls against
+/// the runtime ABI, which such a backend implements or lowers itself.
 void buildSARToLinalgPipeline(OpPassManager &pm);
 
 /// Lowers SAR kernels all the way to the LLVM dialect for CPU execution.

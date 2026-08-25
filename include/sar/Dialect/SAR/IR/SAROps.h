@@ -1,4 +1,4 @@
-//===- SAROps.h - SAR operation declarations --------------------*- C++-*-===//
+//===- SAROps.h - SAR operation declarations --------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

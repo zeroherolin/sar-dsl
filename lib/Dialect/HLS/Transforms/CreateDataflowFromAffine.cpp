@@ -1,4 +1,4 @@
-//===- CreateDataflowFromAffine.cpp - create dataflow from affine ---------===//
+//===- CreateDataflowFromAffine.cpp - build the dataflow hierarchy --------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -37,7 +37,8 @@ struct TaskPartition : public OpRewritePattern<DispatchOp> {
     auto isTaskSeed = [](Operation &op) {
       // Compact unrolled lane loops are body, not tasks (see the band
       // filter in the pass entry).
-      return isa<AffineForOp, scf::ForOp>(op) && !op.hasAttr(kUnrollFactorAttr);
+      return isa<AffineForOp, scf::ForOp>(op) &&
+             !op.hasAttr(kUnrollFactorAttr) && !op.hasAttr(kTaskBodyAttr);
     };
     if (llvm::none_of(block, isTaskSeed))
       return failure();
@@ -96,7 +97,7 @@ struct CreateDataflowFromAffine
       auto *body = band.back().getBody();
       bool hasTaskableLoop = llvm::any_of(*body, [](Operation &op) {
         return isa<AffineForOp, scf::ForOp>(op) &&
-               !op.hasAttr(kUnrollFactorAttr);
+               !op.hasAttr(kUnrollFactorAttr) && !op.hasAttr(kTaskBodyAttr);
       });
       if (hasTaskableLoop)
         dispatchBlock(body);

@@ -9,7 +9,7 @@ import pytest
 
 import sar
 
-from conftest import REPO_ROOT, requires_hls
+from conftest import REPO_ROOT, requires_hls, run_hls_csim
 
 pytestmark = requires_hls
 
@@ -62,6 +62,21 @@ def test_reserved_parameter_names_fall_back():
     assert "float float" not in signature
 
 
+def test_hdl_reserved_parameter_names_fall_back():
+    """Names that become illegal only in RTL still get a stable C++ ABI."""
+    plane = sar.f32[N, N]
+
+    @sar.func
+    def hdl_names(signal: plane, shared: plane) -> plane:
+        return signal + shared
+
+    source = hdl_names.compile(backend="hls").source()
+    signature = source[source.index("void hdl_names("):]
+    signature = signature[:signature.index(")")]
+    assert "in0" in signature and "in1" in signature
+    assert " signal[" not in signature and " shared[" not in signature
+
+
 def test_hls_design_is_not_executable():
 
     @sar.func
@@ -82,25 +97,71 @@ def test_hls_design_survives_cache_artifact_eviction(tmp_path):
 
     design = scale.compile(backend="hls")
     source = design.source()
+    assert "// SAR_DSL_INTERFACE: {" in source
     Path(design.cpp_path).unlink()
     assert design.source() == source
 
     synthesis_dir = tmp_path / "synthesis"
     design.write_synthesis_script(synthesis_dir)
-    assert (synthesis_dir / "scale.cpp").read_text() == source
+    packaged = (synthesis_dir / "scale.cpp").read_text()
+    assert '#include "scale.h"' in packaged
+    assert "SAR_DSL_DECLARATIONS_BEGIN" not in packaged
+    assert "Sub-function prototypes" not in packaged
+    assert packaged.index("void scale(") < packaged.index(
+        "static T sar_hls_maximum(T lhs, T rhs) {")
+    assert "\n\n\n" not in packaged
+    assert "void scale(" in (synthesis_dir / "scale.h").read_text()
     manifest = json.loads((synthesis_dir / "design_manifest.json").read_text())
     assert manifest["schema_version"] == 2
     assert manifest["top"] == "scale"
     assert manifest["generator"]["backend"] == "hls"
     assert manifest["kernel"]["arguments"][0]["dtype"] == "f32"
-    assert manifest["config"]["interface"] == "ap_memory"
+    assert manifest["config"]["interface"] == "axi"
+    assert manifest["optimization_plan"]["clock_ns"] == 4.0
+    assert manifest["optimization_plan"]["timing_budget_ns"] == 3.5
+    assert "max_scratch_arenas" in manifest["optimization_plan"]["values"]
     assert manifest["interfaces"][0]["logical_elements"] == n
     assert manifest["interfaces"][0]["vector_lanes"] == 1
 
     x = np.arange(n, dtype=np.float32)
     testbench_dir = tmp_path / "testbench"
     design.write_testbench([x], [x * 2.0], testbench_dir)
-    assert (testbench_dir / "scale.cpp").read_text() == source
+    assert '#include "scale.h"' in (testbench_dir / "scale.cpp").read_text()
+    assert (testbench_dir / "scale.h").is_file()
+    # No constant tables in this kernel, so no ROM header is written.
+    assert not design.has_tables()
+    assert not (testbench_dir / "scale_tables.h").exists()
+
+
+def test_constant_tables_are_packaged_as_their_own_header(tmp_path):
+    """ROM tables leave the implementation file.
+
+    A transform's twiddle tables routinely outweigh the logic that reads
+    them, so they are packaged as `<top>_tables.h` and the implementation
+    includes it. Both files together must still be the same translation
+    unit the single-file translation output is.
+    """
+    n = 64
+
+    @sar.func
+    def transform(x: sar.c64[n]) -> sar.c64[n]:
+        return sar.fft(x, dim=0)
+
+    design = transform.compile(backend="hls")
+    assert design.has_tables()
+    out = tmp_path / "package"
+    design.write_synthesis_script(out)
+
+    tables = (out / "transform_tables.h").read_text()
+    packaged = (out / "transform.cpp").read_text()
+    assert '#include "transform_tables.h"' in packaged
+    assert "SAR_DSL_TABLES_BEGIN" not in packaged
+    assert "Constant tables" not in packaged
+    # The tables themselves moved; the code that reads them did not.
+    assert "kTwiddleSin_64S0" in tables
+    assert "kTwiddleSin_64S0[" not in tables.split("static const")[0]
+    assert "kTwiddleSin_64S0" in packaged
+    assert "static const float kTwiddleSin_64S0" not in packaged
 
 
 def test_manifest_records_the_physical_vector_interface(tmp_path):
@@ -114,10 +175,21 @@ def test_manifest_records_the_physical_vector_interface(tmp_path):
     design.write_synthesis_script(tmp_path)
     manifest = json.loads((tmp_path / "design_manifest.json").read_text())
     port = next(item for item in manifest["interfaces"] if item["name"] == "x")
+    output = next(item for item in manifest["interfaces"]
+                  if item["direction"] == "out")
+    assert port["protocol"] == "m_axi"
+    assert port["direction"] == "in"
     assert port["vector_lanes"] == 8
     assert port["data_bits"] == 512
     assert port["physical_shape"] == [n, n // 8]
     assert port["logical_elements"] == n * n
+    assert output["vector_lanes"] == 8
+    assert output["data_bits"] == 512
+    assert output["physical_shape"] == [n, n // 8]
+    assert output["logical_elements"] == n * n
+    values = np.arange(n * n, dtype=np.float64).reshape(n, n)
+    design.write_testbench([values], [values * 2.0], tmp_path)
+    run_hls_csim(tmp_path, "scale")
 
 
 @pytest.mark.parametrize("name,value", [
@@ -140,6 +212,64 @@ def test_testbench_rejects_invalid_tolerances(tmp_path, name, value):
     assert not list(tmp_path.iterdir())
 
 
+def test_integer_ports_hls_csim_against_exact_golden_data(tmp_path):
+    """Integer arguments and results reach the validation package.
+
+    Integer planes are written and compared as exact binary values: a 64-bit
+    value does not survive a round trip through the double oracle the
+    floating planes use, and equality is the only meaningful tolerance.
+    """
+    n = 32
+
+    @sar.func
+    def mixed(counts: sar.i64[n],
+              gain: sar.f64[n]) -> (sar.i64[n], sar.f64[n]):
+        return counts + counts, gain * 2.0
+
+    # Values above 2^53, where a double oracle would already have rounded.
+    counts = (np.arange(n, dtype=np.int64) + 1) * 1234567890123
+    gain = np.linspace(0.5, 3.0, n)
+    design = mixed.compile(backend="hls")
+    design.write_testbench([counts, gain], [counts + counts, gain * 2.0],
+                           tmp_path)
+
+    stored = np.fromfile(tmp_path / "mixed_tb_data" / "out0.bin",
+                         dtype=np.int64)
+    np.testing.assert_array_equal(stored, counts + counts)
+
+    run_hls_csim(tmp_path, "mixed")
+
+
+def test_integer_ports_hls_csim_over_axi_and_stream(tmp_path):
+    """The exact-comparison path also covers the physical port ABIs."""
+    n = 256
+
+    @sar.func
+    def twice(x: sar.i32[n]) -> sar.i32[n]:
+        return x + x
+
+    x = (np.arange(n, dtype=np.int32) % 200) - 100
+    for interface in ("axi", "stream"):
+        out = tmp_path / interface
+        design = twice.compile(backend="hls", options={"interface": interface})
+        design.write_testbench([x], [x + x], out)
+        run_hls_csim(out, "twice")
+
+
+def test_integer_golden_data_must_be_integral(tmp_path):
+    """A float oracle for an integer result is a silently rounded
+    comparison, so it is refused rather than truncated."""
+
+    @sar.func
+    def twice(x: sar.i32[4]) -> sar.i32[4]:
+        return x + x
+
+    x = np.arange(4, dtype=np.int32)
+    design = twice.compile(backend="hls")
+    with pytest.raises(sar.LaunchError, match="integer dtype"):
+        design.write_testbench([x], [(x + x).astype(np.float64)], tmp_path)
+
+
 def test_testbench_preserves_high_precision_golden_data(tmp_path):
 
     @sar.func
@@ -150,7 +280,8 @@ def test_testbench_preserves_high_precision_golden_data(tmp_path):
     reference = np.array([1.00000006, 0.99999997], dtype=np.float64)
     identity.compile(backend="hls").write_testbench([values], [reference],
                                                     tmp_path)
-    stored = np.loadtxt(tmp_path / "identity_tb_data" / "out0.dat")
+    stored = np.fromfile(tmp_path / "identity_tb_data" / "out0.bin",
+                         dtype=np.float64)
     np.testing.assert_array_equal(stored, reference)
 
 
@@ -166,6 +297,21 @@ def test_testbench_rejects_unbounded_static_memory(tmp_path, monkeypatch):
         identity.compile(backend="hls").write_testbench([values], [values],
                                                         tmp_path)
     assert not list(tmp_path.iterdir())
+
+
+def test_explicit_production_testbench_disables_size_guard(
+        tmp_path, monkeypatch):
+
+    @sar.func
+    def identity(x: sar.f32[16]) -> sar.f32[16]:
+        return x
+
+    values = np.ones(16, dtype=np.float32)
+    monkeypatch.setenv("SAR_DSL_HLS_TESTBENCH_MAX_BYTES", "32")
+    identity.compile(backend="hls").write_testbench([values], [values],
+                                                    tmp_path,
+                                                    max_bytes=0)
+    assert (tmp_path / "identity_tb.cpp").is_file()
 
 
 def test_fft_kernel_emits_via_affine_flow():
@@ -228,16 +374,9 @@ def test_composed_vocabulary_emits_hls():
         assert "#pragma HLS" in design.source(), fn
 
 
-def test_testbench_csim_passes(tmp_path):
-    """The emitted design + generated testbench form a self-contained
-    C-simulation package: compiled with plain clang++ (Vitis header
-    stubs included in the package), the design must reproduce the
-    golden data."""
-    import subprocess
-
+def test_testbench_hls_csim_passes(tmp_path):
+    """The emitted design reproduces golden data in C-sim through Vitis HLS."""
     import numpy as np
-
-    from sar.compiler.toolchain import find_tool
 
     n = 16
 
@@ -252,28 +391,28 @@ def test_testbench_csim_passes(tmp_path):
     g = rng.uniform(-3.0, 3.0, (n, n))
     design.write_testbench([z, g], [z * np.exp(1j * g)], tmp_path, rtol=1e-12)
 
-    clang = find_tool("clang")
-    subprocess.run([
-        clang + "++", "-O2", "-Wno-unknown-pragmas", "-I", "stubs",
-        "phase.cpp", "phase_tb.cpp", "-o", "csim", "-pthread"
-    ],
-                   cwd=tmp_path,
-                   check=True,
-                   capture_output=True)
-    result = subprocess.run(["./csim"],
-                            cwd=tmp_path,
-                            capture_output=True,
-                            text=True)
-    assert result.returncode == 0, result.stdout
-    assert "PASS" in result.stdout
-    assert (tmp_path / "phase_csim.tcl").exists()
+    run_hls_csim(tmp_path, "phase")
+    assert (tmp_path / "phase_hls_csim.tcl").exists()
+    assert (tmp_path / "phase_portable_cpp_sim.sh").exists()
     assert (tmp_path / "phase_csynth.tcl").exists()
 
 
-def test_nan_semantics_match_numpy_in_emitted_cpp(tmp_path):
-    import subprocess
+def test_stream_testbench_has_a_numerical_oracle(tmp_path):
 
-    from sar.compiler.toolchain import find_tool
+    @sar.func
+    def stream_scale(x: sar.f32[16]) -> sar.f32[16]:
+        return x * 3.0
+
+    values = np.arange(16, dtype=np.float32)
+    design = stream_scale.compile(backend="hls",
+                                  options={"interface": "stream"})
+    design.write_testbench([values], [values * 3.0], tmp_path)
+    run_hls_csim(tmp_path, "stream_scale")
+    manifest = json.loads((tmp_path / "design_manifest.json").read_text())
+    assert {port["protocol"] for port in manifest["interfaces"]} == {"axis"}
+
+
+def test_nan_semantics_match_numpy_in_emitted_cpp(tmp_path):
 
     @sar.func
     def nan_ops(
@@ -292,25 +431,50 @@ def test_nan_semantics_match_numpy_in_emitted_cpp(tmp_path):
     ]
     design = nan_ops.compile(backend="hls")
     design.write_testbench([x], expected, tmp_path)
-    subprocess.run([
-        find_tool("clang") + "++", "-O2", "-Wno-unknown-pragmas", "-I",
-        "stubs", "nan_ops.cpp", "nan_ops_tb.cpp", "-o", "csim", "-pthread"
-    ],
-                   cwd=tmp_path,
-                   check=True,
-                   capture_output=True)
-    result = subprocess.run(["./csim"],
-                            cwd=tmp_path,
-                            capture_output=True,
-                            text=True)
-    assert result.returncode == 0, result.stdout
-    assert "PASS" in result.stdout
+    run_hls_csim(tmp_path, "nan_ops")
 
 
-def test_testbench_rejects_nan_mismatch(tmp_path):
+def test_maximum_minimum_preserve_nan_and_signed_zero(tmp_path):
     import subprocess
 
     from sar.compiler.toolchain import find_tool
+
+    @sar.func
+    def fp_edges(x: sar.f64[4]) -> (sar.f64[4], sar.f64[4]):
+        return sar.maximum(x, -0.0), sar.minimum(x, 0.0)
+
+    design = fp_edges.compile(backend="hls")
+    (tmp_path / "fp_edges.cpp").write_text(design.source())
+    (tmp_path / "edge_tb.cpp").write_text(r"""\
+#include <cmath>
+#include "fp_edges.cpp"
+int main() {
+  double x[4] = {-0.0, 0.0, NAN, 2.0};
+  double maximum[4] = {};
+  double minimum[4] = {};
+  fp_edges(x, maximum, minimum);
+  if (!std::signbit(maximum[0]) || std::signbit(maximum[1]))
+    return 1;
+  if (!std::signbit(minimum[0]) || std::signbit(minimum[1]))
+    return 2;
+  if (!std::isnan(maximum[2]) || !std::isnan(minimum[2]))
+    return 3;
+  return 0;
+}
+""")
+    result = subprocess.run([
+        find_tool("clang") + "++", "-O2", "-Wno-unknown-pragmas",
+        "edge_tb.cpp", "-o", "edge_tb"
+    ],
+                            cwd=tmp_path,
+                            capture_output=True,
+                            text=True)
+    assert result.returncode == 0, result.stderr
+    result = subprocess.run(["./edge_tb"], cwd=tmp_path)
+    assert result.returncode == 0
+
+
+def test_testbench_rejects_nan_mismatch(tmp_path):
 
     @sar.func
     def identity(x: sar.f64[4]) -> sar.f64[4]:
@@ -320,38 +484,24 @@ def test_testbench_rejects_nan_mismatch(tmp_path):
     expected = x.copy()
     expected[1] = np.nan
     identity.compile(backend="hls").write_testbench([x], [expected], tmp_path)
-    subprocess.run([
-        find_tool("clang") + "++", "-O2", "-Wno-unknown-pragmas", "-I",
-        "stubs", "identity.cpp", "identity_tb.cpp", "-o", "csim", "-pthread"
-    ],
-                   cwd=tmp_path,
-                   check=True,
-                   capture_output=True)
-    result = subprocess.run(["./csim"],
-                            cwd=tmp_path,
-                            capture_output=True,
-                            text=True)
-    assert result.returncode != 0
+    _, result = run_hls_csim(tmp_path, "identity", expect_success=False)
     assert "FAIL" in result.stdout
 
 
-def test_f32_chain_csim_matches_the_cpu_backend(tmp_path):
+def test_f32_chain_hls_csim_matches_the_cpu_backend(tmp_path):
     """The HLS x f32 leg of the precision matrix.
 
-    A chain built with `dtype=sar.c64` must emit, csim, and agree with
+    A chain built with `dtype=sar.c64` must emit, simulate, and agree with
     the same build on the cpu backend to single-precision rounding --
     the cpu FFT computes its butterflies in f64 while the HLS FFT
     computes in the declared width, so this is a real cross-backend
     check, not a self-comparison.
     """
-    import subprocess
-
     import numpy as np
 
     from common.params import synthetic_params
     from common.simulate import single_target_scene
     from wka.algorithm import build_kernel, make_inputs
-    from sar.compiler.toolchain import find_tool
 
     n = 32
     params = synthetic_params(n)
@@ -371,20 +521,7 @@ def test_f32_chain_csim_matches_the_cpu_backend(tmp_path):
                            tmp_path,
                            rtol=1e-3,
                            atol=peak * 1e-3)
-    clang = find_tool("clang")
-    subprocess.run([
-        clang + "++", "-O2", "-Wno-unknown-pragmas", "-I", "stubs",
-        "wka_f32.cpp", "wka_f32_tb.cpp", "-o", "csim", "-pthread"
-    ],
-                   cwd=tmp_path,
-                   check=True,
-                   capture_output=True)
-    result = subprocess.run(["./csim"],
-                            cwd=tmp_path,
-                            capture_output=True,
-                            text=True)
-    assert result.returncode == 0, result.stdout
-    assert "PASS" in result.stdout
+    run_hls_csim(tmp_path, "wka_f32")
 
 
 def test_mixed_precision_axi_uses_typed_scratch_arenas():
@@ -393,17 +530,17 @@ def test_mixed_precision_axi_uses_typed_scratch_arenas():
     A port is a platform resource an integrator wires to a memory channel,
     so the signature is the algorithm's own I/O plus the scratch the design
     genuinely needs. Two element types spill here, and a typed C++ signature
-    cannot express both through one pointer, so two arenas is the floor --
-    not two per plane, and nothing at all for a type that never spills.
+    cannot express both through one pointer. Each type may need several
+    conflict-colored ping-pong arenas, but never more than the derived cap.
     """
     n = 64
 
     @sar.func
     def kernel(data: sar.c64[n, n], geometry: sar.f64[n, n]) -> sar.c64[n, n]:
-        real = sar.transpose(sar.real(data))
-        imag = sar.transpose(sar.imag(data))
-        wide = sar.transpose(geometry)
-        return sar.make_complex(real + sar.cast(wide, sar.f32), imag)
+        narrow = sar.fft(data, axis=1)
+        wide_input = sar.make_complex(geometry, geometry * 0.0)
+        wide = sar.fft(wide_input, axis=1)
+        return narrow + sar.cast(wide, sar.c64)
 
     kernel.name = "mixed_scratch"
     design = kernel.compile(backend="hls",
@@ -418,13 +555,21 @@ def test_mixed_precision_axi_uses_typed_scratch_arenas():
     io_ports = sum(2 if t.dtype.is_complex else 1
                    for t in kernel.arg_types + kernel.declared_result_types)
     scratch = args[io_ports:]
-    assert {arg.split(" ", 1)[0] for arg in scratch} == {"float", "double"}
-    assert len(scratch) == 2
+
+    def scalar_type(declaration):
+        vector = re.match(r"hls::vector<(float|double),", declaration)
+        return vector.group(1) if vector else declaration.split(" ", 1)[0]
+
+    scratch_types = [scalar_type(arg) for arg in scratch]
+    assert set(scratch_types) == {"float", "double"}
+    assert all(
+        scratch_types.count(kind) <= design.config.max_scratch_arenas
+        for kind in set(scratch_types))
     assert all(re.search(r"\[\d+\]$", arg) for arg in scratch)
 
 
 def test_twiddle_tables_are_shared_across_same_size_ffts():
-    """Transforms of one size share one cos and one sin table.
+    """Transforms of one size share one cos/sin table per stage.
 
     The emitter lifts twiddle tables to file-scope `const` arrays so the
     tool can map them to ROM; a design whose three same-size transforms
@@ -440,15 +585,21 @@ def test_twiddle_tables_are_shared_across_same_size_ffts():
         return (sar.fft(a, axis=1) * sar.fft(b, axis=1) * sar.fft(a, axis=1))
 
     source = three.compile(backend="hls").source()
-    assert source.count(f"kTwiddleCos_{n}[") == 1, source
-    assert source.count(f"kTwiddleSin_{n}[") == 1, source
-    # The uniquing suffix appearing would mean a duplicate slipped in
-    # under another name.
-    assert f"kTwiddleCos_{n}_2" not in source
+    # The final four-point stage has only 1/0 twiddles; canonicalization folds
+    # those constants away, so only the two non-trivial stage tables remain.
+    for stage in range(2):
+        cos = f"kTwiddleCos_{n}S{stage}"
+        sin = f"kTwiddleSin_{n}S{stage}"
+        assert source.count(cos + "[") == 1, source
+        assert source.count(sin + "[") == 1, source
+        # The uniquing suffix appearing would mean a duplicate slipped in
+        # under another name.
+        assert cos + "_2" not in source
+    assert f"kTwiddleCos_{n}S2" not in source
 
 
 def test_synthesis_script_covers_every_interface(tmp_path):
-    """`write_synthesis_script` exists for the designs csim cannot cover:
+    """`write_synthesis_script` exists for designs C simulation cannot cover:
     synthesis needs no golden data, so the AXI/stream designs get their
     script from here. The scripts name the configured part and clock."""
     n = 16
@@ -467,15 +618,27 @@ def test_synthesis_script_covers_every_interface(tmp_path):
         out = tmp_path / interface
         script = design.write_synthesis_script(out)
         assert script == out / "scale_csynth.tcl"
-        assert (out / "scale.cpp").read_text() == design.source()
+        assert '#include "scale.h"' in (out / "scale.cpp").read_text()
+        assert "void scale(" in (out / "scale.h").read_text()
         tcl = script.read_text()
         assert "set_top scale" in tcl
         assert "csynth_design" in tcl
         assert "set_part xczu9eg-ffvb1156-2-e" in tcl
         assert "create_clock -period 4" in tcl
+        assert "set_clock_uncertainty 12.5%" in tcl
         assert "config_interface -m_axi_alignment_byte_size=64" in tcl
         assert "config_interface -m_axi_max_read_burst_length=64" in tcl
         assert "scale_csynth_elapsed_s.txt" in tcl
+        assert "synthesis report is missing resource estimates" in tcl
+        # Timing is a goal and resources are budgets, so the script treats
+        # them differently: a missed clock is reported and synthesis
+        # continues, an over-budget resource aborts it.
+        assert "SAR-DSL WARNING: estimated clock" in tcl
+        assert 'format "%.3f" $_sar_estimated_clock' in tcl
+        assert 'error "SAR-DSL: $_sar_name usage' in tcl
+        assert "BRAM_18K" in tcl
+        assert "URAM" in tcl
+        assert "DSP" in tcl
 
 
 def test_scratch_is_one_line_wide():
@@ -552,9 +715,9 @@ def test_partition_factors_stay_synthesizable():
     assert max(factors) <= 32, sorted(set(factors))
 
 
-def test_axi_testbench_drives_scalar_scratch_and_emits_cosim(tmp_path):
-    """A scalar AXI package allocates compiler scratch in the harness and
-    carries a ready-to-run RTL co-simulation script."""
+def test_axi_testbench_drives_output_and_emits_cosim(tmp_path):
+    """An AXI package drives its named output and carries an RTL co-sim
+    script."""
     N = 32
 
     @sar.func
@@ -569,7 +732,7 @@ def test_axi_testbench_drives_scalar_scratch_and_emits_cosim(tmp_path):
     design.write_testbench([values], [golden], tmp_path)
     assert (tmp_path / "spectrum_cosim.tcl").is_file()
     testbench = (tmp_path / "spectrum_tb.cpp").read_text()
-    assert "inout" in testbench
+    assert "out0" in testbench
 
 
 def test_streamed_planes_are_shared_across_lifetimes():
@@ -582,8 +745,6 @@ def test_streamed_planes_are_shared_across_lifetimes():
     back. The count has to stay flat as the chain grows, not track its
     length.
     """
-    import re
-
     n = 64
 
     @sar.func
@@ -606,7 +767,7 @@ def test_streamed_planes_are_shared_across_lifetimes():
                                 "uram_bytes": 0,
                                 "lutram_bytes": 0
                             }).source()
-        return len(re.findall(r"m_axi", source))
+        return source.count("#pragma HLS interface m_axi")
 
     short_ports = ports(short, "share_short")
     long_ports = ports(long, "share_long")
@@ -769,8 +930,7 @@ def test_axi_interface_is_a_contract_not_a_placement_result():
 
 
 def test_local_interface_emits_memory_ports():
-    """The default interface hands the kernel plain arrays, which is the
-    signature the generated csim testbench drives."""
+    """An explicit ap_memory interface emits local block-memory arrays."""
     n = 64
 
     @sar.func
@@ -808,12 +968,12 @@ def test_local_interface_rejects_off_chip_spill():
 
 
 def test_stream_interface_emits_axis_pragmas():
-    """The stream interface reaches the emitter as AXI4-Stream pragmas."""
+    """A proven single row-major sweep reaches AXI4-Stream pragmas."""
     n = 64
 
     @sar.func
-    def spectrum(x: sar.c64[n, n]) -> sar.c64[n, n]:
-        return sar.fft(x, axis=1)
+    def spectrum(x: sar.f32[n, n]) -> sar.f32[n, n]:
+        return x * 2.0
 
     spectrum.name = "iface_stream"
     source = spectrum.compile(backend="hls", options={
@@ -823,7 +983,10 @@ def test_stream_interface_emits_axis_pragmas():
     # there is no scratch arena to keep memory-mapped: a design that needs
     # no DRAM declares no AXI master at all.
     axis_ports = set(re.findall(r"interface axis port=(\w+)", source))
-    assert {"x_re", "x_im"} <= axis_ports, axis_ports
+    assert "x" in axis_ports and len(axis_ports) == 2, axis_ports
+    assert "hls::stream<float> &x" in source
+    assert ".read()" in source and ".write(" in source
+    assert not re.search(r"interface axis port=\w+ bundle=", source)
     maxi_ports = re.findall(r"m_axi.*port=(\w+)", source)
     assert not maxi_ports, maxi_ports
     # A stream port carries no burst shaping: that describes addressed
@@ -831,11 +994,8 @@ def test_stream_interface_emits_axis_pragmas():
     assert "max_read_burst_length" not in source
 
 
-def test_stream_interface_keeps_spilled_scratch_memory_mapped():
-    """A buffer that spills to DRAM is read and written by the design, and
-    an AXI4-Stream is unidirectional and consumed once -- `axis` on such a
-    port cannot synthesize. In stream mode only the pure inputs and outputs
-    stream; scratch remains an AXI master."""
+def test_stream_interface_rejects_nonsequential_access():
+    """FFT traffic is addressed and cannot silently become an AXI stream."""
     n = 32
 
     @sar.func
@@ -844,29 +1004,23 @@ def test_stream_interface_keeps_spilled_scratch_memory_mapped():
         return sar.fft(y, axis=0)
 
     two_ffts.name = "iface_stream_scratch"
-    source = two_ffts.compile(backend="hls",
-                              options={
-                                  "interface": "stream",
-                                  "bram_bytes": 1 << 16,
-                                  "uram_bytes": 0,
-                                  "lutram_bytes": 0,
-                              }).source()
-    lines = [
-        line.strip() for line in source.splitlines()
-        if line.strip().startswith("#pragma HLS interface")
-    ]
-    maxi = [line for line in lines if " m_axi " in line]
-    axis = [line for line in lines if " axis " in line]
+    with pytest.raises(sar.CompilationError,
+                       match="complete monotonic row-major access sweep"):
+        two_ffts.compile(backend="hls", options={"interface": "stream"})
 
-    # The budget forces a spill, so the design has a scratch port -- and it
-    # must be memory-mapped, with burst shaping, despite the stream mode.
-    assert maxi, lines
-    assert all("max_read_burst_length" in line for line in maxi), maxi
 
-    # The kernel's own ports still stream, without burst shaping.
-    axis_ports = {line.split("port=")[1].split()[0] for line in axis}
-    assert {"x_re", "x_im"} <= axis_ports, axis_ports
-    assert all("max_read_burst_length" not in line for line in axis), axis
+def test_stream_interface_rejects_square_transpose():
+    """Equal extents do not make a column-major sweep row-major."""
+    n = 32
+
+    @sar.func
+    def transpose(x: sar.f32[n, n]) -> sar.f32[n, n]:
+        return sar.transpose(x)
+
+    transpose.name = "iface_stream_transpose"
+    with pytest.raises(sar.CompilationError,
+                       match="complete monotonic row-major access sweep"):
+        transpose.compile(backend="hls", options={"interface": "stream"})
 
 
 @pytest.mark.parametrize("interface", ["ap_memory", "axi", "stream"])
@@ -876,8 +1030,8 @@ def test_no_memory_port_ever_carries_a_bundle(interface):
     n = 32
 
     @sar.func
-    def spectrum(x: sar.c64[n, n]) -> sar.c64[n, n]:
-        return sar.fft(x, axis=1)
+    def spectrum(x: sar.f32[n, n]) -> sar.f32[n, n]:
+        return x * 2.0
 
     spectrum.name = f"iface_nobundle_{interface}"
     source = spectrum.compile(backend="hls",
@@ -893,10 +1047,8 @@ def test_no_memory_port_ever_carries_a_bundle(interface):
     assert not offenders, offenders
 
 
-def test_stream_testbench_raises_an_actionable_error(tmp_path):
-    """csim for AXI-Stream needs a FIFO-feeding harness that is not
-    implemented. Saying so beats emitting a testbench that cannot compile
-    against the design's signature."""
+def test_stream_fft_rejection_is_actionable(tmp_path):
+    """An addressed FFT cannot be mislabeled as a stream."""
     n = 16
 
     @sar.func
@@ -904,17 +1056,9 @@ def test_stream_testbench_raises_an_actionable_error(tmp_path):
         return sar.fft(x, axis=1)
 
     spectrum.name = "iface_stream_tb"
-    design = spectrum.compile(backend="hls", options={"interface": "stream"})
-    data = np.zeros((n, n), dtype=np.complex64)
-    with pytest.raises(sar.errors.LaunchError) as excinfo:
-        design.write_testbench([data], [data], output_dir=tmp_path)
-    message = str(excinfo.value)
-    # The error has to name the cause and the way forward, not just fail.
-    assert "stream" in message
-    assert "ap_memory" in message
-    assert "FIFO" in message
-    # Nothing half-written is left behind.
-    assert not list(tmp_path.glob("*_tb.cpp"))
+    with pytest.raises(sar.CompilationError,
+                       match="complete monotonic row-major access sweep"):
+        spectrum.compile(backend="hls", options={"interface": "stream"})
 
 
 def test_full_alos_raster_emits():
@@ -923,8 +1067,8 @@ def test_full_alos_raster_emits():
     This is the size the CPU runner processes, and it only fits because
     the full-size planes -- the scene and the FFT scratch -- go behind AXI
     masters under the shipped 80% resource budgets. Guards the whole chain:
-    budget decision, buffer placement, shared constant tables, per-port
-    bundles.
+    budget decision, buffer placement, shared constant tables, and the
+    master count.
     """
     import re
     import sys
@@ -942,18 +1086,24 @@ def test_full_alos_raster_emits():
                           re.M), "no full-size array may stay on chip"
     ports = {
         line.split("port=")[1].split()[0]
-        for line in source.splitlines() if "m_axi" in line
+        for line in source.splitlines()
+        if "#pragma HLS interface m_axi" in line
     }
     bundles = {
         line.split("bundle=")[1].split()[0]
-        for line in source.splitlines() if "m_axi" in line
+        for line in source.splitlines()
+        if "#pragma HLS interface m_axi" in line
     }
     assert bundles, "expected AXI master ports"
-    # Every port takes its own bundle: shared bundles serialize
-    # concurrent bus requests (measured II 13-57 on the gather loops when
-    # six f64 ports shared one). The port count itself stays fixed by the
-    # algorithm's I/O.
-    assert len(bundles) == len(ports), (sorted(bundles), sorted(ports))
+    # Ports are fixed by the algorithm's I/O; masters are not. A full-size
+    # plane takes its own -- sharing would serialize two whole-pass sweeps,
+    # and six f64 ports on one master measured II 13-57 on the gather loops.
+    # Small read-only tables share, which is what a hand-written design
+    # does: synthesizing this chain both ways puts the shared form within
+    # 0.07% on latency and level on BRAM, URAM and DSP, for one channel
+    # fewer. So the masters are bounded by the ports, not equal to them.
+    assert len(bundles) <= len(ports), (sorted(bundles), sorted(ports))
+    assert len(bundles) >= len(ports) - 2, (sorted(bundles), sorted(ports))
 
 
 def test_build_kernel_name_reaches_the_top_function():
@@ -968,9 +1118,10 @@ def test_build_kernel_name_reaches_the_top_function():
 
 
 @pytest.mark.parametrize("algorithm", ["wka", "rda", "csa"])
-def test_alos_runner_emits_the_full_artifact_set(algorithm, tmp_path):
-    """Every ALOS HLS runner produces a synthesizable design *and* a
-    complete csim package, not just the design."""
+@pytest.mark.parametrize("interface", ["axi", "ap_memory"])
+def test_alos_runner_emits_one_matching_artifact_set(algorithm, interface,
+                                                     tmp_path):
+    """One selected size and interface drive every emitted artifact."""
     import importlib
 
     from common.hls_artifacts import emit_alos_artifacts
@@ -978,26 +1129,31 @@ def test_alos_runner_emits_the_full_artifact_set(algorithm, tmp_path):
     algo = importlib.import_module(f"{algorithm}.algorithm")
     ref = importlib.import_module(f"{algorithm}.reference")
     processor = getattr(ref, f"{algorithm.upper()}Processor")
+    stale = tmp_path / f"{algorithm}_alos_axi.cpp"
+    stale.write_text("stale design")
 
     emit_alos_artifacts(algorithm,
                         algo.build_kernel,
                         algo.make_inputs,
                         processor,
                         n=64,
-                        csim_n=32,
-                        out=tmp_path)
+                        out=tmp_path,
+                        options={"interface": interface})
 
     top = f"{algorithm}_alos"
-    for artifact in (f"{top}_axi.cpp", f"{top}_axi_csynth.tcl", f"{top}.cpp",
-                     f"{top}_tb.cpp", f"{top}_csim.tcl", f"{top}_csynth.tcl",
-                     f"{top}_tb_data", "stubs"):
+    for artifact in (f"{top}.h", f"{top}.cpp", f"{top}_tb.cpp",
+                     f"{top}_hls_csim.tcl", f"{top}_portable_cpp_sim.sh",
+                     f"{top}_csynth.tcl", f"{top}_tb_data", f"{top}_cosim.tcl",
+                     "design_manifest.json", "stubs"):
         assert (tmp_path / artifact).exists(), artifact
-    assert list((tmp_path / f"{top}_tb_data").glob("*.dat"))
+    assert list((tmp_path / f"{top}_tb_data").glob("*.bin"))
 
-    # The two designs are separate symbols, so both can sit in one project.
     assert f"void {top}(" in (tmp_path / f"{top}.cpp").read_text()
-    assert f"void {top}_axi(" in (tmp_path / f"{top}_axi.cpp").read_text()
-    # The csim script says which raster it simulates and why.
-    tcl = (tmp_path / f"{top}_csim.tcl").read_text()
-    assert "32 x 32" in tcl and f"{top}_axi.cpp" in tcl
+    tcl = (tmp_path / f"{top}_hls_csim.tcl").read_text()
+    assert f"#include \"{top}.h\"" in (tmp_path / f"{top}.cpp").read_text()
     assert f"set_top {top}" in tcl
+    manifest = json.loads((tmp_path / "design_manifest.json").read_text())
+    assert manifest["config"]["interface"] == interface
+    assert manifest["kernel"]["arguments"][0]["shape"] == [64, 64]
+    assert not list(tmp_path.glob(f"{top}_axi*"))
+    assert not stale.exists()

@@ -37,19 +37,33 @@ static LogicalResult demote(scf::ForOp loop) {
   auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
   OpBuilder builder(yield);
 
+  // A yield naming another carry's argument would need its value copied
+  // before the first write-back clobbers it; stage such a swap through an
+  // explicit buffer in the kernel instead.
+  //
+  // Every carry is checked before any is rewritten. The rewrite below
+  // replaces a carry's argument with its buffer, so a later carry naming an
+  // earlier one would no longer look like a region argument by the time its
+  // own turn came -- the check would pass and the copies would silently be
+  // ordered wrong, which is a wrong image rather than an error.
+  for (auto [init, arg, index] :
+       llvm::zip(loop.getInitArgs(), loop.getRegionIterArgs(),
+                 llvm::seq<unsigned>(0, loop.getNumResults()))) {
+    if (!isa<MemRefType>(init.getType()))
+      continue;
+    Value yielded = yield.getOperand(index);
+    if (yielded != arg && llvm::is_contained(loop.getRegionIterArgs(), yielded))
+      return loop.emitOpError(
+          "chained or swapped buffer carries are not supported; copy "
+          "through a scratch buffer inside the loop instead");
+  }
+
   for (auto [init, arg, result, index] : llvm::zip(
            loop.getInitArgs(), loop.getRegionIterArgs(), loop.getResults(),
            llvm::seq<unsigned>(0, loop.getNumResults()))) {
     if (!isa<MemRefType>(init.getType()))
       continue;
     Value yielded = yield.getOperand(index);
-    // A yield naming another carry's argument would need its value copied
-    // before the first write-back clobbers it; stage such a swap through
-    // an explicit buffer in the kernel instead.
-    if (yielded != arg && llvm::is_contained(loop.getRegionIterArgs(), yielded))
-      return loop.emitOpError(
-          "swapped buffer carries are not supported; copy through a "
-          "scratch buffer inside the loop instead");
     // A function argument is a top-level port of the design, and the HLS
     // dataflow checker forbids a node that both reads and writes a port
     // ("cannot read as well as write over function parameter"). Iterate

@@ -57,7 +57,7 @@ def simulate_point_targets(n: int, p: RadarParams,
 
 
 def demo_scene(n: int, p: RadarParams) -> Tuple[np.ndarray, List[PointTarget]]:
-    """A small constellation of point targets plus the raw echoes."""
+    """A fixed constellation of point targets plus the raw echoes."""
     swath = n / p.fs * p.c / 2.0  # slant-range extent (m)
     strip = n / p.prf * p.vr  # along-track extent (m)
     targets = [

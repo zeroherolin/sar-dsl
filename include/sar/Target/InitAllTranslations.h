@@ -13,7 +13,7 @@
 #define SAR_TARGET_INITALLTRANSLATIONS_H
 
 #include "sar/Target/HLS/EmitHLSCpp.h"
-#include "sar/Target/KernelFacts.h"
+#include "sar/Target/HLS/KernelFacts.h"
 
 namespace mlir {
 namespace sar {

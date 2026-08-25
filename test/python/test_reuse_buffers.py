@@ -1,11 +1,10 @@
-"""Buffer sharing across element types.
+"""What buffer sharing must not change: the answers.
 
-`sar-reuse-buffers` lets a buffer whose last use has passed carry a later
-one. With `allow-retype` the two no longer have to agree on element type:
-their footprints are compared in bytes and the group allocates `memref<Nxi8>`
-that each member reinterprets through `memref.view`. These tests pin the two
-things that makes it worth doing -- fewer allocations -- and the one thing
-that makes it safe to do: the answers do not change.
+Which allocations `sar-reuse-buffers` collapses, and into what, is pinned by
+`test/Dialect/SAR/reuse-buffers.mlir`. These tests cover the part FileCheck
+cannot reach -- running the two forms and comparing them -- plus the pipeline
+property that the affine hand-off never emits a `memref.view`, which the C++
+emitter has no way to express.
 """
 
 import re
@@ -38,106 +37,11 @@ def _opt(mlir_text: str, *args: str) -> str:
 # bytes -- come to life. Written as memref IR directly so the test states the
 # lifetimes it means to test rather than depending on what bufferization
 # happens to emit.
-MIXED_CHAIN = """
-func.func @mixed(%in: memref<{n}xf32>, %tmp: memref<{n}xf32>,
-                 %out: memref<{half}xcomplex<f32>>) {{
-  %a = memref.alloc() : memref<{n}xf32>
-  %b = memref.alloc() : memref<{half}xcomplex<f32>>
-  affine.for %i = 0 to {n} {{
-    %v = affine.load %in[%i] : memref<{n}xf32>
-    %s = arith.mulf %v, %v : f32
-    affine.store %s, %a[%i] : memref<{n}xf32>
-  }}
-  affine.for %i = 0 to {n} {{
-    %v = affine.load %a[%i] : memref<{n}xf32>
-    affine.store %v, %tmp[%i] : memref<{n}xf32>
-  }}
-  affine.for %i = 0 to {half} {{
-    %v = affine.load %tmp[%i] : memref<{n}xf32>
-    %c = complex.create %v, %v : complex<f32>
-    affine.store %c, %b[%i] : memref<{half}xcomplex<f32>>
-  }}
-  affine.for %i = 0 to {half} {{
-    %v = affine.load %b[%i] : memref<{half}xcomplex<f32>>
-    affine.store %v, %out[%i] : memref<{half}xcomplex<f32>>
-  }}
-  return
-}}
-"""
-
-
 def _allocations(ir: str):
     """Every `memref.alloc` in `ir`, as the text of its result type."""
     return re.findall(
         r"memref\.alloc\(\)\s*(?:\{[^}]*\})?\s*:\s*(memref<.*?>)\s*$", ir,
         re.MULTILINE)
-
-
-def test_mixed_precision_chain_drops_an_allocation():
-    """The f32 plane and the c64 plane have disjoint lifetimes and the same
-    256-byte footprint, so one backing allocation serves both."""
-    source = MIXED_CHAIN.format(n=64, half=32)
-
-    separate = _allocations(_opt(source, "--sar-reuse-buffers=min-elements=0"))
-    shared = _allocations(
-        _opt(source, "--sar-reuse-buffers=min-elements=0 allow-retype=true"))
-
-    # Without retyping the two types keep their own allocations.
-    assert sorted(separate) == ["memref<32xcomplex<f32>>", "memref<64xf32>"]
-    # With it there is one, sized in bytes and viewed as both.
-    assert shared == ["memref<256xi8>"]
-
-
-def test_shared_allocation_is_viewed_as_both_types():
-    ir = _opt(MIXED_CHAIN.format(n=64, half=32),
-              "--sar-reuse-buffers=min-elements=0 allow-retype=true")
-    views = re.findall(
-        r"memref\.view [^:]*: memref<256xi8> to (memref<.*?>)\s*$", ir,
-        re.MULTILINE)
-    assert sorted(views) == ["memref<32xcomplex<f32>>", "memref<64xf32>"]
-
-
-def test_backing_allocation_holds_the_strictest_alignment():
-    """complex<f64> is sixteen bytes wide, so the shared storage is aligned
-    to sixteen even though an f64 plane alone would have needed eight."""
-    source = """
-    func.func @widest(%in: memref<64xf64>, %tmp: memref<64xf64>,
-                      %out: memref<32xcomplex<f64>>) {
-      %a = memref.alloc() : memref<64xf64>
-      %b = memref.alloc() : memref<32xcomplex<f64>>
-      affine.for %i = 0 to 64 {
-        %v = affine.load %in[%i] : memref<64xf64>
-        affine.store %v, %a[%i] : memref<64xf64>
-      }
-      affine.for %i = 0 to 64 {
-        %v = affine.load %a[%i] : memref<64xf64>
-        affine.store %v, %tmp[%i] : memref<64xf64>
-      }
-      affine.for %i = 0 to 32 {
-        %v = affine.load %tmp[%i] : memref<64xf64>
-        %c = complex.create %v, %v : complex<f64>
-        affine.store %c, %b[%i] : memref<32xcomplex<f64>>
-      }
-      affine.for %i = 0 to 32 {
-        %v = affine.load %b[%i] : memref<32xcomplex<f64>>
-        affine.store %v, %out[%i] : memref<32xcomplex<f64>>
-      }
-      return
-    }
-    """
-    ir = _opt(source, "--sar-reuse-buffers=min-elements=0 allow-retype=true")
-    assert "memref.alloc() {alignment = 16 : i64} : memref<512xi8>" in ir
-
-
-def test_retired_buffer_too_small_to_back_a_larger_one():
-    """The footprint of a shared allocation is fixed by the buffer that
-    opened it. A later member that does not fit opens its own instead."""
-    # 32 f32 elements is 128 bytes; 32 complex<f32> is 256.
-    ir = _opt(MIXED_CHAIN.format(n=32, half=32),
-              "--sar-reuse-buffers=min-elements=0 allow-retype=true")
-    assert "memref.view" not in ir
-    assert sorted(
-        _allocations(ir)) == ["memref<32xcomplex<f32>>", "memref<32xf32>"]
 
 
 def test_affine_path_never_retypes():

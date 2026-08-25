@@ -1,4 +1,4 @@
-//===- ArrayPartition.cpp - array partition -------------------------------===//
+//===- ArrayPartition.cpp - bank on-chip arrays within the tiers ----------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -9,6 +9,8 @@
 #include "sar/Support/HLSHints.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
+
+#include <functional>
 
 namespace mlir {
 namespace sar {
@@ -23,6 +25,13 @@ using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
 using namespace hls;
+
+/// Bytes one memory primitive holds on the UltraScale+ families the backend
+/// targets: a 36 Kb block RAM (as two 18 Kb halves) and a 288 Kb UltraRAM.
+/// A primitive is claimed whole, so these are the granularity every storage
+/// cost is rounded to.
+constexpr uint64_t kBramBlockBytes = 4608;
+constexpr uint64_t kUramBlockBytes = 36864;
 
 /// Whether `array` is ever cut into a view, following calls into the callee.
 ///
@@ -49,6 +58,23 @@ static bool isViewedAnywhere(Value array, DenseSet<Value> &visited) {
   return false;
 }
 
+/// Re-derives `func`'s type from its entry block after a retyped array, then
+/// pushes the new operand types into every callee. A retyped block argument
+/// leaves the signature stale on its own function, which no callee walk can
+/// repair.
+static void updateSubFuncs(func::FuncOp func, Builder builder);
+
+static void retypeEnclosingFuncs(Value array, Builder builder) {
+  auto func = array.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!func)
+    return;
+  if (isa<BlockArgument>(array))
+    func.setType(builder.getFunctionType(
+        func.front().getArgumentTypes(),
+        func.front().getTerminator()->getOperandTypes()));
+  updateSubFuncs(func, builder);
+}
+
 static void updateSubFuncs(func::FuncOp func, Builder builder) {
   func.walk([&](func::CallOp op) {
     auto callee = SymbolTable::lookupNearestSymbolFrom(op, op.getCalleeAttr());
@@ -56,7 +82,6 @@ static void updateSubFuncs(func::FuncOp func, Builder builder) {
     if (!subFunc || subFunc.isExternal())
       return;
 
-    // Set sub-function type.
     auto subResultTypes = op.getResultTypes();
     auto subInputTypes = op.getOperandTypes();
     auto newType = builder.getFunctionType(subInputTypes, subResultTypes);
@@ -64,18 +89,15 @@ static void updateSubFuncs(func::FuncOp func, Builder builder) {
     if (subFunc.getFunctionType() != newType) {
       subFunc.setType(newType);
 
-      // Set arguments type.
       unsigned index = 0;
       for (auto inputType : op.getOperandTypes())
         subFunc.getArgument(index++).setType(inputType);
 
-      // Set results type.
       auto returnOp = cast<func::ReturnOp>(subFunc.front().getTerminator());
       index = 0;
       for (auto resultType : op.getResultTypes())
         returnOp.getOperand(index++).setType(resultType);
 
-      // Recursively apply array partition strategy.
       updateSubFuncs(subFunc, builder);
     }
   });
@@ -430,8 +452,7 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
         }
         ++maxDistance;
 
-        // This means all accesses have the same index, and this dimension
-        // should not be partitioned.
+        // An invariant index does not benefit from partitioning.
         if (maxDistance == 1)
           continue;
 
@@ -443,21 +464,17 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
         int64_t factor = 1;
         PartitionKind kind = PartitionKind::NONE;
         if (accessNum >= maxDistance) {
-          // This means some elements are accessed more than once or exactly
-          // once, and successive elements are accessed. In most cases, apply
-          // "cyclic" partition should be the best solution.
+          // Cyclic partitioning spreads repeated or consecutive accesses.
           factor = maxDistance;
           kind = PartitionKind::CYCLIC;
         } else if (maxCommonDivisor > 1) {
-          // This means the memory access is perfectly strided.
+          // A uniform stride maps naturally to cyclic banks.
           factor = maxDistance;
           while (factor % maxCommonDivisor != 0)
             factor++;
           kind = PartitionKind::CYCLIC;
         } else {
-          // This means elements are accessed in a descrete manner however not
-          // strided. Typically, "block" partition will be the most benefitial
-          // partition strategy.
+          // Irregular discrete accesses use block partitioning.
           factor = accessNum;
           kind = PartitionKind::BLOCK;
         }
@@ -507,21 +524,21 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
         }
       }
 
-      LLVM_DEBUG(llvm::dbgs() << "\n\nAccesses: ";);
-      for (auto op : loadStores)
-        LLVM_DEBUG(llvm::dbgs() << "\n" << *op;);
+      LLVM_DEBUG({
+        llvm::dbgs() << "\n\nAccesses: ";
+        for (auto op : loadStores)
+          llvm::dbgs() << "\n" << *op;
+      });
     }
   }
 
-  // Apply partition to all sub-functions and traverse all function to update
-  // the "partitionsMap".
+  // Partition callees before propagating their argument layouts to call sites.
   func.walk([&](func::CallOp op) {
     auto subFunc = dyn_cast_or_null<func::FuncOp>(
         SymbolTable::lookupNearestSymbolFrom(op, op.getCalleeAttr()));
     if (!subFunc)
       return;
 
-    // Apply array partition to the sub-function.
     applyAutoArrayPartition(subFunc, lutramMaxBits, maxFactor, lutramBitsBudget,
                             lutramBitsUsed);
 
@@ -596,12 +613,180 @@ static uint64_t roundUpTo(uint64_t value, uint64_t grain) {
   return ((value + grain - 1) / grain) * grain;
 }
 
+/// Number of synthesized reader processes that may need a private ROM copy.
+///
+/// A table handed down a call chain is instantiated once per process that
+/// actually reads it, so the count has to follow it into the callees rather
+/// than stop at the top-level call sites: a transform's twiddle table reaches
+/// one engine but is read by each of its stages, and counting the engine alone
+/// understates the block RAM by the stage count. Copies multiply along call
+/// paths for the same reason. A shared helper is one allocated instance
+/// however often it is called.
+static uint64_t getConstReaderCopies(Value value) {
+  DenseSet<Operation *> sharedInstances;
+
+  std::function<uint64_t(Value)> count = [&](Value current) -> uint64_t {
+    uint64_t copies = 0;
+    bool readHere = false;
+    for (OpOperand &use : current.getUses()) {
+      Operation *owner = use.getOwner();
+      auto call = dyn_cast<func::CallOp>(owner);
+      if (!call) {
+        readHere = true;
+        continue;
+      }
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (!callee || callee.isExternal() ||
+          use.getOperandNumber() >= callee.getNumArguments()) {
+        readHere = true;
+        continue;
+      }
+      if (callee->hasAttr("hls.shared_instance") &&
+          !sharedInstances.insert(callee).second)
+        continue;
+      copies += count(callee.getArgument(use.getOperandNumber()));
+    }
+    return copies + readHere;
+  };
+
+  return std::max<uint64_t>(1, count(value));
+}
+
+/// Re-binds banked UltraRAM arrays whose banks cannot fill an UltraRAM.
+///
+/// Placement picks a tier from the unbanked array, but banking is decided
+/// later and a memory primitive is claimed whole: a 64 KiB array bound to
+/// UltraRAM and then split into 64 banks holds a kilobyte in each of 64
+/// UltraRAMs. Block RAM has an eighth of the granularity, so such a bank
+/// fits it far better -- but the block tier is also the smaller budget, so
+/// the move is only worth making while it has room. Arrays are taken
+/// worst-waste first, which spends the block budget where it buys the most.
+static void rebalanceBankedStorage(ModuleOp module, uint64_t bramBudget,
+                                   uint64_t uramBudget) {
+  struct Candidate {
+    Value array;
+    uint64_t uramBytes;
+    uint64_t bramBytes;
+  };
+  SmallVector<Candidate> candidates;
+  uint64_t bramUsed = 0;
+
+  auto measure = [](MemRefType type, uint64_t block) {
+    uint64_t bytes = (uint64_t)type.getNumElements() *
+                     ((type.getElementTypeBitWidth() + 7) / 8);
+    uint64_t banks = std::max<int64_t>(1, getPartitionFactors(type));
+    return banks * roundUpTo((bytes + banks - 1) / banks, block);
+  };
+
+  // Block-RAM-bound arrays, most expensive first: when the block tier is the
+  // one under pressure they are the candidates to move the other way.
+  SmallVector<Candidate> blockBound;
+  uint64_t uramUsed = 0;
+
+  DenseSet<Value> seen;
+  auto visit = [&](Value array, uint64_t copies) {
+    auto type = dyn_cast<MemRefType>(array.getType());
+    if (!type || !type.hasStaticShape() ||
+        !type.getElementType().isIntOrFloat() || !seen.insert(array).second)
+      return;
+    switch (getMemoryKind(type)) {
+    case MemoryKind::BRAM_1P:
+    case MemoryKind::BRAM_2P:
+    case MemoryKind::BRAM_S2P:
+    case MemoryKind::BRAM_T2P: {
+      uint64_t bram = copies * measure(type, kBramBlockBytes);
+      bramUsed += bram;
+      blockBound.push_back(
+          {array, copies * measure(type, kUramBlockBytes), bram});
+      return;
+    }
+    case MemoryKind::URAM_1P:
+    case MemoryKind::URAM_2P:
+    case MemoryKind::URAM_S2P:
+    case MemoryKind::URAM_T2P:
+      uramUsed += copies * measure(type, kUramBlockBytes);
+      break;
+    default:
+      return;
+    }
+    // An UltraRAM binding is worth moving whenever block RAM would hold the
+    // same array in fewer bytes -- which is the case exactly when a bank
+    // cannot fill an UltraRAM, since a primitive is claimed whole and the
+    // block primitive is an eighth the size.
+    uint64_t uram = copies * measure(type, kUramBlockBytes);
+    uint64_t bram = copies * measure(type, kBramBlockBytes);
+    if (bram < uram)
+      candidates.push_back({array, uram, bram});
+  };
+
+  // Charged the way the final budget check charges: a dataflow buffer is
+  // ping-ponged, and a constant table is instantiated once per reader.
+  module.walk([&](hls::BufferLikeInterface buffer) {
+    visit(buffer.getMemref(), isa<ConstBufferOp>(*buffer)
+                                  ? getConstReaderCopies(buffer.getMemref())
+                                  : 2);
+  });
+  for (auto func : module.getOps<func::FuncOp>())
+    if (hasTopFuncAttr(func))
+      for (BlockArgument arg : func.getArguments())
+        visit(arg, 1);
+
+  llvm::stable_sort(candidates, [](const Candidate &lhs, const Candidate &rhs) {
+    return lhs.uramBytes - lhs.bramBytes > rhs.uramBytes - rhs.bramBytes;
+  });
+  for (Candidate &candidate : candidates) {
+    // Block RAM is the smaller budget, so a move that would overrun it trades
+    // one overflow for another and is not made. Once the UltraRAM tier is
+    // inside its budget there is nothing left to relieve.
+    if (uramUsed <= uramBudget)
+      break;
+    if (bramUsed + candidate.bramBytes > bramBudget)
+      continue;
+    auto type = cast<MemRefType>(candidate.array.getType());
+    candidate.array.setType(MemRefType::get(
+        type.getShape(), type.getElementType(), type.getLayout(),
+        MemoryKindAttr::get(type.getContext(), MemoryKind::BRAM_T2P)));
+    // The tier is part of the memref type, so the owning function and every
+    // callee handed this array have to be retyped with it, or the signature
+    // and the call stop verifying.
+    retypeEnclosingFuncs(candidate.array, Builder(type.getContext()));
+    bramUsed += candidate.bramBytes;
+    uramUsed -= candidate.uramBytes;
+  }
+
+  // The other direction, for a design whose pressure is on the block tier
+  // instead: a transform's twiddle ROM is instantiated once per reading
+  // stage, and a chain of engines can spend more of the block budget on
+  // those copies than on its working buffers while UltraRAM sits idle.
+  // Moved largest-first, since each move frees the most block RAM per
+  // UltraRAM spent.
+  if (bramUsed <= bramBudget)
+    return;
+  llvm::stable_sort(blockBound, [](const Candidate &lhs, const Candidate &rhs) {
+    return lhs.bramBytes > rhs.bramBytes;
+  });
+  for (Candidate &candidate : blockBound) {
+    if (bramUsed <= bramBudget)
+      break;
+    if (uramUsed + candidate.uramBytes > uramBudget)
+      continue;
+    auto type = cast<MemRefType>(candidate.array.getType());
+    candidate.array.setType(MemRefType::get(
+        type.getShape(), type.getElementType(), type.getLayout(),
+        MemoryKindAttr::get(type.getContext(), MemoryKind::URAM_T2P)));
+    retypeEnclosingFuncs(candidate.array, Builder(type.getContext()));
+    uramUsed += candidate.uramBytes;
+    bramUsed -= candidate.bramBytes;
+  }
+}
+
 static LogicalResult verifyFinalMemoryBudget(ModuleOp module,
                                              uint64_t bramBudget,
                                              uint64_t uramBudget,
                                              uint64_t lutramBudget) {
-  constexpr uint64_t bramBlockBytes = 4608;
-  constexpr uint64_t uramBlockBytes = 36864;
+  constexpr uint64_t bramBlockBytes = kBramBlockBytes;
+  constexpr uint64_t uramBlockBytes = kUramBlockBytes;
   struct Usage {
     uint64_t bram = 0;
     uint64_t uram = 0;
@@ -648,11 +833,38 @@ static LogicalResult verifyFinalMemoryBudget(ModuleOp module,
     }
   };
 
+  // A helper carrying `#pragma HLS inline` is folded into its caller, so its
+  // buffers live in the caller's frame. Walk up to the first function that
+  // stays a module and charge them there.
+  auto owningFrame = [&](Operation *operation) -> func::FuncOp {
+    auto func = operation->getParentOfType<func::FuncOp>();
+    while (func && func->getAttr("inline")) {
+      func::FuncOp caller;
+      module.walk([&](func::CallOp call) {
+        if (call.getCallee() == func.getName() && !caller)
+          caller = call->getParentOfType<func::FuncOp>();
+      });
+      if (!caller || caller == func)
+        break;
+      func = caller;
+    }
+    return func;
+  };
+
   module.walk([&](hls::BufferLikeInterface buffer) {
-    auto func = buffer->getParentOfType<func::FuncOp>();
-    if (func)
-      charge(buffer.getMemref(), isa<ConstBufferOp>(*buffer) ? 1 : 2,
-             functionUsage[func.getOperation()]);
+    auto func = owningFrame(buffer.getOperation());
+    if (!func)
+      return;
+    // Vitis double-buffers a dataflow channel so producer and consumer can
+    // run concurrently; a buffer in a sequentially scheduled region is one
+    // instance. Charging every buffer twice overstates a design that carries
+    // no `#pragma HLS dataflow` by the whole working set.
+    auto directive = getFuncDirective(func);
+    bool pingPong = directive && directive.getDataflow();
+    uint64_t copies = isa<ConstBufferOp>(*buffer)
+                          ? getConstReaderCopies(buffer.getMemref())
+                          : (pingPong ? 2 : 1);
+    charge(buffer.getMemref(), copies, functionUsage[func.getOperation()]);
   });
 
   func::FuncOp designTop;
@@ -668,20 +880,26 @@ static LogicalResult verifyFinalMemoryBudget(ModuleOp module,
         for (BlockArgument arg : func.getArguments())
           charge(arg, 1, functionUsage[func.getOperation()]);
 
-  // Outlined helpers execute under the design top. Their local arrays have
-  // disjoint call lifetimes, so peak storage is the top's persistent buffers
-  // plus the largest helper frame, not the sum of every helper in the module.
-  Usage peak = designTop ? functionUsage[designTop.getOperation()] : Usage{};
-  Usage helperPeak;
-  for (auto &[func, usage] : functionUsage)
-    if (!designTop || func != designTop.getOperation()) {
-      helperPeak.bram = std::max(helperPeak.bram, usage.bram);
-      helperPeak.uram = std::max(helperPeak.uram, usage.uram);
-      helperPeak.lutram = std::max(helperPeak.lutram, usage.lutram);
-    }
-  uint64_t bram = peak.bram + helperPeak.bram;
-  uint64_t uram = peak.uram + helperPeak.uram;
-  uint64_t lutram = peak.lutram + helperPeak.lutram;
+  // A helper that stays a module becomes its own RTL block holding its own
+  // memories, whether or not the calls overlap in time -- storage is bound at
+  // elaboration, not scheduled -- so the design costs one frame per such
+  // helper. Charging only the largest of them, as if sequential calls could
+  // share primitives, understates a chain of four transform engines by a
+  // factor of four. A helper carrying `#pragma HLS inline` is folded into its
+  // caller instead, and its buffers were already charged there.
+  Usage total = designTop ? functionUsage[designTop.getOperation()] : Usage{};
+  for (auto &[func, usage] : functionUsage) {
+    if (designTop && func == designTop.getOperation())
+      continue;
+    if (func->getAttr("inline"))
+      continue;
+    total.bram += usage.bram;
+    total.uram += usage.uram;
+    total.lutram += usage.lutram;
+  }
+  uint64_t bram = total.bram;
+  uint64_t uram = total.uram;
+  uint64_t lutram = total.lutram;
 
   auto over = [](uint64_t used, uint64_t budget) {
     return used > budget || (budget == 0 && used != 0);
@@ -773,6 +991,9 @@ struct ArrayPartition : public sar::impl::ArrayPartitionBase<ArrayPartition> {
     });
     applyAutoArrayPartition(topFunc, lutramMaxBits, maxFactor,
                             (uint64_t)lutramBytes * 8, &lutramBitsUsed);
+    // Banking is settled here, so this is the first point at which a bank's
+    // real cost in whole primitives is known.
+    rebalanceBankedStorage(module, bramBytes, uramBytes);
     if (failed(
             verifyFinalMemoryBudget(module, bramBytes, uramBytes, lutramBytes)))
       signalPassFailure();

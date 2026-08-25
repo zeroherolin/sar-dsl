@@ -1,4 +1,4 @@
-//===- CreateTokenStream.cpp - create token stream ------------------------===//
+//===- CreateTokenStream.cpp - order DRAM access with token channels ------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -111,7 +111,8 @@ struct CreateTokenStream
           auto tokenArg = consumer.getBody().insertArgument(
               inputIdx, token.getType(), token.getLoc());
 
-          // Construct stream write on the producer side.
+          // Consume the ordering token before the consumer touches the DRAM
+          // buffer.
           b.setInsertionPointToStart(&consumer.getBody().front());
           StreamReadOp::create(b, loc, Type(), tokenArg);
 

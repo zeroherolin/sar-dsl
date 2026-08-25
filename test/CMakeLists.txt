@@ -6,11 +6,15 @@ configure_lit_site_cfg(
 )
 
 set(SAR_DSL_TEST_DEPENDS
-  FileCheck
   sar-opt
   sar-translate
   sar_runtime
 )
+# Prebuilt LLVM releases provide the FileCheck executable but not a CMake
+# target; CI places its test-tool companion beside the release tools.
+if(TARGET FileCheck)
+  list(APPEND SAR_DSL_TEST_DEPENDS FileCheck)
+endif()
 
 add_lit_testsuite(check-sar-lit "Running the SAR-DSL lit tests"
   ${CMAKE_CURRENT_BINARY_DIR}

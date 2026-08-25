@@ -6,7 +6,8 @@
     ISLR  integrated sidelobe ratio (dB), sidelobe over mainlobe energy
 
 Pure measurement code: no algorithm imports, no CLI. Used by the
-`run_quality` / `run_figures` runners and by `test/python/test_quality.py`.
+`run_cpu_quality` runner, by `plot_cpu_impulse_response`, and by
+`test/python/test_quality.py`.
 """
 
 from __future__ import annotations

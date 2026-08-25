@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """PFA on the HLS backend: emit a Vitis HLS C++ design and a
-C-simulation package with golden data from the NumPy reference.
+validation package with golden data from the NumPy reference.
 
 The Python-defined operators inline at trace time, so the emitted design
 is the same single dataflow module the built-in algorithms produce (the
 in-kernel geometry math lowers through decomplexify/affine like any
 other op chain).
 
+Polar format resamples onto a raster twice the input on each axis, so a
+given `--n` holds four times the plane bytes the stripmap chains do. The
+interface follows the HLS configuration and the testbench drives its physical
+port schema.
+
 Usage:
-    python run_point_target_hls.py [--n 256] [--output PATH]
+    python run_point_target_hls.py [--n 64] [--output PATH]
                            [--no-testbench]
 """
 
@@ -28,11 +33,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n",
                         type=int,
-                        default=256,
-                        help="raster size (power of two)")
+                        default=64,
+                        help="input raster size (power of two); the "
+                        "resampled raster is twice this on each axis")
     parser.add_argument("--output",
                         default=str(_EXAMPLES / "hls_project" / "pfa"),
-                        help="C-simulation package directory")
+                        help="HLS validation package directory")
     parser.add_argument("--no-testbench",
                         action="store_true",
                         help="emit the design only")
@@ -55,7 +61,9 @@ def main() -> None:
     print(f"[2/2] Saved {out}")
     print(f"done: {design.source().count(chr(10))} lines of HLS C++, "
           f"top function 'pfa'")
-    print(f"      csim: cd {out} && vitis_hls -f pfa_csim.tcl")
+    print(f"      C-sim through Vitis HLS: cd {out} && "
+          "vitis_hls -f pfa_hls_csim.tcl")
+    print("      without Vitis: sh pfa_portable_cpp_sim.sh")
 
 
 if __name__ == "__main__":

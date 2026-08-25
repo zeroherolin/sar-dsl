@@ -6,8 +6,6 @@ unrolls the body into the IR once per iteration, `sar.iterate` emits one
 the trace-time-unrolled equivalent, which must agree exactly.
 """
 
-import subprocess
-
 import numpy as np
 import pytest
 
@@ -73,33 +71,20 @@ def test_multiple_carries_of_mixed_type():
 
 
 @requires_hls
-def test_csim_matches_the_reference(tmp_path):
+def test_iterate_hls_csim_matches_the_reference(tmp_path):
     """The compiled loop must survive the whole HLS flow: decomplexify
     through the region, carry demotion after bufferization, and the
-    generated C++ reproducing the reference under csim."""
-    from sar.compiler.toolchain import find_tool
+    generated C++ reproducing the reference in C-sim through Vitis HLS."""
+    from conftest import run_hls_csim
 
     z, f = _inputs()
     want = z.copy()
     for _ in range(8):
         want = want * f
 
-    design = _rotate(8, "it_csim").compile(backend="hls")
+    design = _rotate(8, "it_hls_csim").compile(backend="hls")
     design.write_testbench([z, f], [want], tmp_path, rtol=1e-12)
-    clang = find_tool("clang")
-    subprocess.run([
-        clang + "++", "-O2", "-Wno-unknown-pragmas", "-I", "stubs",
-        "it_csim.cpp", "it_csim_tb.cpp", "-o", "csim", "-pthread"
-    ],
-                   cwd=tmp_path,
-                   check=True,
-                   capture_output=True)
-    result = subprocess.run(["./csim"],
-                            cwd=tmp_path,
-                            capture_output=True,
-                            text=True)
-    assert result.returncode == 0, result.stdout
-    assert "PASS" in result.stdout
+    run_hls_csim(tmp_path, "it_hls_csim")
 
 
 def test_bad_bodies_are_rejected():
@@ -196,26 +181,13 @@ def test_index_drives_dynamic_slice_and_update():
 
 
 @requires_hls
-def test_dynamic_slice_loop_csim(tmp_path):
-    from sar.compiler.toolchain import find_tool
+def test_dynamic_slice_loop_hls_csim(tmp_path):
+    from conftest import run_hls_csim
 
     z, _ = _inputs()
     design = _chunked_kernel("iterate_chunks_hls").compile(backend="hls")
     design.write_testbench([z], [z * 2.0], tmp_path, rtol=1e-12)
-    clang = find_tool("clang")
-    subprocess.run([
-        clang + "++", "-O2", "-Wno-unknown-pragmas", "-I", "stubs",
-        "iterate_chunks_hls.cpp", "iterate_chunks_hls_tb.cpp", "-o", "csim",
-        "-pthread"
-    ],
-                   cwd=tmp_path,
-                   check=True,
-                   capture_output=True)
-    result = subprocess.run(["./csim"],
-                            cwd=tmp_path,
-                            capture_output=True,
-                            text=True)
-    assert result.returncode == 0, result.stdout
+    run_hls_csim(tmp_path, "iterate_chunks_hls")
 
 
 def test_dynamic_slice_argument_validation():

@@ -1,4 +1,4 @@
-//===- LowerDataflow.cpp - lower dataflow ---------------------------------===//
+//===- LowerDataflow.cpp - lower dataflow from task to node level ---------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -162,6 +162,28 @@ struct LowerDataflow : public sar::impl::LowerDataflowBase<LowerDataflow> {
     auto func = getOperation();
     auto context = func.getContext();
     auto builder = OpBuilder(context);
+
+    // Result-carrying high-level tasks are outside the low dataflow model.
+    // Diagnose them before dialect conversion starts: letting an illegal task
+    // reach rollback leaves its yielded SSA values live while the region is
+    // being undone, which turns a useful compiler error into an MLIR use-list
+    // assertion.
+    WalkResult invalidTask = func.walk([&](TaskOp task) {
+      if (!task.getNumResults())
+        return WalkResult::advance();
+      task.emitOpError("should not yield any results");
+      return WalkResult::interrupt();
+    });
+    if (invalidTask.wasInterrupted())
+      return signalPassFailure();
+    WalkResult invalidDispatch = func.walk([&](DispatchOp dispatch) {
+      if (!dispatch.getNumResults())
+        return WalkResult::advance();
+      dispatch.emitOpError("should not yield any results");
+      return WalkResult::interrupt();
+    });
+    if (invalidDispatch.wasInterrupted())
+      return signalPassFailure();
 
     // Collect all constants in the function and localize them to uses.
     SmallVector<Operation *, 16> constants;

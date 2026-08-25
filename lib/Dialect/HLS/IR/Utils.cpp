@@ -13,6 +13,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IntegerSet.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "sar/Support/HLSHints.h"
 
 using namespace mlir;
@@ -38,20 +39,6 @@ static bool isDram(MemRefType type) {
 //===----------------------------------------------------------------------===//
 // Dataflow utils
 //===----------------------------------------------------------------------===//
-
-/// Get the root affine loop contained by the node.
-static AffineForOp getNodeRootLoop(NodeOp currentNode) {
-  assert(llvm::hasSingleElement(currentNode.getOps<AffineForOp>()) &&
-         "node must only contain one loop band");
-  return *currentNode.getOps<AffineForOp>().begin();
-}
-
-/// Get the affine loop band contained by the node.
-AffineLoopBand sar::getNodeLoopBand(NodeOp currentNode) {
-  AffineLoopBand band;
-  getLoopBandFromOutermost(getNodeRootLoop(currentNode), band);
-  return band;
-}
 
 /// Wrap the operations in the block with dispatch op.
 DispatchOp sar::dispatchBlock(Block *block) {
@@ -93,14 +80,12 @@ TaskOp sar::fuseOpsIntoTask(ArrayRef<Operation *> ops,
                        [&](Operation *user) { return !opsSet.count(user); }))
         outputValues.insert(result);
 
-  // Create new graph task with all inputs and outputs.
   auto loc = rewriter.getUnknownLoc();
   rewriter.setInsertionPoint(ops.front());
   auto task =
       TaskOp::create(rewriter, loc, ValueRange(outputValues.getArrayRef()));
   auto taskBlock = rewriter.createBlock(&task.getBody());
 
-  // Move each targeted op into the new graph task.
   rewriter.setInsertionPointToEnd(taskBlock);
   auto yield = YieldOp::create(rewriter, loc, outputValues.getArrayRef());
   for (auto op : ops)
@@ -128,7 +113,6 @@ TaskOp sar::fuseOpsIntoTask(ArrayRef<Operation *> ops,
 NodeOp sar::fuseNodeOps(ArrayRef<NodeOp> nodes, PatternRewriter &rewriter) {
   assert((nodes.size() > 1) && "must fuse at least two nodes");
 
-  // Collect inputs, outputs, and params of the new node.
   llvm::SetVector<Value> inputs;
   llvm::SmallVector<unsigned, 8> inputTaps;
   llvm::SmallVector<Location, 8> inputLocs;
@@ -155,7 +139,6 @@ NodeOp sar::fuseNodeOps(ArrayRef<NodeOp> nodes, PatternRewriter &rewriter) {
       }
     }
 
-  // Construct the new node after the last node.
   rewriter.setInsertionPointAfter(nodes.back());
   auto newNode =
       NodeOp::create(rewriter, rewriter.getUnknownLoc(), inputs.getArrayRef(),
@@ -165,7 +148,6 @@ NodeOp sar::fuseNodeOps(ArrayRef<NodeOp> nodes, PatternRewriter &rewriter) {
   block->addArguments(ValueRange(outputs.getArrayRef()), outputLocs);
   block->addArguments(ValueRange(params.getArrayRef()), paramLocs);
 
-  // Inline all nodes into the new node.
   for (auto node : nodes) {
     auto &nodeOps = node.getBody().front().getOperations();
     auto &newNodeOps = newNode.getBody().front().getOperations();
@@ -216,64 +198,6 @@ SmallVector<NodeOp> sar::getDependentConsumers(Value buffer, NodeOp node) {
       nodes.push_back(consumer);
   return nodes;
 }
-
-/// A helper to get all nested users of a buffer except the given node and with
-/// the given kind (producer or consumer).
-static SmallVector<std::pair<NodeOp, Value>>
-getNestedUsersExcept(Value buffer, OperandKind kind, NodeOp except) {
-  SmallVector<std::tuple<NodeOp, Value, OperandKind>> worklist;
-
-  // A helper to append all node users of the given buffer.
-  auto appendWorklist = [&](Value buffer) {
-    for (auto &use : buffer.getUses())
-      if (auto node = dyn_cast<NodeOp>(use.getOwner()))
-        if (node != except)
-          worklist.push_back({node, buffer, node.getOperandKind(use)});
-  };
-
-  // Initialize the worklist.
-  appendWorklist(buffer);
-
-  SmallVector<std::pair<NodeOp, Value>> nestedUsers;
-  while (!worklist.empty()) {
-    auto current = worklist.pop_back_val();
-    auto node = std::get<0>(current);
-    auto nodeBuffer = std::get<1>(current);
-    auto nodeKind = std::get<2>(current);
-
-    // A node without hierarchy joins the results if the
-    // node kind is aligned.
-    if (!node.hasHierarchy()) {
-      if (nodeKind == kind)
-        nestedUsers.push_back({node, nodeBuffer});
-      continue;
-    }
-
-    // Otherwise descend into the hierarchy and traverse all contained
-    // schedules.
-    auto index =
-        llvm::find(node.getOperands(), nodeBuffer) - node.operand_begin();
-    assert(index != node.getNumOperands() && "invalid node or node buffer");
-    auto arg = node.getBody().getArgument(index);
-
-    for (auto &use : arg.getUses())
-      if (auto schedule = dyn_cast<ScheduleOp>(use.getOwner()))
-        appendWorklist(schedule.getBody().getArgument(use.getOperandNumber()));
-  }
-  return nestedUsers;
-}
-
-/// Get the nested consumer/producer nodes of the given buffer except the given
-/// node.
-SmallVector<std::pair<NodeOp, Value>>
-sar::getNestedConsumersExcept(Value buffer, NodeOp except) {
-  return getNestedUsersExcept(buffer, OperandKind::INPUT, except);
-}
-SmallVector<std::pair<NodeOp, Value>> sar::getNestedProducers(Value buffer) {
-  return getNestedUsersExcept(buffer, OperandKind::OUTPUT, NodeOp());
-}
-
-/// Find buffer value or buffer op across the dataflow hierarchy.
 Value sar::findBuffer(Value memref) {
   if (auto arg = dyn_cast<BlockArgument>(memref)) {
     if (auto node = dyn_cast<NodeOp>(arg.getParentBlock()->getParentOp()))
@@ -364,198 +288,8 @@ bool sar::isWritten(OpOperand &use) {
 }
 
 //===----------------------------------------------------------------------===//
-// Linalg analysis utils
-//===----------------------------------------------------------------------===//
-
-bool sar::isElementwiseGenericOp(linalg::GenericOp op) {
-  // All loops must be parallel loop.
-  if (op.getNumParallelLoops() != op.getNumLoops())
-    return false;
-
-  for (auto valueMap : llvm::zip(op.getOperands(), op.getIndexingMapsArray())) {
-    auto type = dyn_cast<ShapedType>(std::get<0>(valueMap).getType());
-    auto map = std::get<1>(valueMap);
-
-    // If the operand doesn't have static shape, the index map must be identity.
-    if (!type || !type.hasStaticShape()) {
-      if (!map.isIdentity())
-        return false;
-      continue;
-    }
-
-    // Otherwise, each dimension must either have a size of one or have identity
-    // access index.
-    unsigned index = map.getNumDims() - type.getRank();
-    for (auto shapeExpr : llvm::zip(type.getShape(), map.getResults())) {
-      auto dimSize = std::get<0>(shapeExpr);
-      auto expr = std::get<1>(shapeExpr);
-      if (expr != getAffineDimExpr(index++, expr.getContext()) && dimSize != 1)
-        return false;
-    }
-  }
-  return true;
-}
-
-//===----------------------------------------------------------------------===//
 // Memory and loop analysis utils
 //===----------------------------------------------------------------------===//
-
-/// The current op or contained ops have effect on external buffers.
-bool sar::hasEffectOnExternalBuffer(Operation *op) {
-  auto result = op->walk([](MemoryEffectOpInterface effectOp) {
-    SmallVector<MemoryEffects::EffectInstance> effects;
-    effectOp.getEffects(effects);
-    for (auto effect : effects)
-      if (isExtBuffer(effect.getValue()))
-        return WalkResult::interrupt();
-    return WalkResult::advance();
-  });
-  return result.wasInterrupted();
-}
-
-/// Distribute the given factor evenly on all loop levels. The generated factors
-/// are guaranteed to be divisors of the factors in given "constrFactors".
-/// This method can fail due to non-constant loop trip counts.
-LogicalResult sar::getEvenlyDistributedFactors(
-    unsigned maxFactor, FactorList &factors,
-    const SmallVectorImpl<mlir::affine::AffineForOp> &band,
-    const SmallVectorImpl<FactorList> &constrFactorsList, bool powerOf2Constr) {
-
-  // Traverse each loop in the given loop band.
-  SmallVector<FactorList> constrs;
-  SmallVector<bool> reductionFlags;
-  FactorList tripCounts;
-  for (auto loop : llvm::enumerate(band)) {
-    // Every trip count must resolve; an unresolved one fails the band.
-    auto tripCount = getConstantTripCount(loop.value());
-    if (!tripCount.has_value())
-      return failure();
-    tripCounts.push_back(tripCount.value());
-
-    // Collect the constraints at each loop level. Basically, this transposes
-    // the two-dimension argument "constrFactorsList".
-    FactorList constr;
-    for (auto &constrFactors : constrFactorsList) {
-      if (tripCount.value() % constrFactors[loop.index()] != 0)
-        return failure();
-      constr.push_back(constrFactors[loop.index()]);
-    }
-    constrs.push_back(constr);
-
-    // Collect the reduction loop flags.
-    reductionFlags.push_back(!hasParallelAttr(loop.value()) &&
-                             !isLoopParallel(loop.value()));
-  }
-
-  // A helper to increase the factor until all contraints are met.
-  auto increaseFactor = [&](unsigned &factor, unsigned loopDepth) {
-    auto tripCount = tripCounts[loopDepth];
-    auto constr = constrs[loopDepth];
-
-    // The constraints include: 1) factor must be a divisor of trip count; 2)
-    // factor must be a divisor or divisible by all constraints. If applicable,
-    // factor must be a power of 2.
-    auto factorMeetConstr = [&]() {
-      auto result =
-          tripCount % factor == 0 && llvm::all_of(constr, [&](unsigned v) {
-            return v % factor == 0 || factor % v == 0;
-          });
-      if (powerOf2Constr)
-        result &= llvm::isPowerOf2_64(factor);
-      return result;
-    };
-    assert(factorMeetConstr() && "initial factor doesn't meet constraints");
-
-    auto initFactor = factor;
-    if (factor < tripCount) {
-      if (powerOf2Constr)
-        factor *= 2;
-      else
-        factor++;
-    }
-
-    while (!factorMeetConstr() && factor < tripCount) {
-      // Under a power-of-two constraint no factor above the initial one
-      // can satisfy it.
-      if (powerOf2Constr) {
-        factor = initFactor;
-        break;
-      } else
-        factor++;
-    }
-  };
-
-  // A helper to calculate the overall factors of the given factors.
-  auto canReturn = [&](FactorList factors) {
-    // Check whether the current overall factor is larger equal to the max
-    // factor to achieve.
-    unsigned overallFactor = 1;
-    for (auto factor : factors)
-      overallFactor *= factor;
-    if (maxFactor > overallFactor)
-      return false;
-
-    // Check whether the current factors meet all constraints.
-    for (auto t : llvm::zip(factors, constrs)) {
-      auto factor = std::get<0>(t);
-      auto constr = std::get<1>(t);
-      if (llvm::any_of(constr, [&](unsigned v) {
-            return v % factor != 0 && factor % v != 0;
-          }))
-        return false;
-    }
-    return true;
-  };
-
-  // Increase the unroll factors until reach the overall factor.
-  while (!canReturn(factors)) {
-    // Candidates list holding the reduction flag, increasing rate, current
-    // factor, and the loop depth.
-    SmallVector<std::tuple<bool, float, unsigned, unsigned>> candidates;
-    for (auto t : llvm::enumerate(llvm::zip(reductionFlags, factors))) {
-      auto flag = std::get<0>(t.value());
-      auto factor = std::get<1>(t.value());
-      auto newFactor = factor;
-
-      increaseFactor(newFactor, t.index());
-      if (newFactor != factor)
-        candidates.push_back(
-            {flag, (float)newFactor / factor, factor, t.index()});
-    }
-
-    // Break the while loop if there's no candidates available.
-    if (candidates.empty())
-      break;
-
-    // Sort the candidate factors. The rationale is: 1) Parallel loop can help
-    // to best parallelize the band. 2) Smaller increasing rate can help to
-    // match the overall parallel factor as much as possible. 3) Smaller current
-    // factor can help to distribute the overall parallel evenly. 4) Always
-    // choose inner loop can help to achieve deterministic transformation result
-    // of the pass.
-    llvm::sort(candidates, [](auto a, auto b) {
-      // Parallel loop is preferred.
-      if (std::get<0>(a) != std::get<0>(b))
-        return std::get<0>(a) < std::get<0>(b);
-
-      // Smaller increasing rate is preferred.
-      if (std::get<1>(a) != std::get<1>(b))
-        return std::get<1>(a) < std::get<1>(b);
-
-      // Smaller current factor is preferred.
-      if (std::get<2>(a) != std::get<2>(b))
-        return std::get<2>(a) < std::get<2>(b);
-
-      // Inner loop is preferred.
-      return std::get<3>(a) > std::get<3>(b);
-    });
-
-    auto depth = std::get<3>(candidates.front());
-    increaseFactor(factors[depth], depth);
-  }
-
-  return success();
-}
 
 /// Return a pair which indicates whether the if statement is always true or
 /// false, respectively. The returned result is one-hot.
@@ -803,6 +537,63 @@ bool sar::isFullyPartitioned(MemRefType memrefType) {
   return fullyPartitioned;
 }
 
+bool sar::isCompleteRowMajorSweep(Operation *operation, Value memref) {
+  AffineMap map;
+  ValueRange operands;
+  if (auto load = dyn_cast<AffineLoadOp>(operation)) {
+    if (load.getMemRef() != memref)
+      return false;
+    map = load.getAffineMap();
+    operands = load.getMapOperands();
+  } else if (auto store = dyn_cast<AffineStoreOp>(operation)) {
+    if (store.getMemRef() != memref)
+      return false;
+    map = store.getAffineMap();
+    operands = store.getMapOperands();
+  } else {
+    return false;
+  }
+
+  auto type = dyn_cast<MemRefType>(memref.getType());
+  if (!type || !type.hasStaticShape() || !map.isIdentity() ||
+      operands.size() != (unsigned)type.getRank())
+    return false;
+
+  SmallVector<AffineForOp> loops;
+  for (Operation *parent = operation->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (isa<func::FuncOp>(parent))
+      break;
+    auto loop = dyn_cast<AffineForOp>(parent);
+    if (!loop)
+      return false;
+    loops.push_back(loop);
+  }
+  std::reverse(loops.begin(), loops.end());
+  if (loops.size() != (unsigned)type.getRank())
+    return false;
+
+  for (auto [dim, loop] : llvm::enumerate(loops)) {
+    if (operands[dim] != loop.getInductionVar() || !loop.hasConstantBounds() ||
+        loop.getConstantLowerBound() != 0 ||
+        loop.getConstantUpperBound() != type.getDimSize(dim) ||
+        loop.getStep() != 1)
+      return false;
+  }
+  return true;
+}
+
+bool sar::isNestedInLoop(Operation *operation) {
+  for (Operation *parent = operation->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (isa<func::FuncOp>(parent))
+      return false;
+    if (isa<LoopLikeOpInterface>(parent))
+      return true;
+  }
+  return false;
+}
+
 // Calculate partition factors through analyzing the "memrefType" and return
 // them in "factors". Meanwhile, the overall partition number is calculated and
 // returned as well.
@@ -818,140 +609,6 @@ int64_t sar::getPartitionFactors(MemRefType memrefType,
   else if (factors)
     factors->assign(memrefType.getRank(), 1);
   return accumFactor;
-}
-
-/// This is method for finding the number of child loops which immediately
-/// contained by the input operation.
-static unsigned getChildLoopNum(Operation *op) {
-  unsigned childNum = 0;
-  for (auto &region : op->getRegions())
-    for (auto &block : region)
-      for (auto &op : block)
-        if (isa<AffineForOp>(op))
-          ++childNum;
-
-  return childNum;
-}
-
-/// Given a tiled loop band, return true and get the tile (tile-space) loop band
-/// and the point (intra-tile) loop band. If failed, return false.
-bool sar::getTileAndPointLoopBand(const AffineLoopBand &band,
-                                  AffineLoopBand &tileBand,
-                                  AffineLoopBand &pointBand) {
-  tileBand.clear();
-  pointBand.clear();
-  bool isPointLoop = false;
-
-  for (auto loop : band) {
-    if (!isPointLoop && !hasPointAttr(loop))
-      tileBand.push_back(loop);
-
-    else if (isPointLoop && hasPointAttr(loop))
-      pointBand.push_back(loop);
-
-    else if (!isPointLoop && hasPointAttr(loop)) {
-      isPointLoop = true;
-      pointBand.push_back(loop);
-
-    } else {
-      tileBand.clear();
-      pointBand.clear();
-      return false;
-    }
-  }
-  return true;
-}
-
-/// Get the whole loop band given the outermost loop and return it in "band".
-/// Meanwhile, the return value is the innermost loop of this loop band.
-AffineForOp sar::getLoopBandFromOutermost(AffineForOp forOp,
-                                          AffineLoopBand &band) {
-  band.clear();
-  auto currentLoop = forOp;
-  while (true) {
-    band.push_back(currentLoop);
-
-    if (getChildLoopNum(currentLoop) == 1)
-      currentLoop = *currentLoop.getOps<AffineForOp>().begin();
-    else
-      break;
-  }
-  return band.back();
-}
-AffineForOp sar::getLoopBandFromInnermost(AffineForOp forOp,
-                                          AffineLoopBand &band) {
-  band.clear();
-  AffineLoopBand reverseBand;
-
-  auto currentLoop = forOp;
-  while (true) {
-    reverseBand.push_back(currentLoop);
-
-    auto parentLoop = currentLoop->getParentOfType<AffineForOp>();
-    if (!parentLoop)
-      break;
-
-    if (getChildLoopNum(parentLoop) == 1)
-      currentLoop = parentLoop;
-    else
-      break;
-  }
-
-  band.append(reverseBand.rbegin(), reverseBand.rend());
-  return band.front();
-}
-
-/// Collect all loop bands in the "block" and return them in "bands". If
-/// "allowHavingChilds" is true, loop bands containing more than 1 other loop
-/// bands are also collected. Otherwise, only loop bands that contains no child
-/// loops are collected.
-void sar::getLoopBands(Block &block, AffineLoopBands &bands,
-                       bool allowHavingChilds) {
-  bands.clear();
-  block.walk([&](AffineForOp loop) {
-    // A loop carrying an unroll directive is a compact stand-in for
-    // parallel lanes: it belongs to the body of the loop above it, not to
-    // the band, so neither it nor its presence as a child counts here.
-    if (loop->hasAttr(kUnrollFactorAttr))
-      return;
-    unsigned childNum = 0;
-    for (auto &region : loop->getRegions())
-      for (auto &childBlock : region)
-        for (auto &op : childBlock)
-          if (auto child = dyn_cast<AffineForOp>(op))
-            if (!child->hasAttr(kUnrollFactorAttr))
-              ++childNum;
-
-    if (childNum == 0 || (childNum > 1 && allowHavingChilds)) {
-      AffineLoopBand band;
-      getLoopBandFromInnermost(loop, band);
-      bands.push_back(band);
-    }
-  });
-}
-
-std::optional<unsigned> sar::getAverageTripCount(AffineForOp forOp) {
-  if (auto optionalTripCount = getConstantTripCount(forOp))
-    return optionalTripCount.value();
-  else {
-    // Without a constant trip count, estimate from the bound maps: the
-    // midpoint of the smallest and largest possible trip counts. Only
-    // consumers that rank candidates (loop order, parallelization) read
-    // this, so a bounded estimate beats refusing to answer.
-    auto lowerBound = getBoundOfAffineMap(forOp.getLowerBoundMap(),
-                                          forOp.getLowerBoundOperands());
-    auto upperBound = getBoundOfAffineMap(forOp.getUpperBoundMap(),
-                                          forOp.getUpperBoundOperands());
-
-    if (lowerBound && upperBound) {
-      auto lowerTripCount =
-          upperBound.value().second - lowerBound.value().first;
-      auto upperTripCount =
-          upperBound.value().first - lowerBound.value().second;
-      return (lowerTripCount + upperTripCount + 1) / 2;
-    } else
-      return std::optional<unsigned>();
-  }
 }
 
 func::FuncOp sar::getTopFunc(ModuleOp module, std::string topFuncName) {

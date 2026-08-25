@@ -1,4 +1,4 @@
-//===- wka_common.h - Hand-written omega-K HLS types -----------*- C++ -*-===//
+//===- wka_common.h - Hand-written omega-K HLS types ------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -11,11 +11,14 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <hls_vector.h>
 
 using real_t = float;
 using acc_t = float;
 using io_t = float;
+using calc_t = double;
 using bus_t = ap_uint<WKA_AXI_BUS_BITS>;
+using plane_t = hls::vector<float, WKA_PLANE_LANES>;
 
 static_assert(sizeof(io_t) * 8 == WKA_IO_SCALAR_BITS,
               "External DDR packing assumes fixed-width IO scalar data.");
@@ -24,6 +27,8 @@ static_assert(WKA_COMPLEX_SAMPLE_BITS == 64,
 static_assert(
     (WKA_AXI_BUS_BITS % WKA_COMPLEX_SAMPLE_BITS) == 0,
     "AXI bus width must be an integer multiple of the packed sample width.");
+static_assert(WKA_AXI_PLANE_BITS == WKA_PLANE_LANES * WKA_IO_SCALAR_BITS,
+              "Plane vector width must match its scalar lane count.");
 
 struct data_t {
   float r;
@@ -49,7 +54,7 @@ static inline real_t wka_sqrt_real(real_t x) {
   return std::sqrt(x);
 }
 
-static inline int wka_floor_to_int(real_t x) {
+static inline int wka_floor_to_int(calc_t x) {
 #pragma HLS INLINE
   return static_cast<int>(std::floor(x));
 }
@@ -97,12 +102,16 @@ static const int TILE_SIZE = WKA_TILE_SIZE;
 static const int MEM_DEPTH = WKA_MEM_DEPTH;
 static const int BUS_BITS = WKA_AXI_BUS_BITS;
 static const int BUS_LANES = BUS_BITS / WKA_COMPLEX_SAMPLE_BITS;
-static const int REAL_BUS_LANES = BUS_BITS / WKA_IO_SCALAR_BITS;
-static const int MEM_WORDS = MEM_DEPTH / BUS_LANES;
+static const int PLANE_LANES = WKA_PLANE_LANES;
+static const int PLANE_WORDS_PER_ROW = N / PLANE_LANES;
+static const int PLANE_WORDS = MEM_DEPTH / PLANE_LANES;
 
 static_assert((N & (N - 1)) == 0, "WKA_N must be a power of two.");
 static_assert((LOG2_N % 2) == 0, "Radix-4 FFT requires an even LOG2_N.");
-static_assert((N % BUS_LANES) == 0, "WKA_N must align to one AXI word.");
+static_assert(BUS_LANES == PLANE_LANES,
+              "Packed complex words and scalar planes must cover equal lanes.");
+static_assert((N % PLANE_LANES) == 0,
+              "WKA_N must align to one AXI plane word.");
 static_assert((N % TILE_SIZE) == 0, "WKA_N must be divisible by TILE_SIZE.");
 static_assert((TILE_SIZE % BUS_LANES) == 0,
               "TILE_SIZE must align to one AXI word.");
@@ -112,16 +121,18 @@ static_assert((N % WKA_STOLT_OUT_LANES) == 0,
               "WKA_N must be divisible by WKA_STOLT_OUT_LANES.");
 static_assert((BUS_LANES % WKA_STOLT_OUT_LANES) == 0,
               "Stolt lanes must divide the number of AXI lanes.");
+static_assert((WKA_STOLT_OUT_LANES % WKA_STOLT_CACHE_COPIES) == 0,
+              "Stolt cache copies must divide the number of output lanes.");
 
-static const real_t PI = WKA_PI;
-static const real_t C0 = WKA_C0;
-static const real_t FC = WKA_FC;
-static const real_t FS = WKA_FS;
-static const real_t PRF = WKA_PRF;
-static const real_t VR = WKA_VR;
-static const real_t R0 = WKA_R0;
-static const real_t KR = WKA_KR;
-static const real_t STOLT_TIME_SHIFT = WKA_STOLT_TIME_SHIFT;
+static const calc_t PI = WKA_PI;
+static const calc_t C0 = WKA_C0;
+static const calc_t FC = WKA_FC;
+static const calc_t FS = WKA_FS;
+static const calc_t PRF = WKA_PRF;
+static const calc_t VR = WKA_VR;
+static const calc_t R0 = WKA_R0;
+static const calc_t KR = WKA_KR;
+static const calc_t STOLT_TIME_SHIFT = WKA_STOLT_TIME_SHIFT;
 static const int VALID_COLS = WKA_VALID_COLS;
 
 #endif

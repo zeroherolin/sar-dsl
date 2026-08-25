@@ -1,4 +1,4 @@
-//===- config.h - Hand-written omega-K HLS configuration -------*- C++ -*-===//
+//===- config.h - Hand-written omega-K HLS configuration --------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -9,7 +9,6 @@
 
 #include <ap_int.h>
 
-#define WKA_SIZE_SMOKE 0
 #define WKA_SIZE_MEDIUM 1
 #define WKA_SIZE_PRODUCTION 2
 
@@ -19,20 +18,19 @@
 
 // AXI and external sample layout
 #define WKA_AXI_BUS_BITS 512
-#define WKA_AXI_MAX_WIDEN_BITWIDTH 512
-#define WKA_AXI_MAX_READ_BURST_LENGTH 256
-#define WKA_AXI_MAX_WRITE_BURST_LENGTH 256
-#define WKA_AXI_NUM_READ_OUTSTANDING 8
-#define WKA_AXI_NUM_WRITE_OUTSTANDING 8
+#define WKA_AXI_PLANE_BITS 256
+#define WKA_AXI_PLANE_MAX_WIDEN_BITWIDTH 256
+#define WKA_AXI_SCALAR_MAX_WIDEN_BITWIDTH 512
+#define WKA_AXI_MAX_READ_BURST_LENGTH 64
+#define WKA_AXI_MAX_WRITE_BURST_LENGTH 64
+#define WKA_AXI_NUM_READ_OUTSTANDING 16
+#define WKA_AXI_NUM_WRITE_OUTSTANDING 16
 #define WKA_COMPLEX_SAMPLE_BITS 64
 #define WKA_IO_SCALAR_BITS 32
+#define WKA_PLANE_LANES 8
 
 // Problem size and validation profiles
-#if WKA_SIZE_PROFILE == WKA_SIZE_SMOKE
-#define WKA_N 64
-#define WKA_LOG2_N 6
-#define WKA_TILE_SIZE 16
-#elif WKA_SIZE_PROFILE == WKA_SIZE_MEDIUM
+#if WKA_SIZE_PROFILE == WKA_SIZE_MEDIUM
 #define WKA_N 256
 #define WKA_LOG2_N 8
 #define WKA_TILE_SIZE 32
@@ -46,14 +44,14 @@
 #define WKA_MEM_DEPTH (WKA_N * WKA_N)
 
 // Radar parameters
-#define WKA_PI 3.14159265358979323846f
-#define WKA_C0 299792458.0f
-#define WKA_FC 1269999750.06f
-#define WKA_FS 32000000.0f
-#define WKA_PRF 2155.172f
-#define WKA_VR 7072.0f
-#define WKA_R0 843013.994f
-#define WKA_KR (-1.037e12f)
+#define WKA_PI 3.14159265358979323846
+#define WKA_C0 299792458.0
+#define WKA_FC 1269999750.06
+#define WKA_FS 32000000.0
+#define WKA_PRF 2155.172
+#define WKA_VR 7072.0
+#define WKA_R0 843013.994
+#define WKA_KR (-1.037e12)
 #if WKA_SIZE_PROFILE == WKA_SIZE_PRODUCTION
 #define WKA_STOLT_TIME_SHIFT_SAMPLES 4800
 #else
@@ -65,11 +63,7 @@
 
 // Row transform
 #define WKA_ROW_LOAD_STORE_II 1
-#if WKA_SIZE_PROFILE == WKA_SIZE_SMOKE
-#define WKA_FFT_PAR_ROWS 4
-#define WKA_FFT_BLOCK_PART_FACTOR 4
-#define WKA_FFT_BUF_STORAGE_IMPL bram
-#elif WKA_SIZE_PROFILE == WKA_SIZE_MEDIUM
+#if WKA_SIZE_PROFILE == WKA_SIZE_MEDIUM
 #define WKA_FFT_PAR_ROWS 8
 #define WKA_FFT_BLOCK_PART_FACTOR 8
 #define WKA_FFT_BUF_STORAGE_IMPL bram
@@ -85,19 +79,19 @@
 #define WKA_CORNER_LOAD_STORE_II 1
 
 // Bulk compression and Stolt interpolation
-#define WKA_BULK_SAFE_SQRT_EPS 1e-10f
-#define WKA_STOLT_WEIGHT_LUT_SIZE 1024
-#define WKA_STOLT_OUT_LANES 2
+#define WKA_BULK_SAFE_SQRT_EPS 1e-10
+#define WKA_STOLT_OUT_LANES 4
+#define WKA_STOLT_CACHE_COPIES 4
 #define WKA_STOLT_READ_WRITE_II 1
 #define WKA_STOLT_INTERP_II 1
 #define WKA_STOLT_READ_FMUL_LIMIT 32
 #define WKA_STOLT_INTERP_FMUL_LIMIT 48
-#if WKA_SIZE_PROFILE == WKA_SIZE_SMOKE
-#define WKA_STOLT_ROW_PART_FACTOR 4
+#if WKA_SIZE_PROFILE == WKA_SIZE_MEDIUM
+#define WKA_STOLT_ROW_PART_FACTOR 8
 #define WKA_STOLT_ROW_STORAGE_IMPL bram
 #define WKA_STOLT_PACKED_STORAGE_IMPL bram
 #else
-#define WKA_STOLT_ROW_PART_FACTOR 16
+#define WKA_STOLT_ROW_PART_FACTOR 8
 #define WKA_STOLT_ROW_STORAGE_IMPL uram
 #define WKA_STOLT_PACKED_STORAGE_IMPL uram
 #endif

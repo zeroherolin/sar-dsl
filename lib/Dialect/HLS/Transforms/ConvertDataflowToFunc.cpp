@@ -1,4 +1,4 @@
-//===- ConvertDataflowToFunc.cpp - convert dataflow to func ---------------===//
+//===- ConvertDataflowToFunc.cpp - outline dataflow nodes as functions ----===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -22,126 +22,6 @@ using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
 using namespace hls;
-
-namespace {
-struct SplitScheduleExternalBufferAccess : public OpRewritePattern<ScheduleOp> {
-  using OpRewritePattern<ScheduleOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(ScheduleOp schedule,
-                                PatternRewriter &rewriter) const override {
-    auto &scheduleBody = schedule.getBody();
-    SmallVector<Value, 16> newOperands(schedule.getOperands());
-    bool hasChanged = false;
-
-    SmallVector<BlockArgument, 16> args(scheduleBody.getArguments());
-    for (auto arg : args) {
-      // Only external buffers shared by multiple nodes need splitting.
-      auto uses = llvm::make_filter_range(arg.getUses(), [&](auto &use) {
-        return isa<NodeOp>(use.getOwner());
-      });
-      if (!isExtBuffer(arg) || uses.empty() || llvm::hasSingleElement(uses))
-        continue;
-
-      // Add an argument and input for each additional use.
-      for (auto &use : llvm::make_early_inc_range(llvm::drop_begin(uses))) {
-        newOperands.push_back(newOperands[arg.getArgNumber()]);
-        auto newArg = scheduleBody.addArgument(arg.getType(), arg.getLoc());
-        use.set(newArg);
-        hasChanged = true;
-      }
-    }
-
-    if (hasChanged) {
-      auto newSchedule = ScheduleOp::create(
-          rewriter, schedule.getLoc(), newOperands, schedule.getIsLegalAttr());
-      rewriter.inlineRegionBefore(scheduleBody, newSchedule.getBody(),
-                                  newSchedule.getBody().end());
-      rewriter.eraseOp(schedule);
-      return success();
-    }
-    return failure();
-  }
-};
-} // namespace
-
-namespace {
-struct SplitNodeExternalBufferAccess : public OpRewritePattern<NodeOp> {
-  using OpRewritePattern<NodeOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(NodeOp node,
-                                PatternRewriter &rewriter) const override {
-    auto &nodeBody = node.getBody();
-    SmallVector<Value, 16> newInputs(node.getInputs());
-    SmallVector<Value, 16> newOutputs(node.getOutputs());
-    auto numInputs = node.getNumInputs();
-    auto numOutputs = node.getNumOutputs();
-    bool hasChanged = false;
-
-    SmallVector<BlockArgument, 16> inputArgs(node.getInputArgs());
-    SmallVector<BlockArgument, 16> outputArgs(node.getOutputArgs());
-    for (auto arg : inputArgs) {
-      auto uses = llvm::make_filter_range(arg.getUses(), [&](auto &use) {
-        return isa<ScheduleOp>(use.getOwner());
-      });
-      if (!isExtBuffer(arg) || uses.empty() || llvm::hasSingleElement(uses))
-        continue;
-
-      // Add a new argument and new input for each additional uses.
-      for (auto &use : llvm::make_early_inc_range(llvm::drop_begin(uses))) {
-        newInputs.push_back(newInputs[arg.getArgNumber()]);
-        auto newArg =
-            nodeBody.insertArgument(numInputs++, arg.getType(), arg.getLoc());
-        use.set(newArg);
-        hasChanged = true;
-      }
-    }
-
-    for (auto arg : llvm::enumerate(outputArgs)) {
-      auto uses =
-          llvm::make_filter_range(arg.value().getUses(), [&](auto &use) {
-            return isa<ScheduleOp>(use.getOwner());
-          });
-      if (!isExtBuffer(arg.value()) || uses.empty() ||
-          llvm::hasSingleElement(uses))
-        continue;
-
-      // Add a new argument and new input or output for each additional uses
-      // apart from the first written use.
-      bool outputFlag = false;
-      for (auto &use : llvm::make_early_inc_range(uses)) {
-        auto useIsWritten = isWritten(use);
-        if (useIsWritten && !outputFlag) {
-          outputFlag = true;
-          continue;
-        }
-        if (useIsWritten) {
-          newOutputs.push_back(newOutputs[arg.index()]);
-          auto newArg = nodeBody.insertArgument(numInputs + numOutputs++,
-                                                arg.value().getType(),
-                                                arg.value().getLoc());
-          use.set(newArg);
-        } else {
-          newInputs.push_back(newOutputs[arg.index()]);
-          auto newArg = nodeBody.insertArgument(
-              numInputs++, arg.value().getType(), arg.value().getLoc());
-          use.set(newArg);
-        }
-        hasChanged = true;
-      }
-    }
-
-    if (hasChanged) {
-      auto newNode = NodeOp::create(rewriter, node.getLoc(), newInputs,
-                                    newOutputs, node.getParams());
-      rewriter.inlineRegionBefore(nodeBody, newNode.getBody(),
-                                  newNode.getBody().end());
-      rewriter.eraseOp(node);
-      return success();
-    }
-    return failure();
-  }
-};
-} // namespace
 
 namespace {
 struct InlineSchedule : public OpRewritePattern<ScheduleOp> {
@@ -205,7 +85,17 @@ struct ConvertNodeToFunc : public OpRewritePattern<NodeOp> {
                          : WalkResult::advance();
             })
             .wasInterrupted();
-    if (!node.hasHierarchy() && !hasCallsOrTokens &&
+    auto parentSchedule = node->getParentOfType<ScheduleOp>();
+    bool isDataflowProcess = parentSchedule && parentSchedule.getIsLegal() &&
+                             isa<func::FuncOp>(parentSchedule->getParentOp());
+    if (!isDataflowProcess) {
+      auto parentFunc = node->getParentOfType<func::FuncOp>();
+      auto directive =
+          parentFunc ? getFuncDirective(parentFunc) : FuncDirectiveAttr();
+      isDataflowProcess = parentFunc && node->getParentOp() == parentFunc &&
+                          directive && directive.getDataflow();
+    }
+    if (!isDataflowProcess && !node.hasHierarchy() && !hasCallsOrTokens &&
         llvm::hasSingleElement(node.getOps<AffineForOp>()))
       subFunc->setAttr("inline", rewriter.getUnitAttr());
 
@@ -231,22 +121,9 @@ private:
 namespace {
 struct ConvertDataflowToFunc
     : public sar::impl::ConvertDataflowToFuncBase<ConvertDataflowToFunc> {
-  ConvertDataflowToFunc() = default;
-  explicit ConvertDataflowToFunc(bool argSplitExternalAccess) {
-    splitExternalAccess = argSplitExternalAccess;
-  }
-
   void runOnOperation() override {
     auto module = getOperation();
     auto context = module.getContext();
-
-    if (splitExternalAccess.getValue()) {
-      mlir::RewritePatternSet patterns(context);
-      patterns.add<SplitScheduleExternalBufferAccess>(context);
-      patterns.add<SplitNodeExternalBufferAccess>(context);
-      if (failed(applyPatternsGreedily(module, std::move(patterns))))
-        return signalPassFailure();
-    }
 
     // Converting a node creates a new function holding its body, and a
     // nested schedule waits in that body for its turn (the deferral
@@ -291,7 +168,6 @@ struct ConvertDataflowToFunc
 };
 } // namespace
 
-std::unique_ptr<Pass>
-sar::createConvertDataflowToFuncPass(bool splitExternalAccess) {
-  return std::make_unique<ConvertDataflowToFunc>(splitExternalAccess);
+std::unique_ptr<Pass> sar::createConvertDataflowToFuncPass() {
+  return std::make_unique<ConvertDataflowToFunc>();
 }

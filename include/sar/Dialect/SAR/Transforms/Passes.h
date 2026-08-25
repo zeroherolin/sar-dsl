@@ -1,4 +1,4 @@
-//===- Passes.h - SAR dialect transformation passes --------------*- C++-*-===//
+//===- Passes.h - SAR dialect transforms ------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

@@ -8,10 +8,12 @@ this locks in that user-level composition covers algorithm logic beyond
 plain op chaining and reaches both backends.
 """
 
+import json
 import sys
 
 import numpy as np
 import pytest
+import sar
 
 from conftest import REPO_ROOT, requires_cpu, requires_hls
 
@@ -69,13 +71,29 @@ def test_pfa_focuses_and_sva_suppresses_sidelobes(setup):
 
 
 @requires_hls
-def test_pfa_emits_hls_design():
-    """The full PFA + SVA chain must emit as a single design."""
-    import re
+def test_c64_polar_angle_is_not_a_double_scratch_plane():
+    """The dim-0 regrid evaluates atan2 at the gather point.
 
-    n = 32
-    design = build_kernel(n, Geometry(n)).compile(backend="hls")
-    source = design.source()
-    assert "void pfa" in source
-    assert "#pragma HLS" in source
-    assert not re.findall(r"\b(malloc|free|printf|std::cout)\b", source)
+    Materializing that position expression would add one full f64 plane and
+    one double AXI scratch master. The c64 design needs only float arenas even
+    when a tight budget forces its image planes off chip.
+    """
+    n = 128
+    design = build_kernel(n,
+                          Geometry(n),
+                          name="pfa_scalarized_positions",
+                          dtype=sar.c64).compile(backend="hls",
+                                                 options={
+                                                     "interface": "axi",
+                                                     "bram_bytes": 1 << 22,
+                                                     "uram_bytes": 1 << 22,
+                                                     "lutram_bytes": 1 << 15,
+                                                 })
+    ports = [
+        json.loads(line.split("SAR_DSL_INTERFACE: ")[1])
+        for line in design.source().splitlines() if "SAR_DSL_INTERFACE" in line
+    ]
+    scratch = [port for port in ports if port["kind"] == "scratch"]
+    assert scratch
+    assert {port["scalar_type"] for port in scratch} == {"float"}
+    assert "std::atan2" in design.source()

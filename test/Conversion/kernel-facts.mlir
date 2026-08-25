@@ -5,6 +5,7 @@
 // CHECK-SAME: "transposes":4
 // CHECK-SAME: "transforms":
 // CHECK-SAME: 8,4
+// CHECK-SAME: "transform_strided":[false]
 // CHECK-SAME: "buffers":
 func.func @facts(%x: tensor<8x8xcomplex<f32>>, %positions: tensor<8x8xf64>)
     -> tensor<8x8xcomplex<f32>> {

@@ -1,4 +1,4 @@
-//===- AffineLoopOrderOpt.cpp - affine loop order opt ---------------------===//
+//===- AffineLoopOrderOpt.cpp - push carried dependences outward ----------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -36,7 +36,6 @@ bool sar::applyAffineLoopOrderOpt(AffineLoopBand &band,
   if (!isPerfectlyNested(band))
     return false;
 
-  auto &loopBlock = *band.back().getBody();
   auto bandDepth = band.size();
 
   if (!permMap.empty() && isValidLoopInterchangePermutation(band, permMap)) {
@@ -47,14 +46,12 @@ bool sar::applyAffineLoopOrderOpt(AffineLoopBand &band,
     return true;
   }
 
-  // Collect all load and store operations for each memory in the loop block,
-  // and calculate the number of common surrouding loops for later uses.
-  MemAccessesMap loadStoresMap;
-  getMemAccessesMap(loopBlock, loadStoresMap);
-
-  // A map of dependency distances indexed by the loop in the band.
+  // Loops that carry a dependence are the ones to move outward.
+  // Collect the loops carrying a dependence. Their relative order still
+  // matters: even when every loop in a band is non-parallel, moving one
+  // outward can increase the recurrence distance.
   SmallVector<AffineForOp, 8> targetLoops;
-  for (auto loop : band)
+  for (AffineForOp loop : band)
     if (!isLoopParallel(loop))
       targetLoops.push_back(loop);
 
@@ -136,7 +133,6 @@ struct AffineLoopOrderOpt
     AffineLoopBands targetBands;
     getLoopBands(getOperation().front(), targetBands);
 
-    // Apply loop order optimization to each loop band.
     for (auto &band : targetBands) {
       AffineLoopBand tileBand;
       AffineLoopBand pointBand;

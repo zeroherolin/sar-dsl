@@ -1285,21 +1285,50 @@ struct RankFilterOpLowering : OpRewritePattern<RankFilterOp> {
                 tensor::ExtractOp::create(b, loc, op.getInput(), indices));
           }
 
-          // `window` is a compile-time constant, so the sort unrolls into a
-          // straight-line compare-exchange network: no control flow in the
-          // body, and the selected order statistic is one of its outputs.
-          for (int64_t i = 0; i + 1 < window; ++i)
-            for (int64_t j = 0; j + 1 < window - i; ++j) {
-              Value lhs = taps[j], rhs = taps[j + 1];
-              std::tie(taps[j], taps[j + 1]) =
-                  orderedFloatPair(b, loc, lhs, rhs);
-            }
+          // `window` is a compile-time constant, so the selection unrolls
+          // into a straight-line compare-exchange network: no control flow
+          // in the body, and the requested order statistic is one of its
+          // outputs.
+          //
+          // Only that one statistic is wanted, so the network stops as soon
+          // as its slot is settled rather than sorting the whole window. A
+          // pass that carries the largest tap to the top settles one slot
+          // from the top, so `window - orderRank` of them settle position
+          // `orderRank`; carrying the smallest down settles it in
+          // `orderRank + 1`. Running whichever is shorter costs
+          // `window * min(orderRank + 1, window - orderRank)` compares
+          // instead of `window^2 / 2` -- for a minimum or maximum filter,
+          // one pass instead of the whole sort.
+          int64_t fromTop = window - orderRank;
+          int64_t fromBottom = orderRank + 1;
+          if (fromTop <= fromBottom) {
+            for (int64_t i = 0; i < fromTop; ++i)
+              for (int64_t j = 0; j + 1 < window - i; ++j)
+                std::tie(taps[j], taps[j + 1]) =
+                    orderedFloatPair(b, loc, taps[j], taps[j + 1]);
+          } else {
+            for (int64_t i = 0; i < fromBottom; ++i)
+              for (int64_t j = window - 1; j > i; --j)
+                std::tie(taps[j - 1], taps[j]) =
+                    orderedFloatPair(b, loc, taps[j - 1], taps[j]);
+          }
           return taps[orderRank];
         });
     rewriter.replaceOp(op, result);
     return success();
   }
 };
+
+/// Batcher odd-even mergesort stages as (p, k) pairs, outermost first.
+/// A line of `n` takes O(log^2 n) stages holding O(n log^2 n) comparators
+/// in total, against the `n^2` of a compare-exchange bubble sort.
+static SmallVector<std::pair<int64_t, int64_t>> oddEvenMergeStages(int64_t n) {
+  SmallVector<std::pair<int64_t, int64_t>> stages;
+  for (int64_t p = 1; p < n; p *= 2)
+    for (int64_t k = p; k >= 1; k /= 2)
+      stages.push_back({p, k});
+  return stages;
+}
 
 struct SortOpLowering : OpRewritePattern<SortOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -1310,59 +1339,100 @@ struct SortOpLowering : OpRewritePattern<SortOp> {
     int64_t rank = resultType.getRank();
     int64_t dim = op.getDim();
     int64_t extent = resultType.getDimSize(dim);
-    int64_t lineLen = rank == 1 ? 1 : resultType.getDimSize(1 - dim);
 
-    // A full sort is kept as a loop nest rather than a fully unrolled
-    // network: unrolling costs O(extent^2) compare-exchanges of IR, which is
-    // fine for rank_filter's small window but not for a line that can be
-    // hundreds of samples wide. The body stays straight-line (one
-    // compare-exchange, no control flow), so it still pipelines; only the
-    // trip count moves from compile time to run time.
+    // Batcher's network rather than a bubble sort: the extent is a compile-
+    // time constant, so the comparator schedule is too, and it costs
+    // O(n log^2 n) compare-exchanges instead of O(n^2). Each stage is one
+    // parallel sweep of the whole tensor -- every line advances through the
+    // same stage at once, which is the line-level parallelism the sequential
+    // form could not express. Only the stages are ordered; the elements
+    // within one are independent.
     //
-    // Bubble sort with both bounds constant: `extent - 1` full passes sort
-    // any input, and constant bounds keep the emitted loops static.
-    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
-    Value lineBound = arith::ConstantIndexOp::create(rewriter, loc, lineLen);
-    Value passBound = arith::ConstantIndexOp::create(rewriter, loc, extent - 1);
+    // The network is written in its per-element form: an output element
+    // either heads a comparator (taking the minimum with its partner `k`
+    // above), tails one (taking the maximum with its partner `k` below), or
+    // is untouched this stage. `isLow` decides which, from the element index
+    // alone, so the body stays straight-line and the sweep stays parallel.
+    Value sorted = op.getInput();
+    for (auto [p, k] : oddEvenMergeStages(extent)) {
+      Value input = sorted;
+      sorted = buildElementwiseGeneric(
+          rewriter, loc, resultType, ValueRange{},
+          [&](OpBuilder &b, Location nested, ValueRange) -> Value {
+            Value position = linalg::IndexOp::create(b, nested, dim);
+            Value line = rank == 1
+                             ? Value()
+                             : linalg::IndexOp::create(b, nested, 1 - dim);
+            auto at = [&](Value index) {
+              SmallVector<Value> indices(rank);
+              indices[dim] = index;
+              if (rank == 2)
+                indices[1 - dim] = line;
+              return tensor::ExtractOp::create(b, nested, input, indices)
+                  .getResult();
+            };
 
-    auto indicesFor = [&](Value line, Value pos) {
-      if (rank == 1)
-        return SmallVector<Value>{pos};
-      SmallVector<Value> indices(2);
-      indices[dim] = pos;
-      indices[1 - dim] = line;
-      return indices;
-    };
+            // Whether element `x` is the low side of a comparator in this
+            // stage: it sits in the first half of its 2k block (offset by
+            // `k mod p`), its partner is in range, and the pair does not
+            // straddle a 2p merge boundary.
+            auto isLow = [&](Value x) {
+              Value kv = arith::ConstantIndexOp::create(b, nested, k);
+              Value twoK = arith::ConstantIndexOp::create(b, nested, 2 * k);
+              Value twoP = arith::ConstantIndexOp::create(b, nested, 2 * p);
+              Value lo = arith::ConstantIndexOp::create(b, nested, k % p);
+              Value hi = arith::ConstantIndexOp::create(b, nested, k % p + k);
+              Value last = arith::ConstantIndexOp::create(b, nested, extent);
+              Value slot = arith::RemUIOp::create(b, nested, x, twoK);
+              Value inFirstHalf = arith::AndIOp::create(
+                  b, nested,
+                  arith::CmpIOp::create(b, nested, arith::CmpIPredicate::uge,
+                                        slot, lo),
+                  arith::CmpIOp::create(b, nested, arith::CmpIPredicate::ult,
+                                        slot, hi));
+              Value partner = arith::AddIOp::create(b, nested, x, kv);
+              Value partnerInRange = arith::CmpIOp::create(
+                  b, nested, arith::CmpIPredicate::ult, partner, last);
+              Value sameBlock = arith::CmpIOp::create(
+                  b, nested, arith::CmpIPredicate::eq,
+                  arith::DivUIOp::create(b, nested, x, twoP),
+                  arith::DivUIOp::create(b, nested, partner, twoP));
+              return arith::AndIOp::create(
+                  b, nested,
+                  arith::AndIOp::create(b, nested, inFirstHalf, partnerInRange),
+                  sameBlock);
+            };
 
-    // Sorting is in place over the value: each insert yields a new tensor,
-    // so the input is threaded through as the initial state.
-    auto outer = scf::ForOp::create(
-        rewriter, loc, zero, lineBound, one, ValueRange{op.getInput()},
-        [&](OpBuilder &b, Location nested, Value line, ValueRange iter) {
-          auto passes = scf::ForOp::create(
-              b, nested, zero, passBound, one, ValueRange{iter[0]},
-              [&](OpBuilder &pb, Location ploc, Value, ValueRange pit) {
-                auto sweep = scf::ForOp::create(
-                    pb, ploc, zero, passBound, one, ValueRange{pit[0]},
-                    [&](OpBuilder &sb, Location sloc, Value j, ValueRange sit) {
-                      Value next = arith::AddIOp::create(sb, sloc, j, one);
-                      Value lhs = tensor::ExtractOp::create(
-                          sb, sloc, sit[0], indicesFor(line, j));
-                      Value rhs = tensor::ExtractOp::create(
-                          sb, sloc, sit[0], indicesFor(line, next));
-                      auto [lo, hi] = orderedFloatPair(sb, sloc, lhs, rhs);
-                      Value stored = tensor::InsertOp::create(
-                          sb, sloc, lo, sit[0], indicesFor(line, j));
-                      stored = tensor::InsertOp::create(sb, sloc, hi, stored,
-                                                        indicesFor(line, next));
-                      scf::YieldOp::create(sb, sloc, stored);
-                    });
-                scf::YieldOp::create(pb, ploc, sweep.getResult(0));
-              });
-          scf::YieldOp::create(b, nested, passes.getResult(0));
-        });
-    rewriter.replaceOp(op, outer.getResult(0));
+            Value kv = arith::ConstantIndexOp::create(b, nested, k);
+            Value zero = arith::ConstantIndexOp::create(b, nested, 0);
+            Value self = at(position);
+
+            // Low side: min with the partner above.
+            Value above = arith::AddIOp::create(b, nested, position, kv);
+            Value aboveClamped = arith::MinUIOp::create(
+                b, nested, above,
+                arith::ConstantIndexOp::create(b, nested, extent - 1));
+            Value lowMin =
+                orderedFloatPair(b, nested, self, at(aboveClamped)).first;
+
+            // High side: max with the partner below, when that partner is
+            // itself the low side of this stage's comparator.
+            Value belowRaw = arith::SubIOp::create(b, nested, position, kv);
+            Value hasBelow = arith::CmpIOp::create(
+                b, nested, arith::CmpIPredicate::uge, position, kv);
+            Value below =
+                arith::SelectOp::create(b, nested, hasBelow, belowRaw, zero);
+            Value highMax = orderedFloatPair(b, nested, at(below), self).second;
+
+            Value takesLow = isLow(position);
+            Value takesHigh =
+                arith::AndIOp::create(b, nested, hasBelow, isLow(below));
+            Value result =
+                arith::SelectOp::create(b, nested, takesHigh, highMax, self);
+            return arith::SelectOp::create(b, nested, takesLow, lowMin, result);
+          });
+    }
+    rewriter.replaceOp(op, sorted);
     return success();
   }
 };

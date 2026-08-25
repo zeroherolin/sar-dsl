@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """omega-K on the HLS backend, end to end: trace the complete kernel,
-emit a Vitis HLS C++ design and a C-simulation package with golden data
+emit a Vitis HLS C++ design and a validation package with golden data
 from the NumPy reference.
 
 The generated top function takes the raw data as two float planes
 (re, im), followed by the window vectors, then the output magnitude
 plane.
+
+The interface follows the HLS configuration; the generated testbench drives
+the resulting physical port schema, including packed AXI ports and scratch.
 
 Usage:
     python run_point_target_hls.py [--n 256] [--output PATH]
@@ -33,7 +36,7 @@ def main() -> None:
                         help="raster size (power of two)")
     parser.add_argument("--output",
                         default=str(_EXAMPLES / "hls_project" / "wka"),
-                        help="C-simulation package directory")
+                        help="HLS validation package directory")
     parser.add_argument("--no-testbench",
                         action="store_true",
                         help="emit the design only")
@@ -55,7 +58,9 @@ def main() -> None:
     print(f"[2/2] Saved {out}")
     print(f"done: {design.source().count(chr(10))} lines of HLS C++, "
           f"top function 'wka'")
-    print(f"      csim: cd {out} && vitis_hls -f wka_csim.tcl")
+    print(f"      C-sim through Vitis HLS: cd {out} && "
+          "vitis_hls -f wka_hls_csim.tcl")
+    print("      without Vitis: sh wka_portable_cpp_sim.sh")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,17 @@
 // RUN: sar-translate --hls-emit-hlscpp %s | FileCheck %s
 
+// CHECK-LABEL: void a_vector_carry(
+// CHECK: hls::vector<float, 4> [[V:v[0-9]+]] = {{.*}};
+// CHECK: for (
+// CHECK: [[V]] = [[V]];
+func.func private @a_vector_carry(%init: vector<4xf32>) {
+  %result = affine.for %i = 0 to 4 iter_args(%current = %init)
+      -> vector<4xf32> {
+    affine.yield %current : vector<4xf32>
+  }
+  return
+}
+
 // Loop-carried values (`iter_args`) compile to ordinary variables: declared
 // and initialized ahead of the loop, reassigned by the yield, read as the
 // loop's results afterwards. A multi-carry yield stages through temporaries

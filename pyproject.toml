@@ -50,6 +50,12 @@ version = { attr = "sar._version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["test/python"]
+addopts = "--strict-config --strict-markers"
+markers = [
+    "requires_cpu: needs the built native CPU backend toolchain",
+    "requires_hls: needs the built HLS compiler toolchain",
+    "requires_vitis: needs an explicitly enabled Vitis HLS RTL run",
+]
 
 [tool.yapf]
 based_on_style = "pep8"

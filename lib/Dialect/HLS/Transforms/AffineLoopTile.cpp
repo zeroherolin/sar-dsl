@@ -1,4 +1,4 @@
-//===- AffineLoopTile.cpp - affine loop tile ------------------------------===//
+//===- AffineLoopTile.cpp - tile bands that reuse, keep sweeps whole ------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -212,13 +212,18 @@ bool sar::applyLoopTiling(AffineLoopBand &band, FactorList tileList,
     return true;
   }
 
-  // Record the original band size and attributes to make use of later.
+  // Tiling creates one tile and one point loop for each original loop; retain
+  // the attributes that must follow those corresponding loops.
   auto originalBandSize = band.size();
   SmallVector<std::pair<bool, bool>, 6> flags;
-  for (auto loop : band)
+  SmallVector<Attribute, 6> minimumIIs;
+  SmallVector<bool, 6> taskBodies;
+  for (auto loop : band) {
     flags.push_back({hasParallelAttr(loop), hasPointAttr(loop)});
+    minimumIIs.push_back(loop->getAttr(kMinIIAttr));
+    taskBodies.push_back(loop->hasAttr(kTaskBodyAttr));
+  }
 
-  // Apply loop tiling.
   AffineLoopBand tiledBand;
   if (failed(tilePerfectlyNested(band, tileList, &tiledBand)))
     return false;
@@ -227,33 +232,42 @@ bool sar::applyLoopTiling(AffineLoopBand &band, FactorList tileList,
                            tiledBand.end());
   tiledBand.resize(originalBandSize);
 
-  // Annotate the required attributes.
-  for (auto zip : llvm::zip(tiledBand, pointBand, flags)) {
+  for (auto zip :
+       llvm::zip(tiledBand, pointBand, flags, minimumIIs, taskBodies)) {
     auto tileLoop = std::get<0>(zip);
     auto pointLoop = std::get<1>(zip);
     auto flag = std::get<2>(zip);
+    auto minimumII = std::get<3>(zip);
+    bool taskBody = std::get<4>(zip);
 
-    // If a tile loop is parallel, the corresponding point loop should also be
-    // a parallel loop.
     if (flag.first) {
       setParallelAttr(tileLoop);
       setParallelAttr(pointLoop);
     }
 
-    // Re-annotate the point attribute to the tile loop if required.
     if (flag.second)
       setPointAttr(tileLoop);
 
-    // Annotate the point attribute to the point loop.
     if (annotatePointLoop)
       setPointAttr(pointLoop);
+
+    // A minimum II describes one original loop iteration, so after tiling it
+    // belongs to the point loop rather than the loop over tiles.
+    if (minimumII)
+      pointLoop->setAttr(kMinIIAttr, minimumII);
+
+    // A prologue loop and its consumer are one dataflow task. Tiling creates
+    // two loop levels from that prologue, so both inherit the marker; either
+    // level becoming a task seed would split the local-cache lifetime again.
+    if (taskBody) {
+      tileLoop->setAttr(kTaskBodyAttr, UnitAttr::get(tileLoop.getContext()));
+      pointLoop->setAttr(kTaskBodyAttr, UnitAttr::get(pointLoop.getContext()));
+    }
   }
 
-  // Always normalize point loop band.
   for (auto loop : pointBand)
     (void)normalizeAffineFor(loop);
 
-  // Normalize tiled loop band if required.
   if (loopNormalize) {
     band.clear();
     for (auto loop : tiledBand)
@@ -268,8 +282,8 @@ bool sar::applyLoopTiling(AffineLoopBand &band, FactorList tileList,
 
 /// Reduces each tile size to the largest divisor of the corresponding trip
 /// count (if the trip count is known).
-void sar::adjustToDivisorsOfTripCounts(ArrayRef<AffineForOp> band,
-                                       SmallVectorImpl<unsigned> *tileSizes) {
+static void adjustToDivisorsOfTripCounts(ArrayRef<AffineForOp> band,
+                                         SmallVectorImpl<unsigned> *tileSizes) {
   assert(band.size() == tileSizes->size() && "invalid tile size count");
   for (unsigned i = 0, e = band.size(); i < e; i++) {
     unsigned &tSizeAdjusted = (*tileSizes)[i];

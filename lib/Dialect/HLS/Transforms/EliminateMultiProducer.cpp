@@ -1,15 +1,13 @@
-//===- EliminateMultiProducer.cpp - eliminate multi producer --------------===//
+//===- EliminateMultiProducer.cpp - privatize multi-writer buffers --------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/Dominance.h"
-#include "mlir/IR/IntegerSet.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
-#include "llvm/ADT/SetVector.h"
 
 namespace mlir {
 namespace sar {
@@ -24,6 +22,67 @@ using namespace sar;
 using namespace hls;
 
 namespace {
+static Operation *topLevelInNode(Operation *operation, NodeOp node) {
+  Block *body = &node.getBody().front();
+  while (operation->getBlock() != body)
+    operation = operation->getParentOp();
+  return operation;
+}
+
+static bool isCompleteWriteWithinNode(Operation *operation, Value buffer,
+                                      NodeOp node) {
+  auto store = dyn_cast<AffineStoreOp>(operation);
+  auto type = dyn_cast<MemRefType>(buffer.getType());
+  if (!store || store.getMemRef() != buffer || !type ||
+      !type.hasStaticShape() || !store.getAffineMap().isIdentity() ||
+      store.getMapOperands().size() != (unsigned)type.getRank())
+    return false;
+
+  SmallVector<AffineForOp> loops;
+  for (Operation *parent = operation->getParentOp(); parent != node;
+       parent = parent->getParentOp()) {
+    auto loop = dyn_cast_or_null<AffineForOp>(parent);
+    if (!loop)
+      return false;
+    loops.push_back(loop);
+  }
+  std::reverse(loops.begin(), loops.end());
+  if (loops.size() != (unsigned)type.getRank())
+    return false;
+  for (auto [dimension, loop] : llvm::enumerate(loops))
+    if (store.getMapOperands()[dimension] != loop.getInductionVar() ||
+        !loop.hasConstantBounds() || loop.getConstantLowerBound() != 0 ||
+        loop.getConstantUpperBound() != type.getDimSize(dimension) ||
+        loop.getStep() != 1)
+      return false;
+  return true;
+}
+
+/// Whether a complete write of `buffer` finishes before every read.
+///
+/// A privatized in-place output only needs the old buffer when some element
+/// can be read before the node defines it. A full row-major sweep in an
+/// earlier top-level loop initializes every element, so copying the old
+/// contents would be both redundant and, if placed near a later read,
+/// destructive.
+static bool fullyWrittenBeforeReads(NodeOp node, BlockArgument buffer,
+                                    ArrayRef<OpOperand *> reads) {
+  SmallVector<Operation *> completeWriters;
+  for (OpOperand &use : buffer.getUses()) {
+    if (!isWritten(use))
+      continue;
+    Operation *writer = use.getOwner();
+    if (isCompleteWriteWithinNode(writer, buffer, node))
+      completeWriters.push_back(topLevelInNode(writer, node));
+  }
+  return llvm::any_of(completeWriters, [&](Operation *writer) {
+    return llvm::all_of(reads, [&](OpOperand *read) {
+      Operation *reader = topLevelInNode(read->getOwner(), node);
+      return writer != reader && writer->isBeforeInBlock(reader);
+    });
+  });
+}
+
 struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
   using OpRewritePattern<ScheduleOp>::OpRewritePattern;
 
@@ -60,17 +119,13 @@ struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
       producers.pop_back();
 
       for (auto node : producers) {
-        auto newInputs = SmallVector<Value>(node.getInputs());
-        SmallVector<unsigned> newInputTaps(node.getInputTapsAsInt());
+        unsigned originalNumInputs = node.getNumInputs();
         rewriter.setInsertionPoint(node);
 
-        // Create a new buffer and write to them instead of the original buffer.
-        // The original buffer will be passed into the new node as inputs.
-        newInputs.push_back(buffer);
-        newInputTaps.push_back(0);
+        // Create a new buffer and write to it instead of the original one.
         auto newBuffer = BufferOp::create(rewriter, loc, buffer.getType());
         auto bufferIdx = llvm::find(node.getOutputs(), buffer) -
-                         node.getOutputs().begin() + node.getNumInputs();
+                         node.getOutputs().begin() + originalNumInputs;
         node.setOperand(bufferIdx, newBuffer);
 
         buffer.replaceUsesWithIf(newBuffer, [&](OpOperand &use) {
@@ -80,95 +135,46 @@ struct BufferMultiProducer : public OpRewritePattern<ScheduleOp> {
         });
 
         // Create a new node and erase the original one.
-        auto newNode = NodeOp::create(rewriter, node.getLoc(), newInputs,
-                                      node.getOutputs(), node.getParams(),
-                                      newInputTaps, node.getLevelAttr());
+        auto newNode = NodeOp::create(
+            rewriter, node.getLoc(), node.getInputs(), node.getOutputs(),
+            node.getParams(), node.getInputTapsAttr(), node.getLevelAttr());
         rewriter.inlineRegionBefore(node.getBody(), newNode.getBody(),
                                     newNode.getBody().end());
         rewriter.eraseOp(node);
 
-        // Insert new arguments for the original buffer.
-        rewriter.setInsertionPointToStart(&newNode.getBody().front());
         auto newBufferArg = newNode.getBody().getArgument(bufferIdx);
+        SmallVector<OpOperand *> readUses;
+        for (OpOperand &use : newBufferArg.getUses())
+          if (isRead(use))
+            readUses.push_back(&use);
+        if (readUses.empty() ||
+            fullyWrittenBeforeReads(newNode, newBufferArg, readUses))
+          continue;
+
+        // This producer needs the prior contents. Rebuild it with the original
+        // buffer appended to the input segment and add the matching block
+        // argument immediately before the output arguments.
+        SmallVector<Value> inputs(newNode.getInputs());
+        inputs.push_back(buffer);
+        SmallVector<unsigned> inputTaps(newNode.getInputTapsAsInt());
+        inputTaps.push_back(0);
+        rewriter.setInsertionPoint(newNode);
+        auto initializedNode = NodeOp::create(
+            rewriter, newNode.getLoc(), inputs, newNode.getOutputs(),
+            newNode.getParams(), inputTaps, newNode.getLevelAttr());
         auto bufferArg = newNode.getBody().insertArgument(
-            newNode.getNumInputs() - 1, newBufferArg.getType(),
-            newBufferArg.getLoc());
+            originalNumInputs, newBufferArg.getType(), newBufferArg.getLoc());
+        rewriter.inlineRegionBefore(newNode.getBody(),
+                                    initializedNode.getBody(),
+                                    initializedNode.getBody().end());
+        rewriter.eraseOp(newNode);
 
-        // A sole affine-load reader can consume the producer directly.
-        auto readUses = llvm::make_filter_range(
-            newBufferArg.getUses(), [](OpOperand &use) { return isRead(use); });
-        if (llvm::hasSingleElement(readUses))
-          if (auto read = dyn_cast<mlir::affine::AffineReadOpInterface>(
-                  readUses.begin()->getOwner())) {
-            // Every load index must be a known loop induction variable and the
-            // access map must be the identity.
-            AffineLoopBand band;
-            getAffineForIVs(*read, &band);
-
-            // A SetVector: the leftovers below become if-condition operands,
-            // and their order has to follow the band, not pointer values.
-            llvm::SmallSetVector<Value, 4> depInductionVars;
-            for (auto loop : band)
-              depInductionVars.insert(loop.getInductionVar());
-
-            auto noEscapeIndex = true;
-            for (auto operand : read.getMapOperands())
-              if (!depInductionVars.remove(operand))
-                noEscapeIndex = false;
-
-            if (noEscapeIndex && read.getAffineMap().isIdentity()) {
-              SmallVector<AffineExpr, 4> ifExprs;
-              SmallVector<bool, 4> ifEqFlags;
-              SmallVector<Value, 4> ifOperands;
-              unsigned dim = 0;
-              for (auto iv : depInductionVars) {
-                auto loop = getForInductionVarOwner(iv);
-
-                // Create all components required by constructing if operation.
-                if (loop.hasConstantLowerBound()) {
-                  ifExprs.push_back(rewriter.getAffineDimExpr(dim++) -
-                                    loop.getConstantLowerBound());
-                  ifOperands.push_back(loop.getInductionVar());
-                } else {
-                  // Non-constant case requires to integrate the bound affine
-                  // expression and operands into the condition integer set.
-                  auto lowerExpr = loop.getLowerBoundMap().getResult(0);
-                  auto lowerOperands = loop.getLowerBoundOperands();
-                  SmallVector<AffineExpr, 4> newDims;
-                  for (unsigned i = 0, e = lowerOperands.size(); i < e; ++i)
-                    newDims.push_back(rewriter.getAffineDimExpr(i + dim + 1));
-                  lowerExpr = lowerExpr.replaceDimsAndSymbols(newDims, {});
-
-                  ifExprs.push_back(rewriter.getAffineDimExpr(dim) - lowerExpr);
-                  ifOperands.push_back(loop.getInductionVar());
-                  ifOperands.append(lowerOperands.begin(), lowerOperands.end());
-                  dim += lowerOperands.size() + 1;
-                }
-                ifEqFlags.push_back(true);
-              }
-
-              rewriter.setInsertionPoint(read);
-              auto value = mlir::affine::AffineLoadOp::create(
-                  rewriter, read.getLoc(), bufferArg, read.getMapOperands());
-
-              if (!ifExprs.empty()) {
-                auto ifCondition = IntegerSet::get(dim, 0, ifExprs, ifEqFlags);
-                auto ifOp = AffineIfOp::create(rewriter, read.getLoc(),
-                                               ifCondition, ifOperands, false);
-                rewriter.setInsertionPointToStart(ifOp.getThenBlock());
-              }
-
-              mlir::affine::AffineStoreOp::create(rewriter, read.getLoc(),
-                                                  value, newBufferArg,
-                                                  read.getMapOperands());
-              continue;
-            }
-          }
-
-        // Otherwise an explicit copy is created from the original
-        // buffer to new buffer if the new buffer is ever read.
-        if (!readUses.empty())
-          memref::CopyOp::create(rewriter, loc, bufferArg, newBufferArg);
+        // Preserve elements that the node may read before defining them.
+        // The copy belongs at the entry, before any producer writes; placing
+        // it at a later read can overwrite a value computed earlier in the
+        // same node.
+        rewriter.setInsertionPointToStart(&initializedNode.getBody().front());
+        memref::CopyOp::create(rewriter, loc, bufferArg, newBufferArg);
       }
     }
     return success(hasChanged);

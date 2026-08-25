@@ -31,7 +31,7 @@ def build_kernel(n: int,
     `dtype` is the spectral working precision: `sar.c128` (default)
     mirrors numpy.fft's promotion in the reference implementation,
     `sar.c64` keeps the whole data path single-precision -- see
-    `benchmarks/run_precision.py` for what that trades.
+    `benchmarks/run_cpu_precision.py` for what that trades.
     """
     if dtype not in (sar.c128, sar.c64):
         raise ValueError("dtype must be sar.c128 or sar.c64")
@@ -41,6 +41,7 @@ def build_kernel(n: int,
     fa = np.fft.fftshift(np.fft.fftfreq(N, d=1.0 / p.prf))
     fr = np.fft.fftshift(np.fft.fftfreq(N, d=1.0 / p.fs))
 
+    @sar.func
     def wka(raw: sar.c64[N, N], win_r: fd[N], win_a: fd[N]) -> sar.f32[N, N]:
         data = sar.cast(raw, dtype)
 
@@ -86,8 +87,8 @@ def build_kernel(n: int,
 
         return sar.cast(sar.absolute(data), sar.f32)
 
-    wka.__name__ = name
-    return sar.func(wka)
+    wka.name = name
+    return wka
 
 
 def make_inputs(n: int, p: RadarParams):

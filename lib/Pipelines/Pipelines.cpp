@@ -28,11 +28,21 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "sar/Conversion/Passes.h"
+#include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/SAR/Transforms/Passes.h"
 
 using namespace mlir;
 
 void mlir::sar::buildSARToLinalgPipeline(OpPassManager &pm) {
+  // Normalize first: folds and rewrites such as interp1d dim = 0 must run
+  // before the signal ops are matched.
+  pm.addPass(createCanonicalizerPass());
+  // Transforms and interpolation have no linalg form -- they are not
+  // structured loop nests over a fixed index space -- so they become calls
+  // against the runtime ABI, exactly as on the CPU path. A backend consuming
+  // this level implements those calls or lowers them itself; everything else
+  // arrives as linalg on tensors.
+  pm.addPass(sar::createConvertSARSignalToRuntime());
   pm.addPass(sar::createConvertSARToLinalg());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
@@ -50,21 +60,10 @@ void mlir::sar::buildSARToLLVMPipeline(
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 
-  // Generalize before fusing: fusion rewrites `linalg.generic`, so a named
-  // op between two of them -- a broadcast of a frequency axis against the
-  // raster -- would otherwise block the chain.
+  // Expose named operations to element-wise fusion.
   pm.addPass(createLinalgGeneralizeNamedOpsPass());
 
-  // Fuse element-wise chains: long phase-computation sequences collapse
-  // into single generics, eliminating whole intermediate tensors (the
-  // dominant memory-bandwidth cost for large scenes).
-  //
-  // The SAR pass rather than the upstream one: upstream only fuses a
-  // producer with a single consumer, which leaves every value the phase
-  // expression reuses -- the broadcast frequency axes and the terms built
-  // from them -- standing as its own full-raster plane. Recomputing those
-  // costs arithmetic the machine has to spare and saves the traffic it
-  // does not.
+  // Fuse multi-consumer element-wise chains by recomputing cheap producers.
   pm.addNestedPass<func::FuncOp>(
       sar::createSARFuseElementwise({options.recomputeMinElements}));
   pm.addPass(createCanonicalizerPass());
@@ -80,6 +79,12 @@ void mlir::sar::buildSARToLLVMPipeline(
   bufferizeOptions.allowReturnAllocsFromLoops = true;
   pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
 
+  // CSE can make two result positions return the same allocation. The
+  // upstream out-param conversion erases a hoisted allocation at its first
+  // result and otherwise dereferences the duplicate. Split those results
+  // before converting the ABI.
+  pm.addNestedPass<func::FuncOp>(sar::createSARDistinctReturnBuffers());
+
   bufferization::BufferResultsToOutParamsPassOptions outParamsOptions;
   outParamsOptions.hoistStaticAllocs = true;
   // Kernel entry points are public; their results must still become
@@ -88,26 +93,17 @@ void mlir::sar::buildSARToLLVMPipeline(
   pm.addPass(
       bufferization::createBufferResultsToOutParamsPass(outParamsOptions));
 
-  // Share buffers whose lifetimes do not overlap, before deallocation turns
-  // the allocations into a fixed set.
-  // Expand the copies bufferization leaves behind before anything else
-  // reasons about the body: they are calls into a runtime the emitted
-  // kernel does not link against.
+  // Expand copies before lifetime-based buffer sharing.
   pm.addNestedPass<func::FuncOp>(sar::createSARLowerCopy());
 
-  // allow-retype is safe on the CPU path: memref.view lowers through
-  // expand-strided-metadata and finalize-memref-to-llvm without issue.
-  // It is left off on the HLS path below: the C++ emitter only understands
-  // typed arrays and has no memref.view emission.
+  // The CPU path can lower byte-backed retyped buffers through memref.view.
   pm.addNestedPass<func::FuncOp>(sar::createSARReuseBuffers(
       {options.reuseBufferMinElements, /*allowRetype=*/true}));
 
   bufferization::BufferDeallocationPipelineOptions deallocationOptions;
   bufferization::buildBufferDeallocationPipeline(pm, deallocationOptions);
 
-  // linalg -> parallel loops -> OpenMP -> LLVM dialect. Parallel dimensions
-  // become scf.parallel and are distributed over hardware threads through
-  // the OpenMP dialect (linked against LLVM's libomp).
+  // linalg -> parallel loops -> OpenMP -> LLVM dialect.
   pm.addPass(memref::createFoldMemRefAliasOpsPass());
   pm.addPass(memref::createExpandStridedMetadataPass());
   pm.addPass(createConvertLinalgToParallelLoopsPass());
@@ -115,9 +111,7 @@ void mlir::sar::buildSARToLLVMPipeline(
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createLowerAffinePass());
   pm.addPass(createConvertSCFToOpenMPPass());
-  // Inline the alloca-free memref.alloca_scope regions the OpenMP
-  // conversion introduces: reduction bodies keep inner scf.for loops whose
-  // control-flow lowering would otherwise split the single-block region.
+  // Canonicalize alloca_scope regions before control-flow lowering.
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createSCFToControlFlowPass());
   // C wrappers for public entry points only; private runtime-call
@@ -126,12 +120,7 @@ void mlir::sar::buildSARToLLVMPipeline(
   pm.addPass(createConvertComplexToLLVMPass());
   pm.addPass(createConvertMathToLLVMPass());
   pm.addPass(createArithToLLVMConversionPass());
-  // Allocate through the runtime's plane pool rather than libc. A kernel's
-  // intermediate planes are gigabytes each and are freed at the end of the
-  // call; left to libc they are unmapped, and the next call faults and
-  // zeroes every page again before it can store anything. Pooling them
-  // makes that first touch a once-per-process cost instead of a
-  // once-per-call one.
+  // Route allocations through the runtime plane pool.
   FinalizeMemRefToLLVMConversionPassOptions memrefOptions;
   memrefOptions.useGenericFunctions = true;
   pm.addPass(createFinalizeMemRefToLLVMConversionPass(memrefOptions));
@@ -149,23 +138,18 @@ void mlir::sar::buildSARToAffinePipeline(
       {options.fftStageGroup, options.fftParallelRows, options.fftIoUnroll}));
   ConvertSARInterpToAffineOptions interpOptions;
   interpOptions.enableBandedGather = options.interpEnableBandedGather;
+  interpOptions.fullRowMaxBytes = options.interpFullRowMaxBytes;
+  interpOptions.cacheCopies = options.interpCacheCopies;
+  interpOptions.completeBankMaxElements = options.interpCompleteBankMaxElements;
   pm.addPass(sar::createConvertSARInterpToAffine(interpOptions));
   pm.addPass(sar::createConvertSARToLinalg());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 
-  // Generalize before fusing: fusion rewrites `linalg.generic`, so a named
-  // op between two of them -- a broadcast of a frequency axis against the
-  // raster, which every one of these chains has -- would otherwise block
-  // the chain and materialize a full plane holding one row of values.
+  // Expose named operations to element-wise fusion.
   pm.addPass(createLinalgGeneralizeNamedOpsPass());
 
-  // Fuse element-wise chains here, while they are still on tensors: after
-  // bufferization the reused buffers alias, and the write-after-write edges
-  // hide the producer-consumer pairs fusion looks for. Each chain fused is
-  // one fewer full-raster intermediate, and on the HLS path one fewer
-  // buffer needing an interface -- which is why a full-size producer is
-  // fused however many consumers it has.
+  // Fuse before bufferization introduces aliasing edges.
   pm.addNestedPass<func::FuncOp>(
       sar::createSARFuseElementwise({options.recomputeMinElements}));
   pm.addPass(createCanonicalizerPass());
@@ -179,6 +163,8 @@ void mlir::sar::buildSARToAffinePipeline(
   // the strict yield-equivalence check rejects every tensor carry.
   bufferizeOptions.allowReturnAllocsFromLoops = true;
   pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
+
+  pm.addNestedPass<func::FuncOp>(sar::createSARDistinctReturnBuffers());
 
   bufferization::BufferResultsToOutParamsPassOptions outParamsOptions;
   outParamsOptions.hoistStaticAllocs = true;
@@ -197,36 +183,40 @@ void mlir::sar::buildSARToAffinePipeline(
   // per-iteration copy replaces the yield.
   pm.addNestedPass<func::FuncOp>(sar::createSARDemoteLoopCarries());
 
-  // Expand the copies bufferization leaves behind before anything else
-  // reasons about the body: they are calls into a runtime the emitted
-  // kernel does not link against.
+  // HLS packages cannot call the memref copy runtime.
   pm.addNestedPass<func::FuncOp>(sar::createSARLowerCopy());
-
-  // Same-type sharing only. Retyping a buffer through memref.view needs a
-  // target that addresses bytes; here a buffer becomes a typed on-chip
-  // array whose element width drives banking and partitioning, and the
-  // HLS C++ emitter rejects memref.view outright.
-  pm.addNestedPass<func::FuncOp>(sar::createSARReuseBuffers(
-      {options.reuseBufferMinElements, /*allowRetype=*/false}));
 
   pm.addPass(createConvertLinalgToAffineLoopsPass());
 
-  // Fold views into the accesses that reach through them. A view that
-  // survives is a value the dataflow backend cannot place in a task, and on
-  // any path it is a layout later passes would have to carry along; the
-  // expansion turns the ones folding alone cannot reach into plain index
-  // arithmetic first.
+  // Fold views into access indices before whole-sweep fusion. Buffer reuse is
+  // deliberately later: aliasing a later output onto an earlier input makes
+  // independent real/imaginary sweeps appear dependent and prevents the
+  // compiler from fusing their phase arithmetic or corner turns.
   pm.addPass(memref::createFoldMemRefAliasOpsPass());
   pm.addPass(createCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(sar::createAffineStoreForwardPass());
+  pm.addPass(createCanonicalizerPass());
+  if (options.fuseSiblingSweeps) {
+    pm.addNestedPass<func::FuncOp>(sar::createFuseSiblingLoopsPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+  }
 
-  // Route transposes through an on-chip block, once they are loop nests and
-  // before anything tiles them. Both sides of a corner turn then stream
-  // contiguously instead of one of them taking a memory transaction per
-  // element.
+  // Stage corner turns through an on-chip block before tiling.
   if (options.transposeBlockBytes)
     pm.addNestedPass<func::FuncOp>(
         sar::createSARStageTransposes({options.transposeBlockBytes}));
 
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
+  // HLS sharing preserves element types because storage width drives banking.
+  // It runs after fusion and transpose staging so lifetime reuse cannot hide
+  // legal fusion opportunities, and can also share non-overlapping staging
+  // blocks introduced above.
+  pm.addNestedPass<func::FuncOp>(sar::createSARReuseBuffers(
+      {options.reuseBufferMinElements, /*allowRetype=*/false}));
+  pm.addPass(memref::createFoldMemRefAliasOpsPass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 }

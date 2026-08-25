@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Independent NumPy reference for the FP32 WKA implementation.
 
-The default reduced-size run is intended for regression testing.  Full-size
-input can be checked in row ranges with --row-limit before a costly full run.
+``--row-limit`` restricts the comparison to selected rows when a complete
+production raster is unnecessary.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ R0 = np.float64(843013.994)
 KR = np.float64(-1.037e12)
 TAP_START = -3
 TAP_END = 4
-LUT_SIZE = 1024
 PULSE_LEN = np.float64(27.0e-6)
 MAX_NRMSE = 1.0e-3
 MIN_CORRELATION = 0.999
@@ -34,16 +33,6 @@ def synthetic_input(n: int) -> np.ndarray:
     phase = 0.03125 * np.mod(rows, 17) + 0.0625 * np.mod(cols, 29)
     amplitude = 0.25 + 0.05 * np.mod(rows + cols, 11)
     return (amplitude * np.exp(1j * phase)).astype(np.complex64)
-
-
-def stolt_weights() -> np.ndarray:
-    frac = np.arange(LUT_SIZE, dtype=np.float64) / LUT_SIZE
-    taps = np.arange(TAP_START, TAP_END + 1, dtype=np.float64)
-    dist = frac[:, None] - taps[None, :]
-    weight = np.sinc(dist)
-    inside = np.abs(dist) < 4.0
-    window = 0.5 + 0.5 * np.cos(np.pi * dist / 4.0)
-    return np.where(inside, weight * window, 0.0).astype(np.float32)
 
 
 def band_window(n: int, fraction: float) -> np.ndarray:
@@ -78,7 +67,6 @@ def bulk_and_stolt(data: np.ndarray,
     x = FC + fr
     shift = time_shift(n)
     range_phase = 2.0 * np.pi * fr * shift
-    weights = stolt_weights()
 
     output = np.zeros_like(data, dtype=np.complex64)
     rows_to_run = n if row_limit is None else min(n, row_limit)
@@ -100,14 +88,14 @@ def bulk_and_stolt(data: np.ndarray,
         idx_float = np.arange(n, dtype=np.float64) + delta / df_r
         idx_int = np.floor(idx_float).astype(np.int64)
         frac = idx_float - idx_int
-        lut_idx = np.clip((frac * LUT_SIZE).astype(np.int64), 0, LUT_SIZE - 1)
-
         accum = np.zeros(n, dtype=np.complex128)
-        for tap_slot, tap in enumerate(range(TAP_START, TAP_END + 1)):
+        for tap in range(TAP_START, TAP_END + 1):
             src_idx = idx_int + tap
             valid = (src_idx >= 0) & (src_idx < n)
-            accum[valid] += (source[src_idx[valid]] *
-                             weights[lut_idx[valid], tap_slot])
+            distance = frac - tap
+            weight = (np.sinc(distance) *
+                      (0.5 + 0.5 * np.cos(np.pi * distance / 4.0)))
+            accum[valid] += (source[src_idx[valid]] * weight[valid])
         output[i] = (accum * np.exp(-1j * 2.0 * np.pi * fr * shift)).astype(
             np.complex64)
     return output

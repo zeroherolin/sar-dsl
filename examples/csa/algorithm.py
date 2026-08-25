@@ -40,6 +40,7 @@ def build_kernel(n: int,
     rcmc_scale = 4.0 * math.pi * p.r0 / p.c
     az_scale = 4.0 * math.pi * p.fc / p.c
 
+    @sar.func
     def csa(raw: sar.c64[N, N], fa: fd[N], fr: fd[N], tau: fd[N], win_r: fd[N],
             win_a: fd[N]) -> sar.f32[N, N]:
         ones = sar.constant(1.0, dtype=sar.f64, shape=(N, N))
@@ -88,8 +89,8 @@ def build_kernel(n: int,
         data = sar.ifft(sar.ifftshift(data, axis=0), axis=0)
         return sar.cast(sar.absolute(data), sar.f32)
 
-    csa.__name__ = name
-    return sar.func(csa)
+    csa.name = name
+    return csa
 
 
 def make_inputs(n: int, p: RadarParams):

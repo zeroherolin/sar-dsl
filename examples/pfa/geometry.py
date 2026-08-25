@@ -2,7 +2,7 @@
 
 Wavenumbers are scaled so that one image pixel equals one scene unit:
 the rectangular target grid has spacing `2 pi / n` along both axes, and
-the polar collection grid encloses it with a small margin.
+the polar collection grid encloses it with a narrow margin.
 """
 
 from __future__ import annotations

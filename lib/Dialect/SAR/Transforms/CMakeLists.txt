@@ -1,6 +1,7 @@
 add_mlir_library(SARTransforms
   Decomplexify.cpp
   DemoteLoopCarries.cpp
+  DistinctReturnBuffers.cpp
   EmitCInterface.cpp
   FuseElementwise.cpp
   LowerCopy.cpp

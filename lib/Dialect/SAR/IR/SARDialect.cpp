@@ -1,4 +1,4 @@
-//===- SARDialect.cpp - SAR dialect and op implementations ---------------===//
+//===- SARDialect.cpp - SAR dialect and op implementations ----------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

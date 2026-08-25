@@ -17,12 +17,14 @@
 //     Y[k>0] *= exp(-+ 2 pi i p*k / n_cur)
 //
 // The generated structure is shaped for an HLS backend end to end. Lines are
-// processed in blocks of `fft-parallel-rows` lanes: a prefetch sweep copies
-// the block from the source planes into on-chip line buffers with unit-stride
-// external accesses (`fft-io-unroll` elements per beat, so the bus can widen
-// and burst), the butterfly stages run entirely on the line buffers with the
-// lane loop innermost (twiddle factors are fetched once per butterfly and
-// shared across lanes), and a mirrored write-back sweep stores the block.
+// processed in blocks of lines: a prefetch sweep copies the block from the
+// source planes into on-chip line buffers with unit-stride external accesses
+// (`fft-io-unroll` elements per beat, so the bus can widen and burst), the
+// butterfly stages run entirely on the line buffers with
+// `fft-parallel-rows` compute lanes, and a mirrored write-back sweep stores
+// the block. For a slow-axis transform, the transfer block may be wider than
+// the compute engine: sub-blocks reuse the same butterfly lanes while the
+// external sweep still fills a complete packed word.
 // Buffers carry banking hints (`hls.partition_*`) matched to the butterfly
 // and transfer strides; the CPU validation pipeline ignores them.
 //
@@ -63,6 +65,7 @@
 
 #include <cmath>
 #include <complex>
+#include <numeric>
 #include <vector>
 
 namespace mlir {
@@ -132,24 +135,28 @@ static void setPartitionHint(OpBuilder &builder, Operation *op,
   op->setAttr(kPartitionFactorsAttr, builder.getI64ArrayAttr(factors));
 }
 
-/// Creates (or reuses) the flattened per-stage Stockham twiddle tables for a
-/// transform of size `length`, returning the loaded cos/sin buffers.
+/// Creates (or reuses) one Stockham twiddle table per stage, returning the
+/// loaded cos/sin buffers. Stages execute concurrently in a dataflow design;
+/// giving each one only the entries it reads prevents Vitis from replicating
+/// the complete transform table for every reader.
 ///
 /// A radix-4 butterfly reads the three adjacent entries p*3 .. p*3+2 in one
-/// iteration, so the tables are padded to a multiple of three and hinted
-/// cyclic-3: each read lands in its own bank. The padding is never read.
-static std::pair<Value, Value>
-materializeTwiddles(PatternRewriter &rewriter, Location loc, ModuleOp module,
-                    int64_t length, FloatType elemType) {
-  // Stage t occupies [L - (L >> t), ...) with (L >> (t+1)) entries of
-  // cos/sin(2 pi p / n_cur).
-  SmallVector<double> cosTable, sinTable;
-  cosTable.reserve(length + 2);
-  sinTable.reserve(length + 2);
+/// iteration, so that stage is hinted cyclic-3: each read lands in its own
+/// bank.
+static SmallVector<PlanePair> materializeTwiddles(PatternRewriter &rewriter,
+                                                  Location loc, ModuleOp module,
+                                                  int64_t length,
+                                                  FloatType elemType) {
+  SmallVector<PlanePair> tables;
+  auto radices = radixSchedule(length);
+  tables.reserve(radices.size());
   int64_t span = 1;
-  for (int radix : radixSchedule(length)) {
+  for (auto [stage, radix] : llvm::enumerate(radices)) {
     int64_t nCur = length / span;
     int64_t butterflies = nCur / radix;
+    SmallVector<double> cosTable, sinTable;
+    cosTable.reserve(butterflies * (radix - 1));
+    sinTable.reserve(butterflies * (radix - 1));
     for (int64_t p = 0; p < butterflies; ++p)
       for (int output = 1; output < radix; ++output) {
         double angle = 2.0 * M_PI * static_cast<double>(p * output) /
@@ -157,49 +164,36 @@ materializeTwiddles(PatternRewriter &rewriter, Location loc, ModuleOp module,
         cosTable.push_back(std::cos(angle));
         sinTable.push_back(std::sin(angle));
       }
+    std::string suffix =
+        (Twine(length) + "_s" + Twine(stage) + "_" + typeSuffix(elemType))
+            .str();
+    std::string cosName = ensureConstantGlobal(
+        rewriter, module, ("__sar_fft_twiddle_cos_" + suffix), elemType,
+        cosTable);
+    std::string sinName = ensureConstantGlobal(
+        rewriter, module, ("__sar_fft_twiddle_sin_" + suffix), elemType,
+        sinTable);
+    auto twiddleType =
+        MemRefType::get({static_cast<int64_t>(cosTable.size())}, elemType);
+    auto cosBuf =
+        memref::GetGlobalOp::create(rewriter, loc, twiddleType, cosName);
+    auto sinBuf =
+        memref::GetGlobalOp::create(rewriter, loc, twiddleType, sinName);
+    // Banking pays a whole memory primitive per bank, so only production
+    // radix-4 tables large enough to amortize three banks are split.
+    if (radix == 4 && length >= 256) {
+      setPartitionHint(rewriter, cosBuf, {"cyclic"}, {3});
+      setPartitionHint(rewriter, sinBuf, {"cyclic"}, {3});
+    }
+    tables.push_back({cosBuf, sinBuf});
     span *= radix;
   }
-  assert(cosTable.size() == static_cast<size_t>(length - 1));
-  while (cosTable.size() % 3 != 0) {
-    cosTable.push_back(0.0);
-    sinTable.push_back(0.0);
-  }
-  std::string suffix = (Twine(length) + "_" + typeSuffix(elemType)).str();
-  std::string cosName = ensureConstantGlobal(
-      rewriter, module, ("__sar_fft_twiddle_cos_" + suffix), elemType,
-      cosTable);
-  std::string sinName = ensureConstantGlobal(
-      rewriter, module, ("__sar_fft_twiddle_sin_" + suffix), elemType,
-      sinTable);
-  auto twiddleType =
-      MemRefType::get({static_cast<int64_t>(cosTable.size())}, elemType);
-  auto cosBuf =
-      memref::GetGlobalOp::create(rewriter, loc, twiddleType, cosName);
-  auto sinBuf =
-      memref::GetGlobalOp::create(rewriter, loc, twiddleType, sinName);
-  // Banking pays a whole memory primitive per bank, so only tables large
-  // enough to span several primitives are worth splitting.
-  if (cosTable.size() % 3 == 0 && length >= 256) {
-    setPartitionHint(rewriter, cosBuf, {"cyclic"}, {3});
-    setPartitionHint(rewriter, sinBuf, {"cyclic"}, {3});
-  }
-  return {cosBuf, sinBuf};
+  return tables;
 }
 
-/// Returns the number of distinct scratch-buffer slots required for a
-/// `stages`-stage transform when stages are grouped into groups of
-/// `stageGroup` (0 = full unroll = one slot per intermediate stage).
-///
-/// With full unroll (stageGroup == 0), every intermediate stage writes its own
-/// buffer, giving stages-1 slots in total.
-///
-/// With stageGroup == k, stages are packed into ceil(stages/k) groups; the
-/// first stage reads the prefetched block and the last writes the write-back
-/// block, so the groups in between need ceil(stages/k) - 1 slots. Two is the
-/// floor once more than one stage writes scratch: a Stockham butterfly reads
-/// X[q + sp], X[q + s(p + m)] and writes Y[q + 2sp], Y[q + s(2p + 1)], so a
-/// stage whose source and destination were the same line would overwrite
-/// values a later iteration still has to read.
+/// Scratch slots between grouped Stockham stages. Full unroll uses one slot
+/// per intermediate stage; grouped execution uses one per internal group,
+/// with a two-slot floor to keep source and destination distinct.
 static int scratchSlots(int stages, unsigned stageGroup) {
   int intermediates = stages - 1;
   if (intermediates <= 0)
@@ -214,13 +208,22 @@ static int scratchSlots(int stages, unsigned stageGroup) {
   return slots > intermediates ? intermediates : slots;
 }
 
-/// Allocates one line-block buffer: `lanes` lines of `length` elements
-/// (rank-1 when `lanes` is one). A parallel block is hinted complete over
-/// the lane dimension -- each unrolled lane owns its banks, which no local
-/// access analysis can recover from the compact lane loop. `elemFactor`
-/// banks the element dimension cyclically for the io-unrolled transfer
-/// sweeps; only the prefetch and write-back blocks need it, so the
-/// butterfly scratch passes zero and keeps one primitive per lane.
+/// Banks a transfer block needs to sustain an `io`-wide sweep.
+///
+/// The sweep stores `io` consecutive elements per cycle, and a two-port
+/// block RAM serves two of them per bank, so `ceil(io / 2)` banks already
+/// meet the demand. Matching the bank count to `io` instead -- the obvious
+/// choice -- buys no extra throughput and splits the line into more, and
+/// therefore smaller, physical blocks: every bank occupies a whole memory
+/// primitive whatever it holds. Measured on the omega-K engine at 1024,
+/// dropping the count this way holds the transfer loops at II 1 and the
+/// design's latency within 0.24% while returning 28% of its block RAM and
+/// 37% of its UltraRAM, which the lane budget can then spend on
+/// parallelism that does convert into latency.
+static int64_t transferBanks(int64_t io) { return io > 1 ? (io + 1) / 2 : 0; }
+
+/// Allocates a line block, completely partitioned by lane. `elemFactor`
+/// optionally banks transfer buffers along the element dimension.
 static Value allocLineBuffer(PatternRewriter &rewriter, Location loc,
                              int64_t lanes, int64_t length, FloatType elemType,
                              int64_t elemFactor = 0) {
@@ -235,44 +238,46 @@ static Value allocLineBuffer(PatternRewriter &rewriter, Location loc,
   return alloc;
 }
 
-/// Emits the statically unrolled Stockham stages for one block of `lanes`
-/// lines, from the prefetched `src` block through the scratch pool into the
-/// `dst` block. All buffers are lane-major line blocks; nothing here touches
-/// the transform's external planes.
-///
-/// Each stage is a (p, q) butterfly nest with the lane loop innermost. The
-/// lane loop carries `hls.unroll_factor` instead of being cloned: the
-/// emitter prints an unroll directive, so the generated source stays one
-/// engine description however many lanes run. Twiddle factors are loaded
-/// once per butterfly, above the lane loop, and shared by every lane.
-///
-/// Each group reads the previous group's output and writes its own. Reusing
-/// two buffers in ping-pong across all stages would be smaller but turns the
-/// stage chain into a cycle in the dataflow graph -- the backend cannot order
-/// a cycle and falls back to sequential execution. Distinct group buffers keep
-/// the transform a chain.
-///
-/// The 1/L of an inverse transform rides along on the final stage's stores
-/// (`scale`), so no extra pass over the data is needed.
+/// Emits grouped Stockham stages over lane-major line blocks. The compact lane
+/// loop carries an unroll hint, twiddles are shared across lanes, and each
+/// group writes a distinct scratch slot. Inverse scaling is folded into the
+/// final stores.
 static void emitStockham(PatternRewriter &rewriter, Location loc,
                          MLIRContext *ctx, int64_t length, int64_t lanes,
                          PlanePair src, ArrayRef<PlanePair> scratch,
-                         PlanePair dst, Value cosBuf, Value sinBuf,
-                         bool inverse, Value scale, unsigned stageGroup) {
+                         PlanePair dst, ArrayRef<PlanePair> twiddles,
+                         bool inverse, Value scale, unsigned stageGroup,
+                         Value transferLaneBase = {}) {
   auto pDim = getAffineDimExpr(0, ctx);
   auto qDim = getAffineDimExpr(1, ctx);
   auto radices = radixSchedule(length);
   int stages = static_cast<int>(radices.size());
+  assert(twiddles.size() == radices.size() &&
+         "one twiddle table is required per Stockham stage");
   int slots = scratchSlots(stages, stageGroup);
   assert(scratch.size() >= static_cast<size_t>(slots) &&
          "not enough scratch lines for the chosen stage grouping");
 
   // Element maps onto the lane-major line blocks. Butterfly operands are
   // (p, q) plus, when lanes run in parallel, the innermost lane.
-  unsigned numDims = lanes > 1 ? 3 : 2;
-  auto elementMap = [&](AffineExpr elem) {
-    if (lanes > 1)
-      return AffineMap::get(numDims, 0, {getAffineDimExpr(2, ctx), elem}, ctx);
+  bool hasLaneLoop = lanes > 1;
+  unsigned numDims = 2 + hasLaneLoop + static_cast<bool>(transferLaneBase);
+  AffineExpr laneDim = hasLaneLoop ? getAffineDimExpr(2, ctx) : AffineExpr();
+  AffineExpr transferLaneDim =
+      transferLaneBase
+          ? getAffineDimExpr(2 + static_cast<unsigned>(hasLaneLoop), ctx)
+          : AffineExpr();
+  auto elementMap = [&](AffineExpr elem, bool transferBlock) {
+    if (transferBlock) {
+      assert(transferLaneBase &&
+             "a transfer sub-block needs its lane base operand");
+      AffineExpr lane = transferLaneDim;
+      if (hasLaneLoop)
+        lane = lane + laneDim;
+      return AffineMap::get(numDims, 0, {lane, elem}, ctx);
+    }
+    if (hasLaneLoop)
+      return AffineMap::get(numDims, 0, {laneDim, elem}, ctx);
     return AffineMap::get(numDims, 0, {elem}, ctx);
   };
   // Twiddle loads sit above the lane loop and depend on p alone.
@@ -282,7 +287,6 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
 
   PlanePair cur = src;
   int64_t span = 1;
-  int64_t twiddleOffset = 0;
   for (int t = 0; t < stages; ++t) {
     int radix = radices[t];
     // Round-robin over the scratch pool: full unroll makes `t % slots`
@@ -298,13 +302,15 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
     auto pLoop = affine::AffineForOp::create(rewriter, loc, 0, m);
     rewriter.setInsertionPointToStart(pLoop.getBody());
     auto qLoop = affine::AffineForOp::create(rewriter, loc, 0, span);
+    qLoop->setAttr(kMinIIAttr, rewriter.getI64IntegerAttr(2));
     rewriter.setInsertionPointToStart(qLoop.getBody());
 
     // One twiddle fetch per butterfly, shared across all lanes.
+    Value cosBuf = twiddles[t].re;
+    Value sinBuf = twiddles[t].im;
     SmallVector<Value, 3> twCos, twSin;
     for (int output = 1; output < radix; ++output) {
-      AffineExpr twiddleIndex =
-          pDim * (radix - 1) + (output - 1) + twiddleOffset;
+      AffineExpr twiddleIndex = pDim * (radix - 1) + (output - 1);
       twCos.push_back(affine::AffineLoadOp::create(
           rewriter, loc, cosBuf, twiddleMap(twiddleIndex),
           ValueRange{pLoop.getInductionVar()}));
@@ -315,12 +321,14 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
 
     SmallVector<Value> operands{pLoop.getInductionVar(),
                                 qLoop.getInductionVar()};
-    if (lanes > 1) {
+    if (hasLaneLoop) {
       auto laneLoop = affine::AffineForOp::create(rewriter, loc, 0, lanes);
       laneLoop->setAttr(kUnrollFactorAttr, rewriter.getI64IntegerAttr(lanes));
       rewriter.setInsertionPointToStart(laneLoop.getBody());
       operands.push_back(laneLoop.getInductionVar());
     }
+    if (transferLaneBase)
+      operands.push_back(transferLaneBase);
 
     auto load = [&](Value buf, AffineMap map) -> Value {
       return affine::AffineLoadOp::create(rewriter, loc, buf, map, operands);
@@ -345,8 +353,9 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
     SmallVector<Value, 4> inputRe, inputIm;
     for (int input = 0; input < radix; ++input) {
       AffineExpr index = qDim + (pDim + input * m) * span;
-      inputRe.push_back(load(cur.re, elementMap(index)));
-      inputIm.push_back(load(cur.im, elementMap(index)));
+      bool fromTransferBlock = transferLaneBase && t == 0;
+      inputRe.push_back(load(cur.re, elementMap(index, fromTransferBlock)));
+      inputIm.push_back(load(cur.im, elementMap(index, fromTransferBlock)));
     }
 
     SmallVector<Value, 4> dftRe(radix), dftIm(radix);
@@ -394,12 +403,12 @@ static void emitStockham(PatternRewriter &rewriter, Location loc,
         }
       }
       AffineExpr outputIndex = qDim + (pDim * radix + output) * span;
-      store(outRe, nxt.re, elementMap(outputIndex));
-      store(outIm, nxt.im, elementMap(outputIndex));
+      bool toTransferBlock = transferLaneBase && t == stages - 1;
+      store(outRe, nxt.re, elementMap(outputIndex, toTransferBlock));
+      store(outIm, nxt.im, elementMap(outputIndex, toTransferBlock));
     }
 
     cur = nxt;
-    twiddleOffset += m * (radix - 1);
     span *= radix;
   }
 }
@@ -508,18 +517,8 @@ struct FFTSplitToAffinePattern : OpRewritePattern<FFTSplitOp> {
   }
 
 private:
-  /// Emits one transfer sweep between the external planes and a local line
-  /// block: the prefetch (`toLocal`) or its write-back mirror.
-  ///
-  /// The loop order puts whichever index is contiguous in the external
-  /// planes innermost, statically unrolled by `io` (`hls.unroll_factor`),
-  /// so the bus sees unit-stride runs it can widen and burst:
-  ///
-  ///   dim == 1 (or rank 1): for lane { for j step io { for w unroll } }
-  ///   dim == 0:             for j { for lane unroll }
-  ///
-  /// where the external element index is contiguous in (j, w) for dim 1 and
-  /// in lane for dim 0 (adjacent lines are adjacent columns).
+  /// Transfers between external planes and a line block. Loop order and the
+  /// `io` unroll hint keep the external index contiguous for either FFT axis.
   static void emitTransfer(PatternRewriter &rewriter, Location loc,
                            MLIRContext *ctx, bool toLocal, int64_t rank,
                            int64_t dim, int64_t length, int64_t lanes,
@@ -563,17 +562,38 @@ private:
     };
 
     if (rank == 2 && dim == 0) {
-      // Columns: adjacent lanes are contiguous in external storage.
+      // Columns. What lies contiguously in external storage here is the
+      // *line* index, not the element index: consecutive lines of one block
+      // are consecutive addresses within a row. So the lane loop is the one
+      // that has to sweep whole bus words, and it carries the `io` unroll
+      // that the row case gives to the element loop.
+      //
+      // Splitting it into an outer step and an inner run of `io` is what
+      // lets the packing pass see the run: a single unrolled lane loop
+      // leaves `io` separate scalar accesses to one word, and each becomes
+      // its own read-modify-write of that word rather than one packed
+      // transfer.
       auto elemLoop = affine::AffineForOp::create(rewriter, loc, 0, length);
       rewriter.setInsertionPointToStart(elemLoop.getBody());
       operands.push_back(elemLoop.getInductionVar());
       elemExpr = getAffineDimExpr(numDims++, ctx);
       if (lanes > 1) {
-        auto laneLoop = affine::AffineForOp::create(rewriter, loc, 0, lanes);
-        laneLoop->setAttr(kUnrollFactorAttr, rewriter.getI64IntegerAttr(lanes));
+        int64_t run = std::gcd(io, lanes);
+        auto laneLoop =
+            affine::AffineForOp::create(rewriter, loc, 0, lanes, run);
         rewriter.setInsertionPointToStart(laneLoop.getBody());
         operands.push_back(laneLoop.getInductionVar());
         laneExpr = getAffineDimExpr(numDims++, ctx);
+        if (run > 1) {
+          auto beatLoop = affine::AffineForOp::create(rewriter, loc, 0, run);
+          beatLoop->setAttr(kUnrollFactorAttr, rewriter.getI64IntegerAttr(run));
+          rewriter.setInsertionPointToStart(beatLoop.getBody());
+          operands.push_back(beatLoop.getInductionVar());
+          laneExpr = laneExpr + getAffineDimExpr(numDims++, ctx);
+        } else {
+          laneLoop->setAttr(kUnrollFactorAttr,
+                            rewriter.getI64IntegerAttr(lanes));
+        }
       }
       transferBody();
       return;
@@ -600,12 +620,14 @@ private:
     transferBody();
   }
 
-  /// Direct Stockham transform over blocks of `parallelRows` lines.
+  /// Direct Stockham transform over staged blocks of lines.
   ///
-  /// Every block iteration prefetches its lines into an on-chip block,
-  /// runs the butterfly stages on chip with the lane loop innermost, and
-  /// writes the block back -- so the external planes only ever see the
-  /// unit-stride transfer sweeps.
+  /// Every block iteration prefetches its lines into an on-chip block, runs
+  /// the butterfly stages on chip with the lane loop innermost, and writes
+  /// the block back. A slow-axis transfer stages at least one packed word of
+  /// adjacent lines even when the compute engine has fewer lanes; the engine
+  /// then visits that block in sub-blocks. This preserves unit-stride AXI
+  /// sweeps without multiplying every Stockham scratch buffer.
   static void emitPowerOfTwo(PatternRewriter &rewriter, Location loc,
                              MLIRContext *ctx, ModuleOp module, int64_t length,
                              int64_t lines, int64_t rank, int64_t dim,
@@ -613,7 +635,7 @@ private:
                              bool inverse, unsigned stageGroup,
                              unsigned requestedParallelRows,
                              unsigned requestedIoUnroll) {
-    auto [cosBuf, sinBuf] =
+    auto twiddles =
         materializeTwiddles(rewriter, loc, module, length, elemType);
 
     Value scale;
@@ -626,43 +648,71 @@ private:
         std::min<int64_t>(std::max(1u, requestedParallelRows), lines);
     while (lanes > 1 && lines % lanes != 0)
       lanes >>= 1;
-    int64_t io = std::min<int64_t>(std::max(1u, requestedIoUnroll), length);
-    while (io > 1 && length % io != 0)
+    bool slowAxis = rank == 2 && dim == 0;
+    int64_t transferExtent = slowAxis ? lines : length;
+    int64_t io =
+        std::min<int64_t>(std::max(1u, requestedIoUnroll), transferExtent);
+    while (io > 1 && transferExtent % io != 0)
       io >>= 1;
+    int64_t transferLanes = slowAxis ? std::max(lanes, io) : lanes;
+    // A slow-axis transfer block spans `transferLanes` lines and the compute
+    // engine walks it `lanes` at a time, so a lane count that does not
+    // divide the block leaves a final sub-block running past its end. The
+    // autotuner only offers powers of two, where this holds already; a
+    // hand-pinned option need not, so the lanes are reduced to a divisor
+    // rather than allowed to index out of bounds.
+    while (lanes > 1 && transferLanes % lanes != 0)
+      lanes >>= 1;
 
     int stages = static_cast<int>(radixSchedule(length).size());
     int slots = scratchSlots(stages, stageGroup);
-    auto allocBlock = [&](int64_t elemFactor) -> PlanePair {
-      return {
-          allocLineBuffer(rewriter, loc, lanes, length, elemType, elemFactor),
-          allocLineBuffer(rewriter, loc, lanes, length, elemType, elemFactor)};
+    auto allocBlock = [&](int64_t blockLanes, int64_t elemFactor) -> PlanePair {
+      return {allocLineBuffer(rewriter, loc, blockLanes, length, elemType,
+                              elemFactor),
+              allocLineBuffer(rewriter, loc, blockLanes, length, elemType,
+                              elemFactor)};
     };
-    // Only the transfer blocks bank their element dimension: the io-wide
-    // sweeps store io consecutive elements per cycle. The butterfly scratch
-    // keeps one bank per lane. Its taps sit a stride apart, and that stride
-    // is a power of the radix at every stage but the last, so a cyclic
-    // factor separating one stage's taps collapses another stage's onto one
-    // bank and a block factor separates only the first stage. No static
-    // banking of a shared line buffer serves every stage; the lanes absorb
-    // the II instead.
-    PlanePair srcBlock = allocBlock(io);
-    PlanePair dstBlock = allocBlock(io);
+    // Only the transfer blocks bank their element dimension, and only as
+    // far as their sweep needs (see `transferBanks`). The butterfly scratch
+    // keeps one bank per lane: a radix-4 stage writes sixteen values per
+    // lane per iteration, so at the unrolled lane count the write demand
+    // exceeds what any cyclic factor can serve from two-port blocks -- the
+    // achieved II of 2 is that density, not a bank conflict. Measured on
+    // the omega-K engine at 1024, banking the scratch as well leaves the II
+    // unchanged and costs 28% more block RAM. The lanes absorb the II
+    // instead.
+    // A slow-axis sweep widens over adjacent lines, so complete lane banking
+    // is sufficient. Banking its element dimension as well only fragments
+    // the line storage without serving a concurrent access.
+    int64_t transferElemFactor = slowAxis ? 0 : transferBanks(io);
+    PlanePair srcBlock = allocBlock(transferLanes, transferElemFactor);
+    PlanePair dstBlock = allocBlock(transferLanes, transferElemFactor);
     SmallVector<PlanePair> scratch;
     for (int i = 0; i < slots; ++i)
-      scratch.push_back(allocBlock(0));
+      scratch.push_back(allocBlock(lanes, 0));
 
     auto blockLoop =
-        affine::AffineForOp::create(rewriter, loc, 0, lines, lanes);
+        affine::AffineForOp::create(rewriter, loc, 0, lines, transferLanes);
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(blockLoop.getBody());
     Value blockIV = blockLoop.getInductionVar();
 
-    emitTransfer(rewriter, loc, ctx, /*toLocal=*/true, rank, dim, length, lanes,
-                 io, blockIV, in, srcBlock);
-    emitStockham(rewriter, loc, ctx, length, lanes, srcBlock, scratch, dstBlock,
-                 cosBuf, sinBuf, inverse, scale, stageGroup);
+    emitTransfer(rewriter, loc, ctx, /*toLocal=*/true, rank, dim, length,
+                 transferLanes, io, blockIV, in, srcBlock);
+    if (transferLanes == lanes) {
+      emitStockham(rewriter, loc, ctx, length, lanes, srcBlock, scratch,
+                   dstBlock, twiddles, inverse, scale, stageGroup);
+    } else {
+      auto laneBlockLoop =
+          affine::AffineForOp::create(rewriter, loc, 0, transferLanes, lanes);
+      OpBuilder::InsertionGuard laneGuard(rewriter);
+      rewriter.setInsertionPointToStart(laneBlockLoop.getBody());
+      emitStockham(rewriter, loc, ctx, length, lanes, srcBlock, scratch,
+                   dstBlock, twiddles, inverse, scale, stageGroup,
+                   laneBlockLoop.getInductionVar());
+    }
     emitTransfer(rewriter, loc, ctx, /*toLocal=*/false, rank, dim, length,
-                 lanes, io, blockIV, out, dstBlock);
+                 transferLanes, io, blockIV, out, dstBlock);
   }
 
   /// Bluestein's chirp-z reduction for non-power-of-two sizes.
@@ -740,7 +790,7 @@ private:
                              ("__sar_bluestein_kernel_im_" + suffix), elemType,
                              kernelIm));
 
-    auto [cosBuf, sinBuf] =
+    auto twiddles =
         materializeTwiddles(rewriter, loc, module, padded, elemType);
 
     // Every buffer is one padded line wide: the working set is O(M), not
@@ -815,7 +865,7 @@ private:
 
     // ---- forward transform, pointwise product, inverse transform ------ //
     emitStockham(rewriter, loc, ctx, padded, /*lanes=*/1, stage, fwdScratch,
-                 spec, cosBuf, sinBuf,
+                 spec, twiddles,
                  /*inverse=*/false, /*scale=*/nullptr, stageGroup);
 
     elementLoop(0, padded, [&](ValueRange ops) {
@@ -829,7 +879,7 @@ private:
     });
 
     emitStockham(rewriter, loc, ctx, padded, /*lanes=*/1, prod, invScratch,
-                 conv, cosBuf, sinBuf,
+                 conv, twiddles,
                  /*inverse=*/true, /*scale=*/nullptr, stageGroup);
 
     // ---- post-multiply by the chirp, cropping back to n --------------- //

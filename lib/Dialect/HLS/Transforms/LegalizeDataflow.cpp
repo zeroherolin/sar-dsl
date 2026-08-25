@@ -1,4 +1,4 @@
-//===- LegalizeDataflow.cpp - legalize dataflow ---------------------------===//
+//===- LegalizeDataflow.cpp - mark the schedules a region can express -----===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -201,6 +201,16 @@ struct FuseBypassPath : public OpRewritePattern<ScheduleOp> {
 /// 2022.2 likewise rejects one AXI master read by multiple processes. Such a
 /// schedule stays sequential; nested schedules whose ports are independent
 /// remain eligible for dataflow.
+///
+/// Both halves are measured rather than assumed. Marking a top-level
+/// schedule whose arenas are shared makes Vitis refuse the design outright
+/// ("bus interface ... cannot write data in multiple processes"). Forcing
+/// the overlap one level down instead -- on the transform engine's block
+/// loop, whose stages share line buffers -- does synthesize, and costs 2.6x
+/// the latency with 1.6x the block RAM and DSP, because the stages then
+/// contend for memory ports where the sequential form simply took turns.
+/// Overlap is worth having only once the sharing that forces the
+/// serialization is undone, which is a change to the interface model.
 static bool hasSharedExternalBuffer(ScheduleOp schedule) {
   auto isShared = [](Value buffer, bool interfaceArgument) {
     if (!interfaceArgument && !isExtBuffer(buffer))

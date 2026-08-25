@@ -43,9 +43,8 @@ struct Interval {
 
 /// `positions` decomposed as `coeff * j + offset`, where `j` is the index
 /// along the resampled axis and `offset` is an interval covering everything
-/// else. Displacement `positions - j` is bounded exactly when `coeff == 1`
-/// and `offset` is bounded, in which case the displacement interval is
-/// `offset` itself.
+/// else. For a static extent, `positions - j` is bounded by combining the
+/// offset with `(coeff - 1) * [0, extent - 1]`.
 struct AffineInterval {
   /// Coefficient of the identity ramp along the resampled axis.
   double coeff = 0.0;

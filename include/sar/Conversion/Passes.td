@@ -105,9 +105,14 @@ def ConvertSARInterpToAffine
     When `--enable-banded-gather` is set (the default) and displacement-range
     analysis can prove that `|positions[i,j] - j| <= D` for compile-time D,
     each output row reads only a width-W = ceil(D_hi)-floor(D_lo)+taps band
-    of the source row (staged into a small on-chip buffer). This eliminates
-    one full-raster AXI port on the HLS path. Set `--enable-banded-gather=0`
-    to disable the optimisation and always emit the full-plane gather.
+    of the source row (staged into a small on-chip buffer). When no such bound
+    is available, or when a wider sliding band would retain a costly ring
+    dependence, `--full-row-max-bytes` permits the lowering to cache a complete
+    source row if its `--cache-copies` replicas fit that cap. Set
+    `--enable-banded-gather=0` to disable both staging forms and always emit
+    the direct full-plane gather. Bands up to
+    `--complete-bank-max-elements` are completely partitioned so dynamic taps
+    have independent ports; wider buffers use cyclic tap-count banking.
   }];
   let options = [
     Option<"enableBandedGather", "enable-banded-gather", "bool",
@@ -116,6 +121,18 @@ def ConvertSARInterpToAffine
     Option<"bandedProfitThreshold", "banded-profit-threshold", "int64_t",
            /*default=*/"2",
            "Minimum ratio N/W required before emitting the banded path">,
+    Option<"fullRowMaxBytes", "full-row-max-bytes", "uint64_t",
+           /*default=*/"0",
+           "Stage a complete source row when its split-complex buffers fit "
+           "this byte budget; 0 disables the fallback">,
+    Option<"cacheCopies", "cache-copies", "int64_t",
+           /*default=*/"1",
+           "Replicated interpolation caches used to isolate packed compute "
+           "lanes">,
+    Option<"completeBankMaxElements", "complete-bank-max-elements", "int64_t",
+           /*default=*/"16",
+           "Completely partition interpolation bands no wider than this; "
+           "larger bands use cyclic tap banking">,
   ];
   let dependentDialects = [
     "::mlir::affine::AffineDialect",

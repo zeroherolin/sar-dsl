@@ -59,7 +59,13 @@ include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
 link_directories(${LLVM_BUILD_LIBRARY_DIR})
-add_definitions(${LLVM_DEFINITIONS})
+# LLVM's release package exports the C++ ABI macro both through
+# `LLVM_DEFINITIONS` and `llvm_update_compile_flags`. Keep the shared set of
+# definitions, but let the target helper provide this macro once.
+set(_sar_llvm_definitions ${LLVM_DEFINITIONS})
+list(FILTER _sar_llvm_definitions EXCLUDE REGEX "_GLIBCXX_USE_CXX11_ABI")
+add_definitions(${_sar_llvm_definitions})
+unset(_sar_llvm_definitions)
 
 # ------------------------------------------------------------------------- #
 # Subdirectories
@@ -77,7 +83,7 @@ install(FILES include/sar/Runtime/RuntimeEnums.h
 install(FILES LICENSE
   DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/sar-dsl)
 
-option(SAR_DSL_ENABLE_TESTS "Build SAR-DSL lit tests" ON)
+option(SAR_DSL_ENABLE_TESTS "Build SAR-DSL tests" ON)
 if(SAR_DSL_ENABLE_TESTS)
   add_subdirectory(test)
 endif()

@@ -13,7 +13,9 @@
 // CHECK-DAG: memref.global "private" constant @__sar_bluestein_chirp_sin_12_f64 : memref<12xf64>
 // CHECK-DAG: memref.global "private" constant @__sar_bluestein_kernel_re_12_f64 : memref<32xf64>
 // CHECK-DAG: memref.global "private" constant @__sar_bluestein_kernel_im_12_f64 : memref<32xf64>
-// CHECK-DAG: memref.global "private" constant @__sar_fft_twiddle_cos_32_f64 : memref<33xf64>
+// CHECK-DAG: memref.global "private" constant @__sar_fft_twiddle_cos_32_s0_f64 : memref<16xf64>
+// CHECK-DAG: memref.global "private" constant @__sar_fft_twiddle_cos_32_s1_f64 : memref<12xf64>
+// CHECK-DAG: memref.global "private" constant @__sar_fft_twiddle_cos_32_s2_f64 : memref<3xf64>
 
 // CHECK-LABEL: func.func @fft_split_bluestein
 func.func @fft_split_bluestein(%re: tensor<4x12xf64>, %im: tensor<4x12xf64>)

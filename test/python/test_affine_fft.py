@@ -285,6 +285,38 @@ module {{
                                atol=1e-12)
 
 
+def test_affine_fft_slow_axis_stages_wider_than_compute_lanes(tmp_path):
+    """A packed slow-axis transfer may feed a narrower FFT engine.
+
+    The transfer block is eight adjacent columns wide while four butterfly
+    lanes visit it in two sub-blocks. This is the resource-efficient path used
+    when a complete memory beat does not fit as replicated compute hardware.
+    """
+    length, lines = 64, 8
+    mlir = f"""
+module {{
+  func.func @slow(%re: tensor<{length}x{lines}xf64>,
+                  %im: tensor<{length}x{lines}xf64>)
+      -> (tensor<{length}x{lines}xf64>, tensor<{length}x{lines}xf64>) {{
+    %r, %i = sar.fft_split %re, %im {{dim = 0 : i64}}
+        : tensor<{length}x{lines}xf64>
+    return %r, %i : tensor<{length}x{lines}xf64>,
+                    tensor<{length}x{lines}xf64>
+  }}
+}}"""
+    pipeline = ("--sar-affine-to-llvm-pipeline=fft-parallel-rows=4 "
+                "fft-io-unroll=8")
+    lib, fn = compile_split_kernel(mlir, "slow", tmp_path, pipeline=pipeline)
+    rng = np.random.default_rng(25)
+    re = rng.standard_normal((length, lines))
+    im = rng.standard_normal((length, lines))
+    out_re, out_im = run_split(fn, [re, im], [(length, lines)] * 2, np.float64)
+    np.testing.assert_allclose(out_re + 1j * out_im,
+                               np.fft.fft(re + 1j * im, axis=0),
+                               rtol=1e-12,
+                               atol=1e-12)
+
+
 @pytest.mark.parametrize("group", [0, 1, 2])
 def test_affine_bluestein_stage_group_matches_numpy(group, tmp_path):
     """Grouping also reaches the two padded transforms Bluestein runs."""

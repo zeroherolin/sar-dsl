@@ -1,12 +1,15 @@
-//===- EliminateMultiConsumer.cpp - eliminate multi consumer --------------===//
+//===- EliminateMultiConsumer.cpp - eliminate multiple consumers ----------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Utils.h"
+
+#include <limits>
 
 namespace mlir {
 namespace sar {
@@ -20,6 +23,34 @@ using namespace sar;
 using namespace hls;
 
 namespace {
+static std::optional<uint64_t> getStreamTokenCount(BlockArgument argument,
+                                                   bool writer) {
+  Operation *endpoint = nullptr;
+  for (OpOperand &use : argument.getUses()) {
+    Operation *owner = use.getOwner();
+    bool expected =
+        writer ? isa<StreamWriteOp>(owner) && use.getOperandNumber() == 0
+               : isa<StreamReadOp>(owner) && use.getOperandNumber() == 0;
+    if (!expected || endpoint)
+      return std::nullopt;
+    endpoint = owner;
+  }
+  if (!endpoint)
+    return std::nullopt;
+
+  uint64_t count = 1;
+  Operation *node = argument.getOwner()->getParentOp();
+  for (Operation *parent = endpoint->getParentOp(); parent != node;
+       parent = parent->getParentOp()) {
+    auto loop = dyn_cast_or_null<affine::AffineForOp>(parent);
+    auto tripCount = loop ? affine::getConstantTripCount(loop) : std::nullopt;
+    if (!tripCount || *tripCount > std::numeric_limits<uint64_t>::max() / count)
+      return std::nullopt;
+    count *= *tripCount;
+  }
+  return count;
+}
+
 struct InsertForkNode : public OpRewritePattern<NodeOp> {
   using OpRewritePattern<NodeOp>::OpRewritePattern;
 
@@ -55,14 +86,49 @@ struct InsertForkNode : public OpRewritePattern<NodeOp> {
       if (consumers.size() < 2)
         continue;
 
+      std::optional<uint64_t> streamTokens;
+      if (isa<StreamType>(output.getType())) {
+        unsigned outputIndex =
+            llvm::find(node.getOutputs(), output) - node.getOutputs().begin();
+        streamTokens = getStreamTokenCount(
+            node.getBody().getArgument(node.getNumInputs() + outputIndex),
+            /*writer=*/true);
+        for (NodeOp consumer : consumers) {
+          auto input = llvm::find(consumer.getInputs(), output);
+          if (input == consumer.getInputs().end()) {
+            streamTokens.reset();
+            break;
+          }
+          unsigned inputIndex = input - consumer.getInputs().begin();
+          auto count = getStreamTokenCount(
+              consumer.getBody().getArgument(inputIndex), /*writer=*/false);
+          if (!streamTokens || count != streamTokens) {
+            streamTokens.reset();
+            break;
+          }
+        }
+        // Without a static, identical token count a fork cannot know when to
+        // stop. Leave the violation for the scheduler to diagnose rather than
+        // silently duplicating only the first element.
+        if (!streamTokens)
+          continue;
+      }
+
       hasChanged = true;
       rewriter.setInsertionPointAfter(node);
       SmallVector<Value> buffers;
       SmallVector<Location> bufferLocs;
 
-      // Insert a buffer for each consumer.
+      // Insert a private channel for each consumer. Scalar streams cannot use
+      // the memref-copy fork below: a fork consumes one token and writes that
+      // same token to every output stream.
       for (auto consumer : consumers) {
-        auto buffer = BufferOp::create(rewriter, loc, output.getType());
+        Value buffer;
+        if (auto streamType = dyn_cast<StreamType>(output.getType()))
+          buffer = StreamOp::create(rewriter, loc, streamType,
+                                    streamType.getDepth());
+        else
+          buffer = BufferOp::create(rewriter, loc, output.getType());
         output.replaceUsesWithIf(
             buffer, [&](OpOperand &use) { return use.getOwner() == consumer; });
         buffers.push_back(buffer);
@@ -77,31 +143,29 @@ struct InsertForkNode : public OpRewritePattern<NodeOp> {
 
       // Create explicit copy from the original output to the buffers.
       rewriter.setInsertionPointToStart(block);
-      for (auto bufferArg : bufferArgs)
-        memref::CopyOp::create(rewriter, loc, outputArg, bufferArg);
+      if (auto streamType = dyn_cast<StreamType>(output.getType())) {
+        if (*streamTokens > 1) {
+          auto loop =
+              affine::AffineForOp::create(rewriter, loc, 0, *streamTokens);
+          rewriter.setInsertionPointToStart(loop.getBody());
+        }
+        auto value = StreamReadOp::create(
+            rewriter, loc, streamType.getElementType(), outputArg);
+        for (auto bufferArg : bufferArgs)
+          StreamWriteOp::create(rewriter, loc, bufferArg, value.getResult());
+      } else {
+        for (auto bufferArg : bufferArgs)
+          memref::CopyOp::create(rewriter, loc, outputArg, bufferArg);
+      }
     }
     return success(hasChanged);
   }
 };
 } // namespace
 
-/// A top-level input enters its schedule without a producer node, so the
-/// pattern above never forks it. Vitis binds a dual-port memory to two
-/// reader processes on its own, but a third reader has no port left and
-/// dataflow checking rejects the design (HLS 200-779). A wider fan-out
-/// therefore gets an explicit fork copying the input into per-consumer
-/// buffers, leaving the port itself with the fork as its only reader.
-///
-/// Constant tables are exempt: the emitter hoists them to file scope,
-/// where they are ROMs the tool replicates per reader by itself
-/// (measured: one instance per reading process, e.g. the omega-K
-/// twiddle tables). Forking one here would turn a single ROM into
-/// per-consumer ping-pong RAM copies plus the copy logic -- at a large
-/// FFT size that alone overruns the device. The table may reach the
-/// block through any depth of nested schedules, nodes and tasks, so
-/// the walk follows block arguments up through whatever region op
-/// forwarded them (schedules and nodes map operands to body arguments
-/// one to one; tasks carry no operands, so the walk stops there).
+/// Forks top-level inputs with more readers than a dual-port memory can serve.
+/// Constant tables remain shared because Vitis replicates their ROM readers;
+/// the walk follows forwarded block arguments to identify them.
 static bool isConstTable(Value value) {
   while (auto arg = dyn_cast<BlockArgument>(value)) {
     auto parent = arg.getOwner()->getParentOp();
@@ -130,7 +194,15 @@ static void forkWideArgFanOut(Block &block) {
       if (!llvm::is_contained(consumers, node))
         consumers.push_back(node);
     }
-    if (!onlyNodeReads || consumers.size() <= 2)
+    // Legalization rejects every external argument with more than one
+    // consumer: a single pointer cannot be read by multiple Vitis dataflow
+    // processes. Fork a read-only on-chip argument even when it has only two
+    // consumers; the old `> 2` cutoff left the common two-phase case
+    // serialized (RDA's `tau` input) and made a simpler algorithm slower than
+    // the more heavily transformed WKA chain. DRAM arguments stay excluded
+    // above because copying a full spilled plane merely to recover overlap
+    // would exceed the placement budget; those designs must remain ordered.
+    if (!onlyNodeReads || consumers.size() <= 1)
       continue;
 
     Operation *firstConsumer = consumers.front();

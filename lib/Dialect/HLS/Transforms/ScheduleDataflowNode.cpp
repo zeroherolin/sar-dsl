@@ -1,4 +1,4 @@
-//===- ScheduleDataflowNode.cpp - schedule dataflow node ------------------===//
+//===- ScheduleDataflowNode.cpp - give nodes an as-late-as-possible level -===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

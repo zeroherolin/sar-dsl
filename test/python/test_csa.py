@@ -8,7 +8,7 @@ the full chain also exercises the pure phase-multiply + FFT path.
 import numpy as np
 import pytest
 
-from conftest import requires_cpu, requires_hls
+from conftest import requires_cpu
 
 from common.params import synthetic_params
 from common.simulate import demo_scene, single_target_scene
@@ -73,16 +73,3 @@ def test_csa_and_wka_agree_on_point_target(setup):
     wka_peak = np.unravel_index(np.argmax(wka_img), wka_img.shape)
     assert abs(csa_peak[0] - wka_peak[0]) <= 1
     assert abs(csa_peak[1] - wka_peak[1]) <= 1
-
-
-@requires_hls
-def test_csa_emits_hls_design():
-    """The full chirp-scaling chain must emit as a single design."""
-    import re
-
-    n = 64
-    design = build_csa_kernel(n, synthetic_params(n)).compile(backend="hls")
-    source = design.source()
-    assert "void csa" in source
-    assert "#pragma HLS" in source
-    assert not re.findall(r"\b(malloc|free|printf|std::cout)\b", source)

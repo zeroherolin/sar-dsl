@@ -284,7 +284,8 @@ def ConstBufferOp : HLSOp<"dataflow.const_buffer", [
       DeclareOpInterfaceMethods<BufferLikeInterface>]> {
   let summary = "Represent a constant dataflow buffer";
 
-  let arguments = (ins ElementsAttr:$value);
+  let arguments = (ins ElementsAttr:$value,
+                       OptionalAttr<StrAttr>:$source_name);
   let results = (outs AnyBuffer:$memref);
   let assemblyFormat = "attr-dict `:` type($memref)";
 

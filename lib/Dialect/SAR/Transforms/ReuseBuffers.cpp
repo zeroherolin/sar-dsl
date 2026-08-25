@@ -22,6 +22,7 @@
 #include "llvm/Support/MathExtras.h"
 
 #include "sar/Dialect/SAR/Transforms/Passes.h"
+#include "sar/Support/HLSHints.h"
 
 namespace mlir {
 namespace sar {
@@ -156,6 +157,13 @@ struct SARReuseBuffers
     SmallVector<BufferLifetime> candidates;
     for (auto alloc : entry.getOps<memref::AllocOp>()) {
       auto type = alloc.getType();
+      // Banking hints describe an access contract, not merely storage
+      // placement. Keep such line/tile buffers distinct: merging them into an
+      // unhinted whole-plane slot silently drops the ports their unrolled
+      // consumers require and can move the buffer off chip later.
+      if (alloc->hasAttr(kPartitionFactorsAttr) ||
+          alloc->hasAttr(kPartitionKindsAttr))
+        continue;
       if (!type.hasStaticShape() ||
           (uint64_t)type.getNumElements() < minElements)
         continue;

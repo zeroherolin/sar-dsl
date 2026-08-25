@@ -5,32 +5,42 @@
     "shape": [16384, 16384],
     "dtype": "complex64",
     "fft_parallel_rows": 16,
-    "corner_tile_size": 256
+    "stolt_compute_lanes": 4,
+    "stolt_cache_copies": 4,
+    "corner_tile_size": 256,
+    "array_ports": 9,
+    "axi_master_bundles": 8
   },
   "constraints": {
     "part": "xcvu13p-fhgb2104-2-i",
     "clock_ns": 4.0,
     "clock_uncertainty_ns": 0.5,
-    "axi_bus_bits": 512
+    "complex_stream_bits": 512,
+    "plane_port_bits": 256,
+    "bram18k_budget": 4300,
+    "uram_budget": 1024,
+    "dsp_budget": 9830,
+    "ff_budget": 2764800,
+    "lut_budget": 1382400
   },
   "tool": {
     "name": "Vitis HLS",
     "version": "2022.2",
     "flow_target": "vivado",
-    "csynth_elapsed_s": 201.24
+    "csynth_elapsed_s": 419.16
   },
   "report": {
     "estimated_clock_ns": 3.5,
-    "latency_min_cycles": 940925067,
-    "latency_average_cycles": 1487151207,
-    "latency_max_cycles": 2033373247,
-    "interval_min_cycles": 940925068,
-    "interval_max_cycles": 2033373248,
-    "bram18k": 384,
-    "uram": 296,
-    "dsp": 1135,
-    "ff": 210325,
-    "lut": 373962,
+    "latency_min_cycles": 1350448211,
+    "latency_average_cycles": 1350448211,
+    "latency_max_cycles": 1350448211,
+    "interval_min_cycles": 1350448212,
+    "interval_max_cycles": 1350448212,
+    "bram18k": 672,
+    "uram": 848,
+    "dsp": 2860,
+    "ff": 769377,
+    "lut": 658256,
     "timing_constraint_met": true
   }
 }

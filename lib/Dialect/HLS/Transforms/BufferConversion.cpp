@@ -1,4 +1,4 @@
-//===- BufferConversion.cpp - buffer conversion ---------------------------===//
+//===- BufferConversion.cpp - buffer forms a dataflow node cannot carry ---===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -108,8 +108,8 @@ struct ConvertGetGlobalToConstBuffer
                             "initializer, which has no on-chip form"),
              failure();
     PartitionHint hint(op);
-    auto buffer =
-        rewriter.replaceOpWithNewOp<ConstBufferOp>(op, global.getType(), init);
+    auto buffer = rewriter.replaceOpWithNewOp<ConstBufferOp>(
+        op, global.getType(), init, rewriter.getStringAttr(op.getName()));
     hint.attachTo(buffer);
     return success();
   }

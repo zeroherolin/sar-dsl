@@ -115,6 +115,7 @@ def build_kernel(n: int,
         keystone = sar.interp1d(data, pos_range, axis=1)
         return sar.interp1d(keystone, pos_cross, axis=0)
 
+    @sar.func
     def pfa(data: dtype[N, N]) -> (fd[2 * N, 2 * N], fd[2 * N, 2 * N]):
         # The collection axes are fixed by the geometry the kernel was
         # built for, so they bake in as constants (like the radar
@@ -123,8 +124,8 @@ def build_kernel(n: int,
         image = compress(polar_to_rect(data, geom.theta, geom.u, geom.v))
         return abs(image), abs(sva2d(image))
 
-    pfa.__name__ = name
-    return sar.func(pfa)
+    pfa.name = name
+    return pfa
 
 
 def make_inputs(n: int, geom: Geometry):

@@ -8,9 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "generated" / "wka_luts.h"
-SIZES = (64, 256, 16384)
-LUT_SIZE = 1024
-TAPS = tuple(range(-3, 5))
+SIZES = (256, 16384)
 C0 = 299792458.0
 FC = 1269999750.06
 FS = 32000000.0
@@ -31,12 +29,6 @@ def emit_array(handle,
         handle.write("    " + ", ".join(f"{value:.9e}f"
                                         for value in chunk) + ",\n")
     handle.write("};\n\n")
-
-
-def sinc(value: float) -> float:
-    if abs(value) < 1.0e-12:
-        return 1.0
-    return math.sin(math.pi * value) / (math.pi * value)
 
 
 def band_window(n: int, fraction: float) -> list[float]:
@@ -84,29 +76,6 @@ def main() -> None:
         handle.write(
             "#else\n#error Unsupported WKA_N for generated LUTs\n#endif\n\n")
 
-        weights_by_tap: list[list[float]] = [[] for _ in TAPS]
-        for frac_index in range(LUT_SIZE):
-            frac = frac_index / LUT_SIZE
-            for tap_index, tap in enumerate(TAPS):
-                distance = frac - tap
-                if abs(distance) >= 4.0:
-                    weight = 0.0
-                else:
-                    window = 0.5 + 0.5 * math.cos(math.pi * distance / 4.0)
-                    weight = sinc(distance) * window
-                weights_by_tap[tap_index].append(weight)
-        declaration = ("static const float "
-                       f"WKA_STOLT_WEIGHT_ROM[{len(TAPS)}][{LUT_SIZE}] = {{\n")
-        handle.write(declaration)
-        for tap_values in weights_by_tap:
-            handle.write("    {\n")
-            for start in range(0, LUT_SIZE, 6):
-                chunk = tap_values[start:start + 6]
-                handle.write("        " + ", ".join(f"{value:.9e}f"
-                                                    for value in chunk) +
-                             ",\n")
-            handle.write("    },\n")
-        handle.write("};\n\n")
         handle.write("#endif\n")
     print(OUTPUT)
 

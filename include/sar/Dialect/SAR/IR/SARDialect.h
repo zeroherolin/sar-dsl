@@ -1,4 +1,4 @@
-//===- SARDialect.h - SAR dialect declaration -------------------*- C++-*-===//
+//===- SARDialect.h - SAR dialect declaration -------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

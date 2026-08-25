@@ -1,4 +1,4 @@
-//===- AffineStoreForward.cpp - affine store forward ----------------------===//
+//===- AffineStoreForward.cpp - forward stores to loads across ifs --------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -6,6 +6,7 @@
 
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Analysis/AliasAnalysis/LocalAliasAnalysis.h"
+#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/IR/Dominance.h"
@@ -25,6 +26,134 @@ using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
 using namespace sar::hls;
+
+/// Proves that no potentially aliasing `EffectType` occurs between `start` and
+/// `memOp`. Unknown effects and aliases are handled conservatively. This
+/// extends the upstream affine helper to other effect/op combinations.
+template <typename EffectType>
+static bool
+hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref,
+                       llvm::function_ref<bool(Value, Value)> mayAlias) {
+  bool hasSideEffect = false;
+
+  std::function<void(Operation *)> checkOperation = [&](Operation *op) {
+    if (hasSideEffect)
+      return;
+
+    if (auto memEffect = dyn_cast<MemoryEffectOpInterface>(op)) {
+      SmallVector<MemoryEffects::EffectInstance, 1> effects;
+      memEffect.getEffects(effects);
+
+      bool opMayHaveEffect = false;
+      for (auto effect : effects) {
+        if (isa<EffectType>(effect.getEffect())) {
+          if (effect.getValue() && effect.getValue() != memref &&
+              !mayAlias(effect.getValue(), memref))
+            continue;
+          opMayHaveEffect = true;
+          break;
+        }
+      }
+
+      if (!opMayHaveEffect)
+        return;
+
+      if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(
+              op) &&
+          isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(
+              memOp)) {
+        affine::MemRefAccess srcAccess(op);
+        affine::MemRefAccess destAccess(memOp);
+
+        if (srcAccess.memref == destAccess.memref &&
+            affine::getAffineScope(op) == affine::getAffineScope(memOp) &&
+            affine::getAffineScope(op) == affine::getAffineScope(start)) {
+          unsigned minSurroundingLoops =
+              affine::getNumCommonSurroundingLoops(*start, *memOp);
+
+          unsigned nsLoops = affine::getNumCommonSurroundingLoops(*op, *memOp);
+
+          unsigned d;
+          affine::FlatAffineValueConstraints dependenceConstraints;
+          for (d = nsLoops + 1; d > minSurroundingLoops; d--) {
+            affine::DependenceResult result =
+                affine::checkMemrefAccessDependence(
+                    srcAccess, destAccess, d, &dependenceConstraints,
+                    /*dependenceComponents=*/nullptr);
+            if (!noDependence(result)) {
+              hasSideEffect = true;
+              return;
+            }
+          }
+
+          return;
+        }
+      }
+      hasSideEffect = true;
+      return;
+    }
+
+    if (op->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          for (Operation &op : block)
+            checkOperation(&op);
+      return;
+    }
+
+    hasSideEffect = true;
+  };
+
+  auto until = [&](Operation *parent, Operation *to) {
+    assert(parent->isAncestor(to));
+    checkOperation(parent);
+  };
+
+  std::function<void(Operation *, Operation *)> recur =
+      [&](Operation *from, Operation *untilOp) {
+        assert(
+            from->getParentRegion()->isAncestor(untilOp->getParentRegion()) &&
+            "Checking for side effect between two operations without a common "
+            "ancestor");
+
+        if (from->getParentRegion() != untilOp->getParentRegion()) {
+          recur(from, untilOp->getParentOp());
+          until(untilOp->getParentOp(), untilOp);
+          return;
+        }
+
+        SmallVector<Block *, 2> todoBlocks;
+        {
+          for (auto iter = ++from->getIterator(), end = from->getBlock()->end();
+               iter != end && &*iter != untilOp; ++iter) {
+            checkOperation(&*iter);
+          }
+
+          if (untilOp->getBlock() != from->getBlock())
+            for (Block *succ : from->getBlock()->getSuccessors())
+              todoBlocks.push_back(succ);
+        }
+
+        llvm::SmallDenseSet<Block *, 4> done;
+        while (!todoBlocks.empty()) {
+          Block *blk = todoBlocks.pop_back_val();
+          if (done.count(blk))
+            continue;
+          done.insert(blk);
+          for (auto &op : *blk) {
+            if (&op == untilOp)
+              break;
+            checkOperation(&op);
+            if (&op == blk->getTerminator())
+              for (Block *succ : blk->getSuccessors())
+                todoBlocks.push_back(succ);
+          }
+        }
+      };
+
+  recur(start, memOp);
+  return !hasSideEffect;
+}
 
 /// A helper to check whether an ifOp is valid to be replaced with select.
 bool isValid(AffineIfOp ifOp, Operation *targetOp) {
@@ -128,16 +257,13 @@ forwardStoreToLoad(mlir::affine::AffineReadOpInterface loadOp,
     lastWriteStoreOp->getOpOperand(valueIdx).set(select);
     loadOp.getValue().replaceAllUsesWith(select);
 
-    // Record this to erase later.
     loadOpsToErase.push_back(loadOp);
     return newLoad;
   }
 
   // Normal case for direct forwarding.
   loadOp.getValue().replaceAllUsesWith(storeVal);
-  // Record the memref for a later sweep to optimize away.
   memrefsToErase.insert(loadOp.getMemRef());
-  // Record this to erase later.
   loadOpsToErase.push_back(loadOp);
   return mlir::affine::AffineReadOpInterface();
 }
@@ -286,32 +412,13 @@ static void loadCSE(mlir::affine::AffineReadOpInterface loadA,
 
   if (loadB) {
     loadA.getValue().replaceAllUsesWith(loadB);
-    // Record this to erase later.
     loadOpsToErase.push_back(loadA);
   }
 }
 
-// The store to load forwarding and load CSE rely on three conditions:
-//
-// 1) store/load providing a replacement value and load being replaced need to
-// have mathematically equivalent affine access functions (checked after full
-// composition of load/store operands); this implies that they access the same
-// single memref element for all iterations of the common surrounding loop,
-//
-// 2) the store/load op should dominate the load op,
-//
-// 3) no operation that may write to memory read by the load being replaced can
-// occur after executing the instruction (load or store) providing the
-// replacement value and before the load being replaced (thus potentially
-// allowing overwriting the memory read by the load).
-//
-// The above conditions are simple to check, sufficient, and powerful for most
-// cases in practice - they are sufficient, but not necessary --- since they
-// don't reason about loops that are guaranteed to execute at least once or
-// multiple sources to forward from. Likewise, store elimination is not a
-// general dead-store analysis: a store dies only when no use other than a
-// dealloc remains.
-//
+// Forward only equivalent affine accesses when the source dominates and no
+// intervening aliasing write exists. Store removal is limited to buffers with
+// no remaining use other than deallocation.
 static bool applyAffineStoreForward(func::FuncOp func) {
   DominanceInfo domInfo(func);
   PostDominanceInfo postDomInfo(func);

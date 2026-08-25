@@ -92,33 +92,18 @@ def test_emits_on_hls():
 
 
 @requires_hls
-def test_csim_matches_the_reference(tmp_path):
+def test_gather2d_hls_csim_matches_the_reference(tmp_path):
     """The split-complex lowering must be numerically right, not just
     emittable: the cpu path gathers through the complex form, so only
-    csim exercises the plane-pair form the HLS backend runs."""
-    import subprocess
-
-    from sar.compiler.toolchain import find_tool
+    C-sim through Vitis HLS exercises the plane-pair form the backend runs."""
+    from conftest import run_hls_csim
 
     data, rows, cols = _inputs()
     want = _reference(data, rows, cols, "linear", "zero")
 
-    design = _kernel("linear", "zero", "g2d_csim").compile(backend="hls")
+    design = _kernel("linear", "zero", "g2d_hls_csim").compile(backend="hls")
     design.write_testbench([data, rows, cols], [want], tmp_path, rtol=1e-10)
-    clang = find_tool("clang")
-    subprocess.run([
-        clang + "++", "-O2", "-Wno-unknown-pragmas", "-I", "stubs",
-        "g2d_csim.cpp", "g2d_csim_tb.cpp", "-o", "csim", "-pthread"
-    ],
-                   cwd=tmp_path,
-                   check=True,
-                   capture_output=True)
-    result = subprocess.run(["./csim"],
-                            cwd=tmp_path,
-                            capture_output=True,
-                            text=True)
-    assert result.returncode == 0, result.stdout
-    assert "PASS" in result.stdout
+    run_hls_csim(tmp_path, "g2d_hls_csim")
 
 
 def test_bad_arguments_are_rejected():

@@ -1,4 +1,6 @@
 // RUN: sar-opt %s --convert-sar-to-linalg | FileCheck %s
+// RUN: sar-opt %s --convert-sar-to-linalg \
+// RUN:   | FileCheck %s --check-prefix=COUNT
 
 // Reversal reaches linalg as an indexing map rather than a gather.
 // CHECK-DAG: #[[REV:.*]] = affine_map<(d0, d1) -> (d0, -d1 + 7)>
@@ -213,6 +215,57 @@ func.func @rank_filter_rank1(%x: tensor<16xf64>) -> tensor<16xf64> {
   // CHECK-DAG: arith.cmpf ole
   // CHECK-DAG: arith.select
   %0 = sar.rank_filter %x {window = 3 : i64, rank = 1 : i64, dim = 0 : i64} : tensor<16xf64>
+  return %0 : tensor<16xf64>
+}
+
+// A full sort lowers to Batcher's odd-even mergesort: one parallel sweep
+// per network stage, and nothing sequential in between. An 8-element line
+// takes 6 stages (p = 1, 2, 4 with k = p .. 1), so the whole sort is 6
+// generics -- the property that matters is that every one of them is fully
+// parallel, which is what lets the lines advance together.
+
+// CHECK-LABEL: func.func @sort_row
+// CHECK-NOT: scf.for
+// CHECK-COUNT-6: iterator_types = ["parallel", "parallel"]
+// CHECK: return
+func.func @sort_row(%x: tensor<4x8xf64>) -> tensor<4x8xf64> {
+  %0 = sar.sort %x {dim = 1 : i64} : tensor<4x8xf64>
+  return %0 : tensor<4x8xf64>
+}
+
+// The comparator schedule follows the extent, not the line count, and a
+// non-power-of-two extent is handled by the same network: partners past
+// the end simply never pair, so no padding is materialized. 5 elements
+// still take the 6 stages of the next power of two.
+
+// CHECK-LABEL: func.func @sort_rank1_odd_extent
+// CHECK-NOT: scf.for
+// CHECK-COUNT-6: iterator_types = ["parallel"]
+// CHECK: return
+func.func @sort_rank1_odd_extent(%x: tensor<5xf32>) -> tensor<5xf32> {
+  %0 = sar.sort %x {dim = 0 : i64} : tensor<5xf32>
+  return %0 : tensor<5xf32>
+}
+
+// Only the requested statistic is wanted, so the network settles its slot
+// and stops. An extremum needs one pass over the window; the median needs
+// half of them. Sorting the whole window would be 36 compare-exchanges at
+// window = 9, and the body is fully unrolled, so the difference is source
+// size and synthesis time rather than a constant factor.
+
+// COUNT-LABEL: func.func @rank_filter_extremum
+// COUNT-COUNT-8: arith.cmpf ole
+// COUNT-NOT: arith.cmpf ole
+func.func @rank_filter_extremum(%x: tensor<16xf64>) -> tensor<16xf64> {
+  %0 = sar.rank_filter %x {window = 9 : i64, rank = 0 : i64, dim = 0 : i64} : tensor<16xf64>
+  return %0 : tensor<16xf64>
+}
+
+// COUNT-LABEL: func.func @rank_filter_median
+// COUNT-COUNT-30: arith.cmpf ole
+// COUNT-NOT: arith.cmpf ole
+func.func @rank_filter_median(%x: tensor<16xf64>) -> tensor<16xf64> {
+  %0 = sar.rank_filter %x {window = 9 : i64, rank = 4 : i64, dim = 0 : i64} : tensor<16xf64>
   return %0 : tensor<16xf64>
 }
 

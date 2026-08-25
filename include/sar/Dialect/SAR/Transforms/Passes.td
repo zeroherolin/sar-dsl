@@ -88,6 +88,22 @@ def SARDemoteLoopCarries
   ];
 }
 
+def SARDistinctReturnBuffers
+    : Pass<"sar-distinct-return-buffers", "::mlir::func::FuncOp"> {
+  let summary = "Give repeated memref results distinct backing buffers";
+  let description = [{
+    Bufferization may return the same allocation in more than one result
+    position after common-subexpression elimination. The upstream
+    buffer-results-to-out-params pass hoists a returned allocation into the
+    first output argument and erases it; a second reference to that allocation
+    is then dangling. Clone repeated return operands through `memref.copy` so
+    every result owns a distinct buffer before the ABI conversion runs.
+  }];
+  let dependentDialects = [
+    "::mlir::func::FuncDialect", "::mlir::memref::MemRefDialect"
+  ];
+}
+
 def SARPrivatizeOutParams
     : Pass<"sar-privatize-out-params", "::mlir::func::FuncOp"> {
   let summary = "Compute in local buffers, write result ports once";

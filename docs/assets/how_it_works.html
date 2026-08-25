@@ -2,9 +2,9 @@
 <!-- Source of the "How it works" diagram in README.md (hand-laid-out
      HTML/CSS, 1200x900 = 4:3, white background, journal-figure styling).
      Brand marks: Python (python.org via devicon), MLIR (mlir.llvm.org),
-     LLVM dragon (simple-icons, brand color #262D3A), Vitis HLS product
-     icon (shipped with Vitis HLS 2022.2, doc/images/vitis_hls_icon.png). The README embeds the exported how_it_works.png;
-     after editing, re-export with:
+     LLVM dragon (simple-icons, brand color #262D3A), and the Vitis HLS
+     product icon (shipped with Vitis HLS 2022.2). README embeds the exported
+     how_it_works.png. After editing, re-export from this directory with:
        chrome --headless --window-size=1200,900 --force-device-scale-factor=2
               --screenshot=how_it_works.png how_it_works.html -->
 <html><head><meta charset="utf-8"><style>
@@ -141,10 +141,10 @@
   <path d="M424,720 L452,720" stroke="#212327" stroke-width="2.4" fill="none" marker-end="url(#ink)"/>
   <path d="M746,720 L774,720" stroke="#212327" stroke-width="2.4" fill="none" marker-end="url(#ink)"/>
   <!-- validation loop -->
-  <path d="M1102,524 C 1166,524 1166,570 1166,630 L1166,744 C 1166,788 1152,806 1118,814"
+  <path d="M1102,524 C 1166,524 1166,570 1166,630 L1166,744 C 1166,794 1152,812 1118,820"
         stroke="#7c8085" stroke-width="1.9" stroke-dasharray="4.5 4.5"
         fill="none" marker-end="url(#gray)"/>
-  <path d="M940,772 L940,812" stroke="#7c8085" stroke-width="1.9"
+  <path d="M940,772 L940,818" stroke="#7c8085" stroke-width="1.9"
         stroke-dasharray="4.5 4.5" fill="none" marker-end="url(#gray)"/>
 </svg>
 
@@ -224,13 +224,13 @@
 <div class="box hlsbox artifact" style="left:780px; top:670px; width:322px; height:100px;">
   <div class="t"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"
     stroke="#212327" stroke-width="1.7"><use href="#i-doc"/></svg><span class="mono">kernel.hls.cpp</span></div>
-  <div class="s">Vitis HLS C++<br/>csim testbench · csynth script</div>
+  <div class="s">Vitis HLS C++<br/>C-sim testbench · C-synth script</div>
 </div>
 
 <!-- validation bar -->
-<div class="bar" style="left:70px; top:816px; width:1060px; height:50px;">
+<div class="bar" style="left:70px; top:822px; width:1060px; height:50px;">
   closed loop — every backend replays the same golden scenes:&nbsp;
-  per-op &amp; end-to-end numerics vs the NumPy reference&nbsp;·&nbsp;generated csim testbench
+  per-op &amp; end-to-end numerics vs the NumPy reference&nbsp;·&nbsp;generated C-sim testbench
 </div>
 
 <!-- edge labels -->
@@ -239,6 +239,6 @@
 <div class="elabel" style="left:964px; top:216px;">keyed by content</div>
 <div class="elabel code" style="left:712px; top:400px;">sar-to-llvm-pipeline</div>
 <div class="elabel code" style="left:175px; top:390px;">sar-to-affine-pipeline</div>
-<div class="elabel" style="left:1166px; top:600px;">validate</div>
+<div class="elabel" style="left:1140px; top:600px;">validate</div>
 
 </body></html>

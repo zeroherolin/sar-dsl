@@ -50,6 +50,22 @@ func.func @ip(%re: tensor<{n}x{m}xf64>, %im: tensor<{n}x{m}xf64>)
 """
 
 
+def _module_2d(positions):
+    n, m = positions.shape
+    dense = "[" + ", ".join(_dense(row) for row in positions) + "]"
+    return f"""
+func.func @ip(%re: tensor<{n}x{m}xf64>, %im: tensor<{n}x{m}xf64>)
+    -> (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>) {{
+  %p = "sar.constant"() <{{value = dense<{dense}>
+      : tensor<{n}x{m}xf64>}}> : () -> tensor<{n}x{m}xf64>
+  %r, %i = sar.interp1d_split %re, %im, %p
+      : (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>)
+      -> (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>)
+  return %r, %i : tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>
+}}
+"""
+
+
 def _resolve(idx, cols, boundary):
     """The source index a tap resolves to, or None when it contributes zero."""
     if 0 <= idx < cols:
@@ -83,11 +99,71 @@ def _oracle(data, positions, taps=8, boundary="zero"):
     return out
 
 
-def _run(mlir, name, tmp_path, banded, top="ip"):
+def _run(mlir,
+         name,
+         tmp_path,
+         banded,
+         top="ip",
+         full_row_bytes=0,
+         cache_copies=1):
     pipeline = "--sar-affine-to-llvm-pipeline"
+    options = []
     if not banded:
-        pipeline += "=interp-enable-banded-gather=0"
+        options.append("interp-enable-banded-gather=0")
+    if full_row_bytes:
+        options.append(f"interp-full-row-max-bytes={full_row_bytes}")
+    if cache_copies != 1:
+        options.append(f"interp-cache-copies={cache_copies}")
+    if options:
+        pipeline += "=" + " ".join(options)
     return _compile_split_kernel(mlir, top, tmp_path / name, pipeline=pipeline)
+
+
+def _runtime_positions_module(n, m):
+    return f"""
+func.func @ip(%re: tensor<{n}x{m}xf64>, %im: tensor<{n}x{m}xf64>,
+              %pos: tensor<{n}x{m}xf64>)
+    -> (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>) {{
+  %r, %i = sar.interp1d_split %re, %im, %pos
+      : (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>)
+      -> (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>)
+  return %r, %i : tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>
+}}
+"""
+
+
+def test_full_row_cache_matches_runtime_position_gather(tmp_path):
+    """An unbounded runtime position field may use a complete row cache.
+
+    The cached and direct paths differ only in where the source sample is
+    loaded from, so they must remain bit-identical for arbitrary positions.
+    """
+    n, m = 4, 32
+    mlir = _runtime_positions_module(n, m)
+    (tmp_path / "cached").mkdir()
+    (tmp_path / "direct").mkdir()
+    _, cached = _run(mlir,
+                     "cached",
+                     tmp_path,
+                     banded=True,
+                     full_row_bytes=2 * m * 8 * 4,
+                     cache_copies=4)
+    _, direct = _run(mlir, "direct", tmp_path, banded=False)
+
+    rng = np.random.default_rng(314)
+    data = rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))
+    positions = np.empty((n, m), dtype=np.float64)
+    for row in range(n):
+        positions[row] = (np.arange(m, dtype=np.float64) +
+                          rng.uniform(-5.0, 5.0, size=m))
+    args = [
+        np.ascontiguousarray(data.real),
+        np.ascontiguousarray(data.imag), positions
+    ]
+    got_re, got_im = _run_split(cached, args, [(n, m), (n, m)], np.float64)
+    ref_re, ref_im = _run_split(direct, args, [(n, m), (n, m)], np.float64)
+    np.testing.assert_array_equal(got_re, ref_re)
+    np.testing.assert_array_equal(got_im, ref_im)
 
 
 @pytest.mark.parametrize(
@@ -108,7 +184,7 @@ def test_banded_matches_full_plane_and_oracle(tmp_path, shift_fn, label):
 
     (tmp_path / "b").mkdir()
     (tmp_path / "f").mkdir()
-    _, fn_banded = _run(mlir, "b", tmp_path, banded=True)
+    _, fn_banded = _run(mlir, "b", tmp_path, banded=True, cache_copies=4)
     _, fn_full = _run(mlir, "f", tmp_path, banded=False)
 
     rng = np.random.default_rng(42)
@@ -254,3 +330,62 @@ def test_banded_gather2d_matches_full_plane(tmp_path, row_shift):
                                   np.float64)
     np.testing.assert_array_equal(got_re, want_re)
     np.testing.assert_array_equal(got_im, want_im)
+
+
+def _gather2d_runtime_cols_module(n):
+    """A banded gather2d whose row coordinate is provably the output row and
+    whose column coordinate arrives as a kernel argument, so the test can
+    drive values no MLIR literal can spell."""
+    iota = _dense(np.arange(n, dtype=np.float64))
+    return f"""
+module {{
+  func.func @g2d(%re: tensor<{n}x{n}xf64>, %im: tensor<{n}x{n}xf64>,
+                 %cols: tensor<{n}x{n}xf64>)
+      -> (tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>) {{
+    %iota = sar.constant dense<{iota}> : tensor<{n}xf64>
+    %rows = sar.broadcast %iota {{dim = 0 : i64}}
+        : tensor<{n}xf64> -> tensor<{n}x{n}xf64>
+    %or, %oi = sar.gather2d_split %re, %im, %rows, %cols
+        {{boundary = "edge"}}
+        : (tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>,
+           tensor<{n}x{n}xf64>)
+        -> (tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>)
+    return %or, %oi : tensor<{n}x{n}xf64>, tensor<{n}x{n}xf64>
+  }}
+}}
+"""
+
+
+def test_banded_gather2d_sanitizes_unindexable_positions(tmp_path):
+    """A position that cannot become an index reads as zero, on the banded
+    path as much as the full-plane one.
+
+    `edge` clamps rather than masking, so an unsanitized floor hands the
+    garbage index to the clamp and returns a real sample -- or a NaN. Only
+    the two paths agreeing keeps one operation with one meaning.
+    """
+    n = 16
+    mlir = _gather2d_runtime_cols_module(n)
+
+    (tmp_path / "b").mkdir()
+    (tmp_path / "f").mkdir()
+    _, fn_banded = _run(mlir, "b", tmp_path, banded=True, top="g2d")
+    _, fn_full = _run(mlir, "f", tmp_path, banded=False, top="g2d")
+
+    rng = np.random.default_rng(11)
+    data = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    re = np.ascontiguousarray(data.real)
+    im = np.ascontiguousarray(data.imag)
+    cols = np.tile(np.arange(n, dtype=np.float64), (n, 1))
+    specials = [np.nan, np.inf, -np.inf, 1e300]
+    cols[0, :len(specials)] = specials
+    cols = np.ascontiguousarray(cols)
+
+    outs = [(n, n), (n, n)]
+    got_re, got_im = _run_split(fn_banded, [re, im, cols], outs, np.float64)
+    want_re, want_im = _run_split(fn_full, [re, im, cols], outs, np.float64)
+    np.testing.assert_array_equal(got_re, want_re)
+    np.testing.assert_array_equal(got_im, want_im)
+    # And the defined answer is zero, not a clamped neighbour.
+    assert np.array_equal(got_re[0, :len(specials)], np.zeros(len(specials)))
+    assert np.array_equal(got_im[0, :len(specials)], np.zeros(len(specials)))

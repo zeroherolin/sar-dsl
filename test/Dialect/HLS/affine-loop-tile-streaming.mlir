@@ -66,3 +66,27 @@ func.func @streaming_loop_is_outermost(%in: memref<64x64xf32, #hls.mem<dram>>,
   }
   return
 }
+
+// -----
+
+// Lowering-proven scheduling bounds describe point iterations and must remain
+// attached to the corresponding point loop when a surrounding band is tiled.
+
+// CHECK-LABEL: func.func @minimum_ii
+// CHECK: affine.for %{{.*}} = 0 to 8
+// CHECK: affine.for %{{.*}} = 0 to 8
+// CHECK: affine.for %{{.*}} = 0 to 8
+// CHECK: affine.for %{{.*}} = 0 to 8
+// CHECK: } {hls.min_ii = 8
+func.func @minimum_ii(%in: memref<64x64xf32>,
+                      %out: memref<64x64xf32>) {
+  affine.for %i = 0 to 64 {
+    affine.for %j = 0 to 64 {
+      %bias = affine.load %in[0, 0] : memref<64x64xf32>
+      %v = affine.load %in[%i, %j] : memref<64x64xf32>
+      %sum = arith.addf %v, %bias : f32
+      affine.store %sum, %out[%i, %j] : memref<64x64xf32>
+    } {hls.min_ii = 8 : i64}
+  }
+  return
+}

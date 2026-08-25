@@ -1,4 +1,6 @@
 // RUN: sar-opt %s --hls-func-preprocess="top-func=top" | FileCheck %s
+// RUN: sar-opt %s --hls-func-preprocess="top-func=top rewrite-ops=false" \
+// RUN:   | FileCheck %s --check-prefix=ANNOTATE
 
 // Everything downstream of preprocessing reasons in affine terms: raising the
 // memref/arith index forms the frontend leaves behind is what makes the loop
@@ -8,6 +10,11 @@
 
 // CHECK-LABEL: func.func @top
 // CHECK-SAME: attributes {top_func}
+// ANNOTATE-LABEL: func.func @top
+// ANNOTATE-SAME: attributes {top_func}
+// ANNOTATE: memref.alloca
+// ANNOTATE: memref.load
+// ANNOTATE: memref.store
 func.func @top(%in: memref<8xf32>) {
   %tmp = memref.alloca() : memref<8xf32>
   %c1 = arith.constant 1 : index
@@ -34,6 +41,8 @@ func.func @top(%in: memref<8xf32>) {
 // CHECK-LABEL: func.func @other
 // CHECK-NOT: top_func
 // CHECK: {parallel}
+// ANNOTATE-LABEL: func.func @other
+// ANNOTATE: {parallel}
 func.func @other(%m: memref<8xf32>) {
   %c = arith.constant 0.0 : f32
   affine.for %i = 0 to 8 {

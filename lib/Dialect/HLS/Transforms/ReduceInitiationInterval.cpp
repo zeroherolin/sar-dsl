@@ -1,4 +1,4 @@
-//===- ReduceInitiationInterval.cpp - shorten loop-carried chains --------===//
+//===- ReduceInitiationInterval.cpp - shorten loop-carried chains ---------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -65,33 +65,9 @@ static bool findCommutativeChain(Operation *op, AffineWriteOpInterface store,
   return false;
 }
 
-/// The transform reshapes the reduction chain from this:
-/// dst  1
-///   \ /
-///    +   2
-///     \ /
-///      +   3
-///       \ /
-///        +
-///        |
-///       src
-///
-/// To (for exact integer/index arithmetic):
-///  1   2
-///   \ /
-///    +   3
-///     \ /
-///      +  dst
-///       \ /
-///        +
-///        |
-///       src
-///
-/// In this way, the distance between the source store and destination
-/// load is effectively reduced, such that potentially the initial
-/// interval can be reduced as well. (Reshaping the chain into a balanced
-/// tree would shorten it further, at the cost of changing the summation
-/// order -- out of bounds for a pass that must keep results bit-exact.)
+/// Moves loop-invariant heads ahead of the carried value in an associative
+/// integer/index chain. This shortens the recurrence without reordering the
+/// heads or changing floating-point evaluation.
 
 /// "opsToMove" contains the operations to be moved along the "chain".
 static bool optimizeCommutativeChain(SmallVectorImpl<Operation *> &headOps,

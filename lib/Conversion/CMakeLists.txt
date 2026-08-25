@@ -1,8 +1,8 @@
 add_mlir_library(SARConversion
-  SARToLinalg/SARToLinalg.cpp
-  SARSignalToRuntime/SARSignalToRuntime.cpp
   SARFFTToAffine/SARFFTToAffine.cpp
   SARInterpToAffine/SARInterpToAffine.cpp
+  SARSignalToRuntime/SARSignalToRuntime.cpp
+  SARToLinalg/SARToLinalg.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/sar/Conversion

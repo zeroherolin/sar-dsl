@@ -1,5 +1,6 @@
 // RUN: sar-opt %s --hls-place-dataflow-buffer="threshold=4096 bram-bytes=6193152 uram-bytes=23592960 lutram-bytes=901120 lutram-max-bytes=64" | FileCheck %s
 // RUN: sar-opt %s --hls-place-dataflow-buffer="threshold=4096 bram-bytes=9216 uram-bytes=73728 lutram-bytes=0 lutram-max-bytes=64" | FileCheck %s --check-prefix=TIGHT
+// RUN: sar-opt %s --hls-place-dataflow-buffer="threshold=4096 bram-bytes=6193152 uram-bytes=23592960 lutram-bytes=901120 lutram-max-bytes=64 allow-dram=false" | FileCheck %s --check-prefix=NODRAM
 
 // The budgets are hard caps charged in whole primitives, twice per
 // dataflow buffer (Vitis double-buffers every channel); 0 forbids a
@@ -11,6 +12,7 @@
 // place-dataflow-buffer-invalid.mlir.
 
 // CHECK-LABEL: func.func @tiers
+// NODRAM-LABEL: func.func @tiers
 func.func @tiers(%v: f32) {
   // 16 x f32 = 64 B: at the lutram-max boundary, distributed RAM.
   // CHECK: hls.dataflow.buffer {depth = 1 : i32} : memref<16xf32, #hls.mem<lutram_s2p>>
@@ -21,6 +23,12 @@ func.func @tiers(%v: f32) {
   %mid = hls.dataflow.buffer {depth = 1 : i32} : memref<1024xf32>
   // 96x96 x f64 = 9216 elements >= threshold 4096: streamed from DRAM.
   // CHECK: hls.dataflow.buffer {depth = 1 : i32} : memref<96x96xf64, #hls.mem<dram>>
+  //
+  // An `ap_memory` design has no external master to stream through, so the
+  // same plane has to fit a block tier or the design is refused. The
+  // threshold does not apply when there is nowhere to put what it moves.
+  // NODRAM: hls.dataflow.buffer {depth = 1 : i32} : memref<96x96xf64, #hls.mem<uram_t2p>>
+  // NODRAM-NOT: #hls.mem<dram>
   %plane = hls.dataflow.buffer {depth = 1 : i32} : memref<96x96xf64>
   affine.for %i = 0 to 16 {
     affine.store %v, %small[%i] : memref<16xf32>

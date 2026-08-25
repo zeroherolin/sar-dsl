@@ -1,5 +1,4 @@
-//===- HLSHints.h - hint-attribute contract with the HLS backend -*- C++
-//-*-===//
+//===- HLSHints.h - HLS lowering hints --------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -23,6 +22,18 @@ namespace sar {
 /// cloned, the pipelining pass pipelines the enclosing loop, and the loop
 /// passes leave the surrounding band's shape alone.
 constexpr llvm::StringLiteral kUnrollFactorAttr{"hls.unroll_factor"};
+
+/// On an `affine.for`: a lowering-proven recurrence or memory-port lower bound
+/// for the initiation interval. Pipelining may request a slower II, never a
+/// faster one that synthesis cannot achieve.
+constexpr llvm::StringLiteral kMinIIAttr{"hls.min_ii"};
+
+/// On a loop: keep it inside the adjacent dataflow task instead of outlining
+/// it as an independent process.  Prologue loops that fill a local cache and
+/// the compute loop that consumes that cache must remain one function; a
+/// separate process would either expose scalar task results or turn the local
+/// memory into an illegal multi-process channel.
+constexpr llvm::StringLiteral kTaskBodyAttr{"hls.task_body"};
 
 /// On a `memref.alloc` (carried onto the buffer it becomes): the banking
 /// the access pattern was designed for, as parallel string/integer arrays

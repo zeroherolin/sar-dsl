@@ -139,6 +139,31 @@ func.func @split_complex(%re: memref<8x8xf64>, %im: memref<8x8xf64>,
 
 // -----
 
+// A fused consumer may write a pointwise temporary and read it immediately
+// before producing the public result. That local forwarding edge does not
+// make the corner turn cyclic and must not prevent its source planes from
+// being staged.
+
+// CHECK-LABEL: func.func @pointwise_temporary
+// CHECK-COUNT-2: memref.alloc() : memref<2x2xf64>
+func.func @pointwise_temporary(%re: memref<8x8xf64>, %im: memref<8x8xf64>,
+                               %tmp: memref<8x8xf64>,
+                               %out: memref<8x8xf64>) {
+  affine.for %i = 0 to 8 {
+    affine.for %j = 0 to 8 {
+      %a = affine.load %re[%j, %i] : memref<8x8xf64>
+      %b = affine.load %im[%j, %i] : memref<8x8xf64>
+      %sum = arith.addf %a, %b : f64
+      affine.store %sum, %tmp[%i, %j] : memref<8x8xf64>
+      %forwarded = affine.load %tmp[%i, %j] : memref<8x8xf64>
+      affine.store %forwarded, %out[%i, %j] : memref<8x8xf64>
+    }
+  }
+  return
+}
+
+// -----
+
 // A write that does not name every level of the band revisits the same
 // address across the levels it drops, so staging would let a different
 // iteration win. Such a nest is left alone.
@@ -240,4 +265,25 @@ func.func @complex_elements(%in: memref<8x8xcomplex<f32>>,
     }
   }
   return
+}
+
+// A corner turn fused with a reduction carries a value across iterations.
+// Staging rebuilds the band around a block buffer and erases the original,
+// which has no place for a carried result -- so such a nest is left alone
+// rather than reconstructed without its carry.
+
+// CHECK-LABEL: func.func @transpose_with_carry
+// CHECK-NOT: memref.alloc
+// CHECK: affine.for %{{.*}} = 0 to 8 iter_args
+func.func @transpose_with_carry(%in: memref<8x8xf32>,
+                                %out: memref<8x8xf32>) -> f32 {
+  %z = arith.constant 0.0 : f32
+  %s = affine.for %i = 0 to 8 iter_args(%a = %z) -> f32 {
+    affine.for %j = 0 to 8 {
+      %v = affine.load %in[%j, %i] : memref<8x8xf32>
+      affine.store %v, %out[%i, %j] : memref<8x8xf32>
+    }
+    affine.yield %a : f32
+  }
+  return %s : f32
 }

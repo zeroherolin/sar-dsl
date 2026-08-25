@@ -1,4 +1,4 @@
-//===- ShareEquivalentFunctions.cpp - merge reusable HLS helpers ---------===//
+//===- ShareEquivalentFunctions.cpp - merge reusable HLS helpers ----------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -84,6 +84,73 @@ static bool isEngine(func::FuncOp func) {
   return hasStorage && hasCall;
 }
 
+static SmallVector<func::CallOp> getCallSites(ModuleOp module,
+                                              func::FuncOp callee) {
+  SmallVector<func::CallOp> calls;
+  module.walk([&](func::CallOp call) {
+    if (call.getCallee() == callee.getName())
+      calls.push_back(call);
+  });
+  return calls;
+}
+
+/// A hierarchical helper connected to different memories is not the same
+/// hardware instance even when its body is structurally identical. Sharing it
+/// makes Vitis multiplex the masters at the function boundary; in particular,
+/// two otherwise unit-II tile transfers can become one arbitrated engine.
+static bool haveCompatibleMemoryBindings(ModuleOp module, func::FuncOp lhs,
+                                         func::FuncOp rhs) {
+  SmallVector<func::CallOp> calls = getCallSites(module, lhs);
+  llvm::append_range(calls, getCallSites(module, rhs));
+  if (calls.empty())
+    return true;
+
+  for (unsigned index = 0; index < lhs.getNumArguments(); ++index) {
+    Type type = lhs.getArgument(index).getType();
+    if (!isa<BaseMemRefType, hls::StreamType, hls::AxiType>(type))
+      continue;
+
+    Value binding = calls.front().getOperand(index);
+    if (llvm::any_of(ArrayRef(calls).drop_front(), [&](func::CallOp call) {
+          return call.getOperand(index) != binding;
+        }))
+      return false;
+  }
+  return true;
+}
+
+static bool callsMayOverlap(ModuleOp module, func::FuncOp callee) {
+  SmallVector<func::CallOp> calls;
+  module.walk([&](func::CallOp call) {
+    if (call.getCallee() == callee.getName())
+      calls.push_back(call);
+  });
+  bool overlap = false;
+  for (auto call : calls) {
+    auto caller = call->getParentOfType<func::FuncOp>();
+    auto directive = caller ? getFuncDirective(caller) : FuncDirectiveAttr();
+    if (directive && directive.getDataflow())
+      return true;
+
+    // Calls from separate outlined stages overlap when those stages are
+    // themselves launched by a dataflow wrapper.
+    if (!caller)
+      continue;
+    module.walk([&](func::CallOp parentCall) {
+      if (parentCall.getCallee() != caller.getName())
+        return;
+      auto parent = parentCall->getParentOfType<func::FuncOp>();
+      auto parentDirective =
+          parent ? getFuncDirective(parent) : FuncDirectiveAttr();
+      if (parentDirective && parentDirective.getDataflow())
+        overlap = true;
+    });
+    if (overlap)
+      return true;
+  }
+  return false;
+}
+
 struct ShareEquivalentFunctions
     : public sar::impl::ShareEquivalentFunctionsBase<ShareEquivalentFunctions> {
   void runOnOperation() override {
@@ -103,6 +170,9 @@ struct ShareEquivalentFunctions
           func::FuncOp canonical = functions[i];
           func::FuncOp duplicate = functions[j];
           if (!equivalentFunctions(canonical, duplicate))
+            continue;
+          if ((isEngine(canonical) || isEngine(duplicate)) &&
+              !haveCompatibleMemoryBindings(module, canonical, duplicate))
             continue;
 
           module.walk([&](func::CallOp call) {
@@ -128,7 +198,8 @@ struct ShareEquivalentFunctions
       if (calls < 2)
         continue;
       func->removeAttr("inline");
-      func->setAttr("hls.shared_instance", builder.getUnitAttr());
+      if (!callsMayOverlap(module, func))
+        func->setAttr("hls.shared_instance", builder.getUnitAttr());
     }
   }
 };

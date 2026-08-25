@@ -23,3 +23,19 @@ func.func @fft_and_interp(%data: tensor<8x16xcomplex<f32>>,
       -> tensor<8x16xcomplex<f32>>
   return %1 : tensor<8x16xcomplex<f32>>
 }
+
+// Real and imaginary corner turns fuse before lifetime-based buffer reuse can
+// alias one turn's destination onto the other's source. One two-level nest
+// carries both planes instead of two full-raster scans.
+// CHECK-LABEL: func.func @complex_transpose
+// CHECK-COUNT-2: affine.for
+// CHECK: affine.load
+// CHECK: affine.store
+// CHECK: affine.load
+// CHECK: affine.store
+func.func @complex_transpose(%data: tensor<8x16xcomplex<f32>>)
+    -> tensor<16x8xcomplex<f32>> {
+  %0 = sar.transpose %data
+      : tensor<8x16xcomplex<f32>> -> tensor<16x8xcomplex<f32>>
+  return %0 : tensor<16x8xcomplex<f32>>
+}

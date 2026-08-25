@@ -1,4 +1,4 @@
-//===- CreateAxiInterface.cpp - create axi interface ----------------------===//
+//===- CreateAxiInterface.cpp - create AXI interfaces ---------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -14,7 +14,9 @@
 #include "llvm/ADT/MapVector.h"
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
+#include <utility>
 
 namespace mlir {
 namespace sar {
@@ -31,35 +33,24 @@ using namespace hls;
 //===----------------------------------------------------------------------===//
 // Internal DRAM scratch
 //
-// A design's port list is its algorithm's I/O: the kernel's declared arguments
-// and results, and nothing the compiler added for its own convenience. Ports
-// are the contract a board integrator has to wire to physical memory channels,
-// so a compiler that mints extra masters spends a platform resource to buy
-// itself scheduling freedom.
-//
-// Buffers the compiler decides to keep off chip are internal. They are carved
-// at compile-time offsets out of scratch allocations, one per element type
-// and per group of buffers that can share a pointer -- an arena is `float *`
-// or `double *`, and one pointer cannot be both. A type with no spill
-// contributes no port at all.
-//
-// Buffers a single node reads and writes may not share an arena. Merging them
-// would hand that node one pointer it both loads from and stores to, and HLS
-// must then assume every load may alias a store still in flight: the node's
-// bus requests serialize behind their own responses and its initiation
-// interval collapses. Splitting on that conflict is what a hand-written design
-// does when it ping-pongs between a scratch plane and its output plane, and it
-// is the smallest split that keeps the arithmetic pipelined.
-//
-// Sharing within one arena costs nothing extra: buffers that no node pairs up
-// already take turns on that port's data bus, whether or not each of them had
-// a port of its own.
+// Spilled internal buffers are carved into typed arenas at aligned offsets.
+// Buffers participating in a node's writes use different arenas so AXI
+// requests can proceed concurrently; pure read fan-in remains co-located for
+// locality. Coloring reuses masters across non-overlapping nodes while the
+// configured arena limit bounds the external interface.
 //===----------------------------------------------------------------------===//
 
 namespace {
 
 /// Bytes a carved buffer starts on, so no slot straddles an AXI beat.
 constexpr uint64_t kScratchAlignBytes = 64;
+
+/// Element count below which a read-only input shares an AXI master rather
+/// than claiming one. Sized as a raster line: an axis, a window or a
+/// reference chirp is a table of that order, read a row at a time, so
+/// several fit one master without the bursts colliding. A full plane is
+/// orders of magnitude larger and gets its own.
+constexpr int64_t kSharedInputMaxElements = 1 << 16;
 
 /// One carved buffer: where its elements start in the scratch allocation.
 struct ScratchSlot {
@@ -95,6 +86,96 @@ static SmallVector<int64_t> rowMajorStrides(MemRefType type) {
 static bool isCarvable(MemRefType type) {
   return type.hasStaticShape() && type.getLayout().isIdentity() &&
          type.getElementTypeBitWidth() != 0;
+}
+
+/// Convert one proven row-major public buffer to an HLS stream.  The affine
+/// pipeline keeps stream candidates as memrefs until the interface pass so
+/// dataflow and banking can still reason about ordinary memory.  At the ABI
+/// boundary, replace the complete access chain with FIFO operations and
+/// update every callee argument reached by the chain.  The caller has already
+/// proved that there is exactly one monotonic sweep, so dropping the indices
+/// is semantics-preserving.
+static LogicalResult convertSequentialStream(Value value, StreamType streamType,
+                                             DenseSet<Value> &visited) {
+  if (!visited.insert(value).second)
+    return success();
+
+  SmallVector<OpOperand *> uses;
+  for (OpOperand &use : value.getUses())
+    uses.push_back(&use);
+
+  for (OpOperand *use : uses) {
+    Operation *owner = use->getOwner();
+    if (auto load = dyn_cast<AffineLoadOp>(owner)) {
+      if (use->getOperandNumber() != 0)
+        return failure();
+      OpBuilder builder(load);
+      Value read = StreamReadOp::create(builder, load.getLoc(),
+                                        load.getResult().getType(), value)
+                       .getResult();
+      load.getResult().replaceAllUsesWith(read);
+      load.erase();
+      continue;
+    }
+    if (auto store = dyn_cast<AffineStoreOp>(owner)) {
+      if (use->getOperandNumber() != 1)
+        return failure();
+      OpBuilder builder(store);
+      StreamWriteOp::create(builder, store.getLoc(), value,
+                            store.getValueToStore());
+      store.erase();
+      continue;
+    }
+    if (auto load = dyn_cast<memref::LoadOp>(owner)) {
+      if (use->getOperandNumber() != 0)
+        return failure();
+      OpBuilder builder(load);
+      Value read = StreamReadOp::create(builder, load.getLoc(),
+                                        load.getResult().getType(), value)
+                       .getResult();
+      load.getResult().replaceAllUsesWith(read);
+      load.erase();
+      continue;
+    }
+    if (auto store = dyn_cast<memref::StoreOp>(owner)) {
+      if (use->getOperandNumber() != 1)
+        return failure();
+      OpBuilder builder(store);
+      StreamWriteOp::create(builder, store.getLoc(), value,
+                            store.getValueToStore());
+      store.erase();
+      continue;
+    }
+    if (auto call = dyn_cast<func::CallOp>(owner)) {
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (!callee || callee.isExternal() ||
+          use->getOperandNumber() >= callee.getNumArguments())
+        return failure();
+      BlockArgument argument = callee.getArgument(use->getOperandNumber());
+      if (argument.getType() != streamType)
+        argument.setType(streamType);
+      if (failed(convertSequentialStream(argument, streamType, visited)))
+        return failure();
+      continue;
+    }
+    return failure();
+  }
+  return success();
+}
+
+static void refreshFunctionTypes(ModuleOp module, MLIRContext *context) {
+  Builder builder(context);
+  for (auto func : module.getOps<func::FuncOp>()) {
+    if (func.isExternal() || func.empty() ||
+        !func.front().mightHaveTerminator())
+      continue;
+    auto returnOp = dyn_cast<func::ReturnOp>(func.front().getTerminator());
+    if (!returnOp)
+      continue;
+    func.setType(builder.getFunctionType(func.front().getArgumentTypes(),
+                                         returnOp.getOperandTypes()));
+  }
 }
 
 /// The flat index a row-major access of `type` lands on, shifted by `offset`.
@@ -221,14 +302,14 @@ struct AccessRole {
 
 /// Records how `value` is used, following into the callees it is passed to.
 /// A use this walk does not model counts as both a read and a write, which
-/// keeps the conflict graph below conservative.
+/// keeps the conflict graph conservative without inventing alias pressure.
 static void classifyAccess(Value value, AccessRole &role,
                            DenseSet<Value> &visited) {
   if (!visited.insert(value).second)
     return;
 
-  for (auto &use : value.getUses()) {
-    auto *owner = use.getOwner();
+  for (OpOperand &use : value.getUses()) {
+    Operation *owner = use.getOwner();
     if (isa<AffineLoadOp, memref::LoadOp>(owner)) {
       role.reads = true;
     } else if (isa<AffineStoreOp, memref::StoreOp>(owner)) {
@@ -247,30 +328,107 @@ static void classifyAccess(Value value, AccessRole &role,
   }
 }
 
-/// Arenas one element type may claim. A split-complex chain ping-pongs two
-/// planes -- real and imaginary -- and each needs a side to read and a side
-/// to write, so four pointers cover the aliasing a deliverable design
-/// actually has. A denser conflict graph than that comes from chain depth
-/// rather than data layout, and buying it more ports would let a longer
-/// kernel spend memory channels its algorithm never asked for. Past the cap
-/// the extra buffers share, and the traffic they serialize is traffic one
-/// pointer would have serialized anyway.
-constexpr unsigned kMaxScratchArenasPerType = 4;
+/// Returns the outlined dataflow call that consumes a read-only public input,
+/// or null when the input is read by more than one call (or directly in the
+/// implementation). Vitis HLS 2022.2 does not permit one m_axi bundle to be
+/// read by multiple dataflow processes: it reports HLS 200-984 and refuses
+/// synthesis. Inputs consumed by the same process may still share a master,
+/// which preserves the useful channel reduction for, for example, a pair of
+/// windows used by one phase.
+static Operation *singleReadCallSite(Value value, DenseSet<Value> &visited) {
+  if (!visited.insert(value).second)
+    return nullptr;
+
+  Operation *site = nullptr;
+  for (OpOperand &use : value.getUses()) {
+    Operation *owner = use.getOwner();
+    if (auto call = dyn_cast<func::CallOp>(owner)) {
+      if (site && site != call.getOperation())
+        return nullptr;
+      site = call.getOperation();
+      continue;
+    }
+
+    // Public buffers normally reach outlined nodes directly. If a harmless
+    // forwarding op appears between the argument and that call, recurse only
+    // through its single result; unknown users are conservatively rejected so
+    // the interface pass never creates a bundle whose access shape it cannot
+    // prove safe.
+    if (isa<memref::CastOp, memref::SubViewOp, memref::ViewOp>(owner) &&
+        owner->getNumResults() == 1 && use.getOperandNumber() == 0) {
+      Operation *forwarded = singleReadCallSite(owner->getResult(0), visited);
+      if (!forwarded)
+        return nullptr;
+      if (site && site != forwarded)
+        return nullptr;
+      site = forwarded;
+      continue;
+    }
+    return nullptr;
+  }
+  return site;
+}
+
+/// Check the concrete access shape before converting a memref to a FIFO.  A
+/// stream has no address channel, so every dimension must be driven by its
+/// zero-based unit-step loop and the complete row-major extent must be
+/// consumed exactly once.
+static bool isProvablySequentialStream(Value value, bool input,
+                                       unsigned &accesses,
+                                       DenseSet<Value> &active) {
+  if (!active.insert(value).second)
+    return false;
+  bool valid = true;
+  for (OpOperand &use : value.getUses()) {
+    Operation *owner = use.getOwner();
+    if (auto call = dyn_cast<func::CallOp>(owner)) {
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (!callee || callee.isExternal() || isNestedInLoop(call) ||
+          use.getOperandNumber() >= callee.getNumArguments() ||
+          !isProvablySequentialStream(
+              callee.getArgument(use.getOperandNumber()), input, accesses,
+              active)) {
+        valid = false;
+        break;
+      }
+      continue;
+    }
+    bool expected =
+        input ? isa<AffineLoadOp>(owner) : isa<AffineStoreOp>(owner);
+    if (!expected || !isCompleteRowMajorSweep(owner, value)) {
+      valid = false;
+      break;
+    }
+    ++accesses;
+  }
+  active.erase(value);
+  return valid;
+}
+
+static bool isProvablySequentialStream(Value value, const AccessRole &role) {
+  if (role.reads == role.writes || (!role.reads && !role.writes))
+    return false;
+  unsigned accesses = 0;
+  DenseSet<Value> active;
+  return isProvablySequentialStream(value, role.reads, accesses, active) &&
+         accesses == 1;
+}
 
 /// Partitions `candidates` into arenas, returning each one's arena index.
 ///
-/// Two buffers conflict when one node reads one and writes the other: giving
-/// them the same pointer would make that node's loads and stores alias. The
-/// arena count is that conflict graph's coloring, so a chain alternating
-/// between a working plane and a result plane gets two arenas and buffers no
-/// node ever pairs up keep sharing one.
+/// A read/write pair used by one node is a conflict: a single pointer cannot
+/// carry both sides without alias serialization. Pure read/read fan-in and
+/// sequential writes may share an arena.
 ///
 /// Colors most-constrained-first. The order matters for the count, not just
 /// the assignment: taking buffers in declaration order makes a graph two
 /// arenas cover ask for three, because a buffer conflicting with everything
 /// claims a color before the pair it separates has been placed.
 static SmallVector<unsigned>
-colorScratchBanks(ArrayRef<hls::BufferLikeInterface> candidates) {
+colorScratchBanks(ArrayRef<hls::BufferLikeInterface> candidates,
+                  unsigned maxArenas, bool &overflowed,
+                  uint64_t &overflowPenalty) {
   unsigned count = candidates.size();
   SmallVector<unsigned> colors(count, 0);
   if (count < 2)
@@ -279,7 +437,7 @@ colorScratchBanks(ArrayRef<hls::BufferLikeInterface> candidates) {
   llvm::MapVector<Operation *, SmallVector<unsigned>> readers, writers;
   for (auto [index, entry] : llvm::enumerate(candidates)) {
     hls::BufferLikeInterface buffer = entry;
-    for (auto &use : buffer.getMemref().getUses()) {
+    for (OpOperand &use : buffer.getMemref().getUses()) {
       auto call = dyn_cast<func::CallOp>(use.getOwner());
       if (!call)
         continue;
@@ -312,6 +470,28 @@ colorScratchBanks(ArrayRef<hls::BufferLikeInterface> candidates) {
           conflicts[target].insert(source);
         }
   }
+  if (count <= maxArenas)
+    for (auto &[call, written] : writers)
+      for (auto [position, source] : llvm::enumerate(written))
+        for (unsigned target : ArrayRef(written).drop_front(position + 1))
+          if (source != target) {
+            conflicts[source].insert(target);
+            conflicts[target].insert(source);
+          }
+
+  // A pure producer has no read/write alias edges, but its parallel stores
+  // still benefit from every master the interface contract permits.
+  if (readers.empty() && !writers.empty() &&
+      llvm::all_of(conflicts,
+                   [](const DenseSet<unsigned> &set) { return set.empty(); })) {
+    for (unsigned index = 0; index < count; ++index)
+      colors[index] = index % maxArenas;
+    if (count > maxArenas) {
+      overflowed = true;
+      overflowPenalty = count - maxArenas;
+    }
+    return colors;
+  }
 
   SmallVector<unsigned> order(count);
   std::iota(order.begin(), order.end(), 0u);
@@ -321,18 +501,68 @@ colorScratchBanks(ArrayRef<hls::BufferLikeInterface> candidates) {
 
   SmallVector<bool> assigned(count, false);
   for (unsigned index : order) {
-    SmallVector<bool> taken(kMaxScratchArenasPerType, false);
+    SmallVector<bool> taken(maxArenas, false);
     for (unsigned neighbor : conflicts[index])
       if (assigned[neighbor])
         taken[colors[neighbor]] = true;
     unsigned color = 0;
-    while (color < kMaxScratchArenasPerType && taken[color])
+    while (color < maxArenas && taken[color])
       ++color;
-    // Every arena already conflicts with this buffer. Share the first one
-    // rather than mint a port beyond the cap.
-    colors[index] = color < kMaxScratchArenasPerType ? color : 0;
+    if (color == maxArenas) {
+      overflowed = true;
+      color = 0;
+    }
+    colors[index] = color;
     assigned[index] = true;
   }
+
+  // Also evaluate the stricter graph that separates simultaneous writers.
+  // It is profitable while only a small number of edges must be compressed;
+  // dense graphs are better served by preserving every read/write split and
+  // letting sequential writers reuse those masters.
+  SmallVector<DenseSet<unsigned>> writeConflicts = conflicts;
+  for (auto &[call, written] : writers)
+    for (auto [position, source] : llvm::enumerate(written))
+      for (unsigned target : ArrayRef(written).drop_front(position + 1))
+        if (source != target) {
+          writeConflicts[source].insert(target);
+          writeConflicts[target].insert(source);
+        }
+  SmallVector<unsigned> writeOrder(count);
+  std::iota(writeOrder.begin(), writeOrder.end(), 0u);
+  llvm::stable_sort(writeOrder, [&](unsigned lhs, unsigned rhs) {
+    return writeConflicts[lhs].size() > writeConflicts[rhs].size();
+  });
+  SmallVector<unsigned> writeColors(count, 0);
+  SmallVector<bool> writeAssigned(count, false);
+  for (unsigned index : writeOrder) {
+    SmallVector<bool> taken(maxArenas, false);
+    for (unsigned neighbor : writeConflicts[index])
+      if (writeAssigned[neighbor])
+        taken[writeColors[neighbor]] = true;
+    unsigned color = 0;
+    while (color < maxArenas && taken[color])
+      ++color;
+    writeColors[index] = color < maxArenas ? color : 0;
+    writeAssigned[index] = true;
+  }
+  uint64_t writePenalty = 0;
+  for (unsigned lhs = 0; lhs < count; ++lhs)
+    for (unsigned rhs = lhs + 1; rhs < count; ++rhs)
+      if (writeColors[lhs] == writeColors[rhs] &&
+          writeConflicts[lhs].contains(rhs))
+        ++writePenalty;
+  if (writePenalty <= 2) {
+    colors = std::move(writeColors);
+    overflowed = writePenalty != 0;
+    overflowPenalty = writePenalty;
+    return colors;
+  }
+
+  for (unsigned lhs = 0; lhs < count; ++lhs)
+    for (unsigned rhs = lhs + 1; rhs < count; ++rhs)
+      if (colors[lhs] == colors[rhs] && conflicts[lhs].contains(rhs))
+        ++overflowPenalty;
   return colors;
 }
 
@@ -403,6 +633,7 @@ createScratchBuffer(func::FuncOp func, ModuleOp module, OpBuilder &builder,
   builder.setInsertionPointToStart(&func.front());
   Value scratch = BufferOp::create(builder, func.getLoc(), scratchType,
                                    /*depth=*/1, initValue);
+  scratch.getDefiningOp()->setAttr("hls.scratch", builder.getUnitAttr());
 
   for (auto [slot, uses] : llvm::zip(slots, slotUses)) {
     redirectToScratch(uses, slot.buffer.getMemref(), scratch,
@@ -418,9 +649,11 @@ namespace {
 struct CreateAxiInterface
     : public sar::impl::CreateAxiInterfaceBase<CreateAxiInterface> {
   CreateAxiInterface() = default;
-  CreateAxiInterface(std::string hlsTopFunc, bool argStreamInterface) {
+  CreateAxiInterface(std::string hlsTopFunc, bool argStreamInterface,
+                     unsigned argMaxScratchArenas) {
     topFunc = hlsTopFunc;
     streamInterface = argStreamInterface;
+    maxScratchArenas = argMaxScratchArenas;
   }
 
   void runOnOperation() override {
@@ -432,7 +665,7 @@ struct CreateAxiInterface
     // Get the top function of the module.
     auto func = getTopFunc(module, topFunc);
     if (!func) {
-      emitError(module.getLoc(), "fail to find the top function");
+      emitError(module.getLoc(), "failed to find the top function");
       return signalPassFailure();
     }
     setTopFuncAttr(func);
@@ -468,7 +701,16 @@ struct CreateAxiInterface
     }
 
     for (auto &[elementType, candidates] : scratchBanks) {
-      auto colors = colorScratchBanks(candidates);
+      bool overflowed = false;
+      uint64_t overflowPenalty = 0;
+      auto colors = colorScratchBanks(candidates,
+                                      std::max(1u, maxScratchArenas.getValue()),
+                                      overflowed, overflowPenalty);
+      if (overflowed) {
+        func->setAttr("hls.scratch_arena_overflow", builder.getUnitAttr());
+        func->setAttr("hls.scratch_arena_penalty",
+                      builder.getI64IntegerAttr(overflowPenalty));
+      }
       unsigned arenas = 0;
       for (unsigned color : colors)
         arenas = std::max(arenas, color + 1);
@@ -545,8 +787,6 @@ struct CreateAxiInterface
       buffers.push_back(buffer.getMemref());
     }
 
-    // A helper to get AXI bundle type from a buffer.
-    //
     // Bundles are always typed by the underlying element, not the protocol:
     // the distinction between memory-mapped and streaming is expressed in
     // the emitted pragma, not in the IR type, because the verifier requires
@@ -564,18 +804,82 @@ struct CreateAxiInterface
     };
 
     // Convert collected buffers to AXI ports and collect them in "funcPorts".
-    // The list is now exactly the algorithm's I/O plus the carved scratch, and
-    // each of those gets its own master: a port that exists because the
-    // algorithm reads or writes it is one an integrator has to wire anyway,
-    // and sharing a bundle between two of them would serialize their bus
-    // requests. The system interconnect still concentrates these masters onto
-    // however many memory controllers the board has.
+    // The list is now exactly the algorithm's I/O plus the carved scratch.
+    //
+    // A master is a platform resource, so one is spent only where the design
+    // genuinely needs it. Full planes stay separate because sharing would
+    // serialize whole-pass sweeps. Small read-only tables may share when the
+    // same outlined process consumes them, which keeps the algorithm's public
+    // I/O unchanged while avoiding a needless channel. Read-only is necessary
+    // but not sufficient: Vitis 2022.2 rejects one m_axi bundle read by
+    // multiple dataflow processes. Same element type and the same outlined
+    // call are therefore required because a bundle carries one element type
+    // and one process is the only safe sharing boundary.
+    DenseMap<Operation *, DenseMap<Type, AxiBundleOp>> sharedInputBundles;
+    auto getReadShareSite = [&](Value buffer) -> Operation * {
+      if (streamInterface || buffer.getDefiningOp<BufferOp>())
+        return nullptr;
+      auto memrefType = dyn_cast<MemRefType>(buffer.getType());
+      if (!memrefType || !memrefType.hasStaticShape())
+        return nullptr;
+      if (memrefType.getNumElements() > kSharedInputMaxElements)
+        return nullptr;
+      AccessRole role;
+      DenseSet<Value> visited;
+      classifyAccess(buffer, role, visited);
+      if (!role.reads || role.writes)
+        return nullptr;
+      visited.clear();
+      return singleReadCallSite(buffer, visited);
+    };
+
     unsigned bundleIndex = 0;
     for (auto buffer : buffers) {
+      // Public stream ports use a real StreamType all the way through the
+      // implementation.  The runtime wrapper is intentionally kept in the
+      // IR, but it carries the same stream ABI and is never emitted as C++.
+      // Scratch arenas remain addressed memory: they are bidirectional and
+      // cannot satisfy a FIFO's single-consumer contract.
+      bool publicStream = streamInterface && !buffer.getDefiningOp<BufferOp>();
+      SmallVector<int64_t> streamShape;
+      if (publicStream) {
+        auto memrefType = dyn_cast<MemRefType>(buffer.getType());
+        AccessRole role;
+        DenseSet<Value> roleVisited;
+        classifyAccess(buffer, role, roleVisited);
+        if (!memrefType || !isProvablySequentialStream(buffer, role)) {
+          emitError(buffer.getLoc(),
+                    "cannot use AXI4-Stream without one complete monotonic "
+                    "row-major access sweep");
+          return signalPassFailure();
+        }
+        streamShape.assign(memrefType.getShape().begin(),
+                           memrefType.getShape().end());
+        auto streamType = StreamType::get(context, memrefType.getElementType(),
+                                          /*depth=*/2);
+        DenseSet<Value> visited;
+        buffer.setType(streamType);
+        if (failed(convertSequentialStream(buffer, streamType, visited))) {
+          emitError(buffer.getLoc(),
+                    "failed to lower the sequential AXI4-Stream access chain");
+          return signalPassFailure();
+        }
+        refreshFunctionTypes(module, context);
+      }
+
       auto bundleType = getBundleType(buffer);
       builder.setInsertionPointToStart(&func.front());
-      auto bundle = AxiBundleOp::create(builder, loc, bundleType,
-                                        "axi_" + std::to_string(bundleIndex++));
+      AxiBundleOp bundle;
+      if (Operation *shareSite = getReadShareSite(buffer)) {
+        auto &shared = sharedInputBundles[shareSite][bundleType];
+        if (!shared)
+          shared = AxiBundleOp::create(builder, loc, bundleType,
+                                       "axi_" + std::to_string(bundleIndex++));
+        bundle = shared;
+      } else {
+        bundle = AxiBundleOp::create(builder, loc, bundleType,
+                                     "axi_" + std::to_string(bundleIndex++));
+      }
       // Ports go after every bundle, so a reused bundle still dominates the
       // port that refers to it.
       builder.setInsertionPointAfter(bundle);
@@ -584,6 +888,16 @@ struct CreateAxiInterface
       auto axiPort =
           AxiPortOp::create(builder, loc, buffer.getType(), bundle,
                             func.front().addArgument(axiType, buffer.getLoc()));
+      if (publicStream) {
+        SmallVector<int64_t> shape(streamShape);
+        axiPort->setAttr("stream_shape", builder.getI64ArrayAttr(shape));
+      }
+      if (auto scratch = buffer.getDefiningOp<BufferOp>()) {
+        if (scratch->hasAttr("hls.scratch"))
+          axiPort->setAttr("hls.scratch", builder.getUnitAttr());
+        if (auto init = scratch.getInitValueAttr())
+          axiPort->setAttr("init_value", init);
+      }
       buffer.replaceUsesWithIf(
           axiPort, [&](OpOperand &use) { return use.getOwner() != axiPort; });
 
@@ -597,11 +911,14 @@ struct CreateAxiInterface
                                      func.getResultTypes(), funcPorts);
     func.setType(call.getCalleeType());
     func::ReturnOp::create(builder, loc, call.getResults());
+    refreshFunctionTypes(module, context);
   }
 };
 } // namespace
 
 std::unique_ptr<Pass> sar::createCreateAxiInterfacePass(std::string hlsTopFunc,
-                                                        bool streamInterface) {
-  return std::make_unique<CreateAxiInterface>(hlsTopFunc, streamInterface);
+                                                        bool streamInterface,
+                                                        unsigned maxArenas) {
+  return std::make_unique<CreateAxiInterface>(hlsTopFunc, streamInterface,
+                                              maxArenas);
 }

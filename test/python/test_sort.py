@@ -10,6 +10,47 @@ from conftest import requires_cpu, requires_hls
 
 
 @requires_cpu
+@pytest.mark.parametrize("extent", [1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 33, 64])
+def test_sort_is_exact_at_every_extent(extent):
+    """The network is a schedule of comparators derived from the extent, so
+    the extents that are not powers of two are the ones worth pinning: a
+    partner past the end must simply not pair, with no padding value
+    reaching the result."""
+    rows = 3
+    rng = np.random.default_rng(97 + extent)
+    data = rng.uniform(-10.0, 10.0, size=(rows, extent))
+
+    @sar.func
+    def kernel(x: sar.f64[rows, extent]) -> sar.f64[rows, extent]:
+        return sar.sort(x, axis=1)
+
+    # Bit-exact: a compare-exchange network only ever moves values, so
+    # anything short of equality would mean the schedule is wrong.
+    np.testing.assert_array_equal(kernel(data), np.sort(data, axis=1))
+
+
+@requires_cpu
+def test_sort_places_nans_like_numpy():
+    """NaNs sort to the end, as numpy does. The comparator treats a NaN
+    partner as the larger element, which is what carries them there."""
+    rng = np.random.default_rng(23)
+    data = rng.uniform(-5.0, 5.0, size=(2, 13))
+    data[0, 0] = np.nan
+    data[0, 7] = np.nan
+    data[1, 6] = np.nan
+
+    @sar.func
+    def kernel(x: sar.f64[2, 13]) -> sar.f64[2, 13]:
+        return sar.sort(x, axis=1)
+
+    result = kernel(data)
+    expected = np.sort(data, axis=1)
+    np.testing.assert_array_equal(np.isnan(result), np.isnan(expected))
+    np.testing.assert_array_equal(result[~np.isnan(result)],
+                                  expected[~np.isnan(expected)])
+
+
+@requires_cpu
 @pytest.mark.parametrize("dim", [0, 1])
 def test_sort_matches_numpy_cpu(dim):
     """Ascending sort along each axis matches numpy exactly."""
@@ -32,8 +73,8 @@ def test_sort_matches_numpy_cpu(dim):
 
 @requires_cpu
 def test_sort_preserves_interior_order_on_ties():
-    """Stable: ties keep their relative order (implementation detail: bubble
-    sort is stable)."""
+    """Equal values come out equal: ordering ties is not observable, but
+    the sorted line must still be exactly numpy's."""
     data = np.array([[3.0, 1.0, 1.0, 2.0]])
 
     @sar.func

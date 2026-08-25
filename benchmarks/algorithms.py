@@ -3,6 +3,15 @@
 Wraps each example algorithm behind one interface so the runners do not
 repeat the import and setup dance. `pfa` is a spotlight collection with
 its own geometry, hence the separate loader.
+
+The stripmap chains take a `geometry`. `synthetic` derives a
+self-consistent airborne collection in which a point target focuses to
+about one resolution cell, which is what the image-quality and accuracy
+runners measure against. `alos` is the ALOS-1 acquisition the examples
+process and the one the hand-written HLS reference implements, so it is
+what a production-scale synthesis comparison has to use: the geometry
+sets how far Stolt remapping displaces a sample, and with it whether the
+resampling reads a bounded band or a whole row.
 """
 
 from __future__ import annotations
@@ -19,15 +28,19 @@ sys.path[:0] = [str(_REPO / "python"), str(_REPO / "examples")]
 
 import sar  # noqa: E402
 
-from common.params import synthetic_params  # noqa: E402
+from common.params import alos_params, synthetic_params  # noqa: E402
 from common.simulate import single_target_scene  # noqa: E402
 
-__all__ = ["STRIPMAP", "ALL", "LABELS", "load", "focus_point_target"]
+__all__ = [
+    "STRIPMAP", "ALL", "GEOMETRIES", "LABELS", "load", "focus_point_target"
+]
 
 #: Stripmap chains sharing the RadarParams geometry.
 STRIPMAP = ("wka", "rda", "csa")
 #: Every benchmarked chain, in reporting order.
 ALL = STRIPMAP + ("pfa", )
+#: Collection geometries the stripmap chains can be built for.
+GEOMETRIES = {"synthetic": synthetic_params, "alos": alos_params}
 
 LABELS = {
     "wka": "omega-K",
@@ -77,7 +90,7 @@ def _chain(name: str, kernel, raw, inputs, run_reference) -> Chain:
                  kernel)
 
 
-def _stripmap(name: str, n: int, dtype) -> Chain:
+def _stripmap(name: str, n: int, dtype, geometry: str) -> Chain:
     processor = {
         "wka": "WKAProcessor",
         "rda": "RDAProcessor",
@@ -88,39 +101,45 @@ def _stripmap(name: str, n: int, dtype) -> Chain:
     ref = getattr(__import__(f"{name}.reference", fromlist=[processor]),
                   processor)
 
-    params = synthetic_params(n)
-    kernel = alg.build_kernel(
-        n,
-        params,
-        name=name if dtype is sar.c128 else f"{name}_c64",
-        dtype=dtype)
+    params = GEOMETRIES[geometry](n)
+    suffix = "" if dtype is sar.c128 else "_c64"
+    if geometry != "synthetic":
+        suffix += f"_{geometry}"
+    kernel = alg.build_kernel(n, params, name=f"{name}{suffix}", dtype=dtype)
     return _chain(
         name, kernel, single_target_scene(n,
                                           params), alg.make_inputs(n, params),
         lambda: ref(n, params).process(single_target_scene(n, params)))
 
 
-def _pfa(name: str, n: int, dtype) -> Chain:
+def _pfa(name: str, n: int, dtype, geometry: str) -> Chain:
     from pfa.algorithm import build_kernel, make_inputs
     from pfa.geometry import Geometry
     from pfa.reference import PFAProcessor
 
-    geometry = Geometry(n)
+    collection = Geometry(n)
     kernel = build_kernel(n,
-                          geometry,
+                          collection,
                           name=name if dtype is sar.c128 else f"{name}_c64",
                           dtype=dtype)
-    raw = geometry.simulate(geometry.demo_targets())
-    return _chain(name, kernel, raw, make_inputs(n, geometry),
-                  lambda: PFAProcessor(n, geometry).process(raw))
+    raw = collection.simulate(collection.demo_targets())
+    return _chain(name, kernel, raw, make_inputs(n, collection),
+                  lambda: PFAProcessor(n, collection).process(raw))
 
 
-def load(name: str, n: int, dtype=sar.c128) -> Chain:
+def load(name: str, n: int, dtype=sar.c128, geometry: str = "synthetic"):
     """Sets up `name` for an `n`-sized scene (polar-grid edge for PFA).
-    `dtype` selects the working precision the kernel is built with."""
+
+    `dtype` selects the working precision the kernel is built with;
+    `geometry` the stripmap collection it is built for (PFA carries its
+    own spotlight geometry and ignores it).
+    """
     if name not in ALL:
         raise ValueError(f"unknown algorithm {name!r}; known: {ALL}")
-    return (_pfa if name == "pfa" else _stripmap)(name, n, dtype)
+    if geometry not in GEOMETRIES:
+        raise ValueError(f"unknown geometry {geometry!r}; "
+                         f"known: {tuple(GEOMETRIES)}")
+    return (_pfa if name == "pfa" else _stripmap)(name, n, dtype, geometry)
 
 
 def focus_point_target(

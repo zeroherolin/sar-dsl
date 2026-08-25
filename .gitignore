@@ -37,7 +37,4 @@ examples/data/ALPSRP*
 examples/data/*.bin
 examples/*/assets/*_synthetic_*.png
 hls_project/
-vitis_hls.log
-
-# Working notes
-TODO.md
+*.log

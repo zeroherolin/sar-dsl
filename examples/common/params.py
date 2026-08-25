@@ -55,8 +55,9 @@ def alos_params(n: int) -> RadarParams:
     and is a true sub-window of the acquisition. A shorter window would
     place R0 past its own end -- the echo would miss the raster entirely
     -- so it centres R0 instead. Everything the radar itself fixes (`fc`,
-    `fs`, PRF, `Vr`, `R0`, `Kr`, `Tp`) is the acquisition's at every size,
-    which is what makes a reduced raster exercise the real geometry.
+    `fs`, PRF, `Vr`, `R0`, `Kr`, `Tp`) remain the acquisition's values at
+    every size,
+    which is what makes every selected raster exercise the real geometry.
     """
     r0_sample = ALOS_PARAMS.t_shift * ALOS_PARAMS.fs
     if r0_sample + 0.5 * ALOS_PARAMS.pulse_len * ALOS_PARAMS.fs < n:

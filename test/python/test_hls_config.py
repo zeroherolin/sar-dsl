@@ -5,6 +5,7 @@ toolchain, and the wiring, which compiles kernels and checks that the
 resolved values reach the passes.
 """
 
+import json
 import re
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 import sar
 from sar.backends.hls.config import (CONFIG_ENV_VAR, OPTIONS, HLSConfig,
                                      HLSConfigError, shipped_config_path)
+from sar.backends.hls.devices import budgets_for
 
 from conftest import requires_hls
 
@@ -64,9 +66,105 @@ def test_defaults_budget_eighty_percent_of_vu13p():
     assert config.lut == int(1728000 * 0.8)
     assert config.part == "xcvu13p-fhgb2104-2-i"
     assert config.clock_ns == 4.0
+    assert config.clock_uncertainty_percent == 12.5
+    assert config.interface == "axi"
+    assert config.effective_clock_ns() == pytest.approx(3.5)
     # The aggregate the streaming decisions reason against is the tier sum.
     assert config.on_chip_bytes() == (config.bram_bytes + config.uram_bytes +
                                       config.lutram_bytes)
+
+
+def test_shipped_defaults_are_what_the_device_table_derives():
+    """The shipped budgets and the device table must not drift apart.
+
+    The defaults describe VU13P at the same utilization `budgets_for` uses,
+    so the file is redundant with the table -- and a table entry that stops
+    reproducing it is a table entry that has gone wrong.
+    """
+    config = HLSConfig.resolve()
+    derived = budgets_for(config.part)
+    assert derived, "the shipped part must be tabulated"
+    for key, value in derived.items():
+        assert config[key] == value, key
+
+
+def test_naming_a_part_derives_every_budget_from_it():
+    """Mode 1: the device sizes the budgets, so all six follow the part."""
+    config = HLSConfig.resolve({"part": "xczu9eg-ffvb1156-2-e"})
+    assert config.bram_bytes == int(912 * 0.8) * 4608
+    assert config.dsp == int(2520 * 0.8)
+    # No UltraRAM on this device, so the tier is forbidden rather than
+    # inherited from the reference part.
+    assert config.uram_bytes == 0
+    for key in ("bram_bytes", "uram_bytes", "lutram_bytes", "dsp", "ff",
+                "lut"):
+        assert config.provenance[key] == HLSConfig.DERIVED, key
+
+
+def test_utilization_scales_what_the_part_implies():
+    """The percentage is how much of the device the design may claim; the
+    sizing itself stays the device's."""
+    full = HLSConfig.resolve({
+        "part": "xcvu13p-fhgb2104-2-i",
+        "utilization": 100
+    })
+    half = HLSConfig.resolve({
+        "part": "xcvu13p-fhgb2104-2-i",
+        "utilization": 50
+    })
+    assert full.dsp == 12288
+    assert half.dsp == 12288 // 2
+    # The shipped default is this same derivation at 80%.
+    assert HLSConfig.resolve().dsp == int(12288 * 0.8)
+
+
+def test_stated_budgets_are_used_as_written():
+    """Mode 2: six explicit numbers describe whatever device the caller has
+    in mind, and nothing rescales them."""
+    stated = {
+        "bram_bytes": 1 << 20,
+        "uram_bytes": 0,
+        "lutram_bytes": 1 << 16,
+        "dsp": 100,
+        "ff": 1000,
+        "lut": 1000,
+    }
+    config = HLSConfig.resolve(stated)
+    for key, value in stated.items():
+        assert config[key] == value
+        assert config.provenance[key] == HLSConfig.FROM_OPTIONS
+
+
+def test_naming_a_part_and_a_budget_together_is_refused():
+    """The two modes are alternatives, not a ranking.
+
+    A part says the budgets are the device's and a budget says they are the
+    caller's; honouring one of the two would plan against a device that is
+    partly each, which is the mismatch this resolution prevents.
+    """
+    with pytest.raises(HLSConfigError, match="two ways to say the same"):
+        HLSConfig.resolve({"part": "xczu9eg-ffvb1156-2-e", "bram_bytes": 4096})
+
+
+def test_utilization_without_a_part_is_refused():
+    """A percentage scales the budgets a device implies, so it needs one."""
+    with pytest.raises(HLSConfigError, match="without a 'part'"):
+        HLSConfig.resolve({"utilization": 50})
+
+
+def test_an_untabulated_part_names_the_alternative():
+    """Nothing can size an unknown device, so asking for mode 1 with one is
+    an error that points at mode 2 rather than a silent fallback."""
+    with pytest.raises(HLSConfigError, match="not in the device table"):
+        HLSConfig.resolve({"part": "xcvu5p-flva2104-1-e"})
+
+
+def test_the_shipped_defaults_need_no_options_at_all():
+    """With neither mode used, `hls_config.yaml` stands on its own."""
+    config = HLSConfig.resolve()
+    for key in ("bram_bytes", "uram_bytes", "lutram_bytes", "dsp", "ff",
+                "lut"):
+        assert config.provenance[key] == str(shipped_config_path()), key
 
 
 def test_resolved_config_reads_as_a_mapping():
@@ -180,6 +278,9 @@ def test_unknown_key_in_a_config_file_names_the_file(tmp_path):
     ({
         "clock_ns": 0.5
     }, "must be at least 1"),
+    ({
+        "clock_uncertainty_percent": 51
+    }, "must be at most 50"),
 ])
 def test_out_of_range_values_are_rejected(options, expected):
     with pytest.raises(HLSConfigError, match=expected):
@@ -383,6 +484,10 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
                       "array_partition_max_factor": 8,
                       "fft_stage_group": 2,
                       "interp_banded_gather": False,
+                      "interp_full_row_max_bytes": 131072,
+                      "interp_cache_copies": 2,
+                      "interp_complete_bank_max_elements": 64,
+                      "fuse_sibling_sweeps": False,
                       "reuse_buffer_min_elements": 7,
                       "recompute_min_elements": 9,
                       "external_buffer_threshold": 11,
@@ -396,6 +501,10 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
     assert "reuse-buffer-min-elements=7" in lower
     assert "recompute-min-elements=9" in lower
     assert "interp-enable-banded-gather=false" in lower
+    assert "interp-full-row-max-bytes=131072" in lower
+    assert "interp-cache-copies=2" in lower
+    assert "interp-complete-bank-max-elements=64" in lower
+    assert "fuse-sibling-sweeps=false" in lower
     assert "fft-stage-group=2" in lower
     assert "fft-parallel-rows=8" in lower
     # The cap cannot fund one 4 KiB staging block after reserving room for
@@ -408,8 +517,12 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
     assert "uram-bytes=4096" in hls
     assert "lutram-bytes=0" in hls
     assert "axi-interface=true" in hls
-    assert "external-vector-max-lanes=8" in hls
+    assert "external-vector-max-lanes=16" in hls
     assert "external-vector-min-elements=4096" in hls
+    assert "external-vector-pack-outputs=true" in hls
+    assert "external-vector-compute-lanes=16" in hls
+    assert "max-unrolled-ops=4096" in hls
+    assert "max-unroll-factor=32" in hls
     assert "external-buffer-threshold=11" in hls
     # The LUT-bank threshold is derived rather than frozen as a pass
     # default, and arrives in bytes: one bus beat (512/8).
@@ -450,6 +563,38 @@ def test_top_func_names_the_emitted_function():
     design = scale.compile(backend="hls", options={"top_func": "custom_top"})
     assert design.name == "custom_top"
     assert "void custom_top" in design.source()
+
+
+@requires_hls
+def test_clock_uncertainty_reaches_the_plan_and_tcl(tmp_path):
+
+    @sar.func
+    def scale(x: sar.f32[8]) -> sar.f32[8]:
+        return x * 2.0
+
+    design = scale.compile(backend="hls",
+                           options={"clock_uncertainty_percent": 20})
+    assert design.config.effective_clock_ns() == pytest.approx(3.2)
+    script = design.write_synthesis_script(tmp_path)
+    assert "set_clock_uncertainty 20%" in script.read_text()
+    recorded = json.loads((tmp_path / "design_manifest.json").read_text())
+    assert recorded["optimization_plan"]["timing_budget_ns"] == pytest.approx(
+        3.2)
+
+
+@requires_hls
+def test_hdl_keyword_top_name_is_normalized(tmp_path):
+    """A C++-legal HDL keyword must not survive into Vitis `set_top`."""
+
+    @sar.func
+    def scale(x: sar.f32[8]) -> sar.f32[8]:
+        return x * 2.0
+
+    design = scale.compile(backend="hls", options={"top_func": "shared"})
+    assert design.name == "sar_shared"
+    assert "void sar_shared(" in design.source()
+    script = design.write_synthesis_script(tmp_path).read_text()
+    assert "set_top sar_shared" in script
 
 
 @requires_hls

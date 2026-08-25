@@ -1,4 +1,4 @@
-//===- SimplifyCopy.cpp - simplify copy -----------------------------------===//
+//===- SimplifyCopy.cpp - drop copies nothing observes --------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -44,7 +44,7 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
     // return failure.
     auto sourceType = cast<MemRefType>(copy.getSource().getType());
     auto targetType = cast<MemRefType>(copy.getTarget().getType());
-    if (sourceType.getMemorySpaceAsInt() != targetType.getMemorySpaceAsInt())
+    if (sourceType.getMemorySpace() != targetType.getMemorySpace())
       return failure();
 
     LLVM_DEBUG(llvm::dbgs() << "Located at the same memory space\n";);
@@ -97,7 +97,6 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
         targetPostDomUsers.push_back(user);
     }
 
-    // A helper to check whether any user has write effect.
     auto hasWriteUsers = [](SmallVector<Operation *> users) {
       return llvm::any_of(users, [](Operation *user) {
         return hasEffect<MemoryEffects::Write>(user) ||

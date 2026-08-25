@@ -3,6 +3,8 @@
 // RUN:   | FileCheck %s --check-prefix=NOBAND
 // RUN: sar-opt %s --convert-sar-interp-to-affine='banded-profit-threshold=64' \
 // RUN:   | FileCheck %s --check-prefix=NOBAND
+// RUN: sar-opt %s --convert-sar-interp-to-affine='full-row-max-bytes=1024' \
+// RUN:   | FileCheck %s --check-prefix=FULLROW
 
 // Displacement-range analysis proves |positions[i,j] - j| is bounded when the
 // position field is an identity ramp plus a bounded perturbation. The band
@@ -15,8 +17,10 @@
 // Output planes, then the two narrow band buffers.
 // CHECK: memref.alloc() : memref<8x32xf64>
 // CHECK: memref.alloc() : memref<8x32xf64>
-// CHECK: memref.alloc(){{.*}} : memref<16xf64>
-// CHECK: memref.alloc(){{.*}} : memref<16xf64>
+// Small bands use complete banking so dynamic tap slots can issue in parallel.
+// CHECK: memref.alloc(){{.*}}hls.partition_kinds = ["complete"]{{.*}} : memref<16xf64>
+// CHECK: memref.alloc(){{.*}}hls.partition_kinds = ["complete"]{{.*}} : memref<16xf64>
+// CHECK-NOT: hls.min_ii
 // Row loop, then the prologue that primes the window, then the column loop.
 // CHECK: affine.for %{{.*}} = 0 to 8
 // CHECK: affine.for %{{.*}} = 0 to 15
@@ -59,7 +63,7 @@ func.func @sqrt_residual_banded(
     %re: tensor<8x32xf64>, %im: tensor<8x32xf64>,
     %mask: tensor<8x32xf64>) -> (tensor<8x32xf64>, tensor<8x32xf64>) {
   %axis = sar.constant dense<[
-      100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0,
+      100.0, 101.0, 102.0, 103.0, 104.0000000001, 105.0, 106.0, 107.0,
       108.0, 109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0,
       116.0, 117.0, 118.0, 119.0, 120.0, 121.0, 122.0, 123.0,
       124.0, 125.0, 126.0, 127.0, 128.0, 129.0, 130.0, 131.0
@@ -157,6 +161,12 @@ func.func @interp_banded_edges(%re: tensor<2x32xf64>, %im: tensor<2x32xf64>)
 // CHECK-NOT: memref<16xf64>
 // CHECK: memref.load %{{.*}}[%{{.*}}, %{{.*}}] : memref<8x32xf64>
 // CHECK-NOT: sar.interp1d_split
+// FULLROW-LABEL: func.func @interp_unbounded_arg
+// Two f64 planes of the 32-element row occupy 512 bytes and fit the cap.
+// A full row larger than the complete-banking cutoff uses one bank per tap.
+// FULLROW: memref.alloc(){{.*}}hls.partition_factors = [8]{{.*}}hls.partition_kinds = ["cyclic"]{{.*}} : memref<32xf64>
+// FULLROW: memref.alloc(){{.*}}hls.partition_factors = [8]{{.*}}hls.partition_kinds = ["cyclic"]{{.*}} : memref<32xf64>
+// FULLROW-NOT: sar.interp1d_split
 func.func @interp_unbounded_arg(%re: tensor<8x32xf64>, %im: tensor<8x32xf64>,
                                 %pos: tensor<8x32xf64>)
     -> (tensor<8x32xf64>, tensor<8x32xf64>) {
@@ -168,9 +178,8 @@ func.func @interp_unbounded_arg(%re: tensor<8x32xf64>, %im: tensor<8x32xf64>,
 
 // -----
 
-// Unprovable for a second reason: the ramp coefficient is 2, not 1, so the
-// displacement (coeff-1)*j grows with the column index and has no
-// scene-independent bound.
+// A coefficient far from one has a finite bound for this static shape, but the
+// resulting band is wider than the row and fails the profitability gate.
 
 // CHECK-LABEL: func.func @interp_scaled_ramp
 // CHECK-NOT: memref<16xf64>

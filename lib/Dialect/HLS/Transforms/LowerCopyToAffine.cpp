@@ -1,4 +1,4 @@
-//===- LowerCopyToAffine.cpp - lower copy to affine -----------------------===//
+//===- LowerCopyToAffine.cpp - expand memref copies into loop nests -------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

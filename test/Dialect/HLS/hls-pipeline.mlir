@@ -1,19 +1,17 @@
 // RUN: sar-opt %s --hls-pipeline="top-func=stage" | FileCheck %s
 
-// Two-stage affine chain: a multiply loop feeding an add loop through a
-// scratch buffer. The pipeline must extract two dataflow node functions,
-// wire them with a token stream, and attach loop directives. (The two
-// loops are deliberately not fused: each becomes its own dataflow node.)
+// Two pointwise affine stages fuse before task formation, eliminating the
+// full-plane intermediate and its channel.
 
-// Two node functions must appear in the output.
+// One fused node function must appear in the output.
 // CHECK: func.func @stage_node0
-// CHECK: func.func @stage_node1
+// CHECK-NOT: func.func @stage_node1
 
-// The dataflow wrapper must connect them with a stream.
+// The wrapper calls the fused node directly.
 // CHECK-LABEL: func.func @stage(
 // CHECK-SAME:    top_func
-// CHECK:         hls.dataflow.stream
-// CHECK-COUNT-2: call @stage_node
+// CHECK-NOT:     hls.dataflow.stream
+// CHECK-COUNT-1: call @stage_node
 // CHECK:         return
 
 func.func @stage(%in: memref<32x32xf32>, %out: memref<32x32xf32>)

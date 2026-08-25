@@ -427,6 +427,22 @@ def test_multiple_results():
     np.testing.assert_allclose(d, a - b, rtol=1e-6)
 
 
+def test_duplicate_tensor_results_get_distinct_output_buffers():
+    """CSE may leave two result positions naming one tensor SSA value."""
+    n = 8
+
+    @sar.func
+    def duplicate(x: sar.f32[n]) -> (sar.f32[n], sar.f32[n]):
+        result = x * 2.0
+        return result, result
+
+    values = _f32(n)
+    first, second = duplicate(values)
+    np.testing.assert_array_equal(first, values * 2.0)
+    np.testing.assert_array_equal(second, values * 2.0)
+    assert not np.shares_memory(first, second)
+
+
 def test_launcher_validates_arguments():
     N = 8
 

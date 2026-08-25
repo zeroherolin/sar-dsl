@@ -1,4 +1,4 @@
-//===- wka_tb.cpp - Hand-written omega-K HLS testbench -------------------===//
+//===- wka_tb.cpp - Hand-written omega-K HLS testbench --------------------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -19,70 +19,97 @@
 #include "wka_top.h"
 
 struct ddr_buffers_t {
-  bus_t *in;
-  bus_t *out;
-  bus_t *tmp;
+  plane_t *raw_re;
+  plane_t *raw_im;
+  real_t *win_r;
+  real_t *win_a;
+  plane_t *out0;
+  plane_t *scratch0;
+  plane_t *scratch1;
+  plane_t *scratch2;
+  plane_t *scratch3;
   size_t total_samples;
   size_t total_words;
   size_t bytes;
 };
 
-static uint64_t load_sample(const bus_t *memory, size_t sample_index) {
-  size_t word_index = sample_index / BUS_LANES;
-  int lane = static_cast<int>(sample_index % BUS_LANES);
-  return static_cast<uint64_t>(
-      memory[word_index].range((lane + 1) * WKA_COMPLEX_SAMPLE_BITS - 1,
-                               lane * WKA_COMPLEX_SAMPLE_BITS));
+static data_t load_complex_sample(const plane_t *memory_re,
+                                  const plane_t *memory_im,
+                                  size_t sample_index) {
+  size_t word_index = sample_index / PLANE_LANES;
+  int lane = static_cast<int>(sample_index % PLANE_LANES);
+  return data_t(memory_re[word_index][lane], memory_im[word_index][lane]);
 }
 
-static float load_real_sample(const bus_t *memory, size_t sample_index) {
-  size_t word_index = sample_index / REAL_BUS_LANES;
-  int lane = static_cast<int>(sample_index % REAL_BUS_LANES);
-  uint32_t bits = static_cast<uint32_t>(memory[word_index].range(
-      (lane + 1) * WKA_IO_SCALAR_BITS - 1, lane * WKA_IO_SCALAR_BITS));
-  return unpack_real(bits);
+static float load_real_sample(const plane_t *memory, size_t sample_index) {
+  size_t word_index = sample_index / PLANE_LANES;
+  int lane = static_cast<int>(sample_index % PLANE_LANES);
+  return memory[word_index][lane];
 }
 
-static void store_sample(bus_t *memory, size_t sample_index, uint64_t value) {
-  size_t word_index = sample_index / BUS_LANES;
-  int lane = static_cast<int>(sample_index % BUS_LANES);
-  bus_t word = memory[word_index];
-  word.range((lane + 1) * WKA_COMPLEX_SAMPLE_BITS - 1,
-             lane * WKA_COMPLEX_SAMPLE_BITS) = value;
-  memory[word_index] = word;
+static void store_complex_sample(plane_t *memory_re, plane_t *memory_im,
+                                 size_t sample_index, data_t value) {
+  size_t word_index = sample_index / PLANE_LANES;
+  int lane = static_cast<int>(sample_index % PLANE_LANES);
+  memory_re[word_index][lane] = value.real();
+  memory_im[word_index][lane] = value.imag();
 }
 
 static void release_ddr_buffers(ddr_buffers_t &buffers) {
-  delete[] buffers.in;
-  delete[] buffers.out;
-  delete[] buffers.tmp;
-  buffers.in = nullptr;
-  buffers.out = nullptr;
-  buffers.tmp = nullptr;
+  delete[] buffers.raw_re;
+  delete[] buffers.raw_im;
+  delete[] buffers.win_r;
+  delete[] buffers.win_a;
+  delete[] buffers.out0;
+  delete[] buffers.scratch0;
+  delete[] buffers.scratch1;
+  delete[] buffers.scratch2;
+  delete[] buffers.scratch3;
+  buffers = {};
 }
 
 static int allocate_ddr_buffers(ddr_buffers_t &buffers) {
   buffers.total_samples = static_cast<size_t>(N) * N;
-  buffers.total_words = buffers.total_samples / BUS_LANES;
-  buffers.bytes = buffers.total_words * sizeof(bus_t);
-  buffers.in = new (std::nothrow) bus_t[buffers.total_words];
-  buffers.out = new (std::nothrow) bus_t[buffers.total_words];
-  buffers.tmp = new (std::nothrow) bus_t[buffers.total_words];
+  buffers.total_words = buffers.total_samples / PLANE_LANES;
+  buffers.bytes = buffers.total_words * sizeof(plane_t);
+  buffers.raw_re = new (std::nothrow) plane_t[buffers.total_words];
+  buffers.raw_im = new (std::nothrow) plane_t[buffers.total_words];
+  buffers.win_r = new (std::nothrow) real_t[N];
+  buffers.win_a = new (std::nothrow) real_t[N];
+  buffers.out0 = new (std::nothrow) plane_t[buffers.total_words];
+  buffers.scratch0 = new (std::nothrow) plane_t[buffers.total_words];
+  buffers.scratch1 = new (std::nothrow) plane_t[buffers.total_words];
+  buffers.scratch2 = new (std::nothrow) plane_t[buffers.total_words];
+  buffers.scratch3 = new (std::nothrow) plane_t[buffers.total_words];
 
-  if (!buffers.in || !buffers.out || !buffers.tmp) {
+  if (!buffers.raw_re || !buffers.raw_im || !buffers.win_r || !buffers.win_a ||
+      !buffers.out0 || !buffers.scratch0 || !buffers.scratch1 ||
+      !buffers.scratch2 || !buffers.scratch3) {
     std::cerr << "Memory allocation failed!" << std::endl;
     release_ddr_buffers(buffers);
     return -1;
   }
 
-  memset(buffers.out, 0, buffers.bytes);
-  memset(buffers.tmp, 0, buffers.bytes);
+  memset(buffers.out0, 0, buffers.bytes);
+  memset(buffers.scratch0, 0, buffers.bytes);
+  memset(buffers.scratch1, 0, buffers.bytes);
+  memset(buffers.scratch2, 0, buffers.bytes);
+  memset(buffers.scratch3, 0, buffers.bytes);
+  for (int i = 0; i < N; i++) {
+    buffers.win_r[i] = WKA_RANGE_WINDOW_ROM[i];
+    buffers.win_a[i] = WKA_AZIMUTH_WINDOW_ROM[i];
+  }
   return 0;
 }
 
 static void run_wka_kernel(ddr_buffers_t &buffers) {
   std::cout << "Running WKA kernel..." << std::endl;
-  wka_sar_top(buffers.in, buffers.out, buffers.tmp);
+  typedef plane_t(*raster_ptr_t)[PLANE_WORDS_PER_ROW];
+  wka_sar_top(reinterpret_cast<raster_ptr_t>(buffers.raw_re),
+              reinterpret_cast<raster_ptr_t>(buffers.raw_im), buffers.win_r,
+              buffers.win_a, reinterpret_cast<raster_ptr_t>(buffers.out0),
+              buffers.scratch0, buffers.scratch1, buffers.scratch2,
+              buffers.scratch3);
   std::cout << "Kernel done." << std::endl;
 }
 
@@ -175,7 +202,7 @@ static int write_grayscale_bmp(const char *filename,
 
 #if WKA_SIZE_PROFILE != WKA_SIZE_PRODUCTION
 
-static void fill_small_cosim_input(bus_t *ddr_in) {
+static void fill_validation_input(plane_t *raw_re, plane_t *raw_im) {
   for (int i = 0; i < N; i++) {
     for (int j = 0; j < N; j++) {
       float phase = 0.03125f * static_cast<float>(i % 17) +
@@ -183,13 +210,13 @@ static void fill_small_cosim_input(bus_t *ddr_in) {
       float amp = 0.25f + 0.05f * static_cast<float>((i + j) % 11);
       float real = amp * std::cos(phase);
       float imag = amp * std::sin(phase);
-      store_sample(ddr_in, static_cast<size_t>(i) * N + j,
-                   pack_data(data_t(real, imag)));
+      store_complex_sample(raw_re, raw_im, static_cast<size_t>(i) * N + j,
+                           data_t(real, imag));
     }
   }
 }
 
-static int run_reduced_unit_tests() {
+static int run_validation_unit_tests() {
   ddr_buffers_t buffers = {};
   if (allocate_ddr_buffers(buffers) != 0) {
     return -1;
@@ -198,19 +225,21 @@ static int run_reduced_unit_tests() {
   const size_t sample_count = static_cast<size_t>(N) * N;
   std::vector<float> expected_r(sample_count);
   std::vector<float> expected_i(sample_count);
-  fill_small_cosim_input(buffers.in);
+  fill_validation_input(buffers.raw_re, buffers.raw_im);
   for (size_t idx = 0; idx < sample_count; idx++) {
-    data_t value = unpack_data(load_sample(buffers.in, idx));
+    data_t value = load_complex_sample(buffers.raw_re, buffers.raw_im, idx);
     expected_r[idx] = value.real();
     expected_i[idx] = value.imag();
   }
 
-  run_row_transform(buffers.in, buffers.out, WKA_ROW_FORWARD);
-  run_row_transform(buffers.out, buffers.tmp, WKA_ROW_INVERSE);
+  run_row_forward(buffers.raw_re, buffers.raw_im, buffers.scratch0,
+                  buffers.scratch1);
+  run_row_inverse(buffers.scratch0, buffers.scratch1, buffers.scratch2,
+                  buffers.scratch3);
   double ref_energy = 0.0;
   double error_energy = 0.0;
   for (size_t idx = 0; idx < sample_count; idx++) {
-    data_t value = unpack_data(load_sample(buffers.tmp, idx));
+    data_t value = load_complex_sample(buffers.scratch2, buffers.scratch3, idx);
     double dr = static_cast<double>(value.real()) - expected_r[idx];
     double di = static_cast<double>(value.imag()) - expected_i[idx];
     ref_energy += static_cast<double>(expected_r[idx]) * expected_r[idx] +
@@ -227,12 +256,15 @@ static int run_reduced_unit_tests() {
 
   for (size_t idx = 0; idx < sample_count; idx++) {
     float code = static_cast<float>(idx) / static_cast<float>(sample_count);
-    store_sample(buffers.in, idx, pack_data(data_t(code, -code)));
+    store_complex_sample(buffers.raw_re, buffers.raw_im, idx,
+                         data_t(code, -code));
   }
-  corner_turn(buffers.in, buffers.out, false);
-  corner_turn(buffers.out, buffers.tmp, false);
+  corner_turn_complex(buffers.raw_re, buffers.raw_im, buffers.scratch0,
+                      buffers.scratch1);
+  corner_turn_complex(buffers.scratch0, buffers.scratch1, buffers.scratch2,
+                      buffers.scratch3);
   for (size_t idx = 0; idx < sample_count; idx++) {
-    data_t value = unpack_data(load_sample(buffers.tmp, idx));
+    data_t value = load_complex_sample(buffers.scratch2, buffers.scratch3, idx);
     float code = static_cast<float>(idx) / static_cast<float>(sample_count);
     if (std::fabs(value.real() - code) > 1.0e-7f ||
         std::fabs(value.imag() + code) > 1.0e-7f) {
@@ -242,42 +274,38 @@ static int run_reduced_unit_tests() {
     }
   }
 
-  if (std::fabs(WKA_RANGE_WINDOW_ROM[0]) > 1.0e-7f ||
-      std::fabs(WKA_RANGE_WINDOW_ROM[N - 1]) > 1.0e-7f ||
-      std::fabs(WKA_AZIMUTH_WINDOW_ROM[0]) > 1.0e-7f ||
-      std::fabs(WKA_AZIMUTH_WINDOW_ROM[N - 1]) > 1.0e-7f) {
+  if (std::fabs(buffers.win_r[0]) > 1.0e-7f ||
+      std::fabs(buffers.win_r[N - 1]) > 1.0e-7f ||
+      std::fabs(buffers.win_a[0]) > 1.0e-7f ||
+      std::fabs(buffers.win_a[N - 1]) > 1.0e-7f) {
     std::cerr << "Window ROM endpoints are not zero." << std::endl;
     release_ddr_buffers(buffers);
     return -1;
   }
   for (int column = 0; column < N; column++) {
-    float range_mirror = WKA_RANGE_WINDOW_ROM[N - 1 - column];
-    float azimuth_mirror = WKA_AZIMUTH_WINDOW_ROM[N - 1 - column];
-    if (WKA_RANGE_WINDOW_ROM[column] < 0.0f ||
-        WKA_RANGE_WINDOW_ROM[column] > 1.0f ||
-        std::fabs(WKA_RANGE_WINDOW_ROM[column] - range_mirror) > 1.0e-6f ||
-        WKA_AZIMUTH_WINDOW_ROM[column] < 0.0f ||
-        WKA_AZIMUTH_WINDOW_ROM[column] > 1.0f ||
-        std::fabs(WKA_AZIMUTH_WINDOW_ROM[column] - azimuth_mirror) > 1.0e-6f) {
+    if (buffers.win_r[column] < 0.0f || buffers.win_r[column] > 1.0f ||
+        buffers.win_a[column] < 0.0f || buffers.win_a[column] > 1.0f ||
+        buffers.win_r[column] != WKA_RANGE_WINDOW_ROM[column] ||
+        buffers.win_a[column] != WKA_AZIMUTH_WINDOW_ROM[column]) {
       std::cerr << "Window ROM regression failed at " << column << std::endl;
       release_ddr_buffers(buffers);
       return -1;
     }
   }
 
-  std::cout << "Reduced unit tests passed." << std::endl;
+  std::cout << "Validation unit tests passed." << std::endl;
   release_ddr_buffers(buffers);
   return 0;
 }
 
-static int validate_small_cosim_output(const bus_t *ddr_out) {
+static int validate_cosim_output(const plane_t *output) {
   double sum_mag = 0.0;
   float max_mag = 0.0f;
   int nonzero_count = 0;
 
   const size_t sample_count = static_cast<size_t>(N) * N;
   for (size_t idx = 0; idx < sample_count; idx++) {
-    float mag = load_real_sample(ddr_out, idx);
+    float mag = load_real_sample(output, idx);
     if (!std::isfinite(mag)) {
       std::cerr << "Non-finite output detected at sample " << idx << std::endl;
       return -1;
@@ -291,50 +319,50 @@ static int validate_small_cosim_output(const bus_t *ddr_out) {
     }
   }
 
-  std::cout << "Small cosim summary:" << std::endl;
+  std::cout << "RTL co-simulation summary:" << std::endl;
   std::cout << "  sum_mag     = " << sum_mag << std::endl;
   std::cout << "  max_mag     = " << max_mag << std::endl;
   std::cout << "  nonzero_cnt = " << nonzero_count << std::endl;
 
   if (nonzero_count == 0) {
-    std::cerr << "All outputs are zero in small cosim." << std::endl;
+    std::cerr << "All RTL co-simulation outputs are zero." << std::endl;
     return -1;
   }
   return 0;
 }
 
-static int dump_reduced_output(const bus_t *ddr_out) {
+static int dump_validation_output(const plane_t *output) {
   const char *output_path = std::getenv("WKA_TB_DUMP_PATH");
   if (!output_path || output_path[0] == '\0') {
     return 0;
   }
-  FILE *output = std::fopen(output_path, "wb");
-  if (!output) {
-    std::cerr << "Cannot write reduced output: " << output_path << std::endl;
+  FILE *file = std::fopen(output_path, "wb");
+  if (!file) {
+    std::cerr << "Cannot write validation output: " << output_path << std::endl;
     return -1;
   }
   const size_t sample_count = static_cast<size_t>(N) * N;
   for (size_t idx = 0; idx < sample_count; idx++) {
-    float value = load_real_sample(ddr_out, idx);
-    if (std::fwrite(&value, sizeof(value), 1, output) != 1) {
-      std::fclose(output);
-      std::cerr << "Short write while dumping reduced output." << std::endl;
+    float value = load_real_sample(output, idx);
+    if (std::fwrite(&value, sizeof(value), 1, file) != 1) {
+      std::fclose(file);
+      std::cerr << "Short write while dumping validation output." << std::endl;
       return -1;
     }
   }
-  std::fclose(output);
-  std::cout << "Reduced output saved: " << output_path << std::endl;
+  std::fclose(file);
+  std::cout << "Validation output saved: " << output_path << std::endl;
   return 0;
 }
 
-static int compare_reduced_golden(const bus_t *ddr_out,
-                                  const char *golden_path) {
+static int compare_validation_golden(const plane_t *output,
+                                     const char *golden_path) {
   if (!golden_path || golden_path[0] == '\0') {
     return 0;
   }
   FILE *golden = std::fopen(golden_path, "rb");
   if (!golden) {
-    std::cerr << "Cannot open reduced golden: " << golden_path << std::endl;
+    std::cerr << "Cannot open validation golden: " << golden_path << std::endl;
     return -1;
   }
 
@@ -347,10 +375,10 @@ static int compare_reduced_golden(const bus_t *ddr_out,
     float expected = 0.0f;
     if (std::fread(&expected, sizeof(expected), 1, golden) != 1) {
       std::fclose(golden);
-      std::cerr << "Reduced golden is shorter than expected." << std::endl;
+      std::cerr << "Validation golden is shorter than expected." << std::endl;
       return -1;
     }
-    double candidate = load_real_sample(ddr_out, idx);
+    double candidate = load_real_sample(output, idx);
     double error = candidate - expected;
     reference_energy += static_cast<double>(expected) * expected;
     candidate_energy += candidate * candidate;
@@ -366,14 +394,14 @@ static int compare_reduced_golden(const bus_t *ddr_out,
   std::cout << "Golden comparison: NRMSE=" << nrmse
             << " correlation=" << correlation << std::endl;
   if (nrmse > 1.0e-3 || correlation < 0.99999) {
-    std::cerr << "Reduced golden comparison failed." << std::endl;
+    std::cerr << "Validation golden comparison failed." << std::endl;
     return -1;
   }
   return 0;
 }
 
-static int run_small_cosim_tb(const char *golden_path) {
-  if (run_reduced_unit_tests() != 0) {
+static int run_cosim_tb(const char *golden_path) {
+  if (run_validation_unit_tests() != 0) {
     return -1;
   }
 
@@ -382,19 +410,19 @@ static int run_small_cosim_tb(const char *golden_path) {
     return -1;
   }
 
-  std::cout << "Generating synthetic small-cosim input..." << std::endl;
-  fill_small_cosim_input(buffers.in);
+  std::cout << "Generating synthetic RTL co-simulation input..." << std::endl;
+  fill_validation_input(buffers.raw_re, buffers.raw_im);
   std::cout << "Generated " << buffers.total_samples << " samples."
             << std::endl;
 
   run_wka_kernel(buffers);
 
-  int status = validate_small_cosim_output(buffers.out);
+  int status = validate_cosim_output(buffers.out0);
   if (status == 0) {
-    status = compare_reduced_golden(buffers.out, golden_path);
+    status = compare_validation_golden(buffers.out0, golden_path);
   }
   if (status == 0) {
-    status = dump_reduced_output(buffers.out);
+    status = dump_validation_output(buffers.out0);
   }
   release_ddr_buffers(buffers);
   return status;
@@ -402,8 +430,8 @@ static int run_small_cosim_tb(const char *golden_path) {
 
 #else
 
-static int load_full_input(bus_t *ddr_in, size_t total_samples,
-                           const char *input_path) {
+static int load_full_input(plane_t *raw_re, plane_t *raw_im,
+                           size_t total_samples, const char *input_path) {
   std::cout << "Loading binary input..." << std::endl;
   FILE *fin = fopen(input_path, "rb");
   if (!fin) {
@@ -412,22 +440,26 @@ static int load_full_input(bus_t *ddr_in, size_t total_samples,
   }
 
   size_t read_cnt = 0;
-  for (size_t word_idx = 0; word_idx < total_samples / BUS_LANES; word_idx++) {
-    uint64_t lanes[BUS_LANES];
-    size_t got = fread(lanes, sizeof(uint64_t), BUS_LANES, fin);
-    if (got != static_cast<size_t>(BUS_LANES)) {
+  for (size_t word_idx = 0; word_idx < total_samples / PLANE_LANES;
+       word_idx++) {
+    uint64_t lanes[PLANE_LANES];
+    size_t got = fread(lanes, sizeof(uint64_t), PLANE_LANES, fin);
+    if (got != static_cast<size_t>(PLANE_LANES)) {
       fclose(fin);
       std::cerr << "Input file size mismatch, expected " << total_samples
                 << " samples." << std::endl;
       return -1;
     }
-    bus_t packed = 0;
-    for (int lane = 0; lane < BUS_LANES; lane++) {
-      packed.range((lane + 1) * WKA_COMPLEX_SAMPLE_BITS - 1,
-                   lane * WKA_COMPLEX_SAMPLE_BITS) = lanes[lane];
+    plane_t packed_re;
+    plane_t packed_im;
+    for (int lane = 0; lane < PLANE_LANES; lane++) {
+      data_t value = unpack_data(lanes[lane]);
+      packed_re[lane] = value.real();
+      packed_im[lane] = value.imag();
     }
-    ddr_in[word_idx] = packed;
-    read_cnt += BUS_LANES;
+    raw_re[word_idx] = packed_re;
+    raw_im[word_idx] = packed_im;
+    read_cnt += PLANE_LANES;
   }
   fclose(fin);
   std::cout << "Loaded " << read_cnt << " samples." << std::endl;
@@ -440,8 +472,25 @@ static int load_full_input(bus_t *ddr_in, size_t total_samples,
   return 0;
 }
 
-static int generate_full_output(const bus_t *ddr_out, const char *output_path) {
+static int generate_full_output(const plane_t *output,
+                                const char *output_path) {
   std::cout << "Generating SAR image..." << std::endl;
+
+  bool any_nonzero = false;
+  const size_t sample_count = static_cast<size_t>(N) * N;
+  for (size_t index = 0; index < sample_count; index++) {
+    float value = load_real_sample(output, index);
+    if (!std::isfinite(value)) {
+      std::cerr << "Non-finite output detected at sample " << index
+                << std::endl;
+      return -1;
+    }
+    any_nonzero |= value > WKA_TB_NONZERO_MAG_EPS;
+  }
+  if (!any_nonzero) {
+    std::cerr << "All production outputs are zero." << std::endl;
+    return -1;
+  }
 
   const int CROP_W = VALID_COLS;
   const int CROP_H = N;
@@ -465,7 +514,7 @@ static int generate_full_output(const bus_t *ddr_out, const char *output_path) {
     const size_t row_base = static_cast<size_t>(src_row) * N;
     for (int ox = 0; ox < CROP_W; ox++) {
       img_disp[static_cast<size_t>(oy) * CROP_W + ox] =
-          load_real_sample(ddr_out, row_base + ox);
+          load_real_sample(output, row_base + ox);
     }
   }
 
@@ -539,14 +588,15 @@ static int run_full_tb(const char *input_path, const char *output_path) {
     return -1;
   }
 
-  if (load_full_input(buffers.in, buffers.total_samples, input_path) != 0) {
+  if (load_full_input(buffers.raw_re, buffers.raw_im, buffers.total_samples,
+                      input_path) != 0) {
     release_ddr_buffers(buffers);
     return -1;
   }
 
   run_wka_kernel(buffers);
 
-  int status = generate_full_output(buffers.out, output_path);
+  int status = generate_full_output(buffers.out0, output_path);
   release_ddr_buffers(buffers);
   return status;
 }
@@ -559,7 +609,7 @@ int main(int argc, char **argv) {
 
 #if WKA_SIZE_PROFILE != WKA_SIZE_PRODUCTION
   const char *golden_path = (argc > 1) ? argv[1] : nullptr;
-  int status = run_small_cosim_tb(golden_path);
+  int status = run_cosim_tb(golden_path);
 #else
   const char *input_path = (argc > 1) ? argv[1] : WKA_TB_INPUT_PATH;
   const char *output_path = (argc > 2) ? argv[2] : WKA_TB_OUTPUT_PATH;

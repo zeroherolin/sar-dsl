@@ -712,8 +712,8 @@ def SAR_SortOp : SAR_Op<"sort", [Pure, SameOperandsAndResultType]> {
 
     Element type must be float (`f32` or `f64`); complex ordering is
     undefined, so complex inputs are rejected by the verifier. The sort is
-    a compare-exchange network over the static extent, so it carries no
-    data-dependent control flow.
+    an exact compare-exchange network over the static extent (Batcher's
+    odd-even mergesort), so it carries no data-dependent control flow.
   }];
   let arguments = (ins SAR_FloatTensor:$input, I64Attr:$dim);
   let results = (outs SAR_FloatTensor:$result);

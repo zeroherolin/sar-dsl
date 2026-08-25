@@ -15,7 +15,13 @@ func.func @float_semantics(%lhs: memref<1xf32>, %rhs: memref<1xf32>,
   %trig = arith.addf %sin, %cos : f32
   // CHECK: std::sqrt(
   %root = math.sqrt %trig : f32
-  %partial = arith.addf %remainder, %root : f32
+  // CHECK: sar_hls_maximum(
+  %maximum = arith.maximumf %a, %b : f32
+  // CHECK: sar_hls_minimum(
+  %minimum = arith.minimumf %a, %b : f32
+  %extreme = arith.addf %maximum, %minimum : f32
+  %sum = arith.addf %remainder, %root : f32
+  %partial = arith.addf %sum, %extreme : f32
   // CHECK: (float)NAN
   %result = arith.addf %partial, %nan : f32
   memref.store %result, %out[%c0] : memref<1xf32>

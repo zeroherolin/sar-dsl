@@ -25,7 +25,7 @@ from typing import Optional
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - SAR-DSL currently targets Linux
+except ImportError:  # pragma: no cover - cache locking is Linux-specific
     fcntl = None
 
 __all__ = ["KernelCache"]

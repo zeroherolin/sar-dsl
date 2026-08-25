@@ -312,9 +312,9 @@ func.func @branching(%in: memref<64xf64>, %out: memref<64xf64>) {
 
 // -----
 
-// An alias escaping through an *unranked* cast -- the shape of a debug-print
-// call -- pins the buffer just like a ranked one: the cast result may be
-// read after the alloc's own last visible use, so %b may not take over %a.
+// An alias escaping through an *unranked* cast pins the buffer just like a
+// ranked one: the cast result may be read after the alloc's last visible use,
+// so %b may not take over %a.
 
 // CHECK-LABEL: func.func @unranked_cast_alias
 // CHECK-COUNT-2: memref.alloc() : memref<64xf64>

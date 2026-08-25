@@ -27,6 +27,7 @@ import importlib
 import re
 
 import pytest
+import sar
 from conftest import requires_hls
 
 CHAINS = ["wka", "rda", "csa", "pfa"]
@@ -91,14 +92,23 @@ def scratch_bytes(args, io_ports: int) -> int:
     widths = {"float": 4, "double": 8}
     total = 0
     for arg in args[io_ports:]:
-        ctype = arg.split(" ", 1)[0]
-        total += widths[ctype] * int(re.search(r"\[(\d+)\]$", arg).group(1))
+        declaration = re.fullmatch(
+            rf"(?P<ctype>{CTYPE})\s+\w+\[(?P<extent>\d+)\]", arg)
+        assert declaration, arg
+        ctype = declaration.group("ctype")
+        vector = re.fullmatch(r"hls::vector<(float|double),\s*(\d+)>", ctype)
+        element_bytes = (widths[vector.group(1)] *
+                         int(vector.group(2)) if vector else widths[ctype])
+        total += element_bytes * int(declaration.group("extent"))
     return total
 
 
 def scratch_types(args, io_ports: int) -> set:
     """Element types of the trailing scratch arenas."""
-    return {arg.split(" ", 1)[0] for arg in args[io_ports:]}
+    return {
+        re.fullmatch(rf"(?P<ctype>{CTYPE})\s+\w+\[\d+\]", arg).group("ctype")
+        for arg in args[io_ports:]
+    }
 
 
 @requires_hls
@@ -115,13 +125,22 @@ def test_port_count_is_the_algorithm_io(chain, n, placement):
     """
     kernel = build_kernel(chain, n)
     io_ports = io_port_count(kernel)
-    args = signature(axi_design(kernel, placement))
+    design = axi_design(kernel, placement)
+    args = signature(design)
+    source = design.source()
     scratch = args[io_ports:]
-    # Four is the widest conflict graph these chains present. The bound is
-    # what rules out an arena per spilled plane, which is the failure this
-    # guards -- the chains spill far more planes than they declare arenas.
-    assert len(scratch) <= 4 * len(scratch_types(args, io_ports)), args
-    assert len(scratch) <= 4, args
+    # `max_scratch_arenas` caps the masters the compiler may open per
+    # spilling scalar type, and a chain spills at most its data planes and
+    # its geometry planes. That product is the contract; what it rules out
+    # is an arena per spilled plane, which is the failure this guards --
+    # the chains spill far more planes than they declare arenas.
+    arenas = int(design.config.max_scratch_arenas)
+    assert len(scratch) <= arenas * len(scratch_types(args, io_ports)), args
+    assert len(scratch) <= 2 * arenas, args
+    if "Scratch ABI  : conflict graph compacted" in source:
+        penalty = re.search(
+            r"Scratch cost : predicted serialization penalty (\d+)", source)
+        assert penalty and int(penalty.group(1)) > 0
 
 
 def port_shapes(args, io_ports: int) -> list:
@@ -169,7 +188,7 @@ def test_scratch_arenas_are_trailing_and_flat(chain):
     scratch = args[io_ports:]
     assert scratch
     for arg in scratch:
-        assert re.fullmatch(r"(?:float|double) \w+\[\d+\]", arg), arg
+        assert re.fullmatch(rf"{CTYPE} \w+\[\d+\]", arg), arg
     # Every other port is one of the algorithm's own planes: 1-D arrays are
     # its vectors, 2-D its rasters, and none of them is the flat scratch.
     for arg in args[:io_ports]:
@@ -178,22 +197,52 @@ def test_scratch_arenas_are_trailing_and_flat(chain):
 
 @requires_hls
 @pytest.mark.parametrize("interface", ["ap_memory", "axi", "stream"])
-def test_every_port_carries_exactly_one_interface_pragma(interface):
-    """A port with no pragma falls into whatever protocol the Vitis flow
+def test_every_port_carries_one_data_interface(interface):
+    """A port with no data pragma falls into whatever protocol the Vitis flow
     defaults to, which differs between the IP and the kernel flows -- the
     signature stops being a contract. Every argument, the scratch arena
-    included, therefore needs exactly one explicit pragma."""
-    kernel = build_kernel("wka", 64)
+    included, therefore needs exactly one explicit data pragma. Addressed AXI
+    masters additionally carry one AXI-Lite base-address register."""
+    if interface == "stream":
+
+        @sar.func
+        def stream_scale(x: sar.f32[64]) -> sar.f32[64]:
+            return x * 2.0
+
+        kernel = stream_scale
+    else:
+        kernel = build_kernel("wka", 64)
     kernel._compiled.clear()
     design = kernel.compile(backend="hls", options={"interface": interface})
     ports = [
         re.search(r"(\w+)(?:\[|$)",
                   arg.split(" ", 1)[1]).group(1) for arg in signature(design)
     ]
-    pragmas = re.findall(r"#pragma HLS interface \S+ .*?port=(\w+)",
-                         design.source())
+    data_pragmas = re.findall(
+        r"#pragma HLS interface (?:m_axi|bram|axis) .*?port=(\w+)",
+        design.source())
+    control_pragmas = re.findall(
+        r"#pragma HLS interface s_axilite port=(\w+) bundle=ctrl",
+        design.source())
     for port in ports:
-        assert pragmas.count(port) == 1, (port, pragmas)
+        assert data_pragmas.count(port) == 1, (port, data_pragmas)
+        # An addressed AXI master also needs one AXI-Lite base-address
+        # register. Plain memories and streams carry no such register.
+        assert control_pragmas.count(port) == (1 if interface == "axi" else 0)
+
+
+@requires_hls
+def test_axi_write_only_result_uses_an_output_name():
+
+    @sar.func
+    def scale(x: sar.f32[64]) -> sar.f32[64]:
+        return x * 2.0
+
+    design = scale.compile(backend="hls", options={"interface": "axi"})
+    args = signature(design)
+    assert any(
+        re.fullmatch(r"(?:float|hls::vector<float,\s*\d+>) out0\[\d+\]", arg)
+        for arg in args), args
 
 
 @requires_hls
@@ -222,3 +271,63 @@ def test_scratch_holds_what_went_off_chip(chain):
     resident = scratch_bytes(signature(axi_design(kernel, RESIDENT)), io_ports)
     assert spilled >= 256 * 256 * 4, spilled
     assert resident < spilled, (resident, spilled)
+
+
+@requires_hls
+@pytest.mark.parametrize("chain", ("wka", "rda", "csa"))
+def test_small_read_only_inputs_share_one_master(chain):
+    """A port is a platform resource, so one is spent only where needed.
+
+    A full-size plane earns its own AXI master: it is swept for a whole pass
+    and sharing would serialize two such sweeps. A small read-only vector --
+    an axis, a window, a reference chirp -- does not. Those are read a row at
+    a time out of a line-sized table, so several share a master the way a
+    hand-written design would, and the design asks the board for fewer
+    physical channels without changing its port list.
+    """
+    import json
+
+    design = axi_design(build_kernel(chain, 256), PLACEMENTS[0])
+    ports = [
+        json.loads(line.split("SAR_DSL_INTERFACE: ")[1])
+        for line in design.source().splitlines() if "SAR_DSL_INTERFACE" in line
+    ]
+    bundles = {port["bundle"] for port in ports}
+    assert len(bundles) < len(ports), (
+        "no master is shared; every port still claims its own channel")
+
+    # Sharing is confined to read-only inputs: a writer needs exclusive
+    # access, and a plane is large enough that contention would cost more
+    # than the channel saves.
+    shared = {
+        bundle
+        for bundle in bundles
+        if sum(port["bundle"] == bundle for port in ports) > 1
+    }
+    for port in ports:
+        if port["bundle"] in shared:
+            assert port["direction"] == "in", port["name"]
+            assert port["kind"] == "public", port["name"]
+
+
+@requires_hls
+def test_read_only_master_sharing_stays_within_one_dataflow_process():
+    """Vitis 2022.2 rejects a bundle read by different dataflow processes.
+
+    Omega-K's real/imaginary input planes are consumed together by the first
+    FFT and may share; its two windows are consumed together by the windowing
+    phase and may share.  Those two process groups must not be merged into one
+    master even when every array is small enough for the size heuristic.
+    """
+    import json
+
+    design = axi_design(build_kernel("wka", 32), RESIDENT)
+    ports = {
+        port["name"]: port
+        for port in (json.loads(line.split("SAR_DSL_INTERFACE: ")[1])
+                     for line in design.source().splitlines()
+                     if "SAR_DSL_INTERFACE" in line)
+    }
+    assert ports["raw_re"]["bundle"] == ports["raw_im"]["bundle"]
+    assert ports["win_r"]["bundle"] == ports["win_a"]["bundle"]
+    assert ports["raw_re"]["bundle"] != ports["win_r"]["bundle"]

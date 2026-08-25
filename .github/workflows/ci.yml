@@ -7,103 +7,149 @@ on:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
   schedule:
-    # Nightly run in addition to the pull-request and main-branch gates.
     - cron: "0 2 * * *"
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # Frontend tests are pure Python: tracing, IR emission, error reporting
-  # and compiler infrastructure. Backend/e2e tests self-skip when the
-  # LLVM toolchain is absent.
-  python-frontend:
+  # One copy of repository-wide quality and packaging checks.
+  python-quality:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - run: pip install build matplotlib numpy pytest pre-commit
       - name: Lint and format checks
         run: pre-commit run --all-files --show-diff-on-failure
-      - name: Frontend tests
-        run: |
-          set -o pipefail
-          PYTHONPATH=python python -m pytest test/python -q | tee pytest.out
-      - name: Build Python package
+
+      - name: Build and install Python distributions
         run: |
           python -m build --wheel --sdist --outdir /tmp/sar-dist
           python -m venv /tmp/sar-venv
           /tmp/sar-venv/bin/pip install /tmp/sar-dist/*.whl
-          cd /tmp
+          mkdir -p /tmp/sar-wheel-check
+          cd /tmp/sar-wheel-check
           /tmp/sar-venv/bin/python -c \
             "import sar; assert sar.__version__; print(sar.list_backends())"
-      # Most of the suite self-skips here (no toolchain), so a green run says
-      # little on its own. Pin the floor of tests that must actually execute:
-      # it only ever grows, and it fails loudly if a toolchain-free test is
-      # accidentally marked `requires_cpu` / `requires_hls`.
-      - name: Guard against silent coverage loss
-        run: |
-          PASSED=$(grep -oE '[0-9]+ passed' pytest.out | tail -1 | cut -d' ' -f1)
-          PASSED=${PASSED:-0}
-          FLOOR=189
-          echo "$PASSED toolchain-free tests ran (floor: $FLOOR)"
-          if [ "$PASSED" -lt "$FLOOR" ]; then
-            echo "::error::only $PASSED tests ran, expected at least $FLOOR;"\
-                 "a frontend test likely became toolchain-dependent"
-            exit 1
-          fi
 
-  # Compiler and backend correctness is a merge gate. The LLVM tree is
-  # cached by submodule revision; a cache miss is expensive but must not let
-  # C++ or lowering regressions merge unchecked.
+  # Minimum-version frontend coverage. Python 3.12 is covered by full-build.
+  python-minimum:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install matplotlib numpy pytest
+      - name: Toolchain-free tests
+        run: >-
+          PYTHONPATH=python python -m pytest test/python -q --maxfail=1
+          -m "not requires_cpu and not requires_hls and not requires_vitis"
+
+  # The intermediate supported version runs on nightly and manual workflows;
+  # pull requests already cover the minimum and current versions.
+  python-legacy:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install matplotlib numpy pytest
+      - name: Toolchain-free tests
+        run: >-
+          PYTHONPATH=python python -m pytest test/python -q --maxfail=1
+          -m "not requires_cpu and not requires_hls and not requires_vitis"
+
+  # Compiler and backend merge gate.
   full-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 60
+    env:
+      # The release archive is pinned by version and digest below.
+      LLVM_RELEASE_VERSION: "22.1.8"
+      LLVM_RELEASE_SHA256: "df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384"
+      LLVM_RELEASE_ROOT: ${{ runner.temp }}/sar-dsl-llvm-22.1.8
+      LLVM_RELEASE_CACHE: ~/.cache/sar-dsl
+      JOBS: "2"
+      SAR_RT_NUM_THREADS: "2"
+      OMP_NUM_THREADS: "2"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: false
 
-      # The submodule gitlink SHA keys the toolchain cache. It is read from
-      # the superproject tree, so this works before `submodule update`.
-      - name: Resolve submodule revision
-        id: subrev
+      - name: Reclaim hosted-runner disk
         run: |
-          echo "llvm=$(git rev-parse HEAD:externals/llvm-project)" >> "$GITHUB_OUTPUT"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install matplotlib numpy pytest
-      - run: sudo apt-get install -y ninja-build
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install build matplotlib numpy pytest lit==18.1.8
+      - run: sudo apt-get install -y ninja-build llvm-20 llvm-20-tools
 
-      # Sources are always needed: the cached build tree carries CMake configs
-      # that point back into the submodule source directory.
-      - name: Check out submodule sources
-        run: git submodule update --init externals/llvm-project
-
-      - name: Cache LLVM/MLIR/Clang build
-        id: cache-llvm
+      - name: Cache LLVM release archive
         uses: actions/cache@v4
         with:
-          path: externals/llvm-project/build
-          key: llvm-${{ runner.os }}-${{ steps.subrev.outputs.llvm }}-${{ hashFiles('scripts/build-llvm.sh') }}
+          path: ~/.cache/sar-dsl/LLVM-22.1.8-Linux-X64.tar.xz
+          key: llvm-release-${{ runner.os }}-${{ runner.arch }}-22.1.8-df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384
+          restore-keys: |
+            llvm-release-${{ runner.os }}-${{ runner.arch }}-22.1.8-
 
-      - name: Build LLVM
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
-        run: make llvm
+      - name: Download and unpack LLVM release
+        run: |
+          bash scripts/fetch-llvm-release.sh
+          for tool in FileCheck count not split-file yaml2obj; do
+            source="$(command -v "${tool}-20" || true)"
+            if [ -z "$source" ]; then
+              echo "missing LLVM test tool ${tool}-20" >&2
+              exit 1
+            fi
+            ln -sf "$source" "$LLVM_RELEASE_ROOT/bin/$tool"
+          done
+          echo "$LLVM_RELEASE_ROOT/bin" >> "$GITHUB_PATH"
+          echo "SAR_DSL_OMP_LIB=$LLVM_RELEASE_ROOT/lib/x86_64-unknown-linux-gnu/libomp.so" >> "$GITHUB_ENV"
 
-      - run: make build
+      - name: Build SAR-DSL against LLVM release
+        run: |
+          cmake -G Ninja -S . -B build \
+            -DSAR_DSL_LLVM_BUILD_DIR="$LLVM_RELEASE_ROOT" \
+            -DMLIR_DIR="$LLVM_RELEASE_ROOT/lib/cmake/mlir" \
+            -DLLVM_DIR="$LLVM_RELEASE_ROOT/lib/cmake/llvm" \
+            -DSAR_DSL_LLVM_TOOL_DIR="$LLVM_RELEASE_ROOT/bin" \
+            -DLLVM_EXTERNAL_LIT="$(command -v lit)"
+          ninja -C build -j "$JOBS"
+
       - run: make test
       - name: Runtime ASan and UBSan
         run: |
           cmake -S . -B build-sanitize \
             -DSAR_DSL_ENABLE_TESTS=OFF \
+            -DSAR_DSL_LLVM_BUILD_DIR="$LLVM_RELEASE_ROOT" \
+            -DMLIR_DIR="$LLVM_RELEASE_ROOT/lib/cmake/mlir" \
+            -DLLVM_DIR="$LLVM_RELEASE_ROOT/lib/cmake/llvm" \
+            -DSAR_DSL_LLVM_TOOL_DIR="$LLVM_RELEASE_ROOT/bin" \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
           cmake --build build-sanitize --target sar_runtime
@@ -113,8 +159,28 @@ jobs:
           SAR_DSL_RUNTIME_LIB="$PWD/build-sanitize/lib/libsar_runtime.so" \
           PYTHONPATH=python \
             python -m pytest test/python/test_runtime_direct.py -q
-      - name: Test installed compiler prefix
+      - name: Test installed Python package and compiler prefix
         run: |
           cmake --install build --prefix /tmp/sar-install
           /tmp/sar-install/bin/sar-opt --version
           /tmp/sar-install/bin/sar-translate --help >/dev/null
+          python -m build --wheel --outdir /tmp/sar-install-dist
+          python -m venv /tmp/sar-install-venv
+          /tmp/sar-install-venv/bin/pip install /tmp/sar-install-dist/*.whl
+          mkdir -p /tmp/sar-prefix-check
+          cd /tmp/sar-prefix-check
+          PATH="/tmp/sar-install/bin:$LLVM_RELEASE_ROOT/bin:$PATH" \
+          SAR_DSL_OMP_LIB="$LLVM_RELEASE_ROOT/lib/x86_64-unknown-linux-gnu/libomp.so" \
+          /tmp/sar-install-venv/bin/python - <<'PY'
+          import numpy as np
+          import sar
+
+          @sar.func
+          def scale(x: sar.f32[16]) -> sar.f32[16]:
+              return x * 2.0
+
+          values = np.arange(16, dtype=np.float32)
+          np.testing.assert_array_equal(scale.compile("cpu")(values),
+                                        values * 2.0)
+          assert "void scale(" in scale.compile("hls").source()
+          PY

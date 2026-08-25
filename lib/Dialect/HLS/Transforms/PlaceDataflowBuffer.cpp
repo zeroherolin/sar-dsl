@@ -1,4 +1,4 @@
-//===- PlaceDataflowBuffer.cpp - place dataflow buffer --------------------===//
+//===- PlaceDataflowBuffer.cpp - bind buffers to a memory tier or DRAM ----===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -187,17 +187,8 @@ private:
     return type.hasStaticShape() && type.getElementType().isIntOrFloat();
   }
 
-  /// Assign a tier from the buffer's measured size alone: small buffers go
-  /// to distributed RAM where they do not consume a block, planes large
-  /// enough to fill ultra RAM go there, everything else to block RAM.
-  /// Spilling to DRAM is the last resort, once no tier has room.
-  ///
-  /// A dataflow channel is charged at twice its primitive count: Vitis
-  /// double-buffers every channel (ping-pong), so the synthesized design
-  /// holds two copies of each. Constant buffers are ROMs and are read in
-  /// place -- they stay at one copy. Charging the doubling here is what
-  /// keeps the budgets honest: a budget set to a device fraction limits the
-  /// synthesized channels to that fraction.
+  /// Chooses LUTRAM, BRAM, or URAM at primitive granularity. Dataflow channels
+  /// are charged twice for ping-pong storage; constant ROMs are charged once.
   MemoryKind chooseTier(MemRefType type, uint64_t bytes, TierUse &use,
                         bool isConst) const {
     auto fits = [](uint64_t budget, uint64_t used, uint64_t need) {
@@ -222,11 +213,7 @@ private:
       use.bram += need;
       return MemoryKind::BRAM_T2P;
     }
-    // Block RAM is exhausted. A buffer below the URAM block size now takes
-    // a URAM block anyway when one is free: it wastes part of the block,
-    // but overflowing the device's block RAM would waste the whole design
-    // -- this is what soaks up the mid-size working set (row buffers,
-    // banded gather tables) of large-scene designs.
+    // Spill small buffers into a whole URAM block when BRAM is exhausted.
     if (bytes < kUramBlockBytes && fits(budget.uram, use.uram, uramNeed)) {
       use.uram += uramNeed;
       return MemoryKind::URAM_T2P;
@@ -235,21 +222,8 @@ private:
   }
 
   MemRefType getPlacedType(MemRefType type, bool isConstBuffer, TierUse &use) {
-    // Two independent decisions, in order. The threshold answers whether a
-    // buffer belongs on chip at all -- it is what lets scene size grow past
-    // the device -- and the tiers only choose where among the on-chip
-    // memories the survivors sit. Letting the tiers answer the first
-    // question would keep a plane resident whenever any tier had room,
-    // silently overrunning the on-chip budget.
-    //
-    // Constant buffers never stream: they are the ROM tables the design
-    // needs on entry, and `CreateAxiInterface` deliberately keeps them out
-    // of the DRAM scratch -- a streamed one would grow the port count past
-    // the algorithm's own I/O.
-    //
-    // A rebalance keeps DRAM placements as they are and never adds new
-    // ones: this late the graph is scheduled and the external set is
-    // already carved into ports.
+    // The threshold decides residency before tier selection. Constants remain
+    // on chip; rebalance preserves the established external interface.
     if (rebalanceOnly) {
       if (getMemoryKind(type) == MemoryKind::DRAM)
         return type;
@@ -262,9 +236,9 @@ private:
     if (uint64_t bytes = byteSize(type)) {
       kind = chooseTier(type, bytes, use, isConstBuffer);
       if (rebalanceOnly && kind == MemoryKind::DRAM) {
-        // No tier has budget left and nothing may newly stream this late.
-        // Keep the placement the buffer already carries and record the
-        // overflow; the driver turns it into a hard failure.
+        // Rebalancing preserves the established external buffer set. If no
+        // tier fits, retain the existing placement and report the overflow;
+        // the driver turns it into a hard failure.
         auto placed = getMemoryKind(type);
         kind = placed == MemoryKind::UNKNOWN ? MemoryKind::BRAM_T2P : placed;
         uint64_t banks = std::max<int64_t>(1, getPartitionFactors(type));

@@ -21,7 +21,8 @@ func.func @forward(%in: memref<8xf32>, %out: memref<8xf32>) {
   return
 }
 
-// The part plain scal-repl cannot do: a store guarded by an if still forwards
+// The case plain scalar replacement cannot handle: a store guarded by an if
+// still forwards
 // -- the branch collapses into a select between the stored value and what the
 // memory held, so the load after the if is resolved without a branch.
 

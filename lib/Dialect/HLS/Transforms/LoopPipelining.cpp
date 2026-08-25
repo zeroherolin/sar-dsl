@@ -1,4 +1,4 @@
-//===- LoopPipelining.cpp - loop pipelining -------------------------------===//
+//===- LoopPipelining.cpp - attach pipeline pragmas and unroll inside -----===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
@@ -22,39 +22,89 @@ using namespace mlir::affine;
 using namespace sar;
 using namespace hls;
 
-/// Fully unroll all loops inside a block. Loops carrying an unroll directive
-/// stay standing: they are compact stand-ins the emitter unrolls through a
-/// pragma, and cloning them here is exactly what the directive exists to
-/// avoid.
-static bool applyFullyLoopUnrolling(Block &block, unsigned maxIterNum = 10) {
+/// Fully unroll small loops inside a block. A large loop remains compact and
+/// receives a bounded pragma factor: cloning `trip-count * body-ops` without a
+/// budget can make both the generated source and Vitis binding grow by orders
+/// of magnitude.
+static bool applyFullyLoopUnrolling(Block &block, unsigned maxUnrolledOps,
+                                    unsigned maxUnrollFactor,
+                                    unsigned maxIterNum = 10) {
   for (unsigned i = 0; i < maxIterNum; ++i) {
-    bool hasFullyUnrolled = true;
+    // `settled` tracks whether the sweep left the block alone. Unrolling a
+    // loop clones its body -- inner loops included -- into the parent, and
+    // the walk skips the erased loop's region, so those clones are only
+    // seen on the next sweep. Repeating until nothing changes is what
+    // flattens a nest; stopping after one pass would leave inner loops
+    // standing inside a body the caller is about to mark pipelined.
+    bool settled = true;
+    bool failedUnroll = false;
     block.walk<WalkOrder::PreOrder>([&](AffineForOp loop) {
       if (loop->hasAttr(kUnrollFactorAttr))
         return WalkResult::skip();
-      if (failed(loopUnrollFull(loop)))
-        hasFullyUnrolled = false;
-      return WalkResult::advance();
+
+      uint64_t bodyOps = 0;
+      loop.getBody()->walk([&](Operation *op) {
+        if (!isa<AffineYieldOp>(op))
+          ++bodyOps;
+      });
+      auto tripCount = getConstantTripCount(loop);
+      bool materialize =
+          tripCount && bodyOps <= maxUnrolledOps &&
+          uint64_t(*tripCount) * std::max<uint64_t>(1, bodyOps) <=
+              maxUnrolledOps;
+      if (!materialize) {
+        unsigned factor = 1;
+        if (tripCount && maxUnrollFactor > 1) {
+          uint64_t affordable = maxUnrolledOps / std::max<uint64_t>(1, bodyOps);
+          factor = std::min<uint64_t>(
+              {*tripCount, maxUnrollFactor, std::max<uint64_t>(1, affordable)});
+          unsigned powerOfTwo = 1;
+          while (powerOfTwo <= factor / 2)
+            powerOfTwo *= 2;
+          factor = powerOfTwo;
+        }
+        loop->setAttr(
+            kUnrollFactorAttr,
+            IntegerAttr::get(IntegerType::get(loop.getContext(), 64), factor));
+        settled = false;
+        return WalkResult::skip();
+      }
+      // Full unroll erases `loop` and clones its body into the parent, so
+      // the walk must not descend into it: a pre-order walk may only erase
+      // the op it is visiting when it also skips that op's region. The
+      // clones land in the parent block and are reached by the next
+      // iteration of the retry loop below.
+      if (failed(loopUnrollFull(loop))) {
+        failedUnroll = true;
+        return WalkResult::advance();
+      }
+      settled = false;
+      return WalkResult::skip();
     });
 
-    if (hasFullyUnrolled)
+    if (failedUnroll)
+      return false;
+    if (settled)
       return true;
   }
   // The iteration budget ran out with loops still standing.
   return false;
 }
 
-/// Apply loop pipelining to the input loop, all inner loops are automatically
-/// fully unrolled.
-bool sar::applyLoopPipelining(AffineLoopBand &band, unsigned pipelineLoc,
-                              unsigned targetII) {
+static bool applyLoopPipeliningImpl(AffineLoopBand &band, unsigned pipelineLoc,
+                                    unsigned targetII, unsigned maxUnrolledOps,
+                                    unsigned maxUnrollFactor) {
   auto targetLoop = band[pipelineLoc];
+  if (auto minimum = targetLoop->getAttrOfType<IntegerAttr>(kMinIIAttr))
+    targetII = std::max<int64_t>(targetII, minimum.getInt());
 
   if (!targetLoop.getOps<func::CallOp>().empty())
     return false;
 
-  // All inner loops of the pipelined loop are automatically unrolled.
-  if (!applyFullyLoopUnrolling(*targetLoop.getBody()))
+  // Vitis unrolls inner loops of a pipelined loop; reject a choice whose
+  // resulting source and hardware expansion exceed the configured bounds.
+  if (!applyFullyLoopUnrolling(*targetLoop.getBody(), maxUnrolledOps,
+                               maxUnrollFactor))
     return false;
 
   // Erase all loops in loop band that are inside of the pipelined loop.
@@ -89,22 +139,36 @@ bool sar::applyLoopPipelining(AffineLoopBand &band, unsigned pipelineLoc,
   return true;
 }
 
+/// Apply loop pipelining to the input loop, all inner loops are automatically
+/// fully unrolled.
+bool sar::applyLoopPipelining(AffineLoopBand &band, unsigned pipelineLoc,
+                              unsigned targetII) {
+  return applyLoopPipeliningImpl(band, pipelineLoc, targetII,
+                                 /*maxUnrolledOps=*/4096,
+                                 /*maxUnrollFactor=*/32);
+}
+
 namespace {
 struct LoopPipelining : public sar::impl::LoopPipeliningBase<LoopPipelining> {
+  LoopPipelining() = default;
+  LoopPipelining(unsigned maxOps, unsigned maxFactor) {
+    maxUnrolledOps = maxOps;
+    maxUnrollFactor = maxFactor;
+  }
+
   void runOnOperation() override {
     AffineLoopBands targetBands;
     getLoopBands(getOperation().front(), targetBands);
 
-    // Apply loop pipelining to corresponding level of each innermost loop.
     for (auto &band : targetBands) {
       auto currentLoop = band.back();
       unsigned loopLevel = 0;
       while (true) {
         auto parentLoop = currentLoop->getParentOfType<AffineForOp>();
 
-        // If meet the outermost loop, pipeline the current loop.
         if (!parentLoop || pipelineLevel == loopLevel) {
-          applyLoopPipelining(band, band.size() - loopLevel - 1, targetII);
+          applyLoopPipeliningImpl(band, band.size() - loopLevel - 1, targetII,
+                                  maxUnrolledOps, maxUnrollFactor);
           break;
         }
 
@@ -117,6 +181,7 @@ struct LoopPipelining : public sar::impl::LoopPipeliningBase<LoopPipelining> {
 };
 } // namespace
 
-std::unique_ptr<Pass> sar::createLoopPipeliningPass() {
-  return std::make_unique<LoopPipelining>();
+std::unique_ptr<Pass> sar::createLoopPipeliningPass(unsigned maxUnrolledOps,
+                                                    unsigned maxUnrollFactor) {
+  return std::make_unique<LoopPipelining>(maxUnrolledOps, maxUnrollFactor);
 }

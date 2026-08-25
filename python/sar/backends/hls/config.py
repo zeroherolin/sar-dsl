@@ -31,10 +31,12 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 from ...errors import SARError
+from .devices import DEVICES, budgets_for
 
 __all__ = [
     "CONFIG_ENV_VAR", "HLSConfig", "HLSConfigError", "OPTIONS",
-    "check_cpp_identifier", "check_precision", "shipped_config_path"
+    "check_cpp_identifier", "check_precision", "normalize_hls_top_identifier",
+    "shipped_config_path"
 ]
 
 #: Names a YAML file replacing the shipped defaults for a whole project.
@@ -56,6 +58,12 @@ class HLSConfigError(SARError, ValueError):
     """
 
 
+#: The budgets a caller states outright, and the ones `part` derives. Named
+#: here because `_resolve_budgets` has to know which keys the two modes
+#: compete over.
+_BUDGET_KEYS = ("bram_bytes", "uram_bytes", "lutram_bytes", "dsp", "ff", "lut")
+
+
 @dataclass(frozen=True)
 class _Spec:
     kind: str  # "int" | "float" | "bool" | "choice" | "identifier" | "part"
@@ -66,11 +74,23 @@ class _Spec:
     power_of_two: bool = False
     #: None is accepted and means "the backend decides".
     nullable: bool = False
-    #: Optimization strategy rather than a constraint. The compiler derives
+    #: Optimization strategy rather than a constraint. The compiler decides
     #: these, so they carry no default in the shipped file and are not part
     #: of the surface a user configures; pinning one is a diagnostic act.
     advanced: bool = False
+    #: How the compiler arrives at an `advanced` value. `TUNED` keys are
+    #: modelled per kernel against the resource budgets -- they are where
+    #: the latency/area trade-off is actually made. `FIXED` keys are the
+    #: same for every kernel: they encode a property of the lowering or of
+    #: the synthesis tool, and vary only if that changes. Marking them apart
+    #: keeps the tuner's real search space legible, and keeps a constant
+    #: from being mistaken for a decision.
+    strategy: str = ""
 
+
+#: `_Spec.strategy` values.
+TUNED = "tuned"
+FIXED = "fixed"
 
 #: The complete option schema; the shipped YAML carries a default for
 #: every key; the table in docs/backends.md mirrors these one-liners
@@ -92,18 +112,19 @@ OPTIONS: Dict[str, _Spec] = {
           minimum=0,
           maximum=_UINT32_MAX),
     "dsp":
-    _Spec("int", "DSP slice budget checked against synthesis reports "
-          "(`precision` is the pre-synthesis lever)",
+    _Spec("int", "DSP slice budget: bounds how wide the compiler replicates "
+          "the transform datapath, and is checked again against the "
+          "synthesis report",
           minimum=0,
           maximum=_UINT32_MAX),
     "ff":
     _Spec("int",
-          "Flip-flop budget checked against synthesis reports",
+          "Flip-flop budget, checked against the synthesis report only",
           minimum=0,
           maximum=_UINT32_MAX),
     "lut":
     _Spec("int",
-          "Lookup-table budget checked against synthesis reports",
+          "Lookup-table budget, checked against the synthesis report only",
           minimum=0,
           maximum=_UINT32_MAX),
     "interface":
@@ -135,13 +156,28 @@ OPTIONS: Dict[str, _Spec] = {
           choices=("native", "f32", "f64")),
     "part":
     _Spec(
-        "part", "Device part the generated Vitis scripts name (the memory "
-        "budgets above must describe the same device)"),
+        "part", "Device part the generated Vitis scripts name; naming one "
+        "in compile options derives the six budgets above from it"),
+    "utilization":
+    _Spec("float",
+          "Percent of the named part's resources the compiler may plan "
+          "against, leaving the rest for interconnect and placement",
+          minimum=1,
+          maximum=100),
     "clock_ns":
     _Spec("float",
-          "Target clock period of the generated Vitis scripts, in ns",
+          "Target clock period, in ns: the goal the compiler optimizes "
+          "toward and the period latency is quoted at. Unlike the resource "
+          "budgets it is not a hard cap -- a design that misses it is "
+          "reported, not rejected",
           minimum=1,
           maximum=1000),
+    "clock_uncertainty_percent":
+    _Spec("float",
+          "Clock-period margin reserved during HLS scheduling, as a percent "
+          "of clock_ns",
+          minimum=0,
+          maximum=50),
     "fft_stage_group":
     _Spec("int",
           "Stockham stages sharing one scratch slot (0 = a slot per stage, "
@@ -149,14 +185,16 @@ OPTIONS: Dict[str, _Spec] = {
           minimum=0,
           maximum=64,
           nullable=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
     "loop_tile_size":
     _Spec("int", "Loop tiling factor (1 disables tiling, null = the compiler "
           "decides)",
           minimum=1,
           maximum=1024,
           nullable=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
     "fft_parallel_rows":
     _Spec("int", "FFT lines transformed in parallel per prefetched block "
           "(0 disables lane parallelism, null = the compiler derives it "
@@ -165,7 +203,8 @@ OPTIONS: Dict[str, _Spec] = {
           maximum=1024,
           nullable=True,
           power_of_two=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
     "fft_io_unroll":
     _Spec("int", "Elements each FFT prefetch/write-back access moves (one "
           "bus beat lets the AXI port widen; null = the compiler decides)",
@@ -173,7 +212,30 @@ OPTIONS: Dict[str, _Spec] = {
           maximum=1024,
           nullable=True,
           power_of_two=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
+    "fuse_sibling_sweeps":
+    _Spec("bool", "Fuse identical affine sweeps before allocation reuse "
+          "(null = the compiler decides)",
+          nullable=True,
+          advanced=True,
+          strategy=TUNED),
+    "max_unrolled_ops":
+    _Spec("int", "Maximum operation copies materialized by inner-loop unroll "
+          "(null = the compiler decides)",
+          minimum=1,
+          maximum=1 << 30,
+          nullable=True,
+          advanced=True,
+          strategy=TUNED),
+    "max_unroll_factor":
+    _Spec("int", "Maximum factor used when full unroll exceeds the operation "
+          "budget (null = the compiler decides)",
+          minimum=1,
+          maximum=1024,
+          nullable=True,
+          advanced=True,
+          strategy=TUNED),
     "external_vector_max_lanes":
     _Spec("int", "Maximum lanes packed into a proven contiguous AXI access "
           "(null = the compiler decides)",
@@ -181,19 +243,72 @@ OPTIONS: Dict[str, _Spec] = {
           maximum=32,
           nullable=True,
           power_of_two=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
     "external_vector_min_elements":
     _Spec("int", "Smallest AXI array worth changing to a packed ABI "
           "(null = the compiler decides)",
           minimum=1,
           maximum=_UINT32_MAX,
           nullable=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
+    "external_vector_pack_outputs":
+    _Spec("bool", "Allow public output ports to use a packed physical ABI "
+          "(null = the compiler decides)",
+          nullable=True,
+          advanced=True,
+          strategy=TUNED),
+    "external_vector_compute_lanes":
+    _Spec("int", "Maximum unrolled compute lanes per packed transfer "
+          "(null = the compiler decides)",
+          minimum=0,
+          maximum=32,
+          nullable=True,
+          power_of_two=True,
+          advanced=True,
+          strategy=TUNED),
+    "max_scratch_arenas":
+    _Spec("int", "Maximum compiler-owned scratch masters per scalar type "
+          "(null = the compiler decides)",
+          minimum=1,
+          maximum=32,
+          nullable=True,
+          advanced=True,
+          strategy=FIXED),
     "interp_banded_gather":
     _Spec("bool", "Gather interpolation taps from an on-chip band (null = the "
           "compiler decides)",
           nullable=True,
-          advanced=True),
+          advanced=True,
+          strategy=FIXED),
+    "interp_full_row_max_bytes":
+    _Spec("int", "Maximum bytes a split-complex interpolation source row "
+          "may occupy when staged on chip (null = the compiler derives it "
+          "from the block-memory budget)",
+          minimum=0,
+          maximum=_UINT32_MAX,
+          nullable=True,
+          advanced=True,
+          strategy=TUNED),
+    "interp_cache_copies":
+    _Spec("int", "Replicated interpolation caches used to "
+          "isolate packed compute lanes (null = the compiler decides)",
+          minimum=1,
+          maximum=32,
+          nullable=True,
+          power_of_two=True,
+          advanced=True,
+          strategy=TUNED),
+    "interp_complete_bank_max_elements":
+    _Spec("int", "Largest interpolation band completely partitioned into "
+          "register banks (null = the compiler derives it from LUT/FF "
+          "budgets and compute lanes)",
+          minimum=0,
+          maximum=_UINT32_MAX,
+          nullable=True,
+          advanced=True,
+          strategy=TUNED),
     "reuse_buffer_min_elements":
     _Spec("int",
           "Buffers of at least this many elements may share an allocation "
@@ -201,7 +316,8 @@ OPTIONS: Dict[str, _Spec] = {
           minimum=0,
           maximum=_UINT64_MAX,
           nullable=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
     "recompute_min_elements":
     _Spec("int",
           "Producers of at least this many elements are recomputed rather "
@@ -209,21 +325,24 @@ OPTIONS: Dict[str, _Spec] = {
           minimum=0,
           maximum=_UINT64_MAX,
           nullable=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
     "external_buffer_threshold":
     _Spec("int", "Buffers of at least this many elements go off chip "
           "(null = the compiler decides)",
           minimum=0,
           maximum=_UINT32_MAX,
           nullable=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
     "lutram_max_bytes":
     _Spec("int", "Bank size, in bytes, at or below which distributed RAM is "
           "used (null = the compiler decides)",
           minimum=0,
           maximum=_UINT32_MAX,
           nullable=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
     "array_partition_max_factor":
     _Spec("int", "Largest automatic memory-bank factor (null = the compiler "
           "derives it from one AXI beat)",
@@ -231,7 +350,8 @@ OPTIONS: Dict[str, _Spec] = {
           maximum=1024,
           nullable=True,
           power_of_two=True,
-          advanced=True),
+          advanced=True,
+          strategy=TUNED),
     "top_func":
     _Spec("identifier",
           "Name of the emitted top function (null = the kernel's name)",
@@ -272,6 +392,35 @@ public register reinterpret_cast requires return short signed sizeof static
 static_assert static_cast struct switch synchronized template this
 thread_local throw true try typedef typeid typename union unsigned using
 virtual void volatile wchar_t while xor xor_eq
+""".split())
+
+# Vitis emits the top symbol into Verilog/VHDL as well as C++. HDL keywords
+# that are otherwise valid C++ identifiers must therefore be normalized before
+# the symbol reaches `set_top`. The union intentionally includes the common
+# VHDL and Verilog/SystemVerilog words; prefixing a rare collision is safer
+# than producing a package that passes C simulation and fails synthesis.
+_HDL_KEYWORDS = frozenset("""
+abs access after alias all always and architecture array assert assign
+attribute automatic begin block body buf buffer bus case casex casez cell cmos
+component configuration constant context cover deassign default defparam
+design disable disconnect downto edge elsif end endcase endconfig endfunction
+endgenerate endmodule endprimitive endspecify endtable endtask entity event
+exit fairness file force forever fork function generate generic genvar guarded
+highz0 highz1 ifnone impure in inertial initial inout input instance integer is
+label large liblist library linkage literal localparam loop macromodule map
+medium mod nand negedge new next nmos nor noshowcancel not notif0 notif1 null
+of
+on open or others out output package parameter pmos port posedge postponed
+primitive procedure process property protected pull0 pull1 pulldown pullup pure
+range rcmos real realtime record reg register reject release rem repeat report
+restrict return rnmos rol ror rpmos rtran rtranif0 rtranif1 scalared select
+sequence severity shared showcancel signal signed sla sll small specify
+specparam
+sra srl strong strong0 strong1 subtype supply0 supply1 table task time to tran
+tranif0 tranif1 transport tri tri0 tri1 triand trior trireg type unaffected
+units unsigned use uwire variable vectored wait wand weak0 weak1 when while
+wire
+with wor xnor xor
 """.split())
 
 
@@ -354,12 +503,18 @@ def _known_options() -> str:
     ]
     lines.append(f"  {_CONFIG_KEY:<26}"
                  "Path to a YAML file overriding the shipped defaults")
-    advanced = [name for name, spec in OPTIONS.items() if spec.advanced]
-    if advanced:
+    tuned = [name for name, spec in OPTIONS.items() if spec.strategy == TUNED]
+    fixed = [name for name, spec in OPTIONS.items() if spec.strategy == FIXED]
+    if tuned:
         lines.append("")
-        lines.append("The compiler derives these; pin one only to diagnose "
-                     "its effect:")
-        lines.append("  " + ", ".join(advanced))
+        lines.append("The compiler models these against the kernel and the "
+                     "resource budgets; pin one only to diagnose its effect:")
+        lines.append("  " + ", ".join(tuned))
+    if fixed:
+        lines.append("")
+        lines.append("These are the same for every kernel and encode a "
+                     "property of the lowering or of the synthesis tool:")
+        lines.append("  " + ", ".join(fixed))
     return "\n".join(lines)
 
 
@@ -382,6 +537,13 @@ def check_cpp_identifier(value: str, origin: str = "kernel name") -> str:
         raise HLSConfigError(
             f"{origin} {value!r} is not a valid C++ identifier")
     return value
+
+
+def normalize_hls_top_identifier(value: str,
+                                 origin: str = "kernel name") -> str:
+    """Return a C++ and HDL-safe top name, preserving ordinary identifiers."""
+    value = check_cpp_identifier(value, origin)
+    return f"sar_{value}" if value.lower() in _HDL_KEYWORDS else value
 
 
 def _validate(key: str, value, origin: str):
@@ -543,7 +705,60 @@ class HLSConfig(Mapping):
             provenance[key] = cls.FROM_OPTIONS
         if options:
             sources.append(cls.FROM_OPTIONS)
-        return cls(values, sources, provenance)
+        config = cls(values, sources, provenance)
+        config._resolve_budgets(options)
+        return config
+
+    def _resolve_budgets(self, options: Dict[str, object]) -> None:
+        """Applies the two ways a caller may state the resource budgets.
+
+        The budgets and `part` describe one device, so a caller states one or
+        the other, never both:
+
+        * `part`, optionally with `utilization`, derives all six from the
+          device table -- the sizing is the device's, and the percentage is
+          how much of it the design may claim;
+        * the six budgets, stated outright, are used as written and describe
+          whatever device the caller has in mind.
+
+        Mixing them is refused rather than ranked. A part says the budgets
+        are the device's, a budget says it is the caller's, and quietly
+        keeping one of those would plan against a device that is partly each
+        -- the mismatch this resolution exists to prevent.
+
+        A caller who states neither gets `hls_config.yaml`, whose six values
+        stand on their own.
+        """
+        stated = sorted(key for key in _BUDGET_KEYS if key in options)
+        by_part = "part" in options or "utilization" in options
+        if by_part and stated:
+            raise HLSConfigError(
+                "compile options name both a device ('part') and explicit "
+                f"budgets ({stated}); they are two ways to say the same "
+                "thing. Name the part and let the budgets follow it "
+                "(optionally with 'utilization'), or state all six budgets "
+                "and leave 'part' at its default.")
+        if "utilization" in options and "part" not in options:
+            raise HLSConfigError(
+                "compile options set 'utilization' without a 'part'. The "
+                "percentage scales the budgets a device implies, so it needs "
+                "the device to scale.")
+        if not by_part:
+            return
+
+        part = self._values["part"]
+        budgets = budgets_for(part, float(self._values["utilization"]) / 100.0)
+        if not budgets:
+            raise HLSConfigError(
+                f"part {part!r} is not in the device table, so its budgets "
+                "cannot be derived. State the six budgets "
+                f"({list(_BUDGET_KEYS)}) for this device instead, or name a "
+                "tabulated part: " + ", ".join(sorted(DEVICES)))
+        for key, value in budgets.items():
+            self._values[key] = _validate(key, value, self.DERIVED)
+            self._provenance[key] = self.DERIVED
+        if self.DERIVED not in self.sources:
+            self.sources = self.sources + (self.DERIVED, )
 
     # -- Derived values ------------------------------------------------ #
 
@@ -564,13 +779,7 @@ class HLSConfig(Mapping):
                 self.sources = self.sources + (self.DERIVED, )
 
     def repin(self, key: str, value) -> None:
-        """Replaces a derived value with a revised one (still `derived`).
-
-        Only the compiler calls this, when a first decision turned out
-        wrong against measured feedback -- e.g. the placement threshold
-        after the scheduled design overran the memory budgets. A value the
-        user pinned is never revised; that is `adopt`'s contract too.
-        """
+        """Revises a compiler-derived value; pinned values remain unchanged."""
         if self._provenance.get(key) != self.DERIVED:
             raise HLSConfigError(f"cannot repin {key!r}: not a derived value")
         self._values[key] = _validate(key, value, self.DERIVED)
@@ -588,6 +797,12 @@ class HLSConfig(Mapping):
         return (int(self._values["bram_bytes"]) +
                 int(self._values["uram_bytes"]) +
                 int(self._values["lutram_bytes"]))
+
+    def effective_clock_ns(self) -> float:
+        """Scheduling delay budget after the configured uncertainty margin."""
+        period = float(self._values["clock_ns"])
+        margin = float(self._values["clock_uncertainty_percent"]) / 100.0
+        return period * (1.0 - margin)
 
     # -- Mapping ------------------------------------------------------- #
 
@@ -615,21 +830,27 @@ class HLSConfig(Mapping):
 
 
 def check_precision(config: HLSConfig, arg_types, result_types) -> None:
-    """Enforces the `precision` policy on a kernel's planes.
+    """Enforces the `precision` policy on a kernel's signal planes.
 
     The passes have no precision knob -- the declared dtypes are the data
     path -- so the policy is a gate rather than a transformation: an f64
     plane reaching a design budgeted for f32 costs several times the DSPs
     and block RAM per operator, and nothing downstream reports it.
+
+    Only complex planes are judged here, because only they are certainly
+    signal. A real plane may be a sampling coordinate, which `sar.interp1d`
+    and `sar.gather2d` fix at f64 whatever the data path is; telling the two
+    apart takes the traced graph, so `sar-verify-precision` does it on the
+    IR and reports the operation rather than the port.
     """
     policy = config.precision
     if policy == "native":
         return
     for kind, types in (("argument", arg_types), ("result", result_types)):
         for index, ty in enumerate(types):
-            if not (ty.dtype.is_float or ty.dtype.is_complex):
+            if not ty.dtype.is_complex:
                 continue
-            width = "f64" if ty.dtype.name in ("f64", "c128") else "f32"
+            width = "f64" if ty.dtype.name == "c128" else "f32"
             if width != policy:
                 raise HLSConfigError(
                     f"precision={policy!r} but {kind} {index} is "

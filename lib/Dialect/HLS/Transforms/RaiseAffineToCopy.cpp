@@ -1,4 +1,4 @@
-//===- RaiseAffineToCopy.cpp - raise affine to copy -----------------------===//
+//===- RaiseAffineToCopy.cpp - recognize copy loops as memref copies ------===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

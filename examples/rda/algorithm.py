@@ -46,6 +46,7 @@ def build_kernel(n: int,
 
     grid = np.arange(N, dtype=np.float64)
 
+    @sar.func
     def rda(raw: sar.c64[N, N], range_ref: dtype[N], fa: fd[N], tau: fd[N],
             win_a: fd[N]) -> sar.f32[N, N]:
         data = sar.cast(raw, dtype)
@@ -77,8 +78,8 @@ def build_kernel(n: int,
         data = sar.ifft(sar.ifftshift(data, axis=0), axis=0)
         return sar.cast(sar.absolute(data), sar.f32)
 
-    rda.__name__ = name
-    return sar.func(rda)
+    rda.name = name
+    return rda
 
 
 def make_inputs(n: int, p: RadarParams):

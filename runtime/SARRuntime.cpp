@@ -45,29 +45,9 @@ namespace {
 // Plane pool
 //===----------------------------------------------------------------------===//
 //
-// A kernel invocation allocates its intermediate planes, writes them once
-// and frees them. At scene scale each plane is gigabytes, so libc serves it
-// with a fresh mmap and returns it on free -- and the next invocation
-// faults and zeroes every page again before the first useful store. That
-// first touch, not the arithmetic, is what a full-size run spends most of
-// its time on: 4 GiB costs ~1.5 s to fault in against ~0.03 s to rewrite.
-//
-// The pool keeps freed blocks mapped and hands them back to the next
-// request of the same shape, so the pages are faulted once per process
-// rather than once per call. It is not a general allocator: the only
-// requests it ever sees are a kernel's own buffers, a handful of large
-// blocks per call in a repeating pattern.
-//
-// Retention is bounded by the peak the kernel itself reached -- the pool
-// never holds more than was live at once, so a process that could run the
-// kernel can hold its cache. `SAR_RT_POOL_MAX_BYTES` overrides the bound;
-// 0 disables pooling and every block goes straight back to libc.
-//
-// Only blocks worth the bookkeeping are pooled. Below `kPoolMinBytes` a
-// buffer is not what a first touch is spent on, and libc's own free lists
-// already serve it without a round trip to the kernel; leaving those to
-// libc is also what keeps the pool's block list a dozen entries long, so
-// the linear scans below stay cheap.
+// Large intermediate planes are reused by size to avoid repeated mmap and
+// page-fault costs. Retention is bounded by the peak live allocation;
+// `SAR_RT_POOL_MAX_BYTES=0` disables pooling. Small blocks remain with libc.
 
 class PlanePool {
 public:
@@ -562,9 +542,10 @@ using sar_rt::kReflect;
 using sar_rt::kSinc;
 using sar_rt::kZero;
 
-/// Modified Bessel function of the first kind, order zero (power series;
-/// the term test exits well before the bound for the beta range the
-/// verifier admits). The iteration bound matches the HLS lowering's.
+/// Modified Bessel function of the first kind, order zero (power series).
+/// The term test exits well before the bound over the beta range the
+/// verifier admits, so the two backends agree to f64 rounding even though
+/// the HLS lowering runs a shorter, straight-line series instead.
 double besselI0(double x) {
   double sum = 1.0, term = 1.0;
   double halfX = x / 2.0;

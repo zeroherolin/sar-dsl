@@ -6,6 +6,7 @@
 
 #include "sar/Target/HLS/EmitHLSCpp.h"
 #include "mlir/Analysis/CallGraph.h"
+#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/InitAllDialects.h"
@@ -136,6 +137,18 @@ static std::string getDataTypeName(Type type) {
     return intName;
   }
   return "unknown_type";
+}
+
+static std::string getUnsignedDataTypeName(Type type) {
+  type = peelAxiType(type);
+  if (isa<IndexType>(type))
+    return "uint64_t";
+  auto integer = dyn_cast<IntegerType>(type);
+  if (!integer)
+    return "unknown_type";
+  if (integer.getWidth() == 1)
+    return "bool";
+  return "ap_uint<" + std::to_string(integer.getWidth()) + ">";
 }
 
 static std::string getStorageTypeAndImpl(MemoryKind kind, std::string typeStr,
@@ -291,6 +304,167 @@ static PortRole getPortRole(Value value) {
   if (isRead)
     return PortRole::In;
   return PortRole::Unused;
+}
+
+/// AXI4-Stream has no address channel. A memref may use it only when the whole
+/// call chain contains exactly one monotonic row-major sweep, with every
+/// element consumed or produced once.
+static bool isProvablySequentialStreamPort(Value value, PortRole role,
+                                           unsigned &accesses) {
+  for (OpOperand &use : value.getUses()) {
+    Operation *owner = use.getOwner();
+    if (auto call = dyn_cast<func::CallOp>(owner)) {
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (!callee || callee.isExternal() || isNestedInLoop(call) ||
+          use.getOperandNumber() >= callee.getNumArguments() ||
+          !isProvablySequentialStreamPort(
+              callee.getArgument(use.getOperandNumber()), role, accesses))
+        return false;
+      continue;
+    }
+
+    // The interface pass has already converted a proven affine sweep to
+    // StreamRead/StreamWrite operations. There are no indices left to
+    // inspect, but the recursive walk still verifies one FIFO direction.
+    if (isa<StreamType>(value.getType())) {
+      bool expected = (role == PortRole::In && isa<StreamReadOp>(owner)) ||
+                      (role == PortRole::Out && isa<StreamWriteOp>(owner));
+      if (!expected)
+        return false;
+      ++accesses;
+      continue;
+    }
+
+    bool expected = (role == PortRole::In && isa<AffineLoadOp>(owner)) ||
+                    (role == PortRole::Out && isa<AffineStoreOp>(owner));
+    if (!expected || !isCompleteRowMajorSweep(owner, value))
+      return false;
+    ++accesses;
+  }
+  return true;
+}
+
+static bool isProvablySequentialStreamPort(Value value, PortRole role) {
+  if (role != PortRole::In && role != PortRole::Out)
+    return false;
+  unsigned accesses = 0;
+  return isProvablySequentialStreamPort(value, role, accesses) && accesses == 1;
+}
+
+/// Returns memrefs whose accesses in `loop` are proven independent across
+/// iterations of that loop. This is useful for a carved arena: two logical
+/// planes may share one physical pointer while occupying disjoint affine
+/// ranges. Vitis otherwise treats the pointer as loop-carried memory and
+/// raises the II even though no iteration can observe another's write.
+static SmallVector<Value>
+getInterIterationIndependentMemrefs(affine::AffineForOp loop) {
+  SmallVector<Value> result;
+  llvm::MapVector<Value, SmallVector<Operation *>> accesses;
+  loop.getBody()->walk([&](Operation *operation) {
+    if (auto read = dyn_cast<affine::AffineReadOpInterface>(operation))
+      accesses[read.getMemRef()].push_back(operation);
+    else if (auto write = dyn_cast<affine::AffineWriteOpInterface>(operation))
+      accesses[write.getMemRef()].push_back(operation);
+  });
+
+  for (auto &entry : accesses) {
+    bool independent = true;
+    bool hasRead = false;
+    bool hasWrite = false;
+    auto &ops = entry.second;
+    for (unsigned i = 0; i < ops.size() && independent; ++i) {
+      auto *lhs = ops[i];
+      bool lhsWrite = isa<affine::AffineWriteOpInterface>(lhs);
+      hasWrite |= lhsWrite;
+      hasRead |= !lhsWrite;
+      for (unsigned j = 0; j < ops.size(); ++j) {
+        auto *rhs = ops[j];
+        if (lhs == rhs)
+          continue;
+        bool rhsWrite = isa<affine::AffineWriteOpInterface>(rhs);
+        if (!lhsWrite && !rhsWrite)
+          continue;
+
+        unsigned common = affine::getNumCommonSurroundingLoops(*lhs, *rhs);
+        if (common == 0) {
+          independent = false;
+          break;
+        }
+        affine::MemRefAccess lhsAccess(lhs), rhsAccess(rhs);
+        auto dependence = affine::checkMemrefAccessDependence(
+            lhsAccess, rhsAccess, common + 1);
+        if (!affine::noDependence(dependence)) {
+          independent = false;
+          break;
+        }
+      }
+    }
+    if (independent && hasRead && hasWrite)
+      result.push_back(entry.first);
+  }
+
+  // Outlined dataflow nodes may receive the same arena value for two
+  // distinct arguments. Their block arguments therefore look unrelated to
+  // local analysis even though the generated caller aliases them. Re-run the
+  // same affine proof across such argument pairs, treating the two accesses
+  // as views of one memref. This is what lets a carved read range and write
+  // range share storage without forcing a false loop-carried dependence.
+  auto func = loop->getParentOfType<func::FuncOp>();
+  auto module = func ? func->getParentOfType<ModuleOp>() : ModuleOp();
+  if (!func || !module)
+    return result;
+
+  SmallVector<std::pair<BlockArgument, BlockArgument>> aliases;
+  module.walk([&](func::CallOp call) {
+    auto callee = dyn_cast_or_null<func::FuncOp>(
+        SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+    if (callee != func)
+      return;
+    for (unsigned i = 0; i < call.getNumOperands(); ++i)
+      for (unsigned j = i + 1; j < call.getNumOperands(); ++j)
+        if (call.getOperand(i) == call.getOperand(j) &&
+            isa<MemRefType>(callee.getArgument(i).getType()) &&
+            isa<MemRefType>(callee.getArgument(j).getType()))
+          aliases.emplace_back(callee.getArgument(i), callee.getArgument(j));
+  });
+
+  for (auto [lhsArg, rhsArg] : aliases) {
+    auto lhsIt = accesses.find(lhsArg), rhsIt = accesses.find(rhsArg);
+    if (lhsIt == accesses.end() || rhsIt == accesses.end())
+      continue;
+    bool independent = true;
+    bool hasRead = false, hasWrite = false;
+    for (Operation *lhs : lhsIt->second)
+      for (Operation *rhs : rhsIt->second) {
+        bool lhsWrite = isa<affine::AffineWriteOpInterface>(lhs);
+        bool rhsWrite = isa<affine::AffineWriteOpInterface>(rhs);
+        hasRead |= !lhsWrite || !rhsWrite;
+        hasWrite |= lhsWrite || rhsWrite;
+        if (!lhsWrite && !rhsWrite)
+          continue;
+        unsigned common = affine::getNumCommonSurroundingLoops(*lhs, *rhs);
+        if (common == 0) {
+          independent = false;
+          break;
+        }
+        affine::MemRefAccess lhsAccess(lhs), rhsAccess(rhs);
+        rhsAccess.memref = lhsAccess.memref;
+        auto forward = affine::checkMemrefAccessDependence(lhsAccess, rhsAccess,
+                                                           common + 1);
+        auto reverse = affine::checkMemrefAccessDependence(rhsAccess, lhsAccess,
+                                                           common + 1);
+        if (!affine::noDependence(forward) || !affine::noDependence(reverse)) {
+          independent = false;
+          break;
+        }
+      }
+    if (independent && hasRead && hasWrite) {
+      result.push_back(lhsArg);
+      result.push_back(rhsArg);
+    }
+  }
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -551,7 +725,12 @@ public:
   /// Standard expression emitters.
   void emitUnary(Operation *op, const char *syntax);
   void emitBinary(Operation *op, const char *syntax);
+  void emitUnsignedBinary(Operation *op, const char *syntax);
+  void emitUnsignedAssign(Operation *op);
+  void emitFPToUnsigned(arith::FPToUIOp op);
   template <typename OpType> void emitMaxMin(OpType op, const char *syntax);
+  template <typename OpType>
+  void emitUnsignedMaxMin(OpType op, const char *syntax);
 
   /// Special expression emitters.
   void emitSelect(arith::SelectOp op);
@@ -576,10 +755,12 @@ private:
   /// MLIR component and HLS C++ pragma emitters.
   void emitBlock(Block &block);
   void emitLoopDirectives(Operation *op);
-  void emitArrayDirectives(Value memref, bool isInterface = false);
+  void emitArrayDirectives(Value memref, bool isInterface = false,
+                           bool emitStorage = true);
   void emitAxiShape(MemRefType type);
   void emitFunctionDirectives(func::FuncOp func, ArrayRef<Value> portList);
   void emitFunction(func::FuncOp func);
+  void emitInterfaceSchema(func::FuncOp func);
 
   /// Naming and layout helpers.
   StringRef getEmittedFuncName(StringRef symbol);
@@ -847,10 +1028,10 @@ public:
     return emitter.emitMaxMin(op, "std::fmod"), true;
   }
   bool visitOp(arith::MaximumFOp op) {
-    return emitter.emitMaxMin(op, "std::max"), true;
+    return emitter.emitMaxMin(op, "sar_hls_maximum"), true;
   }
   bool visitOp(arith::MinimumFOp op) {
-    return emitter.emitMaxMin(op, "std::min"), true;
+    return emitter.emitMaxMin(op, "sar_hls_minimum"), true;
   }
   bool visitOp(math::PowFOp op) {
     return emitter.emitMaxMin(op, "std::pow"), true;
@@ -866,14 +1047,20 @@ public:
   bool visitOp(arith::MulIOp op) { return emitter.emitBinary(op, "*"), true; }
   bool visitOp(arith::DivSIOp op) { return emitter.emitBinary(op, "/"), true; }
   bool visitOp(arith::RemSIOp op) { return emitter.emitBinary(op, "%"), true; }
-  bool visitOp(arith::DivUIOp op) { return emitter.emitBinary(op, "/"), true; }
-  bool visitOp(arith::RemUIOp op) { return emitter.emitBinary(op, "%"), true; }
+  bool visitOp(arith::DivUIOp op) {
+    return emitter.emitUnsignedBinary(op, "/"), true;
+  }
+  bool visitOp(arith::RemUIOp op) {
+    return emitter.emitUnsignedBinary(op, "%"), true;
+  }
   bool visitOp(arith::XOrIOp op) { return emitter.emitBinary(op, "^"), true; }
   bool visitOp(arith::AndIOp op) { return emitter.emitBinary(op, "&"), true; }
   bool visitOp(arith::OrIOp op) { return emitter.emitBinary(op, "|"), true; }
   bool visitOp(arith::ShLIOp op) { return emitter.emitBinary(op, "<<"), true; }
   bool visitOp(arith::ShRSIOp op) { return emitter.emitBinary(op, ">>"), true; }
-  bool visitOp(arith::ShRUIOp op) { return emitter.emitBinary(op, ">>"), true; }
+  bool visitOp(arith::ShRUIOp op) {
+    return emitter.emitUnsignedBinary(op, ">>"), true;
+  }
   bool visitOp(arith::MaxSIOp op) {
     return emitter.emitMaxMin(op, "std::max"), true;
   }
@@ -881,19 +1068,23 @@ public:
     return emitter.emitMaxMin(op, "std::min"), true;
   }
   bool visitOp(arith::MaxUIOp op) {
-    return emitter.emitMaxMin(op, "std::max"), true;
+    return emitter.emitUnsignedMaxMin(op, "std::max"), true;
   }
   bool visitOp(arith::MinUIOp op) {
-    return emitter.emitMaxMin(op, "std::min"), true;
+    return emitter.emitUnsignedMaxMin(op, "std::min"), true;
   }
 
   /// Special expressions.
   bool visitOp(arith::SelectOp op) { return emitter.emitSelect(op), true; }
   bool visitOp(arith::ConstantOp op) { return emitter.emitConstant(op), true; }
   bool visitOp(arith::IndexCastOp op) { return emitter.emitAssign(op), true; }
-  bool visitOp(arith::UIToFPOp op) { return emitter.emitAssign(op), true; }
+  bool visitOp(arith::UIToFPOp op) {
+    return emitter.emitUnsignedAssign(op), true;
+  }
   bool visitOp(arith::SIToFPOp op) { return emitter.emitAssign(op), true; }
-  bool visitOp(arith::FPToUIOp op) { return emitter.emitFPToInt(op), true; }
+  bool visitOp(arith::FPToUIOp op) {
+    return emitter.emitFPToUnsigned(op), true;
+  }
   bool visitOp(arith::FPToSIOp op) { return emitter.emitFPToInt(op), true; }
 
   /// Width conversions emit as plain assignments: the emitted types
@@ -940,17 +1131,21 @@ bool ExprVisitor::visitOp(arith::CmpIOp op) {
   case arith::CmpIPredicate::ne:
     return emitter.emitBinary(op, "!="), true;
   case arith::CmpIPredicate::slt:
-  case arith::CmpIPredicate::ult:
     return emitter.emitBinary(op, "<"), true;
+  case arith::CmpIPredicate::ult:
+    return emitter.emitUnsignedBinary(op, "<"), true;
   case arith::CmpIPredicate::sle:
-  case arith::CmpIPredicate::ule:
     return emitter.emitBinary(op, "<="), true;
+  case arith::CmpIPredicate::ule:
+    return emitter.emitUnsignedBinary(op, "<="), true;
   case arith::CmpIPredicate::sgt:
-  case arith::CmpIPredicate::ugt:
     return emitter.emitBinary(op, ">"), true;
+  case arith::CmpIPredicate::ugt:
+    return emitter.emitUnsignedBinary(op, ">"), true;
   case arith::CmpIPredicate::sge:
-  case arith::CmpIPredicate::uge:
     return emitter.emitBinary(op, ">="), true;
+  case arith::CmpIPredicate::uge:
+    return emitter.emitUnsignedBinary(op, ">="), true;
   }
   llvm_unreachable("covered switch");
 }
@@ -975,6 +1170,9 @@ void ModuleEmitter::emitStreamChannel(StreamOp op) {
   emitValue(op.getChannel());
   os << ";";
   os << "\n";
+  indent() << "#pragma HLS stream variable=";
+  emitValue(op.getChannel());
+  os << " depth=" << op.getDepth() << "\n";
 }
 
 void ModuleEmitter::emitStreamRead(StreamReadOp op) {
@@ -1026,9 +1224,13 @@ void ModuleEmitter::emitAxiPort(AxiPortOp op) {
   // Only pure inputs and pure outputs stream; everything else stays
   // memory-mapped.
   auto role = getPortRole(op.getElement());
+  bool requestedStream = op.getBundleType().getKind() == AxiKind::STREAM ||
+                         (streamInterface && !op->hasAttr("hls.scratch"));
   bool streaming =
-      op.getBundleType().getKind() == AxiKind::STREAM ||
-      (streamInterface && (role == PortRole::In || role == PortRole::Out));
+      requestedStream && isProvablySequentialStreamPort(op.getElement(), role);
+  if (requestedStream && !streaming)
+    emitError(op, "cannot use AXI4-Stream without one complete monotonic "
+                  "row-major access sweep");
 
   indent() << "#pragma HLS interface";
 
@@ -1050,14 +1252,66 @@ void ModuleEmitter::emitAxiPort(AxiPortOp op) {
 
   os << " port=";
   emitValue(op.getElement());
-  os << " bundle=" << op.getBundleName();
+  // Vitis HLS 2022.2 rejects `bundle=` on an AXI4-Stream pragma. Bundles
+  // only name addressed AXI masters; stream references are independent.
+  if (!streaming)
+    os << " bundle=" << op.getBundleName();
   os << "\n";
 
-  // Array directives describe an on-chip memory's banking and storage type;
-  // a streaming port has neither, so they are emitted only for memory-mapped
-  // ports.
-  if (!streaming && isa<MemRefType>(op.getElement().getType()))
-    emitArrayDirectives(op.getElement(), true);
+  // ``offset=slave`` puts the base address in an AXI-Lite register.  Name
+  // that register explicitly on the same control bundle as ``return``;
+  // otherwise Vitis 2022.2 silently creates its default ``control`` bundle
+  // beside the generated ``ctrl`` bundle, exposing two control interfaces.
+  if (!streaming) {
+    indent() << "#pragma HLS interface s_axilite port=";
+    emitValue(op.getElement());
+    os << " bundle=ctrl\n";
+  }
+
+  // An m_axi port is one physical interface. Array partitioning is an
+  // on-chip banking directive; attaching it here makes Vitis split one
+  // declared master into several RTL masters, violating the generated ABI.
+  // Packing and burst shaping above provide external width. Any banking a
+  // consumer needs belongs on a staged local buffer, never on this port.
+  if (auto init = op->getAttrOfType<TypedAttr>("init_value")) {
+    auto type = cast<MemRefType>(op.getElement().getType());
+    Type scalarType = type.getElementType();
+    unsigned lanes = 1;
+    if (auto vector = dyn_cast<VectorType>(scalarType)) {
+      scalarType = vector.getElementType();
+      lanes = vector.getNumElements();
+    }
+    auto value = getConstantString(scalarType, init);
+    if (value.empty()) {
+      emitError(op, "has an initial value the C++ target cannot emit");
+    } else {
+      for (auto [dim, extent] : llvm::enumerate(type.getShape())) {
+        indent() << "for (int64_t init_i" << dim << " = 0; init_i" << dim
+                 << " < " << extent << "; ++init_i" << dim << ") {\n";
+        addIndent();
+      }
+      if (lanes > 1) {
+        indent() << "for (int64_t init_lane = 0; init_lane < " << lanes
+                 << "; ++init_lane) {\n";
+        addIndent();
+      }
+      indent();
+      emitValue(op.getElement());
+      for (unsigned dim = 0; dim < type.getRank(); ++dim)
+        os << "[init_i" << dim << "]";
+      if (lanes > 1)
+        os << "[init_lane]";
+      os << " = " << value << ";\n";
+      if (lanes > 1) {
+        reduceIndent();
+        indent() << "}\n";
+      }
+      for (unsigned dim = 0; dim < type.getRank(); ++dim) {
+        reduceIndent();
+        indent() << "}\n";
+      }
+    }
+  }
   // An empty line.
   os << "\n";
 }
@@ -1190,8 +1444,10 @@ LogicalResult ModuleEmitter::emitLoopCarries(ValueRange results,
       addAlias(init, result);
       continue;
     }
-    if (isa<ShapedType>(result.getType())) {
-      emitError(op, "only scalar and memref loop carries are supported");
+    if (isa<ShapedType>(result.getType()) &&
+        !isa<VectorType>(result.getType())) {
+      emitError(op,
+                "only scalar, vector and memref loop carries are supported");
       return failure();
     }
     indent();
@@ -1898,6 +2154,30 @@ template <typename OpType> void ModuleEmitter::emitAlloc(OpType op) {
   os << ";";
   os << "\n";
   emitArrayDirectives(op.getResult());
+
+  auto buffer = dyn_cast<BufferOp>(op.getOperation());
+  if (!buffer || !buffer.getInitValue())
+    return;
+  auto type = buffer.getType();
+  auto init = getConstantString(type.getElementType(), *buffer.getInitValue());
+  if (init.empty()) {
+    emitError(buffer, "has an initial value the C++ target cannot emit");
+    return;
+  }
+  for (auto [dim, extent] : llvm::enumerate(type.getShape())) {
+    indent() << "for (int64_t init_i" << dim << " = 0; init_i" << dim << " < "
+             << extent << "; ++init_i" << dim << ") {\n";
+    addIndent();
+  }
+  indent();
+  emitValue(buffer.getResult());
+  for (unsigned dim = 0; dim < type.getRank(); ++dim)
+    os << "[init_i" << dim << "]";
+  os << " = " << init << ";\n";
+  for (unsigned dim = 0; dim < type.getRank(); ++dim) {
+    reduceIndent();
+    indent() << "}\n";
+  }
 }
 
 void ModuleEmitter::emitLoad(memref::LoadOp op) {
@@ -1967,6 +2247,53 @@ void ModuleEmitter::emitBinary(Operation *op, const char *syntax) {
   emitNestedLoopFooter(rank);
 }
 
+void ModuleEmitter::emitUnsignedBinary(Operation *op, const char *syntax) {
+  auto rank = emitNestedLoopHeader(op->getResult(0));
+  indent();
+  emitValue(op->getResult(0), rank);
+  std::string type = getUnsignedDataTypeName(op->getOperand(0).getType());
+  os << " = (" << type << ")(";
+  emitValue(op->getOperand(0), rank);
+  os << ") " << syntax << " (" << type << ")(";
+  emitValue(op->getOperand(1), rank);
+  os << ");\n";
+  emitNestedLoopFooter(rank);
+}
+
+void ModuleEmitter::emitUnsignedAssign(Operation *op) {
+  auto rank = emitNestedLoopHeader(op->getResult(0));
+  indent();
+  emitValue(op->getResult(0), rank);
+  os << " = (" << getUnsignedDataTypeName(op->getOperand(0).getType()) << ")(";
+  emitValue(op->getOperand(0), rank);
+  os << ");\n";
+  emitNestedLoopFooter(rank);
+}
+
+void ModuleEmitter::emitFPToUnsigned(arith::FPToUIOp op) {
+  auto rank = emitNestedLoopHeader(op.getResult());
+  indent();
+  emitValue(op.getResult(), rank);
+  os << " = (" << getUnsignedDataTypeName(op.getResult().getType()) << ")(";
+  emitValue(op.getIn(), rank);
+  os << ");\n";
+  emitNestedLoopFooter(rank);
+}
+
+template <typename OpType>
+void ModuleEmitter::emitUnsignedMaxMin(OpType op, const char *syntax) {
+  auto rank = emitNestedLoopHeader(op.getResult());
+  indent();
+  emitValue(op.getResult(), rank);
+  std::string type = getUnsignedDataTypeName(op.getLhs().getType());
+  os << " = " << syntax << "((" << type << ")(";
+  emitValue(op.getLhs(), rank);
+  os << "), (" << type << ")(";
+  emitValue(op.getRhs(), rank);
+  os << "));\n";
+  emitNestedLoopFooter(rank);
+}
+
 template <typename OpType>
 void ModuleEmitter::emitMaxMin(OpType op, const char *syntax) {
   auto rank = emitNestedLoopHeader(op.getResult());
@@ -2008,13 +2335,23 @@ template <typename OpType> void ModuleEmitter::emitConstant(OpType op) {
 
   if (auto denseAttr = dyn_cast<DenseElementsAttr>(op.getValue())) {
     indent();
-    emitArrayDecl(op.getResult());
+    Type resultType = op.getResult().getType();
+    Type elementType;
+    if (auto memref = dyn_cast<MemRefType>(resultType)) {
+      emitArrayDecl(op.getResult());
+      elementType = memref.getElementType();
+    } else if (auto vector = dyn_cast<VectorType>(resultType)) {
+      emitValue(op.getResult());
+      elementType = vector.getElementType();
+    } else {
+      emitError(op, "has a dense constant with unsupported result type");
+      return;
+    }
     os << " = {";
-    auto type = cast<MemRefType>(op.getResult().getType()).getElementType();
 
     unsigned elementIdx = 0;
     for (auto element : denseAttr.template getValues<Attribute>()) {
-      auto string = getConstantString(type, element);
+      auto string = getConstantString(elementType, element);
       if (string.empty())
         op.emitOpError("constant has invalid value");
       os << string;
@@ -2144,6 +2481,14 @@ void ModuleEmitter::emitLoopDirectives(Operation *loop) {
   if (!loopDirect)
     return;
 
+  if (auto affineLoop = dyn_cast<affine::AffineForOp>(loop)) {
+    for (Value memref : getInterIterationIndependentMemrefs(affineLoop)) {
+      indent() << "#pragma HLS dependence variable=";
+      emitValue(memref);
+      os << " inter false\n";
+    }
+  }
+
   if (!hasParallelAttr(loop) && enforceFalseDependency.getValue())
     indent() << "#pragma HLS dependence false\n";
 
@@ -2151,7 +2496,8 @@ void ModuleEmitter::emitLoopDirectives(Operation *loop) {
     indent() << "#pragma HLS pipeline II=" << loopDirect.getTargetII() << "\n";
 }
 
-void ModuleEmitter::emitArrayDirectives(Value memref, bool isInterface) {
+void ModuleEmitter::emitArrayDirectives(Value memref, bool isInterface,
+                                        bool emitStorage) {
   bool emitPragmaFlag = false;
   auto type = cast<MemRefType>(memref.getType());
 
@@ -2191,7 +2537,7 @@ void ModuleEmitter::emitArrayDirectives(Value memref, bool isInterface) {
 
   // Emit resource pragma when the array is not DRAM kind and is not fully
   // partitioned.
-  if (!isInterface) {
+  if (!isInterface && emitStorage) {
     auto kind = getMemoryKind(type);
     if (kind != MemoryKind::DRAM && !isFullyPartitioned(type)) {
       emitPragmaFlag = true;
@@ -2259,6 +2605,14 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
         emitValue(port);
         os << "\n";
 
+        if (auto memrefPortType = dyn_cast<MemRefType>(port.getType());
+            memrefPortType &&
+            getMemoryKind(memrefPortType) == MemoryKind::DRAM) {
+          indent() << "#pragma HLS interface s_axilite port=";
+          emitValue(port);
+          os << " bundle=ctrl\n";
+        }
+
         if (isDataflow && isa<MemRefType>(port.getType()) &&
             getPortRole(port) == PortRole::In) {
           indent() << "#pragma HLS stable variable=";
@@ -2278,6 +2632,23 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
       if (isa<MemRefType>(port.getType()))
         emitArrayDirectives(port, true);
     }
+
+    // Vitis rejects HLS pragmas at file scope, but a directive inside the top
+    // function may name a file-scope constant. Keep hoisted ROMs readable
+    // without dropping the placement and banking the IR selected.
+    for (Operation *operation : hoistedTables)
+      emitArrayDirectives(cast<ConstBufferOp>(operation).getResult(),
+                          /*isInterface=*/false,
+                          /*emitStorage=*/false);
+    // Hoisted ROMs are immutable globals shared by several outlined stages.
+    // Mark them stable in the top dataflow region so Vitis does not treat a
+    // global read as an implicit process dependency (HLS 214-113/200-471).
+    if (isDataflow)
+      for (Operation *operation : hoistedTables) {
+        indent() << "#pragma HLS stable variable=";
+        emitValue(cast<ConstBufferOp>(operation).getResult());
+        os << "\n";
+      }
   }
 
   if (func->getAttr("inline"))
@@ -2308,32 +2679,56 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
 /// so a name like `stolt` cannot be recovered here without guessing. Only
 /// classifications that follow directly from the operations present are
 /// used; everything else falls back to the bare stage index.
-static StringRef classifyStage(func::FuncOp func) {
+///
+/// `twiddleArguments` marks the parameters that receive an FFT twiddle
+/// table, which is the one stage identity the lowering still records by
+/// name. The walk follows calls, because a stage that drives its work
+/// through helpers holds no arithmetic of its own: an FFT stage is a loop
+/// over butterfly calls, and classifying it on its own body alone would
+/// name it after the one thing it does not do.
+static StringRef
+classifyStage(func::FuncOp func,
+              const llvm::SmallDenseSet<Operation *> &twiddleReaders) {
   if (func->hasAttr("hls.shared_instance"))
     return "engine";
+  if (twiddleReaders.contains(func))
+    return "fft";
 
   bool hasArith = false, hasExt = false, hasTrunc = false;
   bool hasSin = false, hasCos = false;
 
-  func.walk([&](Operation *op) {
-    if (isa<math::SinOp>(op))
-      hasSin = true;
-    if (isa<math::CosOp>(op))
-      hasCos = true;
+  llvm::SmallDenseSet<Operation *> visited;
+  std::function<void(func::FuncOp)> scan = [&](func::FuncOp callee) {
+    if (!visited.insert(callee).second)
+      return;
+    callee.walk([&](Operation *op) {
+      if (auto call = dyn_cast<func::CallOp>(op)) {
+        if (auto target = dyn_cast_or_null<func::FuncOp>(
+                SymbolTable::lookupNearestSymbolFrom(call,
+                                                     call.getCalleeAttr())))
+          scan(target);
+        return;
+      }
+      if (isa<math::SinOp>(op))
+        hasSin = true;
+      if (isa<math::CosOp>(op))
+        hasCos = true;
 
-    if (isa<arith::ExtFOp>(op)) {
-      hasExt = true;
-      return;
-    }
-    if (isa<arith::TruncFOp>(op)) {
-      hasTrunc = true;
-      return;
-    }
-    if (isa<arith::ConstantOp, arith::IndexCastOp>(op))
-      return;
-    if (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()))
-      hasArith = true;
-  });
+      if (isa<arith::ExtFOp>(op)) {
+        hasExt = true;
+        return;
+      }
+      if (isa<arith::TruncFOp>(op)) {
+        hasTrunc = true;
+        return;
+      }
+      if (isa<arith::ConstantOp, arith::IndexCastOp>(op))
+        return;
+      if (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()))
+        hasArith = true;
+    });
+  };
+  scan(func);
 
   // A node that computes a sine and a cosine is applying a phase factor.
   if (hasSin && hasCos)
@@ -2347,6 +2742,45 @@ static StringRef classifyStage(func::FuncOp func) {
   if (!hasExt && !hasTrunc)
     return "copy";
   return "";
+}
+
+/// Functions reached, directly or through further calls, by a value the FFT
+/// lowering emitted as a twiddle table.
+static llvm::SmallDenseSet<Operation *>
+findTwiddleReaders(func::FuncOp topFunc) {
+  llvm::SmallDenseSet<Operation *> readers;
+  if (!topFunc)
+    return readers;
+
+  std::function<void(func::FuncOp, const llvm::SmallDenseSet<unsigned> &)>
+      propagate = [&](func::FuncOp caller,
+                      const llvm::SmallDenseSet<unsigned> &tableArgs) {
+        caller.walk([&](func::CallOp call) {
+          auto callee = dyn_cast_or_null<func::FuncOp>(
+              SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+          if (!callee)
+            return;
+          llvm::SmallDenseSet<unsigned> calleeArgs;
+          for (auto [index, operand] : llvm::enumerate(call.getOperands())) {
+            bool isTable = false;
+            if (auto buffer = operand.getDefiningOp<ConstBufferOp>()) {
+              if (auto source = buffer.getSourceName())
+                isTable = source->contains("fft_twiddle");
+            } else if (auto argument = dyn_cast<BlockArgument>(operand)) {
+              isTable = argument.getOwner()->getParentOp() == caller &&
+                        tableArgs.contains(argument.getArgNumber());
+            }
+            if (isTable)
+              calleeArgs.insert(index);
+          }
+          if (calleeArgs.empty())
+            return;
+          readers.insert(callee);
+          propagate(callee, calleeArgs);
+        });
+      };
+  propagate(topFunc, {});
+  return readers;
 }
 
 StringRef ModuleEmitter::getEmittedFuncName(StringRef symbol) {
@@ -2383,6 +2817,7 @@ void ModuleEmitter::assignFuncNames(ArrayRef<func::FuncOp> funcs,
     if (func != topFunc && seen.insert(func).second)
       ordered.push_back(func);
 
+  auto twiddleReaders = findTwiddleReaders(topFunc);
   unsigned stageIdx = 0;
   for (auto func : ordered) {
     SmallString<32> name;
@@ -2391,7 +2826,7 @@ void ModuleEmitter::assignFuncNames(ArrayRef<func::FuncOp> funcs,
     if (stageIdx < 10)
       nameOs << "0";
     nameOs << stageIdx++;
-    if (auto role = classifyStage(func); !role.empty())
+    if (auto role = classifyStage(func, twiddleReaders); !role.empty())
       nameOs << "_" << role;
     state.funcNames[func.getName()] = std::string(name);
   }
@@ -2418,7 +2853,24 @@ static bool isUsablePortName(StringRef name) {
       "static",    "struct",   "switch",  "template", "this",     "throw",
       "true",      "try",      "typedef", "typeid",   "typename", "union",
       "unsigned",  "using",    "virtual", "void",     "volatile", "while"};
-  if (keywords.contains(name))
+  // Vitis carries top-level argument names into Verilog and VHDL. Keep common
+  // HDL keywords out of emitted port names so every generated view shares a
+  // valid, stable ABI.
+  static const llvm::StringSet<> hdlKeywords = {
+      "architecture",  "array",     "assert",    "assign",    "begin",
+      "block",         "body",      "buffer",    "case",      "component",
+      "configuration", "constant",  "context",   "default",   "design",
+      "entity",        "event",     "file",      "function",  "generate",
+      "generic",       "genvar",    "in",        "initial",   "inout",
+      "input",         "integer",   "is",        "library",   "literal",
+      "localparam",    "map",       "module",    "out",       "output",
+      "package",       "parameter", "port",      "primitive", "procedure",
+      "process",       "property",  "protected", "range",     "real",
+      "record",        "reg",       "register",  "report",    "sequence",
+      "shared",        "signal",    "specify",   "specparam", "subtype",
+      "table",         "task",      "time",      "transport", "type",
+      "units",         "use",       "variable",  "wait",      "wire"};
+  if (keywords.contains(name) || hdlKeywords.contains(name.lower()))
     return false;
 
   // Reserved generated-name shapes: a known stem followed by digits only.
@@ -2461,20 +2913,18 @@ SmallVector<Value, 8> ModuleEmitter::assignPortNames(func::FuncOp func) {
         }
   }
 
-  // Each port must be a distinct value: a function returning one of its
-  // arguments, or the same value twice, would emit two ports with one name
-  // -- C++ that does not compile. Seen within this invocation only, since
-  // the prototype and the definition both walk the same list.
+  // Each port must be a distinct value. `verifyHLSCppTarget` rejects an
+  // aliased signature before any C++ is written, so reaching this with a
+  // duplicate means the module was emitted without that check.
   DenseSet<Value> seenPorts;
 
   auto nameOne = [&](Value port, bool isResult, StringRef given) {
     portList.push_back(port);
 
-    if (!seenPorts.insert(port).second)
-      emitError(func, "port aliasing: a value reaches the signature twice "
-                      "(a result that is also an argument, or one value "
-                      "returned twice); the emitter cannot express aliased "
-                      "ports");
+    assert(seenPorts.insert(port).second &&
+           "aliased port reached emission; verifyHLSCppTarget should have "
+           "rejected it");
+    (void)seenPorts;
 
     // Prototype and definition both ask for the port list; the names are
     // handed out once and reused so the two always agree.
@@ -2506,7 +2956,29 @@ SmallVector<Value, 8> ModuleEmitter::assignPortNames(func::FuncOp func) {
       return;
     }
 
-    auto role = isResult ? PortRole::Out : getPortRole(port);
+    // Internal DRAM arenas are implementation storage, not logical results.
+    // Give them an explicit scratch name so the top signature and manifest
+    // read like a hand-written design instead of exposing generic `inoutN`
+    // placeholders beside the algorithm's public ports.
+    AxiPortOp axiPort;
+    if (hasTopFuncAttr(func)) {
+      func.walk([&](AxiPortOp candidate) {
+        if (candidate.getAxi() == port)
+          axiPort = candidate;
+      });
+      if (axiPort && axiPort->hasAttr("hls.scratch")) {
+        addNamedValue(port, "scratch" + std::to_string(roleIdx[3]++), isPtr);
+        return;
+      }
+    }
+
+    // The design function receives an AxiType wrapper, while the actual
+    // reads/writes are uses of the element produced by hls.axi.port.  Role
+    // analysis on the wrapper sees that plumbing as unknown and labels a
+    // write-only result ``inout``. Follow the port element so public outputs
+    // receive the same clear ``outN`` name their manifest already reports.
+    auto role = isResult ? PortRole::Out
+                         : getPortRole(axiPort ? axiPort.getElement() : port);
     if (role == PortRole::Unused)
       role = PortRole::In;
 
@@ -2634,7 +3106,26 @@ getExactLinearTable(DenseElementsAttr attr) {
   return std::pair(base, step);
 }
 
-static std::string describeTable(DenseElementsAttr attr, unsigned idx) {
+static std::optional<std::string> describeNamedTable(ConstBufferOp op) {
+  auto source = op.getSourceName();
+  if (!source)
+    return std::nullopt;
+
+  SmallVector<StringRef> parts;
+  source->split(parts, '_', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+  if (parts.size() == 7 && parts[0] == "sar" && parts[1] == "fft" &&
+      parts[2] == "twiddle" && (parts[3] == "cos" || parts[3] == "sin") &&
+      parts[5].starts_with("s")) {
+    std::string kind = parts[3] == "cos" ? "Cos" : "Sin";
+    return (Twine("kTwiddle") + kind + "_" + parts[4] + parts[5].upper()).str();
+  }
+  return std::nullopt;
+}
+
+static std::string describeTable(ConstBufferOp op, DenseElementsAttr attr,
+                                 unsigned idx) {
+  if (auto named = describeNamedTable(op))
+    return *named;
   auto type = cast<ShapedType>(attr.getType());
   int64_t n = type.getNumElements();
 
@@ -2695,7 +3186,7 @@ void ModuleEmitter::collectGlobalTables(ModuleOp module,
       return;
 
     // Uniquing keeps two tables that describe the same thing apart.
-    std::string base = describeTable(attr, tableIdx++);
+    std::string base = describeTable(op, attr, tableIdx++);
     std::string name = base;
     for (unsigned suffix = 2; !usedNames.insert(name).second; ++suffix)
       name = base + "_" + std::to_string(suffix);
@@ -2778,12 +3269,17 @@ void ModuleEmitter::emitGlobalTables() {
   if (state.globalTables.empty())
     return;
 
+  // The block is marked so the artifact writer can lift it into
+  // <top>_tables.h: the tables are data, often most of the file's lines, and
+  // separating them leaves the implementation file reading as logic. Direct
+  // sar-translate output stays valid as a single file.
   os << "//===----------------------------------------------------------"
         "------------===//\n"
         "// Constant tables. Lifted to file scope so the design reads as\n"
         "// logic and the tool can map them to ROM.\n"
         "//===----------------------------------------------------------"
-        "------------===//\n\n";
+        "------------===//\n"
+        "// SAR_DSL_TABLES_BEGIN\n";
 
   bool hasLinearTable =
       llvm::any_of(state.linearTables, [&](const auto &entry) {
@@ -2863,6 +3359,102 @@ void ModuleEmitter::emitGlobalTables() {
     // Bind the name so every reader of the buffer resolves to the table.
     state.nameTable[result] = SmallString<8>(StringRef(it->second));
   }
+  os << "// SAR_DSL_TABLES_END\n\n";
+}
+
+void ModuleEmitter::emitInterfaceSchema(func::FuncOp func) {
+  auto ports = assignPortNames(func);
+  for (auto [index, port] : llvm::enumerate(ports)) {
+    AxiPortOp axiPort;
+    func.walk([&](AxiPortOp candidate) {
+      if (candidate.getAxi() == port)
+        axiPort = candidate;
+    });
+
+    Type type = peelAxiType(port.getType());
+    Type elementType = type;
+    SmallVector<int64_t> physicalShape;
+    unsigned depth = 0;
+    if (auto memref = dyn_cast<MemRefType>(type)) {
+      elementType = memref.getElementType();
+      physicalShape.assign(memref.getShape().begin(), memref.getShape().end());
+    } else if (auto stream = dyn_cast<StreamType>(type)) {
+      elementType = stream.getElementType();
+      depth = stream.getDepth();
+      if (axiPort)
+        if (auto shape = axiPort->getAttrOfType<ArrayAttr>("stream_shape"))
+          for (Attribute extent : shape)
+            physicalShape.push_back(cast<IntegerAttr>(extent).getInt());
+    }
+
+    unsigned lanes = 1;
+    Type scalarType = elementType;
+    if (auto vector = dyn_cast<VectorType>(elementType)) {
+      lanes = vector.getNumElements();
+      scalarType = vector.getElementType();
+    }
+    unsigned scalarBits = 0;
+    if (scalarType.isIndex())
+      scalarBits = 64;
+    else if (scalarType.isIntOrFloat())
+      scalarBits = scalarType.getIntOrFloatBitWidth();
+    uint64_t logicalElements = lanes;
+    for (int64_t extent : physicalShape)
+      logicalElements *= extent;
+
+    PortRole role = index >= func.getNumArguments()
+                        ? PortRole::Out
+                        : getPortRole(axiPort ? axiPort.getElement() : port);
+    if (role == PortRole::Unused)
+      role = PortRole::In;
+
+    StringRef protocol = "s_axilite";
+    StringRef bundle = "ctrl";
+    if (axiPort) {
+      bool requestedStream =
+          axiPort.getBundleType().getKind() == AxiKind::STREAM ||
+          (func->hasAttr("stream_interface") &&
+           !axiPort->hasAttr("hls.scratch"));
+      bool streaming = requestedStream && isProvablySequentialStreamPort(
+                                              axiPort.getElement(), role);
+      protocol = streaming ? "axis" : "m_axi";
+      bundle = streaming ? StringRef() : axiPort.getBundleName();
+    } else if (auto memref = dyn_cast<MemRefType>(type)) {
+      protocol = getMemoryKind(memref) == MemoryKind::DRAM ? "m_axi" : "bram";
+      bundle = "";
+    } else if (isa<StreamType>(type)) {
+      protocol = "axis";
+      bundle = "";
+    }
+
+    std::string name = std::string(getName(port));
+    if (!name.empty() && name.front() == '*')
+      name.erase(name.begin());
+
+    os << "// SAR_DSL_INTERFACE: {\"name\":\"" << name << "\",\"protocol\":\""
+       << protocol << "\",\"direction\":\"" << getPortRolePrefix(role)
+       << "\",\"kind\":\""
+       << (axiPort && axiPort->hasAttr("hls.scratch") ? "scratch" : "public")
+       << "\",\"bundle\":\"" << bundle << "\",\"c_type\":\""
+       << getDataTypeName(elementType) << "\",\"scalar_type\":\""
+       << getDataTypeName(scalarType) << "\",\"vector_lanes\":" << lanes
+       << ",\"data_bits\":" << scalarBits * lanes << ",\"depth\":" << depth
+       << ",\"physical_shape\":[";
+    for (auto [dim, extent] : llvm::enumerate(physicalShape)) {
+      if (dim)
+        os << ",";
+      os << extent;
+    }
+    os << "],\"logical_shape\":[";
+    for (auto [dim, extent] : llvm::enumerate(physicalShape)) {
+      if (dim)
+        os << ",";
+      if (dim + 1 == physicalShape.size())
+        extent *= lanes;
+      os << extent;
+    }
+    os << "],\"logical_elements\":" << logicalElements << "}\n";
+  }
 }
 
 void ModuleEmitter::emitFunction(func::FuncOp func) {
@@ -2885,7 +3477,30 @@ void ModuleEmitter::emitFunction(func::FuncOp func) {
   addIndent();
 
   emitFunctionDirectives(func, portList);
+  SmallVector<std::pair<Value, SmallString<8>>> tableNames;
+  auto directive = getFuncDirective(func);
+  if (directive && directive.getDataflow()) {
+    for (Operation *operation : hoistedTables) {
+      Value table = cast<ConstBufferOp>(operation).getResult();
+      if (!state.globalTables.count(table))
+        continue;
+      bool usedHere = llvm::any_of(table.getUses(), [&](OpOperand &use) {
+        return use.getOwner()->getParentOfType<func::FuncOp>() == func;
+      });
+      if (!usedHere)
+        continue;
+      SmallString<8> globalName = getName(table);
+      SmallString<8> localName("v" + std::to_string(state.localNameIdx++));
+      indent() << "const auto &" << localName << " = " << globalName << ";\n";
+      tableNames.push_back({table, globalName});
+      state.nameTable[table] = localName;
+    }
+    if (!tableNames.empty())
+      os << "\n";
+  }
   emitBlock(func.front());
+  for (auto &[table, globalName] : tableNames)
+    state.nameTable[table] = globalName;
   reduceIndent();
   os << "}\n";
   // An empty line.
@@ -2905,10 +3520,11 @@ void ModuleEmitter::emitModule(ModuleOp module) {
     if (hasTopFuncAttr(func))
       topFunc = func;
   }
+  assignFuncNames(funcs, topFunc);
 
   // Only include what the design actually uses. Emitting the full Vitis
   // header set unconditionally drags in headers the design never touches
-  // and breaks plain-C++ csim over stub headers.
+  // and breaks the portable C++ fallback over stub headers.
   bool usesStream = false, usesVector = false, usesApInt = false;
   bool usesMemCpy = false;
   auto noteType = [&](Type type) {
@@ -2940,12 +3556,11 @@ void ModuleEmitter::emitModule(ModuleOp module) {
     });
   }
 
-  os << "//===------------------------------------------------------------*- "
-        "C++ -*-===//\n"
+  os << "//===- SAR-DSL generated Vitis HLS design -----------------------"
+        "*- C++ -*-===//\n"
         "//\n"
-        "// Synthesizable C++ generated by the SAR-DSL HLS emitter\n"
-        "// (sar-translate -hls-emit-hlscpp). Edits here are lost on the next\n"
-        "// build; change the kernel or the pipeline instead.\n"
+        "// Generated by sar-translate --hls-emit-hlscpp.\n"
+        "// Regenerate this file instead of editing it.\n"
         "//\n";
   if (topFunc)
     os << "// Top function : " << topFunc.getName() << "\n";
@@ -2968,14 +3583,26 @@ void ModuleEmitter::emitModule(ModuleOp module) {
       if (!isStream)
         os << "// AXI bus      : " << axiBusBits << "-bit\n";
     }
+    if (topFunc->hasAttr("hls.scratch_arena_overflow")) {
+      os << "// Scratch ABI  : conflict graph compacted to configured master "
+            "limit\n";
+      if (auto penalty =
+              topFunc->getAttrOfType<IntegerAttr>("hls.scratch_arena_penalty"))
+        os << "// Scratch cost : predicted serialization penalty "
+           << penalty.getInt() << "\n";
+    }
   }
-  os << "// Sub-functions: " << (funcs.empty() ? 0 : funcs.size() - 1) << "\n"
-     << "//\n"
+  os << "// Sub-functions: " << (funcs.empty() ? 0 : funcs.size() - 1) << "\n";
+  // The machine-readable port records follow the human-readable summary so
+  // they do not interrupt it; `design.py` parses them back out.
+  if (topFunc)
+    emitInterfaceSchema(topFunc);
+  os << "//\n"
         "//===------------------------------------------------------------"
         "----------===//\n\n";
 
-  os << "#include <cmath>\n";
   os << "#include <algorithm>\n";
+  os << "#include <cmath>\n";
   os << "#include <cstdint>\n";
   if (usesMemCpy)
     os << "#include <cstring>\n";
@@ -2987,22 +3614,14 @@ void ModuleEmitter::emitModule(ModuleOp module) {
   if (usesVector)
     os << "#include <hls_vector.h>\n";
   os << "\n"
-        "static int64_t sar_hls_floor_div(int64_t lhs, int64_t rhs) {\n"
-        "  int64_t quotient = lhs / rhs;\n"
-        "  int64_t remainder = lhs % rhs;\n"
-        "  return quotient - (remainder < 0);\n"
-        "}\n\n"
-        "static int64_t sar_hls_ceil_div(int64_t lhs, int64_t rhs) {\n"
-        "  int64_t quotient = lhs / rhs;\n"
-        "  int64_t remainder = lhs % rhs;\n"
-        "  return quotient + (remainder > 0);\n"
-        "}\n\n"
-        "static int64_t sar_hls_mod(int64_t lhs, int64_t rhs) {\n"
-        "  int64_t remainder = lhs % rhs;\n"
-        "  return remainder < 0 ? remainder + rhs : remainder;\n"
-        "}\n\n";
+        "template <typename T>\n"
+        "static T sar_hls_maximum(T lhs, T rhs);\n\n"
+        "template <typename T>\n"
+        "static T sar_hls_minimum(T lhs, T rhs);\n\n"
+        "static int64_t sar_hls_floor_div(int64_t lhs, int64_t rhs);\n"
+        "static int64_t sar_hls_ceil_div(int64_t lhs, int64_t rhs);\n"
+        "static int64_t sar_hls_mod(int64_t lhs, int64_t rhs);\n\n";
 
-  assignFuncNames(funcs, topFunc);
   collectGlobalTables(module, funcs);
   emitGlobalTables();
 
@@ -3017,26 +3636,63 @@ void ModuleEmitter::emitModule(ModuleOp module) {
            getEmittedFuncName(rhs.getName());
   });
 
-  // Vitis HLS synthesises a single translation unit, so the top function
-  // can come first -- which is what a reader wants -- as long as every
-  // callee is declared above it. Prototypes cost nothing and also make the
-  // file robust against sub-functions that call each other.
-  if (topFunc && !subFuncs.empty()) {
+  // Keep a self-contained declaration block in the translation output. The
+  // Python artifact writer moves this marked block into <top>.h for packaged
+  // projects, while direct sar-translate output remains valid as one file.
+  if (topFunc) {
     os << "//===----------------------------------------------------------"
           "------------===//\n"
           "// Sub-function prototypes, in dataflow order.\n"
           "//===----------------------------------------------------------"
-          "------------===//\n\n";
+          "------------===//\n"
+          "// SAR_DSL_DECLARATIONS_BEGIN\n";
     for (auto func : subFuncs) {
       state.localNameIdx = 0;
       auto portList = assignPortNames(func);
       emitFunctionSignature(func, portList, /*asPrototype=*/true);
       os << "\n";
     }
+    os << "// SAR_DSL_DECLARATIONS_END\n\n";
   }
 
   if (topFunc)
     emitFunction(topFunc);
+
+  os << "// Internal arithmetic helpers.\n\n"
+        "template <typename T>\n"
+        "static T sar_hls_maximum(T lhs, T rhs) {\n"
+        "  if (std::isnan(lhs))\n"
+        "    return lhs;\n"
+        "  if (std::isnan(rhs))\n"
+        "    return rhs;\n"
+        "  if (lhs == rhs && lhs == T(0))\n"
+        "    return std::signbit(lhs) ? rhs : lhs;\n"
+        "  return lhs > rhs ? lhs : rhs;\n"
+        "}\n\n"
+        "template <typename T>\n"
+        "static T sar_hls_minimum(T lhs, T rhs) {\n"
+        "  if (std::isnan(lhs))\n"
+        "    return lhs;\n"
+        "  if (std::isnan(rhs))\n"
+        "    return rhs;\n"
+        "  if (lhs == rhs && lhs == T(0))\n"
+        "    return std::signbit(lhs) ? lhs : rhs;\n"
+        "  return lhs < rhs ? lhs : rhs;\n"
+        "}\n\n"
+        "static int64_t sar_hls_floor_div(int64_t lhs, int64_t rhs) {\n"
+        "  int64_t quotient = lhs / rhs;\n"
+        "  int64_t remainder = lhs % rhs;\n"
+        "  return quotient - (remainder < 0);\n"
+        "}\n\n"
+        "static int64_t sar_hls_ceil_div(int64_t lhs, int64_t rhs) {\n"
+        "  int64_t quotient = lhs / rhs;\n"
+        "  int64_t remainder = lhs % rhs;\n"
+        "  return quotient + (remainder > 0);\n"
+        "}\n\n"
+        "static int64_t sar_hls_mod(int64_t lhs, int64_t rhs) {\n"
+        "  int64_t remainder = lhs % rhs;\n"
+        "  return remainder < 0 ? remainder + rhs : remainder;\n"
+        "}\n\n";
 
   for (auto func : subFuncs)
     emitFunction(func);
@@ -3076,9 +3732,32 @@ static LogicalResult verifyHLSCppTarget(ModuleOp module) {
     if (auto func = dyn_cast<func::FuncOp>(op)) {
       if (!hasRuntimeAttr(func) && hasTopFuncAttr(func))
         ++tops;
-      if (!func.isExternal() && func.getBlocks().size() != 1) {
+      if (func.isExternal()) {
+        func.emitError("HLS C++ target does not support external functions");
+        failed = true;
+      } else if (func.getBlocks().size() != 1) {
         func.emitError("HLS C++ target requires exactly one basic block");
         failed = true;
+      } else {
+        // Each port must be a distinct value: a function returning one of
+        // its arguments, or the same value twice, would declare two ports
+        // with one name. Caught here rather than while naming them, because
+        // this runs before any C++ is written -- reporting it mid-emission
+        // would leave an uncompilable definition on the output stream for
+        // any caller that reads the stream without checking the status.
+        DenseSet<Value> seen;
+        for (Value arg : func.getArguments())
+          seen.insert(arg);
+        if (auto ret = dyn_cast<func::ReturnOp>(func.front().getTerminator()))
+          for (Value result : ret.getOperands())
+            if (!seen.insert(result).second) {
+              func.emitError(
+                  "HLS C++ target does not support port aliasing: a value "
+                  "reaches the signature twice (a result that is also an "
+                  "argument, or one value returned twice)");
+              failed = true;
+              break;
+            }
       }
     }
     for (Region &region : op->getRegions())
@@ -3098,6 +3777,20 @@ static LogicalResult verifyHLSCppTarget(ModuleOp module) {
                     "emission");
       failed = true;
     }
+    if (isa<AffineParallelOp>(op)) {
+      op->emitError("HLS C++ target requires affine.parallel to be lowered "
+                    "before emission");
+      failed = true;
+    }
+    if (auto call = dyn_cast<func::CallOp>(op)) {
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (!callee || callee.isExternal()) {
+        call.emitError("HLS C++ target requires every call to resolve to a "
+                       "defined function");
+        failed = true;
+      }
+    }
     if (auto cmp = dyn_cast<arith::CmpFOp>(op))
       if (!llvm::is_contained(
               {arith::CmpFPredicate::OEQ, arith::CmpFPredicate::UNE,
@@ -3114,6 +3807,28 @@ static LogicalResult verifyHLSCppTarget(ModuleOp module) {
         << tops;
     failed = true;
   }
+  DenseMap<Operation *, unsigned> colors;
+  std::function<bool(func::FuncOp)> visit = [&](func::FuncOp func) {
+    unsigned &color = colors[func.getOperation()];
+    if (color == 1)
+      return true;
+    if (color == 2 || func.isExternal())
+      return false;
+    color = 1;
+    bool recursive = false;
+    func.walk([&](func::CallOp call) {
+      auto callee = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupNearestSymbolFrom(call, call.getCalleeAttr()));
+      if (callee && visit(callee)) {
+        call.emitError("HLS C++ target does not support recursive calls");
+        recursive = true;
+      }
+    });
+    color = 2;
+    return recursive;
+  };
+  for (auto func : module.getOps<func::FuncOp>())
+    failed |= visit(func);
   return failure(failed);
 }
 

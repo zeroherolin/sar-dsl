@@ -1,9 +1,8 @@
 // RUN: sar-opt %s --hls-place-dataflow-buffer="threshold=4096 bram-bytes=9216 uram-bytes=0 lutram-bytes=0 lutram-max-bytes=64 rebalance-only=true" --verify-diagnostics
 
 // The rebalance run recharges buffers the fork/balance passes copied.
-// Nothing may newly stream this late, so an overflow is a hard failure
-// -- and this diagnostic's wording is the HLS backend's retry trigger
-// (`sar/backends/hls/compiler.py`); changing one means changing both.
+// The external buffer set is fixed at this stage, so an overflow is a hard
+// failure.
 
 // expected-error @below {{on-chip working set exceeds the memory budgets}}
 func.func @rebalance_overflow(%v: f32) {

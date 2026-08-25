@@ -1,4 +1,4 @@
-//===- Passes.h - SAR conversion passes --------------------------*- C++-*-===//
+//===- Passes.h - SAR conversion passes -------------------------*- C++ -*-===//
 //
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //

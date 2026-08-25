@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Range-Doppler on the HLS backend: emit a Vitis HLS C++ design
-and a C-simulation package with golden data from the NumPy reference.
+and a validation package with golden data from the NumPy reference.
 
 Usage:
     python run_point_target_hls.py [--n 256] [--output PATH]
@@ -28,7 +28,7 @@ def main() -> None:
                         help="raster size (power of two)")
     parser.add_argument("--output",
                         default=str(_EXAMPLES / "hls_project" / "rda"),
-                        help="C-simulation package directory")
+                        help="HLS validation package directory")
     parser.add_argument("--no-testbench",
                         action="store_true",
                         help="emit the design only")
@@ -50,7 +50,9 @@ def main() -> None:
     print(f"[2/2] Saved {out}")
     print(f"done: {design.source().count(chr(10))} lines of HLS C++, "
           f"top function 'rda'")
-    print(f"      csim: cd {out} && vitis_hls -f rda_csim.tcl")
+    print(f"      C-sim through Vitis HLS: cd {out} && "
+          "vitis_hls -f rda_hls_csim.tcl")
+    print("      without Vitis: sh rda_portable_cpp_sim.sh")
 
 
 if __name__ == "__main__":

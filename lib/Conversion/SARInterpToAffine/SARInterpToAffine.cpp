@@ -8,9 +8,11 @@
 // with a clamped index, and out-of-range taps are masked with selects so
 // the loop body stays straight-line (pipelining-friendly, no control flow).
 //
-// All position/weight arithmetic is performed in f64, mirroring the CPU
-// runtime bit-for-bit for f64 data; f32 planes are widened for the
-// accumulation and truncated on store.
+// All position/weight arithmetic is performed in f64, as on the CPU: f32
+// planes are widened for the accumulation and truncated on store. The two
+// agree to f64 rounding rather than bit for bit -- the sinc taps here
+// share one angle through an addition identity, which costs a DSP slice
+// per tap less and rounds differently from evaluating each angle.
 //
 //===----------------------------------------------------------------------===//
 
@@ -131,6 +133,11 @@ static std::pair<Value, Value> sanitizePosition(ScalarBuilder &s,
   return {safe, valid};
 }
 
+/// Whether the sinc window is a raised cosine, so its angle can be factored.
+static bool hasCosineWindow(const InterpSpec &spec) {
+  return spec.window == "hann" || spec.window == "hamming";
+}
+
 /// Emits the window taper at t = d / (taps/2) for the sinc kernel.
 /// Kaiser uses an unrolled power series for I0 (straight-line, no loops):
 /// with u = (beta^2 / 4) (1 - t^2), I0 = sum_m u^m / (m!)^2.
@@ -139,7 +146,7 @@ static Value emitSincWindow(ScalarBuilder &s, const InterpSpec &spec, Value t) {
   Location loc = s.loc;
   if (spec.window == "rect")
     return s.cst(1.0);
-  if (spec.window == "hann" || spec.window == "hamming") {
+  if (hasCosineWindow(spec)) {
     double c0 = spec.window == "hann" ? 0.5 : 0.54;
     double c1 = spec.window == "hann" ? 0.5 : 0.46;
     return s.add(s.cst(c0), s.mul(s.cst(c1), s.cos(s.mul(t, s.cst(M_PI)))));
@@ -158,6 +165,66 @@ static Value emitSincWindow(ScalarBuilder &s, const InterpSpec &spec, Value t) {
     sum = s.add(sum, term);
   }
   return s.mul(sum, s.cst(1.0 / besselI0(spec.beta)));
+}
+
+/// Transcendentals of the sampling position that every sinc tap shares.
+///
+/// Taps sit at compile-time integer offsets from one fractional position, so
+/// `sin(pi (frac - k))` is `+/- sin(pi frac)` and a raised-cosine window's
+/// angle differs between taps by the constant `pi k / (taps/2)`. Evaluating
+/// the position's sine and cosine once and combining them per tap through the
+/// angle-addition identity replaces `2 * taps` transcendentals with three --
+/// which is what the loop's initiation interval and DSP count are set by.
+struct SincFactors {
+  Value sinPosition;
+  Value windowSin, windowCos;
+};
+
+static SincFactors emitSincFactors(ScalarBuilder &s, const InterpSpec &spec,
+                                   Value frac) {
+  SincFactors factors;
+  factors.sinPosition = s.sin(s.mul(frac, s.cst(M_PI)));
+  if (hasCosineWindow(spec)) {
+    Value angle = s.mul(frac, s.cst(M_PI / double(spec.taps / 2)));
+    factors.windowSin = s.sin(angle);
+    factors.windowCos = s.cos(angle);
+  }
+  return factors;
+}
+
+/// The sinc kernel's weight at tap `k`, given `distance = frac - k`.
+static Value emitSincWeight(ScalarBuilder &s, const InterpSpec &spec,
+                            const SincFactors &factors, Value distance,
+                            int64_t k) {
+  OpBuilder &b = s.b;
+  Location loc = s.loc;
+  Value one = s.cst(1.0);
+  // sinc(d) = sin(pi d) / (pi d), numpy convention, with the removable
+  // singularity at d = 0 resolved by the guard.
+  Value scaled = s.mul(distance, s.cst(M_PI));
+  Value small = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OLT,
+                                      math::AbsFOp::create(b, loc, distance),
+                                      s.cst(1e-12));
+  Value safeScaled = arith::SelectOp::create(b, loc, small, one, scaled);
+  Value numerator = factors.sinPosition;
+  if (k % 2 != 0)
+    numerator = s.mul(numerator, s.cst(-1.0));
+  Value sinc =
+      arith::SelectOp::create(b, loc, small, one, s.div(numerator, safeScaled));
+
+  if (spec.window == "rect")
+    return sinc;
+  if (!hasCosineWindow(spec)) {
+    Value t = s.mul(distance, s.cst(1.0 / double(spec.taps / 2)));
+    return s.mul(sinc, emitSincWindow(s, spec, t));
+  }
+  // cos(A - B) = cos A cos B + sin A sin B, with B = pi k / (taps/2).
+  double c0 = spec.window == "hann" ? 0.5 : 0.54;
+  double c1 = spec.window == "hann" ? 0.5 : 0.46;
+  double offset = M_PI * double(k) / double(spec.taps / 2);
+  Value cosine = s.add(s.mul(factors.windowCos, s.cst(std::cos(offset))),
+                       s.mul(factors.windowSin, s.cst(std::sin(offset))));
+  return s.mul(sinc, s.add(s.cst(c0), s.mul(s.cst(c1), cosine)));
 }
 
 /// Emits the kernel-based gather at fractional position `posF64`. Returns the
@@ -222,6 +289,11 @@ static std::pair<Value, Value> emitInterpGather(ScalarBuilder &s,
   }
 
   Value accRe = zero, accIm = zero;
+  bool isSinc = spec.kernel != "nearest" && spec.kernel != "linear" &&
+                spec.kernel != "cubic";
+  SincFactors sincFactors;
+  if (isSinc)
+    sincFactors = emitSincFactors(s, spec, frac);
   for (int64_t k = tapLo; k <= tapHi; ++k) {
     Value kI = arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(k));
     Value idxK = arith::AddIOp::create(b, loc, idx0, kI);
@@ -270,19 +342,11 @@ static std::pair<Value, Value> emitInterpGather(ScalarBuilder &s,
     } else if (spec.kernel == "cubic") {
       weight = cubicW[k + 1];
     } else {
-      // w(d) = sinc(d) * window(d / (taps/2)), numpy sinc convention. The
-      // distance stays measured against the unresolved tap index: the policy
-      // changes which sample is fetched, not where the kernel is centred.
+      // The distance stays measured against the unresolved tap index: the
+      // boundary policy changes which sample is fetched, not where the kernel
+      // is centred. `frac` is exactly `posF64 - idx0`, so this is `frac - k`.
       Value dist = s.sub(posF64, arith::SIToFPOp::create(b, loc, s.f64, idxK));
-      Value pd = s.mul(dist, s.cst(M_PI));
-      Value small = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OLT,
-                                          math::AbsFOp::create(b, loc, dist),
-                                          s.cst(1e-12));
-      Value safePd = arith::SelectOp::create(b, loc, small, one, pd);
-      Value sincRaw = s.div(s.sin(pd), safePd);
-      Value sinc = arith::SelectOp::create(b, loc, small, one, sincRaw);
-      Value t = s.mul(dist, s.cst(1.0 / double(spec.taps / 2)));
-      weight = s.mul(sinc, emitSincWindow(s, spec, t));
+      weight = emitSincWeight(s, spec, sincFactors, dist, k);
     }
     if (spec.boundary == "zero")
       weight = arith::SelectOp::create(b, loc, inBounds, weight, zero);
@@ -335,8 +399,9 @@ static bool canScalarize(Value value) {
     return llvm::all_of(op->getOperands(),
                         [&](Value operand) { return canScalarize(operand); });
   };
-  return isa<AddOp, SubOp, MulOp, DivOp, AddScalarOp, MulScalarOp, SqrtOp,
-             CosOp, SinOp, ExpOp, LogOp, AbsOp, CmpOp, WhereOp, CastOp>(op) &&
+  return isa<TransposeOp, AddOp, SubOp, MulOp, DivOp, AddScalarOp, MulScalarOp,
+             SqrtOp, CosOp, SinOp, ExpOp, LogOp, Atan2Op, AbsOp, CmpOp, WhereOp,
+             CastOp>(op) &&
          allOperands();
 }
 
@@ -366,6 +431,9 @@ static FailureOr<Value> scalarize(OpBuilder &b, Location loc, Value value,
     Value index = indices[broadcast.getDim()];
     return scalarize(b, loc, broadcast.getInput(), ValueRange{index});
   }
+  if (auto transpose = dyn_cast<TransposeOp>(op))
+    return scalarize(b, loc, transpose.getInput(),
+                     ValueRange{indices[1], indices[0]});
 
   auto binary = [&](Value lhs, Value rhs, auto create) -> FailureOr<Value> {
     FailureOr<Value> left = scalarize(b, loc, lhs, indices);
@@ -394,6 +462,10 @@ static FailureOr<Value> scalarize(OpBuilder &b, Location loc, Value value,
                   [&](Value lhs, Value rhs) {
                     return arith::DivFOp::create(b, loc, lhs, rhs).getResult();
                   });
+  if (auto valueOp = dyn_cast<Atan2Op>(op))
+    return binary(valueOp.getY(), valueOp.getX(), [&](Value y, Value x) {
+      return math::Atan2Op::create(b, loc, y, x).getResult();
+    });
 
   auto unary = [&](Value input, auto create) -> FailureOr<Value> {
     FailureOr<Value> scalar = scalarize(b, loc, input, indices);
@@ -537,64 +609,76 @@ static void emitFullPlaneBody(OpBuilder &b, Location loc, ScalarBuilder &s,
   }
 }
 
-/// Emits the banded gather loop nest.
-///
-/// The window for output column j is source columns [j + bandLo, j + bandHi],
-/// exactly `bandW` wide (a power of two), so it slides by one as j advances
-/// and one new sample per column keeps it current. That is the line-buffer
-/// shape: each source row is read once, sequentially, instead of `taps`
-/// scattered reads per output element.
-///
-/// Residency invariant: at the gather in iteration j, `band[t & (bandW-1)]`
-/// holds source column t for every t in [j + bandLo, j + bandHi]. bandW being
-/// a power of two makes those bandW indices occupy distinct slots, and the
-/// push for column j overwrites exactly the index leaving the window.
-///
-/// Out-of-row source indices are clamped on staging, exactly as the
-/// full-plane path clamps them; those taps still receive zero weight in the
-/// gather, so a clamped value never reaches the accumulator.
-static void emitBandedBody(OpBuilder &b, Location loc, ScalarBuilder &s,
+/// Emits a power-of-two sliding line buffer. At output column `j`, each source
+/// column in `[j + bandLo, j + bandHi]` resides at `column & (bandW - 1)`;
+/// one sequential source read advances the window. Staging uses the same
+/// boundary clamp as the full-plane path.
+static void emitBandedBody(PatternRewriter &b, Location loc, ScalarBuilder &s,
                            const InterpSpec &spec, Value reBuf, Value imBuf,
                            PositionBuilder positionAt, Value outRe, Value outIm,
                            int64_t rows, int64_t cols, Type elemType,
-                           int64_t bandLo, int64_t bandW) {
+                           int64_t bandLo, int64_t bandW,
+                           int64_t completeBankMaxElements, int64_t cacheCopies,
+                           bool completeRow = false) {
   assert(bandW > 0 && (bandW & (bandW - 1)) == 0 && "bandW must be a pow2");
-  int64_t bandHi = bandLo + bandW - 1;
+  assert(cacheCopies > 0 && (cacheCopies & (cacheCopies - 1)) == 0 &&
+         "cache copies must be a pow2");
   Type srcElem = cast<MemRefType>(reBuf.getType()).getElementType();
-  MemRefType bandType = MemRefType::get({bandW}, srcElem);
+  int64_t copies = cacheCopies;
+  MemRefType bandType = MemRefType::get(
+      copies > 1 ? ArrayRef<int64_t>{copies, bandW} : ArrayRef<int64_t>{bandW},
+      srcElem);
 
   Value bandRe = memref::AllocOp::create(b, loc, bandType);
   Value bandIm = memref::AllocOp::create(b, loc, bandType);
-  // Every unrolled tap reads the band in the same cycle through a
-  // data-dependent index no affine analysis can bank; registers are the
-  // only layout that serves them all. Wide bands would burn a register
-  // per element, so they keep the default banking and pay the port limit.
-  if (bandW <= 128)
-    for (Value band : {bandRe, bandIm}) {
-      auto *alloc = band.getDefiningOp();
-      alloc->setAttr(kPartitionKindsAttr, b.getStrArrayAttr({"complete"}));
-      alloc->setAttr(kPartitionFactorsAttr, b.getI64ArrayAttr({bandW}));
+  bandRe.getDefiningOp()->setAttr("hls.banded_gather", b.getUnitAttr());
+  bandIm.getDefiningOp()->setAttr("hls.banded_gather", b.getUnitAttr());
+  // Tap addresses share one dynamic base but differ by consecutive static
+  // offsets. Small bands are completely banked when the logic/timing model
+  // allows it. Wider caches are replicated per packed lane and each copy uses
+  // one tap-count cyclic bank set. This avoids both the high-fanout mux of full
+  // partitioning and conservative cross-lane conflicts.
+  int64_t cyclicDemand = nextPow2(spec.taps);
+  int64_t banks = bandW <= completeBankMaxElements
+                      ? bandW
+                      : std::min<int64_t>(bandW, cyclicDemand);
+  for (Value band : {bandRe, bandIm}) {
+    auto *alloc = band.getDefiningOp();
+    if (copies > 1) {
+      alloc->setAttr(kPartitionKindsAttr,
+                     b.getStrArrayAttr(
+                         {"complete", banks == bandW ? "complete" : "cyclic"}));
+      alloc->setAttr(kPartitionFactorsAttr, b.getI64ArrayAttr({copies, banks}));
+    } else {
+      alloc->setAttr(
+          kPartitionKindsAttr,
+          b.getStrArrayAttr({banks == bandW ? "complete" : "cyclic"}));
+      alloc->setAttr(kPartitionFactorsAttr, b.getI64ArrayAttr({banks}));
     }
+  }
 
   Value maskI =
       arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(bandW - 1));
-  Value bandHiI =
-      arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(bandHi));
-  Value bandLoI =
-      arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(bandLo));
-
   // Stages source column `srcColI64` (clamped into the row) into its slot.
   auto stageColumn = [&](Value i, Value srcColI64) {
     Value col = clampToColumn(s, srcColI64, cols);
     Value slot = arith::IndexCastOp::create(
         b, loc, b.getIndexType(),
         arith::AndIOp::create(b, loc, srcColI64, maskI));
-    memref::StoreOp::create(
-        b, loc, memref::LoadOp::create(b, loc, reBuf, ValueRange{i, col}),
-        bandRe, ValueRange{slot});
-    memref::StoreOp::create(
-        b, loc, memref::LoadOp::create(b, loc, imBuf, ValueRange{i, col}),
-        bandIm, ValueRange{slot});
+    Value reValue = memref::LoadOp::create(b, loc, reBuf, ValueRange{i, col});
+    Value imValue = memref::LoadOp::create(b, loc, imBuf, ValueRange{i, col});
+    if (copies == 1) {
+      memref::StoreOp::create(b, loc, reValue, bandRe, ValueRange{slot});
+      memref::StoreOp::create(b, loc, imValue, bandIm, ValueRange{slot});
+      return;
+    }
+    auto copyLoop = affine::AffineForOp::create(b, loc, 0, copies);
+    copyLoop->setAttr(kUnrollFactorAttr, b.getI64IntegerAttr(copies));
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(copyLoop.getBody());
+    Value copy = copyLoop.getInductionVar();
+    memref::StoreOp::create(b, loc, reValue, bandRe, ValueRange{copy, slot});
+    memref::StoreOp::create(b, loc, imValue, bandIm, ValueRange{copy, slot});
   };
 
   auto rowLoop = affine::AffineForOp::create(b, loc, 0, rows);
@@ -602,11 +686,21 @@ static void emitBandedBody(OpBuilder &b, Location loc, ScalarBuilder &s,
     OpBuilder::InsertionGuard g(b);
     b.setInsertionPointToStart(rowLoop.getBody());
     Value i = rowLoop.getInductionVar();
+    Value bandLoI =
+        arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(bandLo));
+    Value bandHiI = arith::AddIOp::create(
+        b, loc, bandLoI,
+        arith::ConstantOp::create(b, loc, b.getI64IntegerAttr(bandW - 1)));
 
-    // Prime slots for source columns [bandLo, bandHi); the push in iteration
-    // j = 0 supplies the last one.
-    if (bandW > 1) {
-      auto primeLoop = affine::AffineForOp::create(b, loc, 0, bandW - 1);
+    // A sliding band primes all but its newest slot; output iteration zero
+    // pushes that last column and every later iteration advances the window.
+    // A complete-row cache is immutable during the output sweep, so it stages
+    // every slot once and never performs the per-column push (which would
+    // overwrite low columns before an arbitrary runtime position reads them).
+    int64_t primeColumns = completeRow ? bandW : bandW - 1;
+    if (primeColumns > 0) {
+      auto primeLoop = affine::AffineForOp::create(b, loc, 0, primeColumns);
+      primeLoop->setAttr(kTaskBodyAttr, b.getUnitAttr());
       OpBuilder::InsertionGuard g2(b);
       b.setInsertionPointToStart(primeLoop.getBody());
       Value t = arith::IndexCastOp::create(b, loc, b.getI64Type(),
@@ -615,14 +709,20 @@ static void emitBandedBody(OpBuilder &b, Location loc, ScalarBuilder &s,
     }
 
     auto colLoop = affine::AffineForOp::create(b, loc, 0, cols);
+    // The band is banked across the tap footprint above, so a tap-count II
+    // floor would double-charge the same memory-port constraint. Leave the
+    // loop unconstrained and let the HLS scheduler prove the actual
+    // recurrence/port bound for this shape.
     {
       OpBuilder::InsertionGuard g2(b);
       b.setInsertionPointToStart(colLoop.getBody());
       Value j = colLoop.getInductionVar();
       Value jI64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), j);
 
-      // Slide the window: bring in source column j + bandHi.
-      stageColumn(i, arith::AddIOp::create(b, loc, jI64, bandHiI));
+      // Slide the narrow window. A complete-row cache was fully populated by
+      // the prologue and remains read-only throughout this loop.
+      if (!completeRow)
+        stageColumn(i, arith::AddIOp::create(b, loc, jI64, bandHiI));
 
       Value pos = positionAt(i, j);
       // Named lambda: a function_ref bound to a temporary would dangle.
@@ -630,10 +730,20 @@ static void emitBandedBody(OpBuilder &b, Location loc, ScalarBuilder &s,
         Value slot = arith::IndexCastOp::create(
             b, loc, b.getIndexType(),
             arith::AndIOp::create(b, loc, idxI64, maskI));
-        Value vRe =
-            s.toF64(memref::LoadOp::create(b, loc, bandRe, ValueRange{slot}));
-        Value vIm =
-            s.toF64(memref::LoadOp::create(b, loc, bandIm, ValueRange{slot}));
+        SmallVector<Value, 2> indices;
+        if (copies > 1) {
+          Value copyMask = arith::ConstantOp::create(
+              b, loc, b.getI64IntegerAttr(copies - 1));
+          Value copy = arith::IndexCastOp::create(
+              b, loc, b.getIndexType(),
+              arith::AndIOp::create(b, loc, jI64, copyMask));
+          indices.push_back(copy);
+        }
+        indices.push_back(slot);
+        Value vRe = s.toF64(
+            memref::LoadOp::create(b, loc, bandRe, ValueRange(indices)));
+        Value vIm = s.toF64(
+            memref::LoadOp::create(b, loc, bandIm, ValueRange(indices)));
         return {vRe, vIm};
       };
 
@@ -649,10 +759,16 @@ static void emitBandedBody(OpBuilder &b, Location loc, ScalarBuilder &s,
 struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
   bool enableBandedGather;
   int64_t profitThreshold;
+  uint64_t fullRowMaxBytes;
+  int64_t cacheCopies;
+  int64_t completeBankMaxElements;
 
-  Interp1DSplitLowering(MLIRContext *ctx, bool enableBanded, int64_t thresh)
+  Interp1DSplitLowering(MLIRContext *ctx, bool enableBanded, int64_t thresh,
+                        uint64_t maxRowBytes, int64_t copies,
+                        int64_t maxCompleteElements)
       : OpRewritePattern(ctx), enableBandedGather(enableBanded),
-        profitThreshold(thresh) {}
+        profitThreshold(thresh), fullRowMaxBytes(maxRowBytes),
+        cacheCopies(copies), completeBankMaxElements(maxCompleteElements) {}
 
   LogicalResult matchAndRewrite(Interp1DSplitOp op,
                                 PatternRewriter &rewriter) const override {
@@ -695,7 +811,8 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
     // holds, so the residency invariant would not cover it. `edge` is safe --
     // staging already clamps, so a slot outside the row holds the edge sample.
     bool useBanded = false;
-    int64_t bandLo = 0, bandW = 0;
+    bool completeRow = false;
+    int64_t bandW = 0, bandLo = 0;
     if (enableBandedGather && spec.boundary != "reflect") {
       auto range = computeDisplacementRange(op.getPositions(), /*dim=*/1);
       if (range) {
@@ -710,6 +827,25 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
           bandW = w;
           useBanded = true;
         }
+      }
+    }
+
+    // A runtime position field may have no provable displacement bound even
+    // though one complete source row is cheap to keep on chip. The immutable
+    // row cache is also preferable to a wider sliding band whose ring-buffer
+    // dependence dominates scheduling. The compiler supplies a
+    // resource-derived byte cap, so large rows retain the direct fallback.
+    if (enableBandedGather && fullRowMaxBytes != 0) {
+      int64_t stagedWidth = nextPow2(cols);
+      uint64_t elementBytes = (elemType.getIntOrFloatBitWidth() + 7) / 8;
+      uint64_t stagedBytes = 2 * static_cast<uint64_t>(stagedWidth) *
+                             elementBytes * static_cast<uint64_t>(cacheCopies);
+      if (stagedBytes <= fullRowMaxBytes &&
+          (!useBanded || bandW > completeBankMaxElements)) {
+        bandLo = 0;
+        bandW = stagedWidth;
+        useBanded = true;
+        completeRow = true;
       }
     }
 
@@ -731,7 +867,8 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
 
     if (useBanded)
       emitBandedBody(rewriter, loc, s, spec, reBuf, imBuf, positionAt, outRe,
-                     outIm, rows, cols, elemType, bandLo, bandW);
+                     outIm, rows, cols, elemType, bandLo, bandW,
+                     completeBankMaxElements, cacheCopies, completeRow);
     else
       emitFullPlaneBody(rewriter, loc, s, spec, reBuf, imBuf, positionAt, outRe,
                         outIm, rows, cols, elemType);
@@ -742,22 +879,9 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
   }
 };
 
-/// Banded lowering for `sar.gather2d_split`: when the displacement of the
-/// row coordinate off the output row is provably bounded, the gather runs
-/// against a sliding band of whole source rows instead of the resident
-/// plane. The band advances one row per output row (`coeff == 1` is what
-/// the analysis proves), so each source row is read exactly once.
-///
-/// The residency invariant is the row-axis analogue of the interpolation
-/// band: at output row i, `band[t & (bandW-1)]` holds source row
-/// clamp(t) for every t in [i + bandLo, i + bandHi]. Because staging
-/// clamps and the gather masks out-of-plane taps by weight (under the
-/// `zero` boundary) or wants the clamped sample anyway (`edge`), the
-/// numerics match the full-plane path bit for bit.
-///
-/// The column coordinate stays arbitrary -- whole rows are staged -- so
-/// only the row axis needs a bound. When the analysis cannot bound it,
-/// the pattern declines and the op takes the full-plane linalg path.
+/// Uses a sliding band of whole source rows when row displacement is bounded.
+/// Each row is staged once; arbitrary column indices remain supported. The
+/// pattern declines when the row-axis bound or boundary policy is unsuitable.
 struct Gather2DSplitBandedLowering : OpRewritePattern<Gather2DSplitOp> {
   bool enableBandedGather;
   int64_t profitThreshold;
@@ -878,10 +1002,18 @@ struct Gather2DSplitBandedLowering : OpRewritePattern<Gather2DSplitOp> {
       b.setInsertionPointToStart(colLoop.getBody());
       Value j = colLoop.getInductionVar();
 
-      Value rowPos = s.toF64(
+      Value rawRowPos = s.toF64(
           affine::AffineLoadOp::create(b, loc, rowsBuf, ValueRange{i, j}));
-      Value colPos = s.toF64(
+      Value rawColPos = s.toF64(
           affine::AffineLoadOp::create(b, loc, colsBuf, ValueRange{i, j}));
+      // A position that cannot become an i64 index without poison reads as
+      // zero on every backend, so it is replaced before the floor and the
+      // sample it would have produced is masked away. The full-plane gather
+      // does the same; leaving it out here would make the two lowerings of
+      // one operation disagree on non-finite input.
+      auto [rowPos, validRow] = sanitizePosition(s, rawRowPos);
+      auto [colPos, validCol] = sanitizePosition(s, rawColPos);
+      Value validPosition = arith::AndIOp::create(b, loc, validRow, validCol);
 
       // Tap accumulation, matching the full-plane semantics: weights
       // masked out of plane under `zero`, clamped sample under `edge`.
@@ -933,6 +1065,8 @@ struct Gather2DSplitBandedLowering : OpRewritePattern<Gather2DSplitOp> {
         tap(r1, c1, s.mul(fr, fc));
       }
 
+      accRe = arith::SelectOp::create(b, loc, validPosition, accRe, zeroF);
+      accIm = arith::SelectOp::create(b, loc, validPosition, accIm, zeroF);
       affine::AffineStoreOp::create(b, loc, s.fromF64(accRe, elemType), outRe,
                                     ValueRange{i, j});
       affine::AffineStoreOp::create(b, loc, s.fromF64(accIm, elemType), outIm,
@@ -969,7 +1103,8 @@ struct ConvertSARInterpToAffinePass
 
     RewritePatternSet patterns(context);
     patterns.add<Interp1DSplitLowering>(context, enableBandedGather,
-                                        bandedProfitThreshold);
+                                        bandedProfitThreshold, fullRowMaxBytes,
+                                        cacheCopies, completeBankMaxElements);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))

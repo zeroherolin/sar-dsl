@@ -10,7 +10,6 @@
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "sar/Dialect/HLS/IR/HLS.h"
 #include "llvm/ADT/MapVector.h"
 
@@ -31,11 +30,6 @@ hls::MemoryKind getMemoryKind(MemRefType type);
 // Dataflow utils
 //===----------------------------------------------------------------------===//
 
-/// Get the root affine loop contained by the node.
-
-/// Get the affine loop band contained by the node.
-AffineLoopBand getNodeLoopBand(hls::NodeOp currentNode);
-
 /// Wrap the operations in the block with dispatch op.
 hls::DispatchOp dispatchBlock(Block *block);
 
@@ -55,12 +49,6 @@ SmallVector<hls::NodeOp> getProducersExcept(Value buffer, hls::NodeOp except);
 SmallVector<hls::NodeOp> getProducers(Value buffer);
 SmallVector<hls::NodeOp> getDependentConsumers(Value buffer, hls::NodeOp node);
 
-/// Get the nested consumer/producer nodes of the given buffer except the given
-/// node. The corresponding buffer values are also returned.
-SmallVector<std::pair<hls::NodeOp, Value>>
-getNestedConsumersExcept(Value buffer, hls::NodeOp except);
-SmallVector<std::pair<hls::NodeOp, Value>> getNestedProducers(Value buffer);
-
 /// Get the depth of a buffer or stream channel. Note that only if the defining
 /// operation of the buffer is not a hls::BufferOp or stream types, the returned
 /// result will be 1.
@@ -76,31 +64,8 @@ bool isRead(OpOperand &use);
 bool isWritten(OpOperand &use);
 
 //===----------------------------------------------------------------------===//
-// Linalg analysis utils
-//===----------------------------------------------------------------------===//
-
-bool isElementwiseGenericOp(linalg::GenericOp op);
-
-//===----------------------------------------------------------------------===//
 // Memory and loop analysis utils
 //===----------------------------------------------------------------------===//
-
-/// Reduces each tile size to the largest divisor of the corresponding trip
-/// count (if the trip count is known).
-void adjustToDivisorsOfTripCounts(ArrayRef<affine::AffineForOp> band,
-                                  SmallVectorImpl<unsigned> *tileSizes);
-
-/// The current op or contained ops have effect on external buffers.
-bool hasEffectOnExternalBuffer(Operation *op);
-
-/// Distribute the given factor evenly on all loop levels. The generated factors
-/// are guaranteed to be divisors of the factors in given "constrFactors".
-/// This method can fail due to non-constant loop bounds.
-LogicalResult getEvenlyDistributedFactors(
-    unsigned maxFactor, FactorList &factors,
-    const SmallVectorImpl<mlir::affine::AffineForOp> &band,
-    const SmallVectorImpl<FactorList> &constrFactors,
-    bool powerOf2Constr = false);
 
 /// Return a pair which indicates whether the if statement is always true or
 /// false, respectively. The returned result is one-hot.
@@ -137,215 +102,14 @@ int64_t getPartitionFactors(MemRefType memrefType,
 
 bool isFullyPartitioned(MemRefType memrefType);
 
-/// This is method for finding the number of child loops which immediately
-/// contained by the input operation.
+/// Whether `operation` is the sole access in a zero-based, unit-step affine
+/// loop nest that visits every element of `memref` once in row-major order.
+bool isCompleteRowMajorSweep(Operation *operation, Value memref);
 
-/// Given a tiled loop band, return true and get the tile (tile-space) loop
-/// band and the point (intra-tile) loop band. If failed, return false.
-bool getTileAndPointLoopBand(const AffineLoopBand &band,
-                             AffineLoopBand &tileBand,
-                             AffineLoopBand &pointBand);
-
-/// Get the whole loop band given the outermost or innermost loop and return it
-/// in "band". Meanwhile, the return value is the innermost or outermost loop of
-/// this loop band.
-affine::AffineForOp getLoopBandFromOutermost(affine::AffineForOp forOp,
-                                             AffineLoopBand &band);
-affine::AffineForOp getLoopBandFromInnermost(affine::AffineForOp forOp,
-                                             AffineLoopBand &band);
-
-/// Collect all loop bands in the "block" and return them in "bands". If
-/// "allowHavingChilds" is true, loop bands containing more than 1 other loop
-/// bands are also collected. Otherwise, only loop bands that contains no child
-/// loops are collected.
-void getLoopBands(Block &block, AffineLoopBands &bands,
-                  bool allowHavingChilds = false);
-
-std::optional<unsigned> getAverageTripCount(affine::AffineForOp forOp);
+/// Whether `operation` is nested in any loop-like operation in its function.
+bool isNestedInLoop(Operation *operation);
 
 func::FuncOp getTopFunc(ModuleOp module, std::string topFuncName = "");
-
-/// Ensure that all operations that could be executed after `start`
-/// (noninclusive) and prior to `memOp` (e.g. on a control flow/op path between
-/// the operations) do not have the potential memory effect `EffectType` on
-/// `memOp`. `memOp`  is an operation that reads or writes to a memref. For
-/// example, if `EffectType` is MemoryEffects::Write, this method will check if
-/// there is no write to the memory between `start` and `memOp` that would
-/// change the read within `memOp`. `mayAlias` answers whether two values may
-/// address the same memory; anything it cannot rule out is treated as an
-/// intervening effect. This mirrors the upstream affine utility of the same
-/// name, which only exports the (Read, AffineReadOpInterface) instantiation;
-/// the copy exists for the other effect/op combinations and for a `start`
-/// that is not itself the memory op (a store hoisted out of an `affine.if`).
-template <typename EffectType>
-bool hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref,
-                            llvm::function_ref<bool(Value, Value)> mayAlias) {
-  // A boolean representing whether an intervening operation could have impacted
-  // memOp.
-  bool hasSideEffect = false;
-
-  // Check whether the effect on memOp can be caused by a given operation op.
-  std::function<void(Operation *)> checkOperation = [&](Operation *op) {
-    // If the effect has already been found, early exit,
-    if (hasSideEffect)
-      return;
-
-    if (auto memEffect = dyn_cast<MemoryEffectOpInterface>(op)) {
-      SmallVector<MemoryEffects::EffectInstance, 1> effects;
-      memEffect.getEffects(effects);
-
-      bool opMayHaveEffect = false;
-      for (auto effect : effects) {
-        // If op causes EffectType on a potentially aliasing location for memOp,
-        // mark as having the effect.
-        if (isa<EffectType>(effect.getEffect())) {
-          if (effect.getValue() && effect.getValue() != memref &&
-              !mayAlias(effect.getValue(), memref))
-            continue;
-          opMayHaveEffect = true;
-          break;
-        }
-      }
-
-      if (!opMayHaveEffect)
-        return;
-
-      // If the side effect comes from an affine read or write, try to prove the
-      // side effecting `op` cannot reach `memOp`.
-      if (isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(
-              op) &&
-          isa<affine::AffineReadOpInterface, affine::AffineWriteOpInterface>(
-              memOp)) {
-        affine::MemRefAccess srcAccess(op);
-        affine::MemRefAccess destAccess(memOp);
-
-        // Affine dependence analysis is applicable only when both ops operate
-        // on the same memref and share an AffineScope with `start`. A
-        // different memref reaching this point already failed the mayAlias
-        // screen above, so it stays an intervening effect.
-        if (srcAccess.memref == destAccess.memref &&
-            affine::getAffineScope(op) == affine::getAffineScope(memOp) &&
-            affine::getAffineScope(op) == affine::getAffineScope(start)) {
-          // Number of loops containing the start op and the ending operation.
-          unsigned minSurroundingLoops =
-              affine::getNumCommonSurroundingLoops(*start, *memOp);
-
-          // Number of loops containing the operation `op` which has the
-          // potential memory side effect and can occur on a path between
-          // `start` and `memOp`.
-          unsigned nsLoops = affine::getNumCommonSurroundingLoops(*op, *memOp);
-
-          // Take `op` to be a store, sought as one that overwrites memory
-          // after `start` and before `memOp` reads it. Only depths above
-          // `minSurroundingLoops` matter: `start` would already have
-          // overwritten any store surrounded by fewer loops.
-          unsigned d;
-          affine::FlatAffineValueConstraints dependenceConstraints;
-          for (d = nsLoops + 1; d > minSurroundingLoops; d--) {
-            affine::DependenceResult result =
-                affine::checkMemrefAccessDependence(
-                    srcAccess, destAccess, d, &dependenceConstraints,
-                    /*dependenceComponents=*/nullptr);
-            // A dependence failure or the presence of a dependence implies a
-            // side effect.
-            if (!noDependence(result)) {
-              hasSideEffect = true;
-              return;
-            }
-          }
-
-          // No side effect was seen, simply return.
-          return;
-        }
-      }
-      // An unclassified memory effect must be treated as intervening.
-      hasSideEffect = true;
-      return;
-    }
-
-    if (op->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
-      // Recurse into the regions for this op and check whether the internal
-      // operations may have the side effect `EffectType` on memOp.
-      for (Region &region : op->getRegions())
-        for (Block &block : region)
-          for (Operation &op : block)
-            checkOperation(&op);
-      return;
-    }
-
-    // Otherwise, conservatively assume generic operations have the effect
-    // on the operation.
-    hasSideEffect = true;
-  };
-
-  // Check all paths from ancestor op `parent` to the operation `to` for the
-  // effect. It is known that `to` must be contained within `parent`. The
-  // whole parent is scanned rather than just the paths reaching `to` --
-  // conservatively correct, since extra operations can only add effects.
-  auto until = [&](Operation *parent, Operation *to) {
-    assert(parent->isAncestor(to));
-    checkOperation(parent);
-  };
-
-  // Check for all paths from operation `from` to operation `untilOp` for the
-  // given memory effect.
-  std::function<void(Operation *, Operation *)> recur =
-      [&](Operation *from, Operation *untilOp) {
-        assert(
-            from->getParentRegion()->isAncestor(untilOp->getParentRegion()) &&
-            "Checking for side effect between two operations without a common "
-            "ancestor");
-
-        // If the operations are in different regions, recursively consider all
-        // path from `from` to the parent of `to` and all paths from the parent
-        // of `to` to `to`.
-        if (from->getParentRegion() != untilOp->getParentRegion()) {
-          recur(from, untilOp->getParentOp());
-          until(untilOp->getParentOp(), untilOp);
-          return;
-        }
-
-        // Now, assuming that `from` and `to` exist in the same region, perform
-        // a CFG traversal to check all the relevant operations.
-
-        // Additional blocks to consider.
-        SmallVector<Block *, 2> todoBlocks;
-        {
-          // First consider the parent block of `from` an check all operations
-          // after `from`.
-          for (auto iter = ++from->getIterator(), end = from->getBlock()->end();
-               iter != end && &*iter != untilOp; ++iter) {
-            checkOperation(&*iter);
-          }
-
-          // If the parent of `from` doesn't contain `to`, add the successors
-          // to the list of blocks to check.
-          if (untilOp->getBlock() != from->getBlock())
-            for (Block *succ : from->getBlock()->getSuccessors())
-              todoBlocks.push_back(succ);
-        }
-
-        llvm::SmallDenseSet<Block *, 4> done;
-        // Traverse the CFG until hitting `to`.
-        while (!todoBlocks.empty()) {
-          Block *blk = todoBlocks.pop_back_val();
-          if (done.count(blk))
-            continue;
-          done.insert(blk);
-          for (auto &op : *blk) {
-            if (&op == untilOp)
-              break;
-            checkOperation(&op);
-            if (&op == blk->getTerminator())
-              for (Block *succ : blk->getSuccessors())
-                todoBlocks.push_back(succ);
-          }
-        }
-      };
-
-  recur(start, memOp);
-  return !hasSideEffect;
-}
 
 } // namespace sar
 } // namespace mlir

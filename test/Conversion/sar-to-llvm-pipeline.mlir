@@ -1,5 +1,5 @@
 // RUN: sar-opt %s --sar-to-llvm-pipeline | FileCheck %s
-// Full CPU lowering smoke test: everything must reach the LLVM dialect,
+// Full CPU lowering gate: everything must reach the LLVM dialect,
 // kernels become destination-passing-style C-interface functions.
 
 func.func @kernel(%x: tensor<8x16xcomplex<f32>>, %s: tensor<8x16xf32>)

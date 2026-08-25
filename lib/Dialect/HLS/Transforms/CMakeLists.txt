@@ -1,12 +1,10 @@
 add_mlir_library(HLSTransforms
   AffineLoopOrderOpt.cpp
-  AffineLoopPerfection.cpp
   AffineLoopTile.cpp
   AffineStoreForward.cpp
   ArrayPartition.cpp
   BalanceDataflowNode.cpp
   BufferConversion.cpp
-  CollapseMemrefUnitDims.cpp
   ConvertDataflowToFunc.cpp
   CreateAxiInterface.cpp
   CreateDataflowFromAffine.cpp
@@ -17,18 +15,16 @@ add_mlir_library(HLSTransforms
   FuseSiblingLoops.cpp
   LegalizeDataflow.cpp
   LoopPipelining.cpp
+  LoopUtils.cpp
   LowerCopyToAffine.cpp
   LowerDataflow.cpp
   Passes.cpp
   PlaceDataflowBuffer.cpp
   RaiseAffineToCopy.cpp
   ReduceInitiationInterval.cpp
-  RemoveVariableBound.cpp
   ScheduleDataflowNode.cpp
   ShareEquivalentFunctions.cpp
-  SimplifyAffineIf.cpp
   SimplifyCopy.cpp
-  StreamDataflowTask.cpp
   WidenExternalMemory.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -39,6 +35,7 @@ add_mlir_library(HLSTransforms
 
   LINK_LIBS PUBLIC
   HLSDialect
+  SARTransforms
   MLIRAffineDialect
   MLIRAffineAnalysis
   MLIRAffineTransforms

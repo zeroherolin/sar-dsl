@@ -1,5 +1,7 @@
 """Shared pytest fixtures and backend availability markers."""
 
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -17,12 +19,75 @@ def _backend_available(name: str) -> bool:
     return name in backends and backends[name].is_available()
 
 
-requires_cpu = pytest.mark.skipif(
-    not _backend_available("cpu"),
-    reason="CPU backend toolchain not available (build the project first)")
+requires_cpu = pytest.mark.requires_cpu
+requires_hls = pytest.mark.requires_hls
 
-requires_hls = pytest.mark.skipif(not _backend_available("hls"),
-                                  reason="HLS toolchain not available")
+
+def _vitis_available() -> bool:
+    """Whether a Vitis HLS installation can be driven from this shell.
+
+    RTL co-simulation is opt-in because it takes minutes per design. C-sim
+    through Vitis HLS is selected automatically by `run_hls_csim` whenever
+    the executable exists; this gate applies only to RTL co-simulation.
+    """
+    if os.environ.get("SAR_DSL_TEST_VITIS", "") not in ("1", "true", "yes"):
+        return False
+    return shutil.which("vitis_hls") is not None
+
+
+requires_vitis = pytest.mark.requires_vitis
+
+
+def pytest_collection_modifyitems(items):
+    """Skips capability-marked tests only when their dependency is absent."""
+    unavailable = {
+        "requires_cpu":
+        (not _backend_available("cpu"),
+         "CPU backend toolchain not available (build the project first)"),
+        "requires_hls":
+        (not _backend_available("hls"), "HLS toolchain not available"),
+        "requires_vitis":
+        (not _vitis_available(),
+         "Vitis HLS run not requested (set SAR_DSL_TEST_VITIS=1)"),
+    }
+    for item in items:
+        for marker, (missing, reason) in unavailable.items():
+            if missing and item.get_closest_marker(marker) is not None:
+                item.add_marker(pytest.mark.skip(reason=reason))
+                break
+
+
+def run_hls_csim(package,
+                 top: str,
+                 timeout: float = 1800.0,
+                 expect_success: bool = True):
+    """Runs C-sim through Vitis HLS, or portable C++ without Vitis."""
+    import subprocess
+
+    package = Path(package)
+    vitis = shutil.which("vitis_hls")
+    if vitis is not None:
+        command = [vitis, f"{top}_hls_csim.tcl"]
+        mode = "hls_csim"
+    else:
+        command = ["sh", f"{top}_portable_cpp_sim.sh"]
+        mode = "portable_cpp_sim"
+    result = subprocess.run(command,
+                            cwd=package,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout)
+    output = result.stdout + result.stderr
+    if expect_success:
+        assert result.returncode == 0, (
+            f"{mode} simulation failed for {top}:\n{output[-4000:]}")
+        if mode == "hls_csim":
+            assert "CSim done with 0 errors" in output, output[-4000:]
+        else:
+            assert "PASS" in output, output[-4000:]
+    else:
+        assert result.returncode != 0, output[-4000:]
+    return mode, result
 
 
 # Shared utilities for split-complex affine/HLS testing

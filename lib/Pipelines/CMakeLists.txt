@@ -7,6 +7,7 @@ add_mlir_library(SARPipelines
   LINK_LIBS PUBLIC
   SARConversion
   SARTransforms
+  HLSTransforms
   MLIRArithToLLVM
   MLIRBufferizationPipelines
   MLIRBufferizationTransforms

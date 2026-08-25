@@ -13,6 +13,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "sar/Dialect/HLS/Transforms/Passes.h"
+#include "sar/Dialect/SAR/Transforms/Passes.h"
 
 using namespace mlir;
 using namespace sar;
@@ -37,7 +38,7 @@ struct HLSPipelineOptions : public PassPipelineOptions<HLSPipelineOptions> {
 
   Option<unsigned> loopTileSize{
       *this, "loop-tile-size", llvm::cl::init(2),
-      llvm::cl::desc("The tile size of each loop (must larger equal to 1)")};
+      llvm::cl::desc("The tile size of each loop (must be at least 1)")};
 
   Option<unsigned> bramBytes{
       *this, "bram-bytes", llvm::cl::init(9907200),
@@ -68,10 +69,6 @@ struct HLSPipelineOptions : public PassPipelineOptions<HLSPipelineOptions> {
       llvm::cl::desc("Element count at or above which a buffer moves to "
                      "DRAM (2^32-1 keeps everything resident)")};
 
-  Option<bool> balanceDataflow{
-      *this, "balance-dataflow", llvm::cl::init(true),
-      llvm::cl::desc("Whether to balance the dataflow")};
-
   Option<bool> axiInterface{*this, "axi-interface", llvm::cl::init(true),
                             llvm::cl::desc("Create AXI interface")};
 
@@ -91,6 +88,28 @@ struct HLSPipelineOptions : public PassPipelineOptions<HLSPipelineOptions> {
   Option<unsigned> externalVectorMinElements{
       *this, "external-vector-min-elements", llvm::cl::init(4096),
       llvm::cl::desc("Minimum logical elements before packing an AXI port")};
+
+  Option<bool> externalVectorPackOutputs{
+      *this, "external-vector-pack-outputs", llvm::cl::init(true),
+      llvm::cl::desc("Permit public output arrays to use a packed physical "
+                     "ABI")};
+
+  Option<unsigned> externalVectorComputeLanes{
+      *this, "external-vector-compute-lanes", llvm::cl::init(0),
+      llvm::cl::desc("Maximum unrolled compute lanes per packed transfer")};
+
+  Option<unsigned> maxScratchArenas{
+      *this, "max-scratch-arenas", llvm::cl::init(4),
+      llvm::cl::desc("Maximum compiler-owned scratch masters per scalar type")};
+
+  Option<unsigned> maxUnrolledOps{
+      *this, "max-unrolled-ops", llvm::cl::init(4096),
+      llvm::cl::desc("Maximum operation copies materialized by loop unroll")};
+
+  Option<unsigned> maxUnrollFactor{
+      *this, "max-unroll-factor", llvm::cl::init(32),
+      llvm::cl::desc("Maximum factor used when full unroll exceeds the "
+                     "budget")};
 };
 } // namespace
 
@@ -115,8 +134,17 @@ void sar::registerHLSPipeline() {
         pm.addPass(sar::createSimplifyCopyPass());
         pm.addPass(sar::createLowerCopyToAffinePass());
         pm.addPass(memref::createFoldMemRefAliasOpsPass());
-        pm.addPass(sar::createFuseSiblingLoopsPass());
+        pm.addPass(sar::createFuseSiblingLoopsPass(!opts.axiInterface ||
+                                                   opts.streamInterface));
         pm.addPass(mlir::createCSEPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+
+        // Fusion may fold a local producer and its final result copy together.
+        // If that local value also feeds another result, later forwarding can
+        // turn the public output into working storage. Re-establish one-write,
+        // no-read result ports against the IR the HLS pipeline will schedule.
+        pm.addPass(sar::createSARPrivatizeOutParams());
+        pm.addPass(sar::createLowerCopyToAffinePass());
         pm.addPass(mlir::createCanonicalizerPass());
 
         // Place dataflow buffers.
@@ -127,9 +155,11 @@ void sar::registerHLSPipeline() {
             /*allowDram=*/opts.axiInterface || opts.streamInterface));
 
         // Affine loop tiling.
-        pm.addPass(sar::createFuncPreprocessPass(opts.hlsTopFunc));
-        pm.addPass(sar::createAffineLoopPerfectionPass());
-        pm.addPass(sar::createRemoveVariableBoundPass());
+        // Copy/placement transformations may expose new affine loops, but all
+        // operation normalization was already completed above. Re-run only
+        // the loop-parallel analysis instead of the full greedy rewrite set.
+        pm.addPass(sar::createFuncPreprocessPass(opts.hlsTopFunc,
+                                                 /*rewriteOps=*/false));
         pm.addPass(sar::createAffineLoopOrderOptPass());
         if (opts.loopTileSize != 1)
           pm.addPass(sar::createAffineLoopTilePass(opts.loopTileSize,
@@ -145,10 +175,8 @@ void sar::registerHLSPipeline() {
         // interpolation), where the access pattern is known.
 
         // Form dataflow tasks from affine loops.
-        pm.addPass(sar::createCollapseMemrefUnitDimsPass());
         pm.addPass(sar::createAffineStoreForwardPass());
         pm.addPass(sar::createCreateDataflowFromAffinePass());
-        pm.addPass(sar::createStreamDataflowTaskPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
         // Lower and optimize dataflow.
@@ -156,15 +184,16 @@ void sar::registerHLSPipeline() {
         pm.addPass(sar::createEliminateMultiProducerPass());
         pm.addPass(sar::createEliminateMultiConsumerPass());
         pm.addPass(sar::createScheduleDataflowNodePass());
-        if (opts.balanceDataflow)
-          pm.addPass(sar::createBalanceDataflowNodePass());
+        pm.addPass(sar::createBalanceDataflowNodePass());
         pm.addPass(sar::createLowerCopyToAffinePass());
-        pm.addPass(sar::createAffineStoreForwardPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
         // Mark schedules whose nodes are all scheduled as legal, which is
         // what makes the emitter attach `#pragma HLS dataflow`.
         pm.addPass(sar::createLegalizeDataflowPass());
+        // Legalization may expose duplicate coordinate or phase computations;
+        // remove them after the nodes have been merged.
+        pm.addPass(mlir::createCSEPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
         // Forking and balancing create buffer copies after initial placement.
@@ -177,7 +206,6 @@ void sar::registerHLSPipeline() {
             /*allowDram=*/opts.axiInterface || opts.streamInterface));
 
         // Memory optimization.
-        pm.addPass(sar::createSimplifyAffineIfPass());
         pm.addPass(sar::createAffineStoreForwardPass());
         pm.addPass(sar::createReduceInitiationIntervalPass());
         pm.addPass(mlir::createCanonicalizerPass());
@@ -189,16 +217,18 @@ void sar::registerHLSPipeline() {
 
         // Directive-level optimization.
         if (opts.axiInterface || opts.streamInterface)
-          pm.addPass(sar::createCreateAxiInterfacePass(opts.hlsTopFunc,
-                                                       opts.streamInterface));
-        pm.addPass(sar::createLoopPipeliningPass());
+          pm.addPass(sar::createCreateAxiInterfacePass(
+              opts.hlsTopFunc, opts.streamInterface, opts.maxScratchArenas));
+        pm.addPass(sar::createLoopPipeliningPass(opts.maxUnrolledOps,
+                                                 opts.maxUnrollFactor));
         // Pack only memory-mapped interfaces here. AXI4-Stream needs an
         // explicit hls::stream<vector<...>> ABI rather than a vector array
         // carrying an axis pragma, and is handled separately.
         if (opts.axiInterface && !opts.streamInterface)
           pm.addPass(sar::createWidenExternalMemoryPass(
               opts.axiBusBits, opts.externalVectorMaxLanes,
-              opts.externalVectorMinElements));
+              opts.externalVectorMinElements, opts.externalVectorPackOutputs,
+              opts.externalVectorComputeLanes));
         // The banking tier threshold is one number expressed in two units:
         // the placement pass reasons in bytes, this one in bits, because a
         // bank's cost is its bit count. Converting here keeps the single

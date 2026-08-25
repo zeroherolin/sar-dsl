@@ -48,10 +48,13 @@ func.func @wide_fanout(%f: memref<8xf64>, %a: memref<8xf64>,
   return
 }
 
-// Two readers share the dual-port memory natively: no fork, no buffers.
+// Even two readers need a fork: Vitis HLS dataflow legality is per process,
+// not per BRAM port count. Constant tables are the separate exception below.
 
 // CHECK-LABEL: func.func @two_readers
-// CHECK-NOT: hls.dataflow.buffer
+// CHECK-COUNT-2: hls.dataflow.buffer {depth = 1 : i32} : memref<8xf64>
+// CHECK: hls.dataflow.node
+// CHECK-COUNT-2: memref.copy
 func.func @two_readers(%f: memref<8xf64>, %a: memref<8xf64>,
                        %b: memref<8xf64>) {
   hls.dataflow.schedule(%f, %a, %b)

@@ -119,7 +119,7 @@ def find_runtime_library() -> str:
         "SAR_DSL_RUNTIME_LIB")
 
 
-# Kept for callers that cleared the former lookup cache. Resolution is now
+# Compatibility hooks for callers that clear tool lookups. Resolution is
 # environment-sensitive on every call, so clearing is intentionally a no-op.
 def _no_cache() -> None:
     pass
