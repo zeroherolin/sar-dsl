@@ -197,7 +197,7 @@ _The same counts as a share of the budget each resource is constrained by. The g
 
 </div>
 
-All timing values are HLS estimates, not post-place-and-route closure. Constraints, source/report hashes, and derived strategies are in the [machine-readable summary](benchmarks/results/hls_algorithms_c64_production_vitis_2022_2.json).
+All timing values are HLS estimates, not post-place-and-route closure.
 
 Where a plane lives is the compiler's decision, not a directive the user writes. Scaling the configured BRAM, URAM and LUTRAM caps retunes local storage while the top-level interface remains stable:
 
