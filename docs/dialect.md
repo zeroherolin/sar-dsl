@@ -5,14 +5,14 @@ Whole-array operations for SAR imaging. All operations work on builtin ranked te
 ## Element-wise arithmetic
 
 | Op | Signature | Notes |
-| --- | --- | --- | --- |
+| --- | --- | --- |
 | `sar.add/sub/mul/div` | `(T, T) -> T` | float, int or complex elements |
 | `sar.add_scalar` | `(T) -> T`, `scalar: f64` | complex: added to real part |
 | `sar.mul_scalar` | `(T) -> T`, `scalar: f64` |  |
 | `sar.sqrt` | `(T) -> T` | float only |
 | `sar.cos` / `sar.sin` / `sar.exp` / `sar.log` | `(T) -> T` | float only |
 | `sar.atan2` | `(T, T) -> T` | float only; NumPy argument order `(y, x)` |
-| `sar.abs` | `(complex<t> | t) -> t` | complex magnitude / float abs |
+| `sar.abs` | `(complex<t> \| t) -> t` | complex magnitude / float abs |
 | `sar.cmp` | `(t, t) -> t`, `predicate` | 0.0/1.0 mask (frontend: `x > y`, `x == 0.0`, ...) |
 | `sar.where` | `(t, T, T) -> T` | exact per-element selection by a mask (NumPy `where`) |
 | `sar.conj` | `(complex<t>) -> complex<t>` | complex conjugate |
