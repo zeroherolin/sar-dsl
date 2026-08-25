@@ -86,7 +86,7 @@ jobs:
       # The release archive is pinned by version and digest below.
       LLVM_RELEASE_VERSION: "22.1.8"
       LLVM_RELEASE_SHA256: "df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384"
-      LLVM_RELEASE_ROOT: ${{ runner.temp }}/sar-dsl-llvm-22.1.8
+      LLVM_RELEASE_ROOT: /tmp/sar-dsl-llvm-22.1.8
       LLVM_RELEASE_CACHE: ~/.cache/sar-dsl
       JOBS: "2"
       SAR_RT_NUM_THREADS: "2"
