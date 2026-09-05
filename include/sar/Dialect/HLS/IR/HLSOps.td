@@ -151,7 +151,8 @@ def ScheduleOp : HLSOp<"dataflow.schedule", [
   let description = [{
     Schedule op has an isolated region to contain a list of dataflow node ops to
     be scheduled. This op can be explicitly marked as legal when all the
-    dataflow violations have been resolved and all the nodes has been scheduled.
+    dataflow violations have been resolved and all the nodes have been
+    scheduled.
   }];
 
   let arguments = (ins Variadic<AnyType>:$operands, UnitAttr:$isLegal);
@@ -185,8 +186,9 @@ def NodeOp : HLSOp<"dataflow.node", [
   let description = [{
     A node owns an isolated region and accepts only buffers or streams as data
     inputs and outputs. Scalar parameters may enter the region but do not
-    participate in dataflow scheduling. `inputTaps` records the hierarchy level
-    of each input buffer or stream tap.
+    participate in dataflow scheduling. `inputTaps` records, for each input
+    buffer or stream, the depth slot tapped by this node; each tap must be
+    smaller than the corresponding buffer or stream depth.
   }];
 
   let arguments = (ins Variadic<AnyBufferOrStream>:$inputs,
@@ -233,7 +235,7 @@ def NodeOp : HLSOp<"dataflow.node", [
     /// Get the parent schedule op.
     ScheduleOp getScheduleOp();
 
-    /// Get input taps.
+    /// Get and set input taps.
     void setInputTap(unsigned idx, unsigned tap);
     unsigned getInputTap(unsigned idx);
     SmallVector<unsigned> getInputTapsAsInt();
@@ -243,7 +245,7 @@ def NodeOp : HLSOp<"dataflow.node", [
     unsigned getNumOutputs();
     unsigned getNumParams();
 
-    /// Get the type of operand: input, output, or param.
+    /// Get the kind of operand: input, output, or param.
     OperandKind getOperandKind(OpOperand &operand);
     OperandKind getOperandKind(unsigned operandIdx);
 

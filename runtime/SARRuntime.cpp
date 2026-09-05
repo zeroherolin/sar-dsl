@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <complex>
 #include <condition_variable>
@@ -28,9 +29,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <limits>
+#include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__linux__)
@@ -46,8 +51,9 @@ namespace {
 //===----------------------------------------------------------------------===//
 //
 // Large intermediate planes are reused by size to avoid repeated mmap and
-// page-fault costs. Retention is bounded by the peak live allocation;
-// `SAR_RT_POOL_MAX_BYTES=0` disables pooling. Small blocks remain with libc.
+// page-fault costs. Retention is bounded by the peak live allocation, or by
+// `SAR_RT_POOL_MAX_BYTES` when set; `SAR_RT_POOL_MAX_BYTES=0` disables
+// pooling. Small blocks remain with libc.
 
 class PlanePool {
 public:
@@ -67,8 +73,9 @@ public:
                    alignment);
       std::abort();
     }
-    bool pooled = enabled && size >= kPoolMinBytes;
-    if (!pooled)
+    // Small blocks, and everything when pooling is disabled, stay with libc
+    // and are never tracked; release() frees whatever it does not find.
+    if (!enabled || size < kPoolMinBytes)
       return allocateRaw(size, alignment);
 
     std::lock_guard<std::mutex> guard(mutex);
@@ -79,6 +86,7 @@ public:
       cachedBytes -= cache[i].size;
       cache[i] = cache.back();
       cache.pop_back();
+      blocks[ptr].cached = false;
       liveBytes += size;
       peakLiveBytes = std::max(peakLiveBytes, liveBytes);
       return ptr;
@@ -86,7 +94,7 @@ public:
 
     evictCachedToFit(size);
     void *ptr = allocateRaw(size, alignment);
-    blocks.push_back({ptr, size, alignment});
+    blocks.emplace(ptr, Block{size, alignment, false});
     liveBytes += size;
     peakLiveBytes = std::max(peakLiveBytes, liveBytes);
     return ptr;
@@ -95,31 +103,42 @@ public:
   void release(void *ptr) {
     if (!ptr)
       return;
-    if (enabled) {
-      std::lock_guard<std::mutex> guard(mutex);
-      // Blocks libc served directly are not listed here and fall through.
-      for (size_t i = 0; i < blocks.size(); ++i) {
-        if (blocks[i].ptr != ptr)
-          continue;
-        Block block = blocks[i];
-        liveBytes -= block.size;
-        size_t bound = limit ? limit : peakLiveBytes;
-        if (liveBytes + cachedBytes + block.size <= bound) {
-          cache.push_back(block);
-          cachedBytes += block.size;
-          return;
-        }
-        blocks[i] = blocks.back();
-        blocks.pop_back();
-        free(ptr);
-        return;
-      }
+    if (!enabled) {
+      free(ptr);
+      return;
     }
+    std::lock_guard<std::mutex> guard(mutex);
+    auto found = blocks.find(ptr);
+    if (found == blocks.end()) {
+      // Not pool-eligible: allocated straight from libc.
+      free(ptr);
+      return;
+    }
+    Block &block = found->second;
+    if (block.cached) {
+      std::fprintf(stderr, "sar_runtime: allocation released twice\n");
+      std::abort();
+    }
+    liveBytes -= block.size;
+    size_t bound = limit ? limit : peakLiveBytes;
+    if (liveBytes + cachedBytes + block.size <= bound) {
+      block.cached = true;
+      cache.push_back({ptr, block.size, block.alignment});
+      cachedBytes += block.size;
+      return;
+    }
+    blocks.erase(found);
     free(ptr);
   }
 
 private:
   struct Block {
+    size_t size;
+    size_t alignment;
+    bool cached;
+  };
+
+  struct CacheEntry {
     void *ptr;
     size_t size;
     size_t alignment;
@@ -141,16 +160,10 @@ private:
     size_t bound = limit ? std::max(limit, requiredLive)
                          : std::max(peakLiveBytes, requiredLive);
     while (!cache.empty() && liveBytes + cachedBytes + request > bound) {
-      Block victim = cache.back();
+      CacheEntry victim = cache.back();
       cache.pop_back();
       cachedBytes -= victim.size;
-      for (size_t i = 0; i < blocks.size(); ++i) {
-        if (blocks[i].ptr != victim.ptr)
-          continue;
-        blocks[i] = blocks.back();
-        blocks.pop_back();
-        break;
-      }
+      blocks.erase(victim.ptr);
       free(victim.ptr);
     }
   }
@@ -167,8 +180,8 @@ private:
   }
 
   std::mutex mutex;
-  std::vector<Block> blocks; // every live block the pool handed out
-  std::vector<Block> cache;  // freed blocks kept mapped for reuse
+  std::unordered_map<void *, Block> blocks; // pool-eligible blocks, by pointer
+  std::vector<CacheEntry> cache; // freed blocks kept mapped for reuse
   size_t liveBytes = 0;
   size_t cachedBytes = 0;
   size_t peakLiveBytes = 0;
@@ -197,22 +210,90 @@ template <typename T, int Rank> struct MemRefDescriptor {
 // Parallel helpers
 //===----------------------------------------------------------------------===//
 
-static unsigned availableWorkerCount() {
+struct AffinityMask {
+  std::vector<unsigned long> words;
+
+  size_t bytes() const { return words.size() * sizeof(unsigned long); }
+
+  unsigned count() const {
 #if defined(__linux__)
-  cpu_set_t affinity;
-  CPU_ZERO(&affinity);
-  if (sched_getaffinity(0, sizeof(affinity), &affinity) == 0)
-    return std::max(1, CPU_COUNT(&affinity));
+    return static_cast<unsigned>(CPU_COUNT_S(
+        bytes(), reinterpret_cast<const cpu_set_t *>(words.data())));
+#else
+    unsigned result = 0;
+    for (unsigned long word : words)
+      result += static_cast<unsigned>(__builtin_popcountl(word));
+    return result;
 #endif
+  }
+};
+
+static AffinityMask currentAffinityMask() {
+#if defined(__linux__)
+  AffinityMask result;
+  result.words.resize(128 / sizeof(unsigned long));
+  while (true) {
+    std::fill(result.words.begin(), result.words.end(), 0UL);
+    if (sched_getaffinity(0, result.bytes(),
+                          reinterpret_cast<cpu_set_t *>(result.words.data())) ==
+        0)
+      return result;
+    if (errno != EINVAL || result.bytes() >= (1u << 20))
+      break;
+    result.words.resize(result.words.size() * 2);
+  }
+#endif
+  return {};
+}
+
+static unsigned workerCountFor(const AffinityMask &affinity) {
+  if (!affinity.words.empty())
+    return std::max(1u, affinity.count());
   return std::max(1u, std::thread::hardware_concurrency());
 }
+
+static unsigned availableWorkerCount() {
+  return workerCountFor(currentAffinityMask());
+}
+
+static void applyAffinityMask(const AffinityMask &affinity) {
+#if defined(__linux__)
+  if (!affinity.words.empty())
+    (void)sched_setaffinity(
+        0, affinity.bytes(),
+        reinterpret_cast<const cpu_set_t *>(affinity.words.data()));
+#else
+  (void)affinity;
+#endif
+}
+
+class AffinityScope {
+public:
+  explicit AffinityScope(const AffinityMask &target)
+      : previous(currentAffinityMask()) {
+    applyAffinityMask(target);
+  }
+  ~AffinityScope() { applyAffinityMask(previous); }
+
+private:
+  AffinityMask previous;
+};
+
+/// Snapshot the process mask when the runtime library is loaded. libomp may
+/// later bind the calling thread to one core before the first FFT call; using
+/// that narrowed thread mask would incorrectly cap the independent runtime
+/// pool at one core. A numactl/cgroup restriction is already present at load
+/// time and therefore remains respected.
+static const AffinityMask initialAffinityMask = currentAffinityMask();
+static const unsigned initialAvailableWorkerCount =
+    workerCountFor(initialAffinityMask);
 
 /// Worker count for runtime parallelism. Explicit requests are capped by the
 /// process affinity, so a container cannot accidentally create host-wide
 /// thread counts.
 unsigned runtimeWorkerCount() {
   static const unsigned cached = [] {
-    unsigned available = availableWorkerCount();
+    unsigned available = initialAvailableWorkerCount;
     for (const char *var : {"SAR_RT_NUM_THREADS", "OMP_NUM_THREADS"}) {
       if (const char *env = std::getenv(var)) {
         char *end = nullptr;
@@ -264,6 +345,7 @@ public:
       ++generation;
     }
     ready.notify_all();
+    AffinityScope affinity(initialAffinityMask);
     runChunk(0, function, total, active);
 
     std::unique_lock<std::mutex> lock(mutex);
@@ -284,6 +366,7 @@ private:
   }
 
   void workerLoop(unsigned id) {
+    applyAffinityMask(initialAffinityMask);
     uint64_t observed = 0;
     while (true) {
       std::function<void(int64_t, int64_t)> function;
@@ -434,7 +517,10 @@ public:
     bSpec = std::move(b);
   }
 
-  void run(std::complex<double> *line, bool inverse) const {
+  int64_t workspaceSize() const { return m; }
+
+  void run(std::complex<double> *line, bool inverse,
+           std::vector<std::complex<double>> &workspace) const {
     if (chirp.empty()) {
       pow2->run(line, inverse);
       return;
@@ -443,18 +529,19 @@ public:
       // ifft(x) = conj(fft(conj(x))) / n
       for (int64_t k = 0; k < n; ++k)
         line[k] = std::conj(line[k]);
-      forward(line);
+      forward(line, workspace);
       double scale = 1.0 / static_cast<double>(n);
       for (int64_t k = 0; k < n; ++k)
         line[k] = std::conj(line[k]) * scale;
     } else {
-      forward(line);
+      forward(line, workspace);
     }
   }
 
 private:
-  void forward(std::complex<double> *line) const {
-    std::vector<std::complex<double>> a(m, std::complex<double>(0.0, 0.0));
+  void forward(std::complex<double> *line,
+               std::vector<std::complex<double>> &a) const {
+    a.assign(m, std::complex<double>(0.0, 0.0));
     for (int64_t k = 0; k < n; ++k)
       a[k] = line[k] * chirp[k];
     pow2->run(a.data(), /*inverse=*/false);
@@ -472,15 +559,90 @@ private:
   std::vector<std::complex<double>> bSpec;
 };
 
+class LinePlanCache {
+public:
+  static LinePlanCache &instance() {
+    static LinePlanCache cache;
+    return cache;
+  }
+
+  std::shared_ptr<const LinePlan> get(int64_t size) {
+    // SAR_RT_FFT_PLAN_CACHE_MAX=0 disables the cache: build a fresh plan
+    // per call and retain nothing, matching SAR_RT_POOL_MAX_BYTES=0.
+    if (limit == 0)
+      return std::make_shared<const LinePlan>(size);
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      auto found = plans.find(size);
+      if (found != plans.end()) {
+        order.splice(order.begin(), order, found->second.order);
+        return found->second.plan;
+      }
+    }
+    // Bluestein construction runs two full m-point FFTs; build outside the
+    // lock so a large plan does not stall concurrent transforms.
+    auto plan = std::make_shared<const LinePlan>(size);
+    std::lock_guard<std::mutex> guard(mutex);
+    auto found = plans.find(size);
+    if (found != plans.end()) {
+      // Another thread built this length concurrently; keep its copy.
+      order.splice(order.begin(), order, found->second.order);
+      return found->second.plan;
+    }
+    order.push_front(size);
+    plans.emplace(size, Entry{plan, order.begin()});
+    while (plans.size() > limit) {
+      int64_t victim = order.back();
+      order.pop_back();
+      plans.erase(victim);
+    }
+    return plan;
+  }
+
+  void clear() {
+    std::lock_guard<std::mutex> guard(mutex);
+    plans.clear();
+    order.clear();
+  }
+
+  int64_t size() const {
+    std::lock_guard<std::mutex> guard(mutex);
+    return static_cast<int64_t>(plans.size());
+  }
+
+private:
+  struct Entry {
+    std::shared_ptr<const LinePlan> plan;
+    std::list<int64_t>::iterator order;
+  };
+
+  LinePlanCache() {
+    if (const char *env = std::getenv("SAR_RT_FFT_PLAN_CACHE_MAX")) {
+      char *end = nullptr;
+      long value = std::strtol(env, &end, 10);
+      if (end != env && *end == '\0' && value >= 0)
+        limit = static_cast<size_t>(value);
+    }
+  }
+
+  mutable std::mutex mutex;
+  std::map<int64_t, Entry> plans;
+  std::list<int64_t> order;
+  size_t limit = 16;
+};
+
 template <typename Scalar>
 void fft1d(const MemRefDescriptor<std::complex<Scalar>, 1> *in,
            MemRefDescriptor<std::complex<Scalar>, 1> *out, bool inverse) {
   int64_t n = in->sizes[0];
-  LinePlan plan(n);
+  auto plan = LinePlanCache::instance().get(n);
   std::vector<std::complex<double>> line(n);
+  std::vector<std::complex<double>> workspace;
+  if (plan->workspaceSize())
+    workspace.reserve(plan->workspaceSize());
   for (int64_t i = 0; i < n; ++i)
     line[i] = std::complex<double>(in->at(i).real(), in->at(i).imag());
-  plan.run(line.data(), inverse);
+  plan->run(line.data(), inverse, workspace);
   for (int64_t i = 0; i < n; ++i)
     out->at(i) = std::complex<Scalar>(static_cast<Scalar>(line[i].real()),
                                       static_cast<Scalar>(line[i].imag()));
@@ -494,17 +656,20 @@ void fft2d(const MemRefDescriptor<std::complex<Scalar>, 2> *in,
   int64_t cols = in->sizes[1];
   int64_t numLines = (dim == 1) ? rows : cols;
   int64_t lineLen = (dim == 1) ? cols : rows;
-  LinePlan plan(lineLen);
+  auto plan = LinePlanCache::instance().get(lineLen);
 
   parallelFor(numLines, [&](int64_t begin, int64_t end) {
     std::vector<std::complex<double>> line(lineLen);
+    std::vector<std::complex<double>> workspace;
+    if (plan->workspaceSize())
+      workspace.reserve(plan->workspaceSize());
     for (int64_t l = begin; l < end; ++l) {
       for (int64_t k = 0; k < lineLen; ++k) {
         const std::complex<Scalar> &v =
             (dim == 1) ? in->at(l, k) : in->at(k, l);
         line[k] = std::complex<double>(v.real(), v.imag());
       }
-      plan.run(line.data(), inverse);
+      plan->run(line.data(), inverse, workspace);
       for (int64_t k = 0; k < lineLen; ++k) {
         std::complex<Scalar> v(static_cast<Scalar>(line[k].real()),
                                static_cast<Scalar>(line[k].imag()));
@@ -569,6 +734,8 @@ inline int64_t applyBoundary(int64_t idx, int64_t cols, int64_t boundary) {
     return std::max<int64_t>(0, std::min<int64_t>(cols - 1, idx));
   if (cols == 1)
     return 0;
+  // Reflect: mirror with the edge sample repeated (numpy `symmetric`), so
+  // indices fold with period 2*cols and -1 reads sample 0.
   int64_t period = 2 * cols;
   idx %= period;
   if (idx < 0)
@@ -601,6 +768,9 @@ inline std::complex<double> sampleInterp(const std::complex<double> *row,
                                          int64_t kernel, int64_t taps,
                                          int64_t window, double beta,
                                          double invI0Beta, int64_t boundary) {
+  // Guards the float -> int64 conversion below: positions beyond +/-2^62
+  // are unmappable and have a defined zero result on every backend (the
+  // affine lowering applies the same bound in sanitizePosition).
   constexpr double safeIndexLimit = 0x1p62;
   if (!std::isfinite(position) || position <= -safeIndexLimit ||
       position >= safeIndexLimit)
@@ -691,6 +861,30 @@ void interp1d2d(const MemRefDescriptor<std::complex<Scalar>, 2> *data,
 
 extern "C" {
 
+static thread_local const char *lastRuntimeError = nullptr;
+
+void sar_rt_error_clear() { lastRuntimeError = nullptr; }
+
+const char *sar_rt_error_get() { return lastRuntimeError; }
+
+void sar_rt_fft_plan_cache_clear() { LinePlanCache::instance().clear(); }
+
+int64_t sar_rt_fft_plan_cache_size() {
+  return LinePlanCache::instance().size();
+}
+
+int64_t sar_rt_worker_count() {
+  return static_cast<int64_t>(runtimeWorkerCount());
+}
+
+int64_t sar_rt_available_worker_count() {
+  return static_cast<int64_t>(initialAvailableWorkerCount);
+}
+
+int64_t sar_rt_current_affinity_count() {
+  return static_cast<int64_t>(availableWorkerCount());
+}
+
 //===----------------------------------------------------------------------===//
 // Buffer allocation
 //===----------------------------------------------------------------------===//
@@ -699,28 +893,64 @@ extern "C" {
 // a kernel's `memref.alloc` calls these instead of malloc/aligned_alloc,
 // and its buffers come from the pool above.
 
-/// ABI-boundary shape check. These entry points form a C ABI that foreign
-/// callers can reach directly, so a mismatch aborts with a diagnostic in
-/// every build -- an assert would vanish under NDEBUG and turn the mismatch
-/// into an out-of-bounds write.
-static void requireRuntime(bool ok, const char *what) {
+/// Fatal checks for allocation hooks, which cannot report an error through
+/// the generated allocation ABI.
+static void requireRuntimeFatal(bool ok, const char *what) {
   if (!ok) {
     std::fprintf(stderr, "sar_runtime: %s\n", what);
     std::abort();
   }
 }
 
+static bool requireRuntime(bool ok, const char *what) {
+  if (lastRuntimeError)
+    return false;
+  if (ok)
+    return true;
+  lastRuntimeError = what;
+  return false;
+}
+
+static bool runtimeReady() { return lastRuntimeError == nullptr; }
+
+} // extern "C"
+
+template <typename T, int Rank>
+static bool requireDescriptorLayout(const MemRefDescriptor<T, Rank> *desc,
+                                    const char *what) {
+  if (!requireRuntime(desc && desc->aligned, what))
+    return false;
+  __int128 first = desc->offset;
+  __int128 last = desc->offset;
+  for (int dim = 0; dim < Rank; ++dim) {
+    if (!requireRuntime(desc->sizes[dim] > 0 && desc->strides[dim] != 0, what))
+      return false;
+    __int128 extent = static_cast<__int128>(desc->sizes[dim] - 1);
+    __int128 delta = extent * static_cast<__int128>(desc->strides[dim]);
+    if (delta < 0)
+      first += delta;
+    else
+      last += delta;
+  }
+  return requireRuntime(first >= std::numeric_limits<int64_t>::min() &&
+                            last <= std::numeric_limits<int64_t>::max(),
+                        what);
+}
+
+extern "C" {
+
 void *_mlir_memref_to_llvm_alloc(int64_t size) {
-  requireRuntime(size >= 0, "allocation size must be non-negative");
+  requireRuntimeFatal(size >= 0, "allocation size must be non-negative");
   return PlanePool::instance().allocate(static_cast<size_t>(size),
                                         sizeof(void *));
 }
 
 void *_mlir_memref_to_llvm_aligned_alloc(int64_t alignment, int64_t size) {
-  requireRuntime(size >= 0, "allocation size must be non-negative");
-  requireRuntime(alignment > 0 && (alignment & (alignment - 1)) == 0 &&
-                     alignment % static_cast<int64_t>(sizeof(void *)) == 0,
-                 "allocation alignment must be a pointer-sized power of two");
+  requireRuntimeFatal(size >= 0, "allocation size must be non-negative");
+  requireRuntimeFatal(
+      alignment > 0 && (alignment & (alignment - 1)) == 0 &&
+          alignment % static_cast<int64_t>(sizeof(void *)) == 0,
+      "allocation alignment must be a pointer-sized power of two");
   return PlanePool::instance().allocate(static_cast<size_t>(size),
                                         static_cast<size_t>(alignment));
 }
@@ -732,62 +962,90 @@ void _mlir_memref_to_llvm_free(void *ptr) {
 void _mlir_ciface_sar_rt_fft_1d_c64(
     MemRefDescriptor<std::complex<float>, 1> *in,
     MemRefDescriptor<std::complex<float>, 1> *out, int64_t dim, bool inverse) {
-  requireRuntime(dim == 0, "fft_1d_c64: dim must be 0");
-  requireRuntime(in->sizes[0] >= 2, "fft_1d_c64: extent must be at least 2");
-  requireRuntime(in->sizes[0] == out->sizes[0],
-                 "fft_1d_c64: output shape must match input shape");
+  if (!runtimeReady() ||
+      !requireRuntime(in && out, "fft_1d_c64: null descriptor") ||
+      !requireRuntime(dim == 0, "fft_1d_c64: dim must be 0") ||
+      !requireDescriptorLayout(in, "fft_1d_c64: invalid input layout") ||
+      !requireDescriptorLayout(out, "fft_1d_c64: invalid output layout") ||
+      !requireRuntime(in->sizes[0] >= 2,
+                      "fft_1d_c64: extent must be at least 2") ||
+      !requireRuntime(in->sizes[0] == out->sizes[0],
+                      "fft_1d_c64: output shape must match input shape"))
+    return;
   fft1d<float>(in, out, inverse);
 }
 
 void _mlir_ciface_sar_rt_fft_1d_c128(
     MemRefDescriptor<std::complex<double>, 1> *in,
     MemRefDescriptor<std::complex<double>, 1> *out, int64_t dim, bool inverse) {
-  requireRuntime(dim == 0, "fft_1d_c128: dim must be 0");
-  requireRuntime(in->sizes[0] >= 2, "fft_1d_c128: extent must be at least 2");
-  requireRuntime(in->sizes[0] == out->sizes[0],
-                 "fft_1d_c128: output shape must match input shape");
+  if (!runtimeReady() ||
+      !requireRuntime(in && out, "fft_1d_c128: null descriptor") ||
+      !requireRuntime(dim == 0, "fft_1d_c128: dim must be 0") ||
+      !requireDescriptorLayout(in, "fft_1d_c128: invalid input layout") ||
+      !requireDescriptorLayout(out, "fft_1d_c128: invalid output layout") ||
+      !requireRuntime(in->sizes[0] >= 2,
+                      "fft_1d_c128: extent must be at least 2") ||
+      !requireRuntime(in->sizes[0] == out->sizes[0],
+                      "fft_1d_c128: output shape must match input shape"))
+    return;
   fft1d<double>(in, out, inverse);
 }
 
 void _mlir_ciface_sar_rt_fft_2d_c64(
     MemRefDescriptor<std::complex<float>, 2> *in,
     MemRefDescriptor<std::complex<float>, 2> *out, int64_t dim, bool inverse) {
-  requireRuntime(dim == 0 || dim == 1, "fft_2d_c64: dim must be 0 or 1");
-  requireRuntime(in->sizes[0] > 0 && in->sizes[1] > 0 && in->sizes[dim] >= 2,
-                 "fft_2d_c64: extents must be positive and transform "
-                 "extent at least 2");
-  requireRuntime(in->sizes[0] == out->sizes[0] && in->sizes[1] == out->sizes[1],
-                 "fft_2d_c64: output shape must match input shape");
+  if (!runtimeReady() ||
+      !requireRuntime(in && out, "fft_2d_c64: null descriptor") ||
+      !requireRuntime(dim == 0 || dim == 1, "fft_2d_c64: dim must be 0 or 1") ||
+      !requireDescriptorLayout(in, "fft_2d_c64: invalid input layout") ||
+      !requireDescriptorLayout(out, "fft_2d_c64: invalid output layout") ||
+      !requireRuntime(in->sizes[0] > 0 && in->sizes[1] > 0 &&
+                          in->sizes[dim] >= 2,
+                      "fft_2d_c64: extents must be positive and transform "
+                      "extent at least 2") ||
+      !requireRuntime(in->sizes[0] == out->sizes[0] &&
+                          in->sizes[1] == out->sizes[1],
+                      "fft_2d_c64: output shape must match input shape"))
+    return;
   fft2d<float>(in, out, dim, inverse);
 }
 
 void _mlir_ciface_sar_rt_fft_2d_c128(
     MemRefDescriptor<std::complex<double>, 2> *in,
     MemRefDescriptor<std::complex<double>, 2> *out, int64_t dim, bool inverse) {
-  requireRuntime(dim == 0 || dim == 1, "fft_2d_c128: dim must be 0 or 1");
-  requireRuntime(in->sizes[0] > 0 && in->sizes[1] > 0 && in->sizes[dim] >= 2,
-                 "fft_2d_c128: extents must be positive and transform "
-                 "extent at least 2");
-  requireRuntime(in->sizes[0] == out->sizes[0] && in->sizes[1] == out->sizes[1],
-                 "fft_2d_c128: output shape must match input shape");
+  if (!runtimeReady() ||
+      !requireRuntime(in && out, "fft_2d_c128: null descriptor") ||
+      !requireRuntime(dim == 0 || dim == 1,
+                      "fft_2d_c128: dim must be 0 or 1") ||
+      !requireDescriptorLayout(in, "fft_2d_c128: invalid input layout") ||
+      !requireDescriptorLayout(out, "fft_2d_c128: invalid output layout") ||
+      !requireRuntime(in->sizes[0] > 0 && in->sizes[1] > 0 &&
+                          in->sizes[dim] >= 2,
+                      "fft_2d_c128: extents must be positive and transform "
+                      "extent at least 2") ||
+      !requireRuntime(in->sizes[0] == out->sizes[0] &&
+                          in->sizes[1] == out->sizes[1],
+                      "fft_2d_c128: output shape must match input shape"))
+    return;
   fft2d<double>(in, out, dim, inverse);
 }
 
-static void requireInterpArgs(int64_t rows, int64_t cols, int64_t kernel,
+static bool requireInterpArgs(int64_t rows, int64_t cols, int64_t kernel,
                               int64_t taps, int64_t window, double beta,
                               int64_t boundary, const char *what) {
-  requireRuntime(rows > 0 && cols > 0, what);
-  requireRuntime(kernel >= kNearest && kernel <= kSinc,
-                 "interp1d: unknown kernel");
-  requireRuntime(window >= kRect && window <= kKaiser,
-                 "interp1d: unknown window");
-  requireRuntime(boundary >= kZero && boundary <= kReflect,
-                 "interp1d: unknown boundary");
-  requireRuntime(kernel != kSinc || (taps >= 4 && taps <= 32 && taps % 2 == 0),
-                 "interp1d: sinc taps must be even and in [4, 32]");
-  requireRuntime(window != kKaiser ||
-                     (std::isfinite(beta) && beta > 0.0 && beta <= 12.0),
-                 "interp1d: Kaiser beta must be finite and in (0, 12]");
+  return requireRuntime(rows > 0 && cols > 0, what) &&
+         requireRuntime(kernel >= kNearest && kernel <= kSinc,
+                        "interp1d: unknown kernel") &&
+         requireRuntime(window >= kRect && window <= kKaiser,
+                        "interp1d: unknown window") &&
+         requireRuntime(boundary >= kZero && boundary <= kReflect,
+                        "interp1d: unknown boundary") &&
+         requireRuntime(kernel != kSinc ||
+                            (taps >= 4 && taps <= 32 && taps % 2 == 0),
+                        "interp1d: sinc taps must be even and in [4, 32]") &&
+         requireRuntime(window != kKaiser ||
+                            (std::isfinite(beta) && beta > 0.0 && beta <= 12.0),
+                        "interp1d: Kaiser beta must be finite and in (0, 12]");
 }
 
 void _mlir_ciface_sar_rt_interp1d_2d_c64(
@@ -795,14 +1053,23 @@ void _mlir_ciface_sar_rt_interp1d_2d_c64(
     MemRefDescriptor<double, 2> *positions,
     MemRefDescriptor<std::complex<float>, 2> *out, int64_t kernel, int64_t taps,
     int64_t window, double beta, int64_t boundary) {
-  requireInterpArgs(data->sizes[0], data->sizes[1], kernel, taps, window, beta,
-                    boundary, "interp1d_2d_c64: extents must be positive");
-  requireRuntime(data->sizes[0] == positions->sizes[0] &&
-                     data->sizes[1] == positions->sizes[1],
-                 "interp1d_2d_c64: positions shape must match data");
-  requireRuntime(data->sizes[0] == out->sizes[0] &&
-                     data->sizes[1] == out->sizes[1],
-                 "interp1d_2d_c64: output shape must match data");
+  if (!runtimeReady() ||
+      !requireRuntime(data && positions && out,
+                      "interp1d_2d_c64: null descriptor") ||
+      !requireDescriptorLayout(data, "interp1d_2d_c64: invalid data layout") ||
+      !requireDescriptorLayout(positions,
+                               "interp1d_2d_c64: invalid positions layout") ||
+      !requireDescriptorLayout(out, "interp1d_2d_c64: invalid output layout") ||
+      !requireInterpArgs(data->sizes[0], data->sizes[1], kernel, taps, window,
+                         beta, boundary,
+                         "interp1d_2d_c64: extents must be positive") ||
+      !requireRuntime(data->sizes[0] == positions->sizes[0] &&
+                          data->sizes[1] == positions->sizes[1],
+                      "interp1d_2d_c64: positions shape must match data") ||
+      !requireRuntime(data->sizes[0] == out->sizes[0] &&
+                          data->sizes[1] == out->sizes[1],
+                      "interp1d_2d_c64: output shape must match data"))
+    return;
   interp1d2d<float>(data, positions, out, kernel, taps, window, beta, boundary);
 }
 
@@ -811,14 +1078,24 @@ void _mlir_ciface_sar_rt_interp1d_2d_c128(
     MemRefDescriptor<double, 2> *positions,
     MemRefDescriptor<std::complex<double>, 2> *out, int64_t kernel,
     int64_t taps, int64_t window, double beta, int64_t boundary) {
-  requireInterpArgs(data->sizes[0], data->sizes[1], kernel, taps, window, beta,
-                    boundary, "interp1d_2d_c128: extents must be positive");
-  requireRuntime(data->sizes[0] == positions->sizes[0] &&
-                     data->sizes[1] == positions->sizes[1],
-                 "interp1d_2d_c128: positions shape must match data");
-  requireRuntime(data->sizes[0] == out->sizes[0] &&
-                     data->sizes[1] == out->sizes[1],
-                 "interp1d_2d_c128: output shape must match data");
+  if (!runtimeReady() ||
+      !requireRuntime(data && positions && out,
+                      "interp1d_2d_c128: null descriptor") ||
+      !requireDescriptorLayout(data, "interp1d_2d_c128: invalid data layout") ||
+      !requireDescriptorLayout(positions,
+                               "interp1d_2d_c128: invalid positions layout") ||
+      !requireDescriptorLayout(out,
+                               "interp1d_2d_c128: invalid output layout") ||
+      !requireInterpArgs(data->sizes[0], data->sizes[1], kernel, taps, window,
+                         beta, boundary,
+                         "interp1d_2d_c128: extents must be positive") ||
+      !requireRuntime(data->sizes[0] == positions->sizes[0] &&
+                          data->sizes[1] == positions->sizes[1],
+                      "interp1d_2d_c128: positions shape must match data") ||
+      !requireRuntime(data->sizes[0] == out->sizes[0] &&
+                          data->sizes[1] == out->sizes[1],
+                      "interp1d_2d_c128: output shape must match data"))
+    return;
   interp1d2d<double>(data, positions, out, kernel, taps, window, beta,
                      boundary);
 }

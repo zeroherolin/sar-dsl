@@ -6,10 +6,9 @@
 // Complex element types are preserved (they lower later through the complex
 // dialect); signal-processing ops are handled by ConvertSARSignalToRuntime.
 //
-// Two ops are not element-wise sweeps and do not fit linalg's parallel
-// iteration model: `sar.cumsum` carries a running sum along the scanned
-// axis, and `sar.rank_filter` sorts a window per output element. Both
-// become scf loop nests over tensors instead.
+// `sar.cumsum` is not an element-wise sweep and does not fit linalg's
+// parallel iteration model: it carries a running sum along the scanned
+// axis, so it becomes an scf loop nest over tensors instead.
 //
 //===----------------------------------------------------------------------===//
 
@@ -72,8 +71,8 @@ static Value buildElementwiseGeneric(
   return generic.getResult(0);
 }
 
-/// Creates a scalar constant of the given float-or-complex element type from
-/// a double value (imaginary part zero for complex types).
+/// Creates a scalar constant of the given float, integer or complex element
+/// type from a double value (imaginary part zero for complex types).
 static Value buildScalarConstant(OpBuilder &b, Location loc, Type elementType,
                                  double value) {
   if (auto complexTy = dyn_cast<ComplexType>(elementType)) {
@@ -159,8 +158,44 @@ static Value convertReal(OpBuilder &b, Location loc, Value value, Type target) {
                : arith::TruncIOp::create(b, loc, target, value).getResult();
   if (sourceInt)
     return arith::SIToFPOp::create(b, loc, target, value);
-  if (targetInt)
-    return arith::FPToSIOp::create(b, loc, target, value);
+  if (targetInt) {
+    // Define float-to-int conversion for every IEEE input. LLVM's fptosi is
+    // poison for NaN, infinities and out-of-range values; HLS C++ has the same
+    // undefined edge. Feed it a proven-safe value, then select saturation
+    // results (NaN -> 0) without ever executing an invalid conversion.
+    auto sourceFloat = cast<FloatType>(source);
+    unsigned width = targetInt.getWidth();
+    double limit = std::ldexp(1.0, width - 1);
+    Value lowFloat =
+        arith::ConstantOp::create(b, loc, b.getFloatAttr(sourceFloat, -limit));
+    Value highFloat =
+        arith::ConstantOp::create(b, loc, b.getFloatAttr(sourceFloat, limit));
+    Value zeroFloat =
+        arith::ConstantOp::create(b, loc, b.getFloatAttr(sourceFloat, 0.0));
+    Value below = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OLT,
+                                        value, lowFloat);
+    Value above = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OGE,
+                                        value, highFloat);
+    Value nan =
+        arith::CmpFOp::create(b, loc, arith::CmpFPredicate::UNE, value, value);
+    Value invalid = arith::OrIOp::create(
+        b, loc, nan, arith::OrIOp::create(b, loc, below, above));
+    Value safe =
+        arith::SelectOp::create(b, loc, invalid, zeroFloat, value).getResult();
+    Value converted = arith::FPToSIOp::create(b, loc, target, safe);
+    APInt min = APInt::getSignedMinValue(width);
+    APInt max = APInt::getSignedMaxValue(width);
+    Value minInt =
+        arith::ConstantOp::create(b, loc, b.getIntegerAttr(target, min));
+    Value maxInt =
+        arith::ConstantOp::create(b, loc, b.getIntegerAttr(target, max));
+    Value zeroInt =
+        arith::ConstantOp::create(b, loc, b.getIntegerAttr(target, 0));
+    Value result =
+        arith::SelectOp::create(b, loc, below, minInt, converted).getResult();
+    result = arith::SelectOp::create(b, loc, above, maxInt, result);
+    return arith::SelectOp::create(b, loc, nan, zeroInt, result);
+  }
   return convertFloat(b, loc, value, cast<FloatType>(target));
 }
 
@@ -1235,6 +1270,9 @@ struct CumsumOpLowering : OpRewritePattern<CumsumOp> {
   }
 };
 
+/// Returns `lhs` and `rhs` as an ordered (low, high) pair, with NaN ordered
+/// after every number so the compare-exchange networks built on this keep a
+/// consistent total order.
 static std::pair<Value, Value>
 orderedFloatPair(OpBuilder &builder, Location loc, Value lhs, Value rhs) {
   Value rhsIsNaN =

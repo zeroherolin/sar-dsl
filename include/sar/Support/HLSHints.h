@@ -29,7 +29,7 @@ constexpr llvm::StringLiteral kUnrollFactorAttr{"hls.unroll_factor"};
 constexpr llvm::StringLiteral kMinIIAttr{"hls.min_ii"};
 
 /// On a loop: keep it inside the adjacent dataflow task instead of outlining
-/// it as an independent process.  Prologue loops that fill a local cache and
+/// it as an independent process. Prologue loops that fill a local cache and
 /// the compute loop that consumes that cache must remain one function; a
 /// separate process would either expose scalar task results or turn the local
 /// memory into an illegal multi-process channel.

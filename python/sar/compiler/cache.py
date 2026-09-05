@@ -28,7 +28,7 @@ try:
 except ImportError:  # pragma: no cover - cache locking is Linux-specific
     fcntl = None
 
-__all__ = ["KernelCache"]
+__all__ = ["KernelCache", "cache_stats", "clear_cache"]
 
 #: Marker file recording the last use of an entry (LRU ordering).
 _ACCESS_MARKER = ".accessed"
@@ -260,19 +260,45 @@ class KernelCache:
         digest.update(module_text.encode())
         digest.update(backend.encode())
         digest.update(repr(sorted(options.items())).encode())
-        self.key = digest.hexdigest()[:24]
+        self.key = digest.hexdigest()
         root = _default_cache_root()
         self.dir = root / self.key
         self.enabled = os.environ.get("SAR_DSL_DISABLE_CACHE", "0") != "1"
         # Artifacts are written even when lookups are disabled, so the
         # directory always has to exist.
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self._lock = (self.dir / ".lock").open("a+")
-        if fcntl is not None:
-            fcntl.flock(self._lock, fcntl.LOCK_SH)
+        self._lock = self._open_locked()
         _prune_lru(root, _max_cache_size())
         self._touch()
         self._root = root
+
+    def _open_locked(self):
+        """Creates the entry directory and takes a shared lock on it.
+
+        `clear_cache` in another process can win the exclusive lock and
+        remove the entry between our mkdir and flock, so the open may
+        fail or the flock may land on an unlinked ``.lock`` inode.
+        Revalidate after locking and retry, recreating the entry.
+        """
+        for attempt in range(3):
+            self.dir.mkdir(parents=True, exist_ok=True)
+            try:
+                lock = (self.dir / ".lock").open("a+")
+            except FileNotFoundError:
+                if attempt == 2:
+                    raise
+                continue
+            if fcntl is not None:
+                fcntl.flock(lock, fcntl.LOCK_SH)
+            try:
+                if os.path.samestat(os.fstat(lock.fileno()),
+                                    os.stat(self.dir / ".lock")):
+                    return lock
+            except OSError:
+                pass
+            lock.close()
+        raise FileNotFoundError(
+            f"cache entry {self.dir} was removed concurrently on every "
+            "attempt to lock it")
 
     def _touch(self) -> None:
         """Records this entry as most recently used."""
@@ -329,3 +355,82 @@ class KernelCache:
         os.replace(scratch, p)
         _prune_lru(self._root, _max_cache_size())
         return p
+
+    def close(self) -> None:
+        """Releases the entry lock descriptor; safe to call repeatedly."""
+        lock = getattr(self, "_lock", None)
+        if lock is not None and not lock.closed:
+            lock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+    def __del__(self):  # pragma: no cover - deterministic callers use close
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def cache_stats() -> dict:
+    """Read-only size and entry summary for the active artifact cache."""
+    root = _default_cache_root()
+    entries = []
+    if root.is_dir():
+        for entry in root.iterdir():
+            if not entry.is_dir():
+                continue
+            marker = entry / _ACCESS_MARKER
+            try:
+                used = (marker if marker.exists() else entry).stat().st_mtime
+            except OSError:
+                continue
+            entries.append({
+                "key": entry.name,
+                "bytes": _entry_size(entry),
+                "last_used": used,
+            })
+    entries.sort(key=lambda item: item["last_used"], reverse=True)
+    return {
+        "root": str(root),
+        "entries": len(entries),
+        "bytes": sum(item["bytes"] for item in entries),
+        "items": entries,
+    }
+
+
+def clear_cache() -> dict:
+    """Removes unlocked cache entries and reports removed/retained counts."""
+    root = _default_cache_root()
+    removed = retained = 0
+    if not root.is_dir():
+        return {"removed": 0, "retained": 0, "root": str(root)}
+    fresh = time.time() - _PRUNE_GRACE_SECONDS
+    for entry in list(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        lock = None
+        try:
+            # The access marker appears only once KernelCache.__init__
+            # holds the shared lock; a markerless fresh directory is a
+            # construction in flight that the flock cannot protect yet
+            # (same grace window as `_prune_lru`).
+            if (not (entry / _ACCESS_MARKER).exists()
+                    and entry.stat().st_mtime > fresh):
+                retained += 1
+                continue
+            if fcntl is not None:
+                lock = (entry / ".lock").open("a+")
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            shutil.rmtree(entry)
+            removed += 1
+        except (BlockingIOError, OSError):
+            retained += 1
+        finally:
+            if lock is not None:
+                lock.close()
+    _pruned_roots.pop(root, None)
+    return {"removed": removed, "retained": retained, "root": str(root)}

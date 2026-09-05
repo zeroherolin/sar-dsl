@@ -10,9 +10,9 @@
     cpu_speedup.png           SAR-DSL CPU speedup over the NumPy reference
                               across the measured scene sizes
 
-Both read checked-in JSON measurements rather than re-running anything. That
-keeps the figures and the documented values on one data source and makes them
-regenerable on a machine with neither Vitis nor the reference host.
+All four read checked-in JSON measurements rather than re-running anything.
+That keeps the figures and the documented values on one data source and makes
+them regenerable on a machine with neither Vitis nor the reference host.
 
 Unlike `plot_cpu_impulse_response.py`, nothing here focuses a scene, so the
 figures redraw identically on any machine.

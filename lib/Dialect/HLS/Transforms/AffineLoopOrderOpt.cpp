@@ -77,7 +77,7 @@ bool sar::applyAffineLoopOrderOpt(AffineLoopBand &band,
             permMap.push_back(loc);
         }
 
-        // Check the validation of the current permutation.
+        // Check the validity of the current permutation.
         if (isValidLoopInterchangePermutation(band, permMap)) {
           LLVM_DEBUG(llvm::dbgs() << "(";);
           LLVM_DEBUG(for (unsigned i = 0, e = permMap.size(); i < e; ++i) {
@@ -111,7 +111,7 @@ bool sar::applyAffineLoopOrderOpt(AffineLoopBand &band,
             permMap.push_back(loc);
         }
 
-        // Check the validation of the current permutation.
+        // Check the validity of the current permutation.
         if (isValidLoopInterchangePermutation(band, permMap)) {
           auto newRoot = band[permuteLoops(band, permMap)];
           band.clear();

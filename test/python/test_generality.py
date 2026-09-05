@@ -15,7 +15,7 @@ import pytest
 import sar
 
 from conftest import requires_hls
-from sar.backends.hls.devices import DEVICES
+from sar.backends.hls.devices import DEVICES, budgets_for
 
 pytestmark = requires_hls
 
@@ -67,11 +67,14 @@ def _emit(name, spec, body):
         return body(x)
 
     kernel.name = name
+    physical = budgets_for(_DEVICE_PARTS["xcvu13p"], 1.0)
     return kernel.specialize(spec).compile(backend="hls",
                                            options={
                                                "interface": "axi",
-                                               "bram_bytes": 1 << 24,
-                                               "uram_bytes": 1 << 25,
+                                               "bram_bytes":
+                                               physical["bram_bytes"],
+                                               "uram_bytes":
+                                               physical["uram_bytes"],
                                                "lutram_bytes": 0
                                            }).source()
 
@@ -208,7 +211,6 @@ def test_oversampled_grid_is_streamed(n):
     resident, which is how a design ends up asking for more on-chip
     memory than a device has.
     """
-    import re
 
     budget = 256 * 1024
 

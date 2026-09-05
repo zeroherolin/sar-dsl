@@ -470,6 +470,8 @@ colorScratchBanks(ArrayRef<hls::BufferLikeInterface> candidates,
           conflicts[target].insert(source);
         }
   }
+  // With no more buffers than arenas, any conflict graph still colors within
+  // the limit, so separating simultaneous writers as well costs nothing.
   if (count <= maxArenas)
     for (auto &[call, written] : writers)
       for (auto [position, source] : llvm::enumerate(written))
@@ -575,14 +577,12 @@ createScratchBuffer(func::FuncOp func, ModuleOp module, OpBuilder &builder,
   DenseMap<StringRef, unsigned> callerCounts;
   module.walk([&](func::CallOp call) { ++callerCounts[call.getCallee()]; });
 
-  // A constant buffer holds data the design needs on entry, so it is not
-  // scratch: it keeps its own storage and its initializer.
   unsigned widest = elementType.getIntOrFloatBitWidth();
 
   // A buffer may ask to start at a value. One allocation carries one such
   // value, so the scratch adopts it -- initializing a buffer that asked for
   // nothing is harmless, contradicting one that asked for something is not,
-  // so a second, different request keeps its own storage.
+  // so a second, different request is rejected below.
   TypedAttr initValue;
   for (auto buffer : candidates)
     if (auto buf = dyn_cast<BufferOp>(*buffer))
@@ -686,6 +686,8 @@ struct CreateAxiInterface
     // needs to keep its nodes pipelined.
     llvm::MapVector<Type, SmallVector<hls::BufferLikeInterface>> scratchBanks;
     for (auto buffer : func.getOps<hls::BufferLikeInterface>()) {
+      // A constant buffer holds data the design needs on entry, so it is not
+      // scratch: it keeps its own storage and its initializer.
       if (isa<ConstBufferOp>(*buffer) || !isExtBuffer(buffer.getMemref()))
         continue;
       Type elementType = buffer.getMemrefType().getElementType();
@@ -777,7 +779,7 @@ struct CreateAxiInterface
       }
 
     // Move buffers allocated in the top function to the main function. After
-    // the carving above the only one left is the scratch.
+    // the carving above the only ones left are the scratch arenas.
     for (auto buffer :
          llvm::make_early_inc_range(func.getOps<hls::BufferLikeInterface>())) {
       if (!isExtBuffer(buffer.getMemref()) || isa<ConstBufferOp>(*buffer))

@@ -1,6 +1,7 @@
 // RUN: sar-opt %s --hls-place-dataflow-buffer="threshold=4096 bram-bytes=6193152 uram-bytes=23592960 lutram-bytes=901120 lutram-max-bytes=64" | FileCheck %s
 // RUN: sar-opt %s --hls-place-dataflow-buffer="threshold=4096 bram-bytes=9216 uram-bytes=73728 lutram-bytes=0 lutram-max-bytes=64" | FileCheck %s --check-prefix=TIGHT
 // RUN: sar-opt %s --hls-place-dataflow-buffer="threshold=4096 bram-bytes=6193152 uram-bytes=23592960 lutram-bytes=901120 lutram-max-bytes=64 allow-dram=false" | FileCheck %s --check-prefix=NODRAM
+// RUN: sar-opt %s --hls-place-dataflow-buffer="threshold=4096 bram-bytes=131072 uram-bytes=0 lutram-bytes=0 lutram-max-bytes=0 bram-block-bytes=1024 uram-block-bytes=0" | FileCheck %s --check-prefix=GEOMETRY
 
 // The budgets are hard caps charged in whole primitives, twice per
 // dataflow buffer (Vitis double-buffers every channel); 0 forbids a
@@ -64,6 +65,8 @@ func.func @const_stays_resident() -> f64 {
 // TIGHT: hls.dataflow.buffer {depth = 1 : i32} : memref<1024xf32, #hls.mem<bram_t2p>>
 // TIGHT: hls.dataflow.buffer {depth = 1 : i32} : memref<1024xf32, #hls.mem<uram_t2p>>
 // TIGHT: hls.dataflow.buffer {depth = 1 : i32} : memref<1024xf32, #hls.mem<dram>>
+// GEOMETRY-LABEL: func.func @budget_spills
+// GEOMETRY: hls.dataflow.buffer {depth = 1 : i32} : memref<1024xf32, #hls.mem<bram_t2p>>
 func.func @budget_spills(%v: f32) {
   %a = hls.dataflow.buffer {depth = 1 : i32} : memref<1024xf32>
   %b = hls.dataflow.buffer {depth = 1 : i32} : memref<1024xf32>

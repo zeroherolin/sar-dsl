@@ -203,8 +203,8 @@ bool sar::applyLoopTiling(AffineLoopBand &band, FactorList tileList,
   if (!isPerfectlyNested(band))
     return false;
 
-  // All-ones tiling changes nothing but the annotation on
-  // loops as point loop.
+  // All-ones tiling changes nothing except annotating the loops as point
+  // loops.
   if (llvm::all_of(tileList, [](unsigned size) { return size == 1; })) {
     for (auto loop : band)
       if (annotatePointLoop)
@@ -291,8 +291,8 @@ static void adjustToDivisorsOfTripCounts(ArrayRef<AffineForOp> band,
     if (!mayConst)
       continue;
 
-    // Adjust the tile size to largest factor of the trip count less than
-    // tSize.
+    // Adjust the tile size to the largest factor of the trip count that does
+    // not exceed the requested size.
     uint64_t constTripCount = mayConst.value();
     // A tile that already spans the whole loop is a deliberate choice --
     // the dimension carries no reuse and is kept as one contiguous sweep --

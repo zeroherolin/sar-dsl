@@ -12,6 +12,8 @@ Each pointer refers to a StridedMemRef descriptor::
 from __future__ import annotations
 
 import ctypes
+import functools
+import warnings
 from typing import List, Sequence
 
 import numpy as np
@@ -19,9 +21,68 @@ import numpy as np
 from ..errors import LaunchError
 from ..ir import TensorType
 
-__all__ = ["CompiledKernel", "make_descriptor"]
+__all__ = [
+    "CompiledKernel", "clear_fft_plan_cache", "fft_plan_cache_size",
+    "make_descriptor", "thread_config"
+]
 
 _descriptor_cache = {}
+
+
+@functools.lru_cache(maxsize=None)
+def _load_runtime(path: str):
+    """dlopens the runtime once per path and declares its prototypes.
+
+    Path resolution stays uncached (see toolchain.find_runtime_library):
+    a changed path loads the new library, the same path reuses the
+    handle.
+    """
+    library = ctypes.CDLL(path)
+    library.sar_rt_fft_plan_cache_clear.restype = None
+    library.sar_rt_fft_plan_cache_clear.argtypes = []
+    for symbol in ("sar_rt_fft_plan_cache_size", "sar_rt_worker_count",
+                   "sar_rt_available_worker_count",
+                   "sar_rt_current_affinity_count"):
+        fn = getattr(library, symbol)
+        fn.restype = ctypes.c_int64
+        fn.argtypes = []
+    return library
+
+
+def _runtime_library():
+    from ..compiler.toolchain import find_runtime_library
+    return _load_runtime(find_runtime_library())
+
+
+def _runtime_error_api(library):
+    clear = library.sar_rt_error_clear
+    clear.restype = None
+    clear.argtypes = []
+    get = library.sar_rt_error_get
+    get.restype = ctypes.c_char_p
+    get.argtypes = []
+    return clear, get
+
+
+def clear_fft_plan_cache() -> None:
+    """Drops cached immutable CPU FFT plans; active calls keep their plan."""
+    _runtime_library().sar_rt_fft_plan_cache_clear()
+
+
+def fft_plan_cache_size() -> int:
+    """Number of transform lengths currently held by the CPU runtime."""
+    return int(_runtime_library().sar_rt_fft_plan_cache_size())
+
+
+def thread_config() -> dict:
+    """Runtime-pool participants and CPUs visible through process affinity."""
+    library = _runtime_library()
+    return {
+        "runtime_workers": int(library.sar_rt_worker_count()),
+        "available_workers": int(library.sar_rt_available_worker_count()),
+        "current_affinity_workers":
+        int(library.sar_rt_current_affinity_count()),
+    }
 
 
 def _descriptor_type(rank: int):
@@ -105,6 +166,20 @@ class CompiledKernel:
             ctypes.POINTER(_descriptor_type(t.rank))
             for t in list(arg_types) + list(result_types)
         ]
+        try:
+            self._error_clear, self._error_get = _runtime_error_api(
+                self._library)
+        except AttributeError:
+            # The runtime reports failures by setting an error and
+            # returning early, so without this channel an invalid call
+            # returns uninitialized output with no diagnostic.
+            self._error_clear = self._error_get = None
+            warnings.warn(
+                f"compiled kernel library {self.library_path} does not "
+                "expose sar_rt_error_get; runtime error reporting is "
+                "unavailable and invalid runtime calls will fail silently",
+                RuntimeWarning,
+                stacklevel=2)
 
     def __call__(self, *arrays):
         """Runs the kernel on numpy arrays, returning new output arrays.
@@ -129,7 +204,14 @@ class CompiledKernel:
         ]
 
         descriptors = [make_descriptor(a) for a in inputs + outputs]
+        if self._error_clear is not None:
+            self._error_clear()
         self._fn(*[ctypes.byref(d) for d in descriptors])
+        if self._error_get is not None:
+            error = self._error_get()
+            if error:
+                raise LaunchError(
+                    f"kernel '{self.name}' runtime failure: {error.decode()}")
 
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-08-27",
+  "source": {"base_commit": "099d023aef3d93421f2657bb1fd2aea5f7eb79d0", "source_state": "non-release measurement"},
+  "constraints": {"part": "xcvu13p-fhgb2104-2-i", "clock_ns": 4.0, "timing_budget_ns": 3.5, "interface": "ap_memory", "dtype": "c128"},
+  "tool": {"name": "Vitis HLS", "version": "2022.2"},
+  "designs": [
+    {"shape": [8, 64], "taps": 8, "cache_copies": 1, "strategy": "band", "success": true, "latency_cycles": 1625, "interval_cycles": 1626, "compute_ii": 1, "estimated_clock_ns": 3.466, "bram18k": 2, "uram": 0, "dsp": 778, "ff": 64756, "lut": 62748},
+    {"shape": [8, 64], "taps": 8, "cache_copies": 1, "strategy": "full_row", "success": true, "latency_cycles": 3561, "interval_cycles": 3562, "compute_ii": 4, "estimated_clock_ns": 3.408, "bram18k": 2, "uram": 0, "dsp": 220, "ff": 27173, "lut": 26280},
+    {"shape": [8, 64], "taps": 8, "cache_copies": 1, "strategy": "direct", "success": true, "latency_cycles": 2166, "interval_cycles": 2167, "compute_ii": 4, "estimated_clock_ns": 3.408, "bram18k": 2, "uram": 0, "dsp": 220, "ff": 26881, "lut": 24360},
+    {"shape": [8, 128], "taps": 16, "cache_copies": 4, "strategy": "band", "success": false, "timeout_s": 900, "reason": "Vitis memory-port scheduling did not converge"},
+    {"shape": [8, 128], "taps": 16, "cache_copies": 4, "strategy": "full_row", "success": true, "latency_cycles": 10761, "interval_cycles": 10762, "compute_ii": 8, "estimated_clock_ns": 3.661, "bram18k": 4, "uram": 0, "dsp": 220, "ff": 46905, "lut": 63458},
+    {"shape": [8, 128], "taps": 16, "cache_copies": 4, "strategy": "direct", "success": true, "latency_cycles": 8378, "interval_cycles": 8379, "compute_ii": 8, "estimated_clock_ns": 3.661, "bram18k": 4, "uram": 0, "dsp": 220, "ff": 37328, "lut": 29645}
+  ],
+  "conclusion": "A narrow completely banked cache reduced II in the measured case, while full-row staging did not. These ap_memory microkernels do not model the external-memory behavior of production AXI designs."
+}

@@ -97,7 +97,7 @@ CONSTRUCTS = {
 #: Attribute variants of the three ops whose lowering is selected by an
 #: attribute rather than by the operation itself. The construct matrix
 #: above pins one variant each; a kernel, boundary or index mode that only
-#: one backend can lower is exactly the split this file exists to catch,
+#: one backend can lower would violate the shared-language contract,
 #: and the op name alone does not reach it.
 VARIANTS = {
     f"interp1d_{kernel}_{boundary}":

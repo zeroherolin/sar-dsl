@@ -43,9 +43,18 @@ SPILLING = {
     "lutram_bytes": 1 << 15
 }
 RESIDENT = {
+    # This synthetic target isolates the no-spill ABI behavior. It is not a
+    # Vitis synthesis target, so the complete contract states its geometry
+    # and resources explicitly instead of borrowing the shipped VU13P part.
+    "part": "sar-test-resident-device",
     "bram_bytes": 1 << 28,
     "uram_bytes": 1 << 28,
-    "lutram_bytes": 1 << 20
+    "lutram_bytes": 1 << 20,
+    "dsp": 1 << 20,
+    "ff": 1 << 28,
+    "lut": 1 << 28,
+    "bram_block_bytes": 4608,
+    "uram_block_bytes": 36864,
 }
 PLACEMENTS = [SPILLING, RESIDENT]
 CTYPE = r"(?:float|double|hls::vector<(?:float|double),\s*\d+>)"

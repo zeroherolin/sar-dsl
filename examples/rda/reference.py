@@ -21,8 +21,8 @@ __all__ = ["RDAProcessor", "make_range_reference"]
 def make_range_reference(n: int, p: RadarParams) -> np.ndarray:
     """Frequency-domain range matched filter (unshifted FFT layout).
 
-    The chirp replica matches the synthetic echo model: duration half the
-    sampled window, centered in fast time; it is rolled to start at sample
+    The chirp replica matches the echo model (rate `kr`, duration
+    `pulse_len`), centered in fast time; it is rolled to start at sample
     zero so that compressed peaks appear at the echo delay position. A
     band-matched Hann taper (centered on DC, hence ifftshift) covers the
     chirp bandwidth for sidelobe control.

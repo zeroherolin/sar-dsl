@@ -8,6 +8,7 @@ measurements. Figure helpers write through `tmp_path`, so tests do not modify
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -33,6 +34,7 @@ import run_cpu_quality  # noqa: E402
 import run_hls_resources  # noqa: E402
 import provenance  # noqa: E402
 import metrics  # noqa: E402
+import importlib.util  # noqa: E402
 from hls_reports import (
     parse_csynth_xml,
     parse_vitis_warnings,  # noqa: E402
@@ -41,6 +43,14 @@ from hls_reports import validate_constraints  # noqa: E402
 from algorithms import ALL, STRIPMAP, load  # noqa: E402
 
 N = 32
+
+
+def test_generated_documentation_references_are_current():
+    path = REPO_ROOT / "docs/check_references.py"
+    spec = importlib.util.spec_from_file_location("check_references", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.check() == []
 
 
 def test_vitis_warning_parser_groups_repeated_codes(tmp_path):
@@ -71,6 +81,51 @@ def test_provenance_handles_missing_git(monkeypatch):
     data = provenance.environment()
     assert data["git_commit"] is None
     assert data["git_dirty"] is None
+    assert data["git_diff_sha256"] is None
+
+
+def test_result_provenance_refuses_dirty_tree_without_opt_in(monkeypatch):
+    dirty = {
+        "git_dirty": True,
+        "git_diff_sha256": "a" * 64,
+    }
+    monkeypatch.setattr(provenance, "environment", lambda: dict(dirty))
+    with pytest.raises(RuntimeError, match="dirty worktree"):
+        provenance.result_environment()
+    with pytest.raises(RuntimeError, match="dirty worktree"):
+        provenance.check_result_preconditions()
+    assert provenance.result_environment(allow_dirty=True) == dirty
+
+
+def test_result_provenance_treats_unknown_git_state_as_dirty(monkeypatch):
+    unknown = {"git_dirty": None, "git_diff_sha256": None}
+    monkeypatch.setattr(provenance, "environment", lambda: dict(unknown))
+    with pytest.raises(RuntimeError, match="cannot determine"):
+        provenance.result_environment()
+    with pytest.raises(RuntimeError, match="cannot determine"):
+        provenance.check_result_preconditions()
+    assert provenance.result_environment(allow_dirty=True) == unknown
+
+
+def test_dirty_tree_hash_tracks_uncommitted_content(tmp_path, monkeypatch):
+    monkeypatch.setattr(provenance, "_REPO", tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"],
+                   cwd=tmp_path,
+                   check=True)
+    subprocess.run(["git", "config", "user.name", "Test"],
+                   cwd=tmp_path,
+                   check=True)
+    source = tmp_path / "source.txt"
+    source.write_text("one\n")
+    subprocess.run(["git", "add", "source.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    assert provenance._dirty_tree_sha256() is None
+    source.write_text("two\n")
+    first = provenance._dirty_tree_sha256()
+    source.write_text("three\n")
+    second = provenance._dirty_tree_sha256()
+    assert first and second and first != second
 
 
 def test_accuracy_rejects_result_count_mismatch():
@@ -87,6 +142,36 @@ def test_benchmark_positive_integer_validation(parser):
     assert parser("3") == 3
     with pytest.raises(argparse.ArgumentTypeError, match="positive integer"):
         parser("0")
+
+
+def test_cpu_timing_reports_robust_statistics():
+    single = run_cpu_performance._timing_statistics([4.0])
+    assert single == {
+        "best": 4.0,
+        "mean": 4.0,
+        "median": 4.0,
+        "p95": 4.0,
+        "stdev": 0.0,
+        "samples": [4.0],
+    }
+
+    times = [3.0, 1.0, 2.0, 5.0]
+    timing = run_cpu_performance._timing_statistics(times)
+    assert timing["best"] == 1.0
+    assert timing["mean"] == pytest.approx(2.75)
+    assert timing["median"] == pytest.approx(2.5)
+    assert timing["p95"] == 5.0  # rank ceil(0.95 * 4) - 1 = 3
+    assert timing["stdev"] == pytest.approx(math.sqrt(8.75 / 3))
+    assert timing["samples"] == times
+
+    # At 20 samples the p95 rank lands on the second-largest value, not
+    # the maximum.
+    descending = [float(value) for value in range(20, 0, -1)]
+    assert run_cpu_performance._timing_statistics(descending)["p95"] == 19.0
+
+    measured = run_cpu_performance._timed(lambda: None, 4)
+    assert set(measured) == set(timing)
+    assert len(measured["samples"]) == 4
 
 
 def test_quality_metrics_reject_degenerate_inputs():
@@ -146,6 +231,50 @@ def test_checked_in_hls_results_are_self_consistent():
                     assert all(count > 0
                                for count in design["warning_counts"].values())
                 assert len(design["report_sha256"]) == 64
+
+
+def test_checked_in_fft_dse_supports_the_balanced_default():
+    data = json.loads((REPO_ROOT / "benchmarks/results" /
+                       "hls_fft_dse_c64_n128_vitis_2022_2.json").read_text())
+    designs = data["designs"]
+    balanced = next(row for row in designs
+                    if (row["fft_parallel_rows"], row["fft_stage_group"],
+                        row["fft_io_unroll"]) == (4, 2, 4))
+    serial = next(row for row in designs if row["fft_parallel_rows"] == 0)
+    wide = next(row for row in designs if row["fft_parallel_rows"] == 8)
+    ungrouped = next(row for row in designs if row["fft_stage_group"] == 0)
+    assert balanced["latency_cycles"] < serial["latency_cycles"]
+    assert wide["bram18k"] > balanced["bram18k"] * 1.5
+    assert ungrouped["latency_cycles"] == balanced["latency_cycles"]
+    assert ungrouped["bram18k"] > balanced["bram18k"]
+
+
+def test_checked_in_cpu_baseline_records_mkl_and_numa_scaling():
+    data = json.loads((REPO_ROOT / "benchmarks/results" /
+                       "cpu_numa_mkl_2026_08_27.json").read_text())
+    fft = data["fft_c128_2048x2048_median_ms"]
+    assert all(mkl < sar
+               for mkl, sar in zip(fft["mkl_dfti"], fft["sar_runtime"]))
+    rda = data["rda_c128_n2048_median_ms"]
+    assert rda["both_interleaved_120"] < rda["node0_local_60"]
+    assert rda["node0_smt_120"] > rda["node0_local_60"]
+
+
+def test_checked_in_gather_dse_supports_complexity_guard():
+    data = json.loads((REPO_ROOT / "benchmarks/results" /
+                       "hls_gather_dse_c128_vitis_2022_2.json").read_text())
+    small = [row for row in data["designs"] if row["shape"] == [8, 64]]
+    band = next(row for row in small if row["strategy"] == "band")
+    direct = next(row for row in small if row["strategy"] == "direct")
+    assert band["compute_ii"] < direct["compute_ii"]
+    assert band["latency_cycles"] < direct["latency_cycles"]
+    wide_band = next(row for row in data["designs"]
+                     if row["shape"] == [8, 128] and row["strategy"] == "band")
+    wide_direct = next(
+        row for row in data["designs"]
+        if row["shape"] == [8, 128] and row["strategy"] == "direct")
+    assert not wide_band["success"] and wide_band["timeout_s"] == 900
+    assert wide_direct["success"]
 
 
 def test_checked_in_hls_budget_sweep_is_self_consistent():
@@ -222,7 +351,7 @@ def test_summary_figures_are_drawn_from_the_recorded_measurements():
 
     They exist so the README can show the synthesis and CPU results without
     Vitis or the reference host, which only holds while they read
-    `benchmarks/results/`. A figure that quietly re-measured would caption
+    `benchmarks/results/`. A figure that re-measured would caption
     this machine's numbers with those claims.
     """
     constraints, designs = plot_cpu_hls_results._production_designs()
@@ -630,7 +759,7 @@ def test_production_designs_still_derive_their_recorded_strategy(top):
 
     `benchmarks/results/` records latency and resources for designs the
     compiler derived a particular strategy for. Nothing else ties those
-    numbers to the compiler: a change in `autotune` that quietly picks
+    numbers to the compiler: a change in `autotune` that picks
     another lane count or stage grouping leaves the tables describing a
     design this tree no longer emits, and both suites stay green while it
     happens. So the derivation is replayed here and held to what was

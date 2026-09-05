@@ -33,8 +33,8 @@ struct ALAPScheduleNode : public OpRewritePattern<NodeOp> {
     DominanceInfo domInfo;
     unsigned level = 0;
     for (auto output : node.getOutputs()) {
-      // Stop to schedule the node if an internal buffer has multi-producer or
-      // multi-consumer violation. DRAM buffer is not considered - the
+      // Do not schedule the node if an internal buffer has a multi-producer
+      // or multi-consumer violation. DRAM buffers are not considered - the
       // dependencies associated with them are handled later by tokens.
       if (!isExtBuffer(output) && !ignoreViolations)
         if (getDependentConsumers(output, node).size() > 1 ||

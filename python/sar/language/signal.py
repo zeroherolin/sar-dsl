@@ -13,10 +13,10 @@ from typing import Optional
 
 import numpy as np
 
-from . import (Tensor, TraceError, _require_tensor, _resolve_axis, _tracing,
-               absolute, broadcast, cast, concatenate, conj, constant, exp,
-               expj, f32, fft, ifft, interp1d, log, maximum, minimum, op, sin,
-               sqrt, where)
+from . import (Tensor, TraceError, _require_tensor, _resolve_axis, _strict_int,
+               _tracing, absolute, broadcast, cast, concatenate, conj,
+               constant, exp, expj, f32, fft, ifft, interp1d, log, maximum,
+               minimum, op, sin, sqrt, where)
 from . import sum as _sum
 
 __all__ = [
@@ -76,7 +76,7 @@ def circshift(x: Tensor,
     if not 0 <= dim < x.rank:
         raise TraceError(f"circshift dim {dim} out of range for rank {x.rank}")
     n = x.shape[dim]
-    k = int(shift) % n
+    k = _strict_int(shift, "circshift shift") % n
     if k == 0:
         return x
     if x.rank == 1:
@@ -228,9 +228,14 @@ def multilook(x: Tensor, factors) -> Tensor:
     x = _require_tensor(x, "sar.multilook")
     if x.rank != 2 or not x.dtype.is_float:
         raise TraceError("sar.multilook expects a rank-2 float tensor")
-    fa, fr = (int(f) for f in factors)
-    if fa < 1 or fr < 1:
-        raise TraceError("multilook factors must be positive")
+    try:
+        factors = tuple(factors)
+    except TypeError:
+        raise TraceError(
+            "multilook factors must contain two integers") from None
+    if len(factors) != 2:
+        raise TraceError("multilook factors must contain two integers")
+    fa, fr = (_strict_int(f, "multilook factor", minimum=1) for f in factors)
     if x.shape[0] % fa or x.shape[1] % fr:
         raise TraceError(
             f"multilook factors {(fa, fr)} must divide the shape {x.shape}")
@@ -423,7 +428,8 @@ def window(kind: str, n: int, **params) -> Tensor:
     if kind not in _WINDOWS:
         raise TraceError(
             f"unknown window '{kind}'; available: {sorted(_WINDOWS)}")
-    samples = _WINDOWS[kind](int(n), **params)
+    n = _strict_int(n, "window length", minimum=1)
+    samples = _WINDOWS[kind](n, **params)
     return constant(samples) if _tracing() else samples
 
 

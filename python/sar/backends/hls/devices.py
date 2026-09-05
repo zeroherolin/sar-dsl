@@ -2,15 +2,13 @@
 
 The six resource budgets -- three memory tiers plus DSP, FF and LUT -- have
 to describe the same device as `part`. Keeping them consistent by hand is a
-silent failure mode: a budget left at the VU13P default while `part` names a
-Zynq describes a device several times its size, and nothing downstream
-contradicts it.
+resource mismatch: a VU13P budget paired with a Zynq part describes a device
+several times larger than the synthesis target.
 
 So the table below records what each supported part *has*, and
-`budgets_for` sizes the six from it. Naming a part in compile options is one
-of the two ways `config.py` accepts the budgets; stating them outright is
-the other, and the two are mutually exclusive precisely so a design is never
-planned against a device that is partly each.
+`budgets_for` sizes the six from it. Naming a part by itself asks `config.py`
+to derive the budgets; a complete explicit contract may instead name that
+part and all six values, so no budget is inherited from another device.
 
 Primitive geometry differs by family too, and the placement passes charge
 banks in whole primitives: `storage_primitives` reports the block sizes
@@ -39,9 +37,6 @@ DEFAULT_UTILIZATION = 0.8
 _BRAM36_BYTES = 4608  # 36 Kb
 _URAM_BYTES = 36864  # 288 Kb
 _BRAM18_BYTES = 2304  # 18 Kb, the unit Vitis reports utilization in
-
-#: 7-series and earlier have no UltraRAM and a 36 Kb block RAM.
-_SERIES7_BRAM_BYTES = 4608
 
 
 @dataclass(frozen=True)
@@ -177,12 +172,15 @@ def storage_primitives(part: Optional[str]) -> Tuple[int, int]:
 
     A family without UltraRAM reports zero for it, so a caller charging
     banked storage does not price a tier the device cannot provide.
-    Unknown parts fall back to the UltraScale+ geometry the defaults
-    describe.
+    Unknown parts return ``(0, 0)``. Their primitive geometry must be stated
+    explicitly with their budgets; silently assuming UltraScale+ would plan
+    against a different device than the generated Tcl names.
     """
+    if part is None:
+        return _BRAM36_BYTES, _URAM_BYTES
     device = find_device(part)
     if device is None:
-        return _BRAM36_BYTES, _URAM_BYTES
+        return 0, 0
     return device.bram_block_bytes, device.uram_block_bytes
 
 

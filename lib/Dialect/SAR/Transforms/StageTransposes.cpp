@@ -419,7 +419,7 @@ struct SARStageTransposes
     // map, the inner band also matches on its own. Staging rewrites a nest
     // by erasing its entire band, so attempting to stage the inner nest
     // afterward would be a use-after-free. Pre-order guarantees a container
-    // precedes what it holds, so tracking which outer loops were kept
+    // precedes what it holds, so we track which outer loops were kept
     // and skip any nest whose outer loop is a descendant of one of them.
     DenseSet<Operation *> outermost;
     SmallVector<TransposeNest> toStage;

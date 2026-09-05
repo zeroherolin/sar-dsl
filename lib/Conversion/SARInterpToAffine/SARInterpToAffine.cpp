@@ -384,6 +384,9 @@ static Value toResultTensor(PatternRewriter &rewriter, Location loc,
       rewriter, loc, type, alloc, /*restrict=*/true, /*writable=*/true);
 }
 
+/// Whether `scalarize` can rebuild every element of `value` as scalar
+/// arithmetic. Must accept exactly what `scalarize` handles: the lowering
+/// asserts that an expression accepted here scalarizes successfully.
 static bool canScalarize(Value value) {
   if (isa<BlockArgument>(value))
     return isa<RankedTensorType>(value.getType());
@@ -405,6 +408,9 @@ static bool canScalarize(Value value) {
          allOperands();
 }
 
+/// Rebuilds one element of the tensor expression `value` at `indices` as
+/// scalar arithmetic, so a position expression can be recomputed inside the
+/// gather loop instead of being materialized as a plane.
 static FailureOr<Value> scalarize(OpBuilder &b, Location loc, Value value,
                                   ValueRange indices) {
   auto tensorType = dyn_cast<RankedTensorType>(value.getType());
@@ -631,8 +637,12 @@ static void emitBandedBody(PatternRewriter &b, Location loc, ScalarBuilder &s,
 
   Value bandRe = memref::AllocOp::create(b, loc, bandType);
   Value bandIm = memref::AllocOp::create(b, loc, bandType);
-  bandRe.getDefiningOp()->setAttr("hls.banded_gather", b.getUnitAttr());
-  bandIm.getDefiningOp()->setAttr("hls.banded_gather", b.getUnitAttr());
+  StringRef strategy = completeRow ? "full_row" : "band";
+  for (Value band : {bandRe, bandIm}) {
+    band.getDefiningOp()->setAttr("hls.banded_gather", b.getUnitAttr());
+    band.getDefiningOp()->setAttr("hls.gather_strategy",
+                                  b.getStringAttr(strategy));
+  }
   // Tap addresses share one dynamic base but differ by consecutive static
   // offsets. Small bands are completely banked when the logic/timing model
   // allows it. Wider caches are replicated per packed lane and each copy uses
@@ -870,6 +880,10 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
                      outIm, rows, cols, elemType, bandLo, bandW,
                      completeBankMaxElements, cacheCopies, completeRow);
     else
+      for (Value out : {outRe, outIm})
+        out.getDefiningOp()->setAttr("hls.gather_strategy",
+                                     rewriter.getStringAttr("direct"));
+    if (!useBanded)
       emitFullPlaneBody(rewriter, loc, s, spec, reBuf, imBuf, positionAt, outRe,
                         outIm, rows, cols, elemType);
 
@@ -881,7 +895,8 @@ struct Interp1DSplitLowering : OpRewritePattern<Interp1DSplitOp> {
 
 /// Uses a sliding band of whole source rows when row displacement is bounded.
 /// Each row is staged once; arbitrary column indices remain supported. The
-/// pattern declines when the row-axis bound or boundary policy is unsuitable.
+/// pattern declines when no row-axis bound is available or the band is too
+/// wide to profit.
 struct Gather2DSplitBandedLowering : OpRewritePattern<Gather2DSplitOp> {
   bool enableBandedGather;
   int64_t profitThreshold;

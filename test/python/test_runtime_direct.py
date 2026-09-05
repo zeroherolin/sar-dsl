@@ -128,6 +128,19 @@ def test_fft_2d_c64_precision(runtime_lib, descriptor):
     np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-5)
 
 
+def test_runtime_fft_accepts_strided_and_negative_stride_memrefs(
+        runtime_lib, descriptor):
+    rng = np.random.default_rng(55)
+    base = _random_complex(rng, (8, 16), np.complex128)
+    for view in (base[:, ::2], base[:, ::-2]):
+        out = _call_fft(runtime_lib, descriptor, view, 1, False,
+                        "_mlir_ciface_sar_rt_fft_2d_c128")
+        np.testing.assert_allclose(out,
+                                   np.fft.fft(view, axis=1),
+                                   rtol=1e-12,
+                                   atol=1e-12)
+
+
 def test_fft_roundtrip(runtime_lib, descriptor):
     """ifft(fft(x)) == x."""
     rng = np.random.default_rng(4)
@@ -137,6 +150,29 @@ def test_fft_roundtrip(runtime_lib, descriptor):
     restored = _call_fft(runtime_lib, descriptor, spectrum, 0, True,
                          "_mlir_ciface_sar_rt_fft_1d_c128")
     np.testing.assert_allclose(restored, x, rtol=1e-12, atol=1e-12)
+
+
+def test_fft_plan_cache_reuses_lengths_and_can_be_cleared(
+        runtime_lib, descriptor):
+    from sar.runtime import clear_fft_plan_cache, fft_plan_cache_size
+
+    clear_fft_plan_cache()
+    assert fft_plan_cache_size() == 0
+    rng = np.random.default_rng(44)
+    for n in (12, 12, 16):
+        x = _random_complex(rng, (n, ), np.complex128)
+        _call_fft(runtime_lib, descriptor, x, 0, False,
+                  "_mlir_ciface_sar_rt_fft_1d_c128")
+    assert fft_plan_cache_size() == 2
+    clear_fft_plan_cache()
+    assert fft_plan_cache_size() == 0
+
+
+def test_runtime_thread_config_respects_affinity():
+    from sar.runtime import thread_config
+
+    config = thread_config()
+    assert 1 <= config["runtime_workers"] <= config["available_workers"]
 
 
 # --------------------------------------------------------------------------- #
@@ -292,6 +328,102 @@ def test_runtime_rejects_negative_allocations():
     assert "allocation size must be non-negative" in proc.stderr
 
 
+def test_runtime_rejects_double_free():
+    script = textwrap.dedent("""
+        import ctypes
+        from sar.compiler.toolchain import find_runtime_library
+
+        lib = ctypes.CDLL(find_runtime_library())
+        alloc = lib._mlir_memref_to_llvm_alloc
+        alloc.argtypes = [ctypes.c_int64]
+        alloc.restype = ctypes.c_void_p
+        release = lib._mlir_memref_to_llvm_free
+        release.argtypes = [ctypes.c_void_p]
+        ptr = alloc(1 << 20)
+        release(ptr)
+        release(ptr)
+    """)
+    import os
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "python"))
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True,
+                          text=True,
+                          env=env,
+                          timeout=30)
+    assert proc.returncode < 0
+    assert "allocation released twice" in proc.stderr
+
+
+def test_runtime_fft_descriptor_errors_are_recoverable(runtime_lib,
+                                                       descriptor):
+    from sar.compiler.toolchain import find_runtime_library
+
+    lib = ctypes.CDLL(find_runtime_library())
+    clear = lib.sar_rt_error_clear
+    clear.restype = None
+    get = lib.sar_rt_error_get
+    get.restype = ctypes.c_char_p
+    x = np.ones(8, dtype=np.complex128)
+    out = np.empty_like(x)
+    a, b = descriptor(x), descriptor(out)
+    b.sizes[0] = 7
+    fn = lib._mlir_ciface_sar_rt_fft_1d_c128
+    fn.restype = None
+    clear()
+    fn(ctypes.byref(a), ctypes.byref(b), ctypes.c_int64(0),
+       ctypes.c_bool(False))
+    assert b"output shape must match" in get()
+    # Process and runtime remain usable after the rejected call.
+    clear()
+    got = _call_fft(runtime_lib, descriptor, x, 0, False,
+                    "_mlir_ciface_sar_rt_fft_1d_c128")
+    np.testing.assert_allclose(got, np.fft.fft(x), rtol=1e-12, atol=1e-12)
+
+
+def test_runtime_interp_enum_errors_are_recoverable(runtime_lib, descriptor):
+    lib = runtime_lib
+    clear = lib.sar_rt_error_clear
+    clear.restype = None
+    get = lib.sar_rt_error_get
+    get.restype = ctypes.c_char_p
+    data = np.ones((1, 8), dtype=np.complex128)
+    positions = np.arange(8, dtype=np.float64).reshape(1, 8)
+    out = np.empty_like(data)
+    descriptors = [descriptor(x) for x in (data, positions, out)]
+    fn = lib._mlir_ciface_sar_rt_interp1d_2d_c128
+    fn.restype = None
+    clear()
+    fn(*[ctypes.byref(x) for x in descriptors], ctypes.c_int64(99),
+       ctypes.c_int64(8), ctypes.c_int64(1), ctypes.c_double(2.5),
+       ctypes.c_int64(0))
+    assert b"unknown kernel" in get()
+
+
+def test_runtime_preserves_first_error_and_skips_later_calls(
+        runtime_lib, descriptor):
+    lib = runtime_lib
+    clear = lib.sar_rt_error_clear
+    clear.restype = None
+    get = lib.sar_rt_error_get
+    get.restype = ctypes.c_char_p
+    x = np.ones(8, dtype=np.complex128)
+    first_out = np.full_like(x, 11)
+    second_out = np.full_like(x, 22)
+    a, first, second = descriptor(x), descriptor(first_out), descriptor(
+        second_out)
+    first.sizes[0] = 7
+    fn = lib._mlir_ciface_sar_rt_fft_1d_c128
+    fn.restype = None
+    clear()
+    fn(ctypes.byref(a), ctypes.byref(first), ctypes.c_int64(0),
+       ctypes.c_bool(False))
+    initial = get()
+    fn(ctypes.byref(a), ctypes.byref(second), ctypes.c_int64(0),
+       ctypes.c_bool(False))
+    assert get() == initial
+    np.testing.assert_array_equal(second_out, np.full_like(x, 22))
+
+
 # --------------------------------------------------------------------------- #
 # Thread configuration
 # --------------------------------------------------------------------------- #
@@ -334,6 +466,65 @@ def test_runtime_thread_env_is_honoured(env_var):
                           timeout=30)
     assert proc.returncode == 0, proc.stderr
     assert "OK" in proc.stdout
+
+
+def test_openmp_binding_does_not_shrink_runtime_pool():
+    """Pool sizing uses load-time process affinity, not a bound OMP thread."""
+    script = textwrap.dedent("""
+        import os
+        # runtimeWorkerCount() caps SAR_RT_NUM_THREADS at the load-time
+        # affinity count, so snapshot the mask before the runtime loads.
+        expected_workers = min(8, len(os.sched_getaffinity(0)))
+
+        import numpy as np
+        import sar
+        from sar.runtime import thread_config
+
+        @sar.func
+        def scale(x: sar.f64[4096]) -> sar.f64[4096]:
+            return x * 2.0
+
+        scale(np.ones(4096))  # initialize libomp and apply close binding
+        config = thread_config()
+        assert config["available_workers"] > 2, config
+        assert config["runtime_workers"] == expected_workers, config
+        x = np.ones((64, 64), dtype=np.complex128)
+        import ctypes
+        from sar.compiler.toolchain import find_runtime_library
+        from sar.runtime import make_descriptor
+        lib = ctypes.CDLL(find_runtime_library())
+        fn = lib._mlir_ciface_sar_rt_fft_2d_c128
+        out = np.empty_like(x)
+        a, b = make_descriptor(x), make_descriptor(out)
+        fn(ctypes.byref(a), ctypes.byref(b), ctypes.c_int64(1),
+           ctypes.c_bool(False))
+        task_mask_counts = []
+        for path in __import__("pathlib").Path("/proc/self/task").iterdir():
+            with (path / "status").open() as handle:
+                line = next(line for line in handle
+                            if line.startswith("Cpus_allowed_list:"))
+            count = 0
+            for span in line.split(":", 1)[1].strip().split(","):
+                bounds = [int(value) for value in span.split("-")]
+                count += bounds[-1] - bounds[0] + 1
+            task_mask_counts.append(count)
+        assert (task_mask_counts.count(config["available_workers"])
+                >= expected_workers - 1), task_mask_counts
+        print(config)
+    """)
+    import os
+    env = dict(os.environ,
+               PYTHONPATH=str(REPO_ROOT / "python"),
+               SAR_RT_NUM_THREADS="8",
+               OMP_NUM_THREADS="8",
+               OMP_PROC_BIND="close",
+               OMP_PLACES="cores")
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True,
+                          text=True,
+                          env=env,
+                          timeout=60)
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_runtime_thread_pool_is_reused_and_concurrent_calls_are_safe():

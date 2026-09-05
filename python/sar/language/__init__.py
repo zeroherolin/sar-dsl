@@ -20,12 +20,14 @@ operations::
 from __future__ import annotations
 
 import functools
+import hashlib
 import inspect
 import math
 import numbers
 import os
 import re
 import threading
+from collections import OrderedDict
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,10 +40,49 @@ from .diagnostics import (DomainWarning, PrecisionWarning, _UNKNOWN_AXIS,
                           is_double as _is_double, propagate_axes as
                           _propagate_axes, source_location as _source_location,
                           warn_if_host_widens as _warn_if_host_widens)
+from ._schema import (GATHER_BOUNDARIES, GATHER_KERNELS, INTERP_BOUNDARIES,
+                      INTERP_KERNELS, INTERP_WINDOWS, REDUCE_KINDS)
 
 
 def _is_real_scalar(value) -> bool:
     return isinstance(value, numbers.Real)
+
+
+def _strict_int(value, what: str, minimum: Optional[int] = None) -> int:
+    """Validates an integer-valued language parameter without truncation."""
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TraceError(f"{what} must be an integer, got {value!r}")
+    value = int(value)
+    if minimum is not None and value < minimum:
+        raise TraceError(f"{what} must be at least {minimum}, got {value}")
+    return value
+
+
+def _memo_limit(env: str, default: int) -> int:
+    raw = os.environ.get(env, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise TraceError(f"{env} must be a non-negative integer") from exc
+    if value < 0:
+        raise TraceError(f"{env} must be a non-negative integer")
+    return value
+
+
+def _lru_get(mapping, key, factory, env: str, default: int):
+    """Returns `mapping[key]`, building missing entries with `factory()`.
+
+    The mapping stays a least-recently-used memo bounded by the
+    env-configured limit; 0 leaves it unbounded."""
+    if key in mapping:
+        mapping.move_to_end(key)
+        return mapping[key]
+    value = mapping[key] = factory()
+    limit = _memo_limit(env, default)
+    if limit:
+        while len(mapping) > limit:
+            mapping.popitem(last=False)
+    return value
 
 
 __all__ = [
@@ -341,14 +382,24 @@ class Tensor:
     def __truediv__(self, other):
         if _is_real_scalar(other):
             if self.dtype.is_int:
+                if (not isinstance(other, bool)
+                        and isinstance(other, numbers.Integral)
+                        and other == -1):
+                    return self._integer_scalar("mul", -1)
                 return self._integer_scalar("div", other)
             other = _constant_splat(other, self._value.type)
+        if self.dtype.is_int:
+            raise TraceError(
+                "integer tensor division requires a nonzero integer scalar; "
+                "cast the operands (sar.cast(x, sar.f32)) for true division")
         return self._binary("div", other)
 
     def __rtruediv__(self, other):
+        if self.dtype.is_int:
+            raise TraceError(
+                "integer division cannot use a tensor as the denominator; "
+                "cast it (sar.cast(x, sar.f32)) for true division")
         if _is_real_scalar(other):
-            if self.dtype.is_int:
-                return self._integer_scalar("div", other, reflected=True)
             other = _constant_splat(other, self._value.type)
         return self._binary("div", other, reflected=True)
 
@@ -847,6 +898,8 @@ def _reduce_emit(x: Tensor, kind: str, dim: int) -> Tensor:
 
 def _reduce(kind: str, x: Tensor, dim: Optional[int]) -> Tensor:
     x = _require_tensor(x, f"sar.{kind}")
+    if kind not in REDUCE_KINDS:
+        raise TraceError(f"sar.reduce kind must be one of {REDUCE_KINDS}")
     if kind != "sum" and not x.dtype.is_float:
         raise TraceError(f"sar.{kind} expects a float tensor")
     if x.dtype.is_int:
@@ -936,51 +989,52 @@ def sign(x: Tensor) -> Tensor:
     return where(x != x, x, where(x > 0.0, 1.0, where(x < 0.0, -1.0, 0.0)))
 
 
-def _trunc(x: Tensor) -> Tensor:
-    """Truncation toward zero via an i64 round trip.
+def _safe_trunc(x: Tensor):
+    """Truncation plus a mask proving the float-to-int conversion is safe.
 
-    Limitation: values must fit in i64 (|x| < 2^63). Inputs outside that
-    range -- including inf and NaN -- produce undefined results rather
-    than an error, matching C float-to-int semantics. SAR position and
-    index computations are always far below this bound.
+    Values outside the mask are already integral at their storage precision,
+    or are non-finite, so floor/ceil/round return the original value. The
+    conversion itself sees zero there and can never receive NaN, infinity or
+    an out-of-range value.
     """
-    return cast(cast(x, i64), _SPEC_BY_DTYPE[x.dtype])
+    limit = float(1 << (30 if x.dtype == F32 else 62))
+    in_range = (x > -limit) * (x < limit)
+    safe = where(in_range, x, 0.0)
+    truncated = cast(cast(safe, i64), _SPEC_BY_DTYPE[x.dtype])
+    return truncated, in_range
 
 
 def floor(x: Tensor) -> Tensor:
-    """numpy `floor` as a composition.
-
-    Values must fit in i64; inf/NaN inputs are undefined (see `_trunc`).
-    """
+    """numpy `floor` as a composition, including NaN and infinities."""
     x = _require_tensor(x, "sar.floor")
     if not x.dtype.is_float:
         raise TraceError("sar.floor expects a float tensor")
-    t = _trunc(x)
-    return where(x < t, t - 1.0, t)
+    t, in_range = _safe_trunc(x)
+    result = where(in_range, where(x < t, t - 1.0, t), x)
+    return where(x == 0.0, x, result)
 
 
 def ceil(x: Tensor) -> Tensor:
-    """numpy `ceil` as a composition.
-
-    Values must fit in i64; inf/NaN inputs are undefined (see `_trunc`).
-    """
+    """numpy `ceil` as a composition, including NaN and infinities."""
     x = _require_tensor(x, "sar.ceil")
     if not x.dtype.is_float:
         raise TraceError("sar.ceil expects a float tensor")
-    t = _trunc(x)
-    return where(x > t, t + 1.0, t)
+    t, in_range = _safe_trunc(x)
+    result = where(in_range, where(x > t, t + 1.0, t), x)
+    return where(x == 0.0, x, result)
 
 
 def round(x: Tensor) -> Tensor:  # noqa: A001 - numpy-style rounding
     """Rounds half away from zero (Matlab `round`; note numpy rounds
     half to even).
 
-    Values must fit in i64; inf/NaN inputs are undefined (see `_trunc`).
+    NaN and infinities propagate; signed zero is preserved.
     """
     x = _require_tensor(x, "sar.round")
     if not x.dtype.is_float:
         raise TraceError("sar.round expects a float tensor")
-    return sign(x) * floor(absolute(x) + 0.5)
+    rounded = sign(x) * floor(absolute(x) + 0.5)
+    return where(x == 0.0, x, rounded)
 
 
 def _shape_values(values, rank: int, what: str, minimum: int = 1):
@@ -1027,7 +1081,7 @@ def _dynamic_offsets(offsets, rank: int, what: str):
 
 
 def dynamic_slice(x: Tensor, offsets, sizes, strides=None) -> Tensor:
-    """Extract a static-shape window at runtime offsets.
+    """Extracts a static-shape window at runtime offsets.
 
     Offsets outside the valid range are clamped so the complete result stays
     in bounds. This makes an ``sar.iterate(..., index=True)`` index usable for
@@ -1051,7 +1105,7 @@ def dynamic_slice(x: Tensor, offsets, sizes, strides=None) -> Tensor:
 
 
 def dynamic_update_slice(x: Tensor, update: Tensor, offsets) -> Tensor:
-    """Copy ``update`` into ``x`` at runtime, clamped offsets."""
+    """Copies ``update`` into ``x`` at clamped runtime offsets."""
     x = _require_tensor(x, "sar.dynamic_update_slice")
     update = _require_tensor(update, "sar.dynamic_update_slice")
     if update.rank != x.rank or update.dtype != x.dtype:
@@ -1123,10 +1177,11 @@ def pad(x: Tensor, pad_width, value: float = 0.0) -> Tensor:
     if len(widths) != x.rank:
         raise TraceError(f"sar.pad: {fmt}")
     try:
-        low = [int(lo) for lo, _ in widths]
-        high = [int(hi) for _, hi in widths]
+        pairs = [(lo, hi) for lo, hi in widths]
     except (TypeError, ValueError):
         raise TraceError(f"sar.pad: {fmt}") from None
+    low = [_strict_int(lo, "sar.pad padding") for lo, _ in pairs]
+    high = [_strict_int(hi, "sar.pad padding") for _, hi in pairs]
     if any(v < 0 for v in low + high):
         raise TraceError("padding amounts must be non-negative")
     shape = tuple(s + lo + hi for s, lo, hi in zip(x.shape, low, high))
@@ -1155,7 +1210,9 @@ def broadcast(x: Tensor,
     x = _require_tensor(x, "sar.broadcast")
     if x.rank != 1:
         raise TraceError("sar.broadcast expects a rank-1 tensor")
-    shape = tuple(int(d) for d in shape)
+    shape = tuple(
+        _strict_int(d, "sar.broadcast shape dimension", minimum=1)
+        for d in shape)
     if len(shape) != 2 or dim not in (0, 1):
         raise TraceError("sar.broadcast currently supports rank-2 results "
                          "with dim in {0, 1}")
@@ -1260,10 +1317,6 @@ def ifft(x: Tensor,
     return _fft_norm(_fft("ifft", x, dim), dim, norm, inverse=True)
 
 
-_INTERP_KERNELS = ("nearest", "linear", "cubic", "sinc")
-_INTERP_WINDOWS = ("rect", "hann", "hamming", "kaiser")
-
-
 def interp1d(data: Tensor,
              positions: Tensor,
              dim: Optional[int] = None,
@@ -1296,22 +1349,22 @@ def interp1d(data: Tensor,
             "interp1d positions must be an f64 tensor with the data shape")
     if dim not in (0, 1):
         raise TraceError("interp1d dim must be 0 or 1")
-    if kernel not in _INTERP_KERNELS:
-        raise TraceError(f"interp1d kernel must be one of {_INTERP_KERNELS}, "
+    if kernel not in INTERP_KERNELS:
+        raise TraceError(f"interp1d kernel must be one of {INTERP_KERNELS}, "
                          f"got {kernel!r}")
-    taps = int(taps)
+    taps = _strict_int(taps, "interp1d taps", minimum=1)
     if kernel == "sinc":
         if taps % 2 or not 4 <= taps <= 32:
             raise TraceError("interp1d taps must be even and in [4, 32]")
-        if window not in _INTERP_WINDOWS:
+        if window not in INTERP_WINDOWS:
             raise TraceError(
-                f"interp1d window must be one of {_INTERP_WINDOWS}, "
+                f"interp1d window must be one of {INTERP_WINDOWS}, "
                 f"got {window!r}")
         if window == "kaiser" and not 0.0 < float(beta) <= 12.0:
             raise TraceError("interp1d beta must be in (0, 12]")
-    if boundary not in ("zero", "edge", "reflect"):
+    if boundary not in INTERP_BOUNDARIES:
         raise TraceError(
-            f"interp1d boundary must be one of ('zero', 'edge', 'reflect'), "
+            f"interp1d boundary must be one of {INTERP_BOUNDARIES}, "
             f"got {boundary!r}")
     return data._emit(
         "interp1d", [data, positions], data._value.type, {
@@ -1350,12 +1403,13 @@ def gather2d(data: Tensor,
             raise TraceError(f"gather2d {name} must be a rank-2 f64 tensor")
     if rows.shape != cols.shape:
         raise TraceError("gather2d rows and cols must share a shape")
-    if kernel not in ("nearest", "linear"):
+    if kernel not in GATHER_KERNELS:
         raise TraceError(
-            f"gather2d kernel must be 'nearest' or 'linear', got {kernel!r}")
-    if boundary not in ("zero", "edge"):
+            f"gather2d kernel must be one of {GATHER_KERNELS}, got {kernel!r}")
+    if boundary not in GATHER_BOUNDARIES:
         raise TraceError(
-            f"gather2d boundary must be 'zero' or 'edge', got {boundary!r}")
+            f"gather2d boundary must be one of {GATHER_BOUNDARIES}, "
+            f"got {boundary!r}")
     out = TensorType(rows.shape, data.dtype)
     return data._emit("gather2d", [data, rows, cols], out, {
         "kernel": kernel,
@@ -1403,8 +1457,8 @@ def rank_filter(x: Tensor,
     x = _require_tensor(x, "sar.rank_filter")
     if not x.dtype.is_float:
         raise TraceError("sar.rank_filter expects a float tensor")
-    window = int(window)
-    rank = int(rank)
+    window = _strict_int(window, "sar.rank_filter window", minimum=1)
+    rank = _strict_int(rank, "sar.rank_filter rank")
     if window < 1 or window % 2 == 0:
         raise TraceError("sar.rank_filter window must be a positive odd "
                          f"integer, got {window}")
@@ -1438,7 +1492,7 @@ def median_filter(x: Tensor,
                   axis: Optional[int] = None) -> Tensor:
     """Running median along `dim`/`axis` (scipy `ndimage.median_filter`
     restricted to one axis): `rank_filter` at rank `window // 2`."""
-    return rank_filter(x, window, int(window) // 2, dim=dim, axis=axis)
+    return rank_filter(x, window, window // 2, dim=dim, axis=axis)
 
 
 def sort(x: Tensor,
@@ -1491,11 +1545,11 @@ def iterate(trips: int, body: Callable, *carries: Tensor, index: bool = False):
     The trip count is a compile-time constant.
     """
     fn = _current_function()
-    if isinstance(trips, bool) or not isinstance(trips, (int, np.integer)):
-        raise TraceError("sar.iterate trips must be a positive integer")
-    trips = int(trips)
-    if trips < 1:
-        raise TraceError("sar.iterate trips must be a positive integer")
+    try:
+        trips = _strict_int(trips, "sar.iterate trips", minimum=1)
+    except TraceError:
+        raise TraceError(
+            "sar.iterate trips must be a positive integer") from None
     carried = tuple(_require_tensor(c, "sar.iterate") for c in carries)
     if not carried:
         raise TraceError("sar.iterate needs at least one carried tensor")
@@ -1551,7 +1605,9 @@ def _freeze_for_key(value):
     their bytes.
     """
     if isinstance(value, np.ndarray):
-        return ("ndarray", value.shape, str(value.dtype), value.tobytes())
+        data = np.ascontiguousarray(value).view(np.uint8)
+        digest = hashlib.sha256(data).hexdigest()
+        return ("ndarray", value.shape, str(value.dtype), digest)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_for_key(v) for v in value)
     if isinstance(value, dict):
@@ -1598,7 +1654,7 @@ def op(fn=None, *, const=()):
     const_names = frozenset(const)
     signature = inspect.signature(fn)
     #: One GenericKernel per (tensor parameters, constant values).
-    variants: Dict[tuple, GenericKernel] = {}
+    variants = OrderedDict()
     variants_lock = threading.RLock()
 
     def eager(args, kwargs):
@@ -1624,21 +1680,23 @@ def op(fn=None, *, const=()):
                tuple(
                    sorted(
                        (k, _freeze_for_key(v)) for k, v in constants.items())))
+
+        def build_variant():
+
+            def bound_fn(*tensors,
+                         _names=tuple(tensor_names),
+                         _consts=dict(constants)):
+                call = dict(_consts)
+                call.update(zip(_names, tensors))
+                return fn(**call)
+
+            bound_fn.__name__ = fn.__name__
+            bound_fn.__doc__ = fn.__doc__
+            return GenericKernel(bound_fn)
+
         with variants_lock:
-            generic = variants.get(key)
-            if generic is None:
-
-                def bound_fn(*tensors,
-                             _names=tuple(tensor_names),
-                             _consts=dict(constants)):
-                    call = dict(_consts)
-                    call.update(zip(_names, tensors))
-                    return fn(**call)
-
-                bound_fn.__name__ = fn.__name__
-                bound_fn.__doc__ = fn.__doc__
-                generic = GenericKernel(bound_fn)
-                variants[key] = generic
+            generic = _lru_get(variants, key, build_variant,
+                               "SAR_DSL_OP_VARIANTS_MAX", 64)
         return generic(*[bound.arguments[n] for n in tensor_names])
 
     @functools.wraps(fn)
@@ -1651,6 +1709,22 @@ def op(fn=None, *, const=()):
     #: ``f.func.specialize(sar.c64[512, 512], ...)``.
     wrapper.func = GenericKernel(fn)
     wrapper.specialize = wrapper.func.specialize
+
+    def clear_specializations():
+        with variants_lock:
+            variants.clear()
+        wrapper.func.clear_specializations()
+
+    def specialization_stats():
+        with variants_lock:
+            eager_count = len(variants)
+        return {
+            "operator_variants": eager_count,
+            "direct_variants": wrapper.func.specialization_stats()["variants"],
+        }
+
+    wrapper.clear_specializations = clear_specializations
+    wrapper.specialization_stats = specialization_stats
     return wrapper
 
 
@@ -1658,23 +1732,22 @@ def op(fn=None, *, const=()):
 # Kernel tracing
 # --------------------------------------------------------------------------- #
 
-#: MLIR bare identifiers, which is what a kernel name becomes (`@name`).
-_MLIR_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$.]*\Z")
+#: Portable across MLIR symbols, generated C++/HDL identifiers and artifact
+#: filenames. Backend-specific keyword normalization remains the backend's
+#: job, but punctuation accepted only by MLIR must not enter the shared ABI.
+_PORTABLE_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def _validated_kernel_name(name: str) -> str:
-    """Rejects names that cannot be emitted as an MLIR symbol.
-
-    Without this the invalid name reaches `sar-opt` and surfaces as a parse
-    error about the serialized IR ("@ identifier expected to start with
-    letter"), which says nothing about the Python that caused it. Lambdas
-    (`<lambda>`) and non-ASCII identifiers are the practical cases.
-    """
-    if not _MLIR_IDENTIFIER.match(name):
+    """Validates names shared by MLIR, C++, HDL, and artifact filenames."""
+    if not isinstance(name, str) or not _PORTABLE_IDENTIFIER.fullmatch(name):
         raise TraceError(
-            f"kernel name {name!r} is not a valid MLIR symbol; kernels need "
-            "an ASCII identifier name -- define the kernel with `def` "
-            "instead of a lambda, or rename it")
+            f"kernel name {name!r} is not a portable identifier; use an "
+            "ASCII letter or underscore followed by letters, digits or "
+            "underscores (define the kernel with `def` instead of a lambda)")
+    if name.startswith(("sar_rt_", "_mlir_")):
+        raise TraceError(
+            f"kernel name {name!r} uses a reserved runtime ABI prefix")
     return name
 
 
@@ -1687,20 +1760,21 @@ class Kernel:
 
     def __init__(self,
                  fn: Callable,
-                 arg_types: Optional[Sequence[TensorType]] = None):
+                 arg_types: Optional[Sequence[TensorType]] = None,
+                 annotation_locals: Optional[Dict[str, object]] = None):
         self._fn = fn
         self._lock = threading.RLock()
         self._name = _validated_kernel_name(fn.__name__)
         functools.update_wrapper(self, fn)
         if arg_types is None:
             self.arg_types, self.declared_result_types = \
-                self._parse_signature(fn)
+                self._parse_signature(fn, annotation_locals)
         else:
             self.arg_types = list(arg_types)
             self.declared_result_types: Optional[List[TensorType]] = None
         self.param_names = self._parse_param_names(fn, len(self.arg_types))
         self._module_text: Optional[str] = None
-        self._compiled = {}
+        self._compiled = OrderedDict()
 
     @property
     def name(self) -> str:
@@ -1717,11 +1791,21 @@ class Kernel:
             self._compiled.clear()
 
     @staticmethod
-    def _resolve_annotation(annotation, fn: Callable):
-        """Evaluates postponed (PEP 563) string annotations, including
-        closure variables of factory functions building kernels."""
+    def _resolve_annotation(annotation,
+                            fn: Callable,
+                            annotation_locals: Optional[Dict[str,
+                                                             object]] = None):
+        """Evaluates postponed (PEP 563) string annotations.
+
+        Names resolve like the kernel's own code would: closure cells
+        first, then the kernel's module globals, and only then locals
+        captured at the decoration site -- a factory's local shape
+        variables are visible, but a foreign wrapper's locals can never
+        shadow names of the module defining the kernel."""
         if not isinstance(annotation, str):
             return annotation
+        globalns = dict(annotation_locals or {})
+        globalns.update(getattr(fn, "__globals__", {}))
         namespace = {}
         if fn.__closure__:
             for name, cell in zip(fn.__code__.co_freevars, fn.__closure__):
@@ -1729,11 +1813,9 @@ class Kernel:
                     namespace[name] = cell.cell_contents
                 except ValueError:
                     pass
-        # Shapes are expressions (`sar.c64[N, N]`), so evaluating the
-        # string is the only way to resolve it; what can be improved is
-        # the report when it fails.
+        # Shape annotations are expressions such as `sar.c64[N, N]`.
         try:
-            return eval(annotation, getattr(fn, "__globals__", {}), namespace)
+            return eval(annotation, globalns, namespace)
         except Exception as exc:
             raise TraceError(
                 f"kernel '{fn.__name__}': cannot evaluate the type "
@@ -1756,7 +1838,10 @@ class Kernel:
         return [p.name for p in params]
 
     @classmethod
-    def _parse_signature(cls, fn: Callable):
+    def _parse_signature(cls,
+                         fn: Callable,
+                         annotation_locals: Optional[Dict[str,
+                                                          object]] = None):
         sig = inspect.signature(fn)
         arg_types: List[TensorType] = []
         for p in sig.parameters.values():
@@ -1764,7 +1849,8 @@ class Kernel:
                 raise TraceError(
                     f"kernel '{fn.__name__}': parameter '{p.name}' must be "
                     "positional")
-            annotation = cls._resolve_annotation(p.annotation, fn)
+            annotation = cls._resolve_annotation(p.annotation, fn,
+                                                 annotation_locals)
             if not isinstance(annotation, TensorType):
                 raise TraceError(
                     f"kernel '{fn.__name__}': parameter '{p.name}' needs a "
@@ -1775,7 +1861,7 @@ class Kernel:
         if ret is inspect.Signature.empty:
             raise TraceError(
                 f"kernel '{fn.__name__}' needs a return type annotation")
-        ret = cls._resolve_annotation(ret, fn)
+        ret = cls._resolve_annotation(ret, fn, annotation_locals)
         rets = ret if isinstance(ret, tuple) else (ret, )
         for r in rets:
             if not isinstance(r, TensorType):
@@ -1852,15 +1938,31 @@ class Kernel:
         with self._lock:
             if key is None:
                 return _compile(self, backend=backend, options=options)
-            if key not in self._compiled:
-                self._compiled[key] = _compile(self,
-                                               backend=backend,
-                                               options=options)
-            return self._compiled[key]
+            return _lru_get(
+                self._compiled, key,
+                lambda: _compile(self, backend=backend, options=options),
+                "SAR_DSL_COMPILED_MAX", 16)
+
+    def clear_compiled(self) -> None:
+        """Drops in-process launchers; on-disk artifacts remain cached."""
+        with self._lock:
+            self._compiled.clear()
+
+    def compilation_stats(self) -> dict:
+        with self._lock:
+            return {"compiled_launchers": len(self._compiled)}
 
     def __call__(self, *arrays):
         """JIT-compiles for the CPU backend and executes."""
         return self.compile("cpu")(*arrays)
+
+    def dump_pipeline(self,
+                      output_dir,
+                      backend: str = "cpu",
+                      options: Optional[dict] = None):
+        """Compiles and exports intermediate artifacts for inspection."""
+        from ..compiler import dump_pipeline
+        return dump_pipeline(self, output_dir, backend, options)
 
 
 def _type_of_array(value) -> TensorType:
@@ -1884,7 +1986,7 @@ class GenericKernel:
     def __init__(self, fn: Callable):
         self._fn = fn
         functools.update_wrapper(self, fn)
-        self._variants: Dict[tuple, Kernel] = {}
+        self._variants = OrderedDict()
         self._lock = threading.RLock()
 
     def specialize(self, *arg_types: TensorType) -> Kernel:
@@ -1892,9 +1994,18 @@ class GenericKernel:
         (`sar.c64[512, 512]`, ...); useful for emission backends."""
         key = tuple(arg_types)
         with self._lock:
-            if key not in self._variants:
-                self._variants[key] = Kernel(self._fn, arg_types=key)
-            return self._variants[key]
+            return _lru_get(self._variants, key,
+                            lambda: Kernel(self._fn, arg_types=key),
+                            "SAR_DSL_SPECIALIZATIONS_MAX", 64)
+
+    def clear_specializations(self) -> None:
+        """Drops shape/dtype variants and their in-process launchers."""
+        with self._lock:
+            self._variants.clear()
+
+    def specialization_stats(self) -> dict:
+        with self._lock:
+            return {"variants": len(self._variants)}
 
     def __call__(self, *arrays):
         return self.specialize(*[_type_of_array(a) for a in arrays])(*arrays)
@@ -1918,7 +2029,17 @@ def func(fn: Callable):
     ]
     if annotated and not any(annotated):
         return GenericKernel(fn)
-    return Kernel(fn)
+    # PEP 563 stores annotations as strings. A local shape variable in a
+    # factory function is not necessarily a closure variable (it may only
+    # occur in the annotation), so capture the decoration-site locals; they
+    # resolve after the kernel's module globals (see _resolve_annotation).
+    frame = inspect.currentframe()
+    try:
+        caller = frame.f_back if frame else None
+        annotation_locals = dict(caller.f_locals) if caller is not None else {}
+    finally:
+        del frame
+    return Kernel(fn, annotation_locals=annotation_locals)
 
 
 # The composed signal-processing vocabulary lives in a submodule (the

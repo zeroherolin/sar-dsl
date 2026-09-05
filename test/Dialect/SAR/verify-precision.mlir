@@ -63,3 +63,14 @@ func.func @position_arithmetic_shared_with_data(%z: tensor<4x8xcomplex<f32>>,
   %c = sar.cast %s : tensor<4x8xf64> -> tensor<4x8xf32>
   return %r, %c : tensor<4x8xcomplex<f32>>, tensor<4x8xf32>
 }
+
+// -----
+
+// An argument is part of the signature contract even when nothing reads
+// it: it still becomes a port of the emitted design.
+// expected-error @+1 {{block argument type 'tensor<4xf64>' violates precision=f32}}
+func.func @unused_argument_is_still_checked(%x: tensor<4xf32>,
+                                            %dead: tensor<4xf64>)
+    -> tensor<4xf32> {
+  return %x : tensor<4xf32>
+}

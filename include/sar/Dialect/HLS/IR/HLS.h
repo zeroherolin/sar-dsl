@@ -54,7 +54,7 @@ LoopDirectiveAttr getLoopDirective(Operation *op);
 void setLoopDirective(Operation *op, LoopDirectiveAttr loopDirective);
 void setLoopDirective(Operation *op, bool pipeline, int64_t targetII);
 
-/// Parrallel and point loop attribute utils.
+/// Parallel and point loop attribute utils.
 bool hasParallelAttr(Operation *op);
 void setParallelAttr(Operation *op);
 bool hasPointAttr(Operation *op);
@@ -62,7 +62,7 @@ void setPointAttr(Operation *op);
 
 /// Function directives attribute utils.
 FuncDirectiveAttr getFuncDirective(Operation *op);
-void setFuncDirective(Operation *op, FuncDirectiveAttr FuncDirective);
+void setFuncDirective(Operation *op, FuncDirectiveAttr funcDirective);
 void setFuncDirective(Operation *op, bool pipeline, int64_t targetInterval,
                       bool dataflow);
 

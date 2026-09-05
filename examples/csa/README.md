@@ -31,33 +31,24 @@ The residual phase introduced by the scaling multiply (Cumming & Wong eq. 7.36) 
 ## Running
 
 ```bash
-# from the repository root, after `make build`
-python examples/csa/run_point_target_cpu.py --n 512          # focus + PNG
-python examples/csa/run_point_target_hls.py --n 256     # design + validation package
+PYTHONPATH=python python examples/csa/run_point_target_cpu.py --n 512
+PYTHONPATH=python python examples/csa/run_point_target_hls.py --n 256
 ```
 
-At `--n 512` the brightest target lands on its predicted pixel:
-
-```
-peak at (333, 358), expected (333, 358), error (+0, +0)
-  range: IRW  2.12 samples, PSLR  -31.7 dB, ISLR  -28.3 dB
-azimuth: IRW  2.20 samples, PSLR  -27.2 dB, ISLR  -22.9 dB
-```
-
-The HLS runner writes the validation package into `hls_project/csa/`; its contents are listed in [docs/backends.md](../../docs/backends.md#hls-validation-package). C-sim through Vitis HLS matches the NumPy reference to 2.3e-10 over 65536 output samples.
+The CPU runner saves a focused image and reports impulse-response metrics. The HLS runner writes `hls_project/csa/`; package contents are listed in the [backend guide](../../docs/backends.md#generated-package). Numerical results are maintained in the [benchmark report](../../benchmarks/README.md).
 
 ![synthetic point targets](assets/csa_synthetic_512.png)
 
 ## Real data (ALOS-1)
 
 ```bash
-python examples/data/extract_alos.py   # once; shared by all three algorithms
-python examples/csa/run_alos_cpu.py
-python examples/csa/run_alos_hls.py
+PYTHONPATH=python python examples/data/extract_alos.py
+PYTHONPATH=python python examples/csa/run_alos_cpu.py
+PYTHONPATH=python python examples/csa/run_alos_hls.py
 ```
 
-The runner reports wall time and urban-area contrast. The focused image is committed as `assets/san_francisco_csa.png`; the raw product it is made from is not redistributed here.
+The runner reports wall time and urban-area contrast. The focused image is committed as `assets/san_francisco_csa.png`; download and prepare the matching ALOS-1 granule as described in [the examples guide](../README.md#alos-1-stripmap-data).
 
-`run_alos_hls.py` writes one package under `hls_project/csa_alos/`. `csa_alos.h` / `csa_alos.cpp`, its testbench, binary data, manifest, stubs, and C-sim/C-synth/C-RTL scripts plus the portable fallback all describe the same `--n` raster and interface selected by the HLS configuration.
+`run_alos_hls.py` writes `hls_project/csa_alos/`, specialized to the selected raster and HLS configuration.
 
 Tests (`test/python/test_csa.py`) check numerical equivalence with the reference, point-target focusing, cross-algorithm agreement with omega-K, and HLS C++ emission.

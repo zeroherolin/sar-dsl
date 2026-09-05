@@ -26,9 +26,9 @@ struct SARBufferPipelineOptions
       llvm::cl::desc("Only share buffers holding at least this many elements"),
       llvm::cl::init(0)};
 
-  /// Above this size a producer is fused into every consumer rather than
-  /// stored: recomputing costs an arithmetic unit, storing costs a buffer
-  /// and the traffic through it. Zero recomputes everything it can.
+  /// At and above this size a producer is fused into every consumer rather
+  /// than stored: recomputing costs an arithmetic unit, storing costs a
+  /// buffer and the traffic through it. Zero recomputes everything it can.
   Option<uint64_t> recomputeMinElements{
       *this, "recompute-min-elements",
       llvm::cl::desc("Recompute rather than store results of at least this "

@@ -156,7 +156,7 @@ hasNoInterveningEffect(Operation *start, Operation *memOp, Value memref,
 }
 
 /// A helper to check whether an ifOp is valid to be replaced with select.
-bool isValid(AffineIfOp ifOp, Operation *targetOp) {
+static bool isValid(AffineIfOp ifOp, Operation *targetOp) {
   return !ifOp.hasElse() && ifOp.getThenBlock()->getOperations().size() == 2 &&
          ifOp->getParentRegion()->isAncestor(targetOp->getParentRegion());
 }
@@ -208,7 +208,7 @@ forwardStoreToLoad(mlir::affine::AffineReadOpInterface loadOp,
           startOp = ifOp;
     }
 
-    // 2. The store has to dominate the load op to be candidate.
+    // 2. The store has to dominate the load op to be a candidate.
     if (!domInfo.dominates(startOp, loadOp))
       continue;
 
@@ -296,9 +296,10 @@ static void findUnusedStore(mlir::affine::AffineWriteOpInterface writeA,
     if (srcAccess != destAccess)
       continue;
 
-    // Both operations must lie in the same region. Likewise a
-    // special case that when write A is the sole operation in an if statement,
-    // where write B is possible to be unused.
+    // Both operations must lie in the same region, with the same special
+    // case as above: a write that is the sole operation inside an
+    // `affine.if` is represented by the if statement in the dominance and
+    // interference checks.
     Operation *targetA = writeA;
     Operation *targetB = writeB;
     if (targetA->getParentRegion() != targetB->getParentRegion()) {
@@ -356,7 +357,7 @@ static void findUnusedStore(mlir::affine::AffineWriteOpInterface writeA,
 
 // The load to load forwarding / redundant load elimination is similar to the
 // store to load forwarding.
-// loadA will be be replaced with loadB if:
+// loadA will be replaced with loadB if:
 // 1) loadA and loadB have mathematically equivalent affine access functions.
 // 2) loadB dominates loadA.
 // 3) There is no write between loadA and loadB.
@@ -378,7 +379,7 @@ static void loadCSE(mlir::affine::AffineReadOpInterface loadA,
       continue;
     }
 
-    // 2. The store has to dominate the load op to be candidate.
+    // 2. loadB has to dominate loadA to be a candidate.
     if (!domInfo.dominates(loadB, loadA))
       continue;
 
@@ -396,7 +397,7 @@ static void loadCSE(mlir::affine::AffineReadOpInterface loadA,
   }
 
   // Of the legal load candidates, use the one that dominates all others
-  // to minimize the subsequent need to loadCSE
+  // to minimize the subsequent need to loadCSE.
   Value loadB;
   for (mlir::affine::AffineReadOpInterface option : loadCandidates) {
     if (llvm::all_of(loadCandidates,

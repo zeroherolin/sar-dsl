@@ -34,9 +34,8 @@ hls::MemoryKind getMemoryKind(MemRefType type);
 hls::DispatchOp dispatchBlock(Block *block);
 
 /// Fuse the given operations into a new task. The new task will be created
-/// before the first operation or last operation and each operation will be
-/// inserted in order. This method always succeeds even if the resulting IR is
-/// invalid.
+/// before the first operation and each operation will be inserted in order.
+/// This method always succeeds even if the resulting IR is invalid.
 hls::TaskOp fuseOpsIntoTask(ArrayRef<Operation *> ops,
                             PatternRewriter &rewriter);
 
@@ -49,9 +48,8 @@ SmallVector<hls::NodeOp> getProducersExcept(Value buffer, hls::NodeOp except);
 SmallVector<hls::NodeOp> getProducers(Value buffer);
 SmallVector<hls::NodeOp> getDependentConsumers(Value buffer, hls::NodeOp node);
 
-/// Get the depth of a buffer or stream channel. Note that only if the defining
-/// operation of the buffer is not a hls::BufferOp or stream types, the returned
-/// result will be 1.
+/// Get the depth of a buffer or stream channel. Note that the returned result
+/// will be 1 unless the value is stream-typed or backed by a buffer op.
 unsigned getBufferDepth(Value memref);
 
 /// Find buffer value or buffer op across the dataflow hierarchy.
@@ -68,7 +66,7 @@ bool isWritten(OpOperand &use);
 //===----------------------------------------------------------------------===//
 
 /// Return a pair which indicates whether the if statement is always true or
-/// false, respectively. The returned result is one-hot.
+/// false, respectively. At most one of the two flags is true.
 std::pair<bool, bool> ifAlwaysTrueOrFalse(mlir::affine::AffineIfOp ifOp);
 
 /// Check whether the two given if statements have the same condition.
@@ -90,7 +88,7 @@ void getMemAccessesMap(Block &block, MemAccessesMap &map,
 
 bool crossRegionDominates(Operation *a, Operation *b);
 
-/// Calculate the upper and lower bound of the affine map if possible.
+/// Calculate the lower and upper bound of the affine map if possible.
 std::optional<std::pair<int64_t, int64_t>>
 getBoundOfAffineMap(AffineMap map, ValueRange operands);
 

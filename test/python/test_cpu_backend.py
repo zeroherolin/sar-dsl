@@ -7,7 +7,8 @@ import pytest
 
 import sar
 
-from conftest import requires_cpu
+from conftest import (FLOAT_TO_INT_EDGE_EXPECTED, FLOAT_TO_INT_EDGE_VALUES,
+                      requires_cpu)
 
 pytestmark = requires_cpu
 
@@ -119,6 +120,17 @@ def test_int_casts_and_argmax_chain():
                                np.trunc(vals),
                                rtol=0,
                                atol=0)
+
+
+def test_float_to_int_cast_has_defined_saturation_edges():
+    """NaN/Inf/out-of-range casts must not reach LLVM fptosi as poison."""
+
+    @sar.func
+    def narrow(x: sar.f64[7]) -> sar.i32[7]:
+        return sar.cast(x, sar.i32)
+
+    np.testing.assert_array_equal(narrow(FLOAT_TO_INT_EDGE_VALUES),
+                                  FLOAT_TO_INT_EDGE_EXPECTED)
 
 
 def test_reductions():

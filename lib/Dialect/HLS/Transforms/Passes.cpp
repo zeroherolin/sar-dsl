@@ -60,6 +60,14 @@ struct HLSPipelineOptions : public PassPipelineOptions<HLSPipelineOptions> {
       llvm::cl::desc("Bank size at or below which distributed RAM is used, "
                      "in bytes (one bus beat at the default 512-bit bus)")};
 
+  Option<unsigned> bramBlockBytes{
+      *this, "bram-block-bytes", llvm::cl::init(4608),
+      llvm::cl::desc("Bytes in one block-RAM primitive")};
+
+  Option<unsigned> uramBlockBytes{
+      *this, "uram-block-bytes", llvm::cl::init(36864),
+      llvm::cl::desc("Bytes in one UltraRAM primitive (0 when unavailable)")};
+
   Option<unsigned> arrayPartitionMaxFactor{
       *this, "array-partition-max-factor", llvm::cl::init(32),
       llvm::cl::desc("Largest factor automatic array banking may apply")};
@@ -150,7 +158,8 @@ void sar::registerHLSPipeline() {
         // Place dataflow buffers.
         pm.addPass(sar::createPlaceDataflowBufferPass(
             opts.externalBufferThreshold, opts.bramBytes, opts.uramBytes,
-            opts.lutramBytes, opts.lutramMaxBytes,
+            opts.lutramBytes, opts.lutramMaxBytes, opts.bramBlockBytes,
+            opts.uramBlockBytes,
             /*rebalanceOnly=*/false,
             /*allowDram=*/opts.axiInterface || opts.streamInterface));
 
@@ -201,7 +210,8 @@ void sar::registerHLSPipeline() {
         // overflow without changing the established DRAM interface.
         pm.addPass(sar::createPlaceDataflowBufferPass(
             opts.externalBufferThreshold, opts.bramBytes, opts.uramBytes,
-            opts.lutramBytes, opts.lutramMaxBytes,
+            opts.lutramBytes, opts.lutramMaxBytes, opts.bramBlockBytes,
+            opts.uramBlockBytes,
             /*rebalanceOnly=*/true,
             /*allowDram=*/opts.axiInterface || opts.streamInterface));
 
@@ -235,7 +245,8 @@ void sar::registerHLSPipeline() {
         // derived value (one bus beat) authoritative for both.
         pm.addPass(sar::createArrayPartitionPass(
             /*lutramMaxBits=*/opts.lutramMaxBytes * 8, opts.lutramBytes,
-            opts.bramBytes, opts.uramBytes, opts.arrayPartitionMaxFactor));
+            opts.bramBytes, opts.uramBytes, opts.bramBlockBytes,
+            opts.uramBlockBytes, opts.arrayPartitionMaxFactor));
         pm.addPass(sar::createShareEquivalentFunctionsPass());
         pm.addPass(mlir::createCanonicalizerPass());
       });

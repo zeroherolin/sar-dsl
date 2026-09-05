@@ -11,6 +11,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <functional>
+#include <limits>
 
 namespace mlir {
 namespace sar {
@@ -25,13 +26,6 @@ using namespace mlir;
 using namespace mlir::affine;
 using namespace sar;
 using namespace hls;
-
-/// Bytes one memory primitive holds on the UltraScale+ families the backend
-/// targets: a 36 Kb block RAM (as two 18 Kb halves) and a 288 Kb UltraRAM.
-/// A primitive is claimed whole, so these are the granularity every storage
-/// cost is rounded to.
-constexpr uint64_t kBramBlockBytes = 4608;
-constexpr uint64_t kUramBlockBytes = 36864;
 
 /// Whether `array` is ever cut into a view, following calls into the callee.
 ///
@@ -58,12 +52,12 @@ static bool isViewedAnywhere(Value array, DenseSet<Value> &visited) {
   return false;
 }
 
+static void updateSubFuncs(func::FuncOp func, Builder builder);
+
 /// Re-derives `func`'s type from its entry block after a retyped array, then
 /// pushes the new operand types into every callee. A retyped block argument
 /// leaves the signature stale on its own function, which no callee walk can
 /// repair.
-static void updateSubFuncs(func::FuncOp func, Builder builder);
-
 static void retypeEnclosingFuncs(Value array, Builder builder) {
   auto func = array.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!func)
@@ -168,7 +162,7 @@ bool sar::applyArrayPartition(Value array, ArrayRef<unsigned> factors,
     // Distributed RAM comes out of the SLICEM LUTs the datapath is built
     // from, so it is the one tier that has to be rationed against the
     // budget here as well: past it, the bank keeps whatever placement
-    // already chose rather than quietly overdrawing the fabric.
+    // already chose, keeping the emitted design within the fabric budget.
     uint64_t banks = 1;
     for (unsigned f : factors)
       banks *= std::max(1u, f);
@@ -292,22 +286,22 @@ getDimAccessMaps(Operation *op, AffineValueMap valueMap, int64_t dim) {
   return maps;
 }
 
-SmallVector<int64_t> createPermutationMap(ArrayRef<Value> vec1,
-                                          ArrayRef<Value> vec2) {
+static SmallVector<int64_t> createPermutationMap(ArrayRef<Value> vec1,
+                                                 ArrayRef<Value> vec2) {
   if (llvm::SmallDenseSet<Value>(vec1.begin(), vec1.end()) !=
       llvm::SmallDenseSet<Value>(vec2.begin(), vec2.end()))
     return {};
 
-  SmallVector<int64_t> permutation_map(vec1.size());
-  llvm::SmallDenseMap<Value, int> index_map;
+  SmallVector<int64_t> permutationMap(vec1.size());
+  llvm::SmallDenseMap<Value, int> indexMap;
 
   for (size_t i = 0; i < vec1.size(); ++i) {
-    index_map[vec1[i]] = i;
+    indexMap[vec1[i]] = i;
   }
   for (size_t i = 0; i < vec2.size(); ++i) {
-    permutation_map[i] = index_map[vec2[i]];
+    permutationMap[i] = indexMap[vec2[i]];
   }
-  return permutation_map;
+  return permutationMap;
 }
 
 /// Find the suitable array partition factors and kinds for all arrays in the
@@ -340,7 +334,7 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
   using Partition = std::pair<PartitionKind, int64_t>;
   llvm::MapVector<Value, SmallVector<Partition, 4>> partitionsMap;
 
-  // Traverse all blocks that requires to be considered.
+  // Traverse all blocks that need to be considered.
   for (auto block : targetBlocks) {
     MemAccessesMap accessesMap;
     getMemAccessesMap(*block, accessesMap, /*includeVectorTransfer=*/true);
@@ -361,7 +355,7 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
       LLVM_DEBUG(llvm::dbgs()
                      << "\n----------\nArray partition for " << memref;);
 
-      // Find the best partition solution for each dimensions of the
+      // Find the best partition solution for each dimension of the
       // memref.
       for (int64_t dim = 0; dim < memrefType.getRank(); ++dim) {
         // Collect all array access indices of the current dimension.
@@ -450,6 +444,8 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
               requireMux = true;
           }
         }
+        // Convert the largest constant distance into the number of elements
+        // it spans.
         ++maxDistance;
 
         // An invariant index does not benefit from partitioning.
@@ -557,7 +553,7 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
           partitions = SmallVector<Partition, 4>(
               memrefType.getRank(), Partition(PartitionKind::NONE, 1));
 
-        // Traverse all dimension of the memref.
+        // Traverse all dimensions of the memref.
         if (auto attr = dyn_cast<PartitionLayoutAttr>(memrefType.getLayout()))
           for (int64_t dim = 0; dim < memrefType.getRank(); ++dim) {
             auto kind = attr.getKinds()[dim];
@@ -573,7 +569,7 @@ bool sar::applyAutoArrayPartition(func::FuncOp func, unsigned lutramMaxBits,
     }
   });
 
-  // Constuct and set new type to each partitioned MemRefType.
+  // Construct and set new type to each partitioned MemRefType.
   auto builder = Builder(func);
   for (auto [memref, partitions] : partitionsMap) {
     SmallVector<hls::PartitionKind, 4> kinds;
@@ -663,7 +659,8 @@ static uint64_t getConstReaderCopies(Value value) {
 /// the move is only worth making while it has room. Arrays are taken
 /// worst-waste first, which spends the block budget where it buys the most.
 static void rebalanceBankedStorage(ModuleOp module, uint64_t bramBudget,
-                                   uint64_t uramBudget) {
+                                   uint64_t uramBudget, uint64_t bramBlockBytes,
+                                   uint64_t uramBlockBytes) {
   struct Candidate {
     Value array;
     uint64_t uramBytes;
@@ -695,17 +692,19 @@ static void rebalanceBankedStorage(ModuleOp module, uint64_t bramBudget,
     case MemoryKind::BRAM_2P:
     case MemoryKind::BRAM_S2P:
     case MemoryKind::BRAM_T2P: {
-      uint64_t bram = copies * measure(type, kBramBlockBytes);
+      uint64_t bram = copies * measure(type, bramBlockBytes);
       bramUsed += bram;
       blockBound.push_back(
-          {array, copies * measure(type, kUramBlockBytes), bram});
+          {array, uramBlockBytes ? copies * measure(type, uramBlockBytes) : 0,
+           bram});
       return;
     }
     case MemoryKind::URAM_1P:
     case MemoryKind::URAM_2P:
     case MemoryKind::URAM_S2P:
     case MemoryKind::URAM_T2P:
-      uramUsed += copies * measure(type, kUramBlockBytes);
+      if (uramBlockBytes)
+        uramUsed += copies * measure(type, uramBlockBytes);
       break;
     default:
       return;
@@ -714,9 +713,9 @@ static void rebalanceBankedStorage(ModuleOp module, uint64_t bramBudget,
     // same array in fewer bytes -- which is the case exactly when a bank
     // cannot fill an UltraRAM, since a primitive is claimed whole and the
     // block primitive is an eighth the size.
-    uint64_t uram = copies * measure(type, kUramBlockBytes);
-    uint64_t bram = copies * measure(type, kBramBlockBytes);
-    if (bram < uram)
+    uint64_t uram = uramBlockBytes ? copies * measure(type, uramBlockBytes) : 0;
+    uint64_t bram = copies * measure(type, bramBlockBytes);
+    if (uramBlockBytes && bram < uram)
       candidates.push_back({array, uram, bram});
   };
 
@@ -769,7 +768,7 @@ static void rebalanceBankedStorage(ModuleOp module, uint64_t bramBudget,
   for (Candidate &candidate : blockBound) {
     if (bramUsed <= bramBudget)
       break;
-    if (uramUsed + candidate.uramBytes > uramBudget)
+    if (!uramBlockBytes || uramUsed + candidate.uramBytes > uramBudget)
       continue;
     auto type = cast<MemRefType>(candidate.array.getType());
     candidate.array.setType(MemRefType::get(
@@ -781,12 +780,10 @@ static void rebalanceBankedStorage(ModuleOp module, uint64_t bramBudget,
   }
 }
 
-static LogicalResult verifyFinalMemoryBudget(ModuleOp module,
-                                             uint64_t bramBudget,
-                                             uint64_t uramBudget,
-                                             uint64_t lutramBudget) {
-  constexpr uint64_t bramBlockBytes = kBramBlockBytes;
-  constexpr uint64_t uramBlockBytes = kUramBlockBytes;
+static LogicalResult
+verifyFinalMemoryBudget(ModuleOp module, uint64_t bramBudget,
+                        uint64_t uramBudget, uint64_t lutramBudget,
+                        uint64_t bramBlockBytes, uint64_t uramBlockBytes) {
   struct Usage {
     uint64_t bram = 0;
     uint64_t uram = 0;
@@ -825,7 +822,10 @@ static LogicalResult verifyFinalMemoryBudget(ModuleOp module,
     case MemoryKind::URAM_2P:
     case MemoryKind::URAM_S2P:
     case MemoryKind::URAM_T2P:
-      usage.uram += copies * banks * roundUpTo(bankBytes, uramBlockBytes);
+      if (uramBlockBytes)
+        usage.uram += copies * banks * roundUpTo(bankBytes, uramBlockBytes);
+      else
+        usage.uram = std::numeric_limits<uint64_t>::max();
       break;
     case MemoryKind::UNKNOWN:
     case MemoryKind::DRAM:
@@ -921,16 +921,23 @@ struct ArrayPartition : public sar::impl::ArrayPartitionBase<ArrayPartition> {
   ArrayPartition() = default;
   ArrayPartition(unsigned argLutramMaxBits, unsigned argLutramBytes,
                  unsigned argBramBytes, unsigned argUramBytes,
+                 unsigned argBramBlockBytes, unsigned argUramBlockBytes,
                  unsigned argMaxFactor) {
     lutramMaxBits = argLutramMaxBits;
     lutramBytes = argLutramBytes;
     bramBytes = argBramBytes;
     uramBytes = argUramBytes;
+    bramBlockBytes = argBramBlockBytes;
+    uramBlockBytes = argUramBlockBytes;
     maxFactor = argMaxFactor;
   }
 
   void runOnOperation() override {
     auto module = getOperation();
+    if (bramBlockBytes == 0 || (uramBytes != 0 && uramBlockBytes == 0)) {
+      module.emitError("invalid target memory primitive geometry");
+      return signalPassFailure();
+    }
 
     // Get the top function. After AXI interface creation the module holds a
     // runtime wrapper that calls the design top; partitioning must start from
@@ -993,19 +1000,22 @@ struct ArrayPartition : public sar::impl::ArrayPartitionBase<ArrayPartition> {
                             (uint64_t)lutramBytes * 8, &lutramBitsUsed);
     // Banking is settled here, so this is the first point at which a bank's
     // real cost in whole primitives is known.
-    rebalanceBankedStorage(module, bramBytes, uramBytes);
-    if (failed(
-            verifyFinalMemoryBudget(module, bramBytes, uramBytes, lutramBytes)))
+    rebalanceBankedStorage(module, bramBytes, uramBytes, bramBlockBytes,
+                           uramBlockBytes);
+    if (failed(verifyFinalMemoryBudget(module, bramBytes, uramBytes,
+                                       lutramBytes, bramBlockBytes,
+                                       uramBlockBytes)))
       signalPassFailure();
   }
 };
 } // namespace
 
-std::unique_ptr<Pass> sar::createArrayPartitionPass(unsigned lutramMaxBits,
-                                                    unsigned lutramBytes,
-                                                    unsigned bramBytes,
-                                                    unsigned uramBytes,
-                                                    unsigned maxFactor) {
+std::unique_ptr<Pass>
+sar::createArrayPartitionPass(unsigned lutramMaxBits, unsigned lutramBytes,
+                              unsigned bramBytes, unsigned uramBytes,
+                              unsigned bramBlockBytes, unsigned uramBlockBytes,
+                              unsigned maxFactor) {
   return std::make_unique<ArrayPartition>(lutramMaxBits, lutramBytes, bramBytes,
-                                          uramBytes, maxFactor);
+                                          uramBytes, bramBlockBytes,
+                                          uramBlockBytes, maxFactor);
 }

@@ -36,6 +36,8 @@ _discovery_lock = threading.RLock()
 
 
 def register_backend(cls: Type[BaseBackend]) -> None:
+    """Adds a backend class to the registry under its ``name``; a name
+    already taken by a different class is rejected."""
     with _discovery_lock:
         if not issubclass(cls, BaseBackend):
             raise SARError(f"{cls!r} is not a BaseBackend subclass")

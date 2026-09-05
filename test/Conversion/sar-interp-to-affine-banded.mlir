@@ -18,8 +18,8 @@
 // CHECK: memref.alloc() : memref<8x32xf64>
 // CHECK: memref.alloc() : memref<8x32xf64>
 // Small bands use complete banking so dynamic tap slots can issue in parallel.
-// CHECK: memref.alloc(){{.*}}hls.partition_kinds = ["complete"]{{.*}} : memref<16xf64>
-// CHECK: memref.alloc(){{.*}}hls.partition_kinds = ["complete"]{{.*}} : memref<16xf64>
+// CHECK: memref.alloc(){{.*}}hls.gather_strategy = "band"{{.*}}hls.partition_kinds = ["complete"]{{.*}} : memref<16xf64>
+// CHECK: memref.alloc(){{.*}}hls.gather_strategy = "band"{{.*}}hls.partition_kinds = ["complete"]{{.*}} : memref<16xf64>
 // CHECK-NOT: hls.min_ii
 // Row loop, then the prologue that primes the window, then the column loop.
 // CHECK: affine.for %{{.*}} = 0 to 8
@@ -158,14 +158,16 @@ func.func @interp_banded_edges(%re: tensor<2x32xf64>, %im: tensor<2x32xf64>)
 // no compile-time range and the full-plane gather is kept.
 
 // CHECK-LABEL: func.func @interp_unbounded_arg
+// CHECK: memref.alloc(){{.*}}hls.gather_strategy = "direct"
+// CHECK: memref.alloc(){{.*}}hls.gather_strategy = "direct"
 // CHECK-NOT: memref<16xf64>
 // CHECK: memref.load %{{.*}}[%{{.*}}, %{{.*}}] : memref<8x32xf64>
 // CHECK-NOT: sar.interp1d_split
 // FULLROW-LABEL: func.func @interp_unbounded_arg
 // Two f64 planes of the 32-element row occupy 512 bytes and fit the cap.
 // A full row larger than the complete-banking cutoff uses one bank per tap.
-// FULLROW: memref.alloc(){{.*}}hls.partition_factors = [8]{{.*}}hls.partition_kinds = ["cyclic"]{{.*}} : memref<32xf64>
-// FULLROW: memref.alloc(){{.*}}hls.partition_factors = [8]{{.*}}hls.partition_kinds = ["cyclic"]{{.*}} : memref<32xf64>
+// FULLROW: memref.alloc(){{.*}}hls.gather_strategy = "full_row"{{.*}}hls.partition_factors = [8]{{.*}}hls.partition_kinds = ["cyclic"]{{.*}} : memref<32xf64>
+// FULLROW: memref.alloc(){{.*}}hls.gather_strategy = "full_row"{{.*}}hls.partition_factors = [8]{{.*}}hls.partition_kinds = ["cyclic"]{{.*}} : memref<32xf64>
 // FULLROW-NOT: sar.interp1d_split
 func.func @interp_unbounded_arg(%re: tensor<8x32xf64>, %im: tensor<8x32xf64>,
                                 %pos: tensor<8x32xf64>)

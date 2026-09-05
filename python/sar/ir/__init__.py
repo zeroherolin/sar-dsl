@@ -159,7 +159,7 @@ class DenseAttr:
 
     @classmethod
     def splat(cls, value, type: TensorType) -> "DenseAttr":
-        """Build a scalar dense attribute without allocating the tensor."""
+        """Builds a scalar dense attribute without allocating the tensor."""
         scalar = np.asarray(value, dtype=type.dtype.to_numpy()).item()
         return cls(f"dense<{cls._render(scalar, type.dtype)}> : {type.mlir}")
 

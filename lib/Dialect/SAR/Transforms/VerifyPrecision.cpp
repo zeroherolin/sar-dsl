@@ -6,7 +6,6 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Interfaces/FunctionInterfaces.h"
 
 #include "llvm/ADT/STLExtras.h"
 
@@ -128,10 +127,6 @@ struct VerifyPrecision
         return true;
       };
 
-      // A function type repeats its block-argument and terminator types,
-      // which are checked below with the exemption applied.
-      if (isa<FunctionOpInterface>(op))
-        return WalkResult::advance();
       for (Value operand : op->getOperands())
         if (!positions.contains(operand) &&
             reject(operand.getType(), "operand"))
@@ -139,6 +134,9 @@ struct VerifyPrecision
       for (Value result : op->getResults())
         if (!positions.contains(result) && reject(result.getType(), "result"))
           return WalkResult::interrupt();
+      // Entry blocks carry the function signature, so an unused argument
+      // still violates the contract here even though no operand check can
+      // reach it.
       for (Region &region : op->getRegions())
         for (Block &block : region)
           for (BlockArgument argument : block.getArguments())

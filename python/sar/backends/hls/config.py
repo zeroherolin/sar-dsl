@@ -8,12 +8,14 @@ weakest first::
 
 where the user file comes from ``options={"config": path}`` or, failing
 that, ``$SAR_DSL_HLS_CONFIG``; it overrides the keys it names and leaves
-the rest at the shipped default.
+the rest at the shipped default. A key restated at its default value is
+a no-op, so a copy of the shipped file behaves exactly like the shipped
+defaults.
 
 Every value is validated against `OPTIONS`. An unknown key, a value of
 the wrong type and a value outside the range the passes accept all raise
 `HLSConfigError` -- an option the user believed in and the backend
-ignored is the failure mode this module exists to prevent.
+ignored would make the reported configuration unreliable.
 
 The resolved mapping is what the backend passes down and what a design
 reports as `HLSDesign.config`.
@@ -31,7 +33,7 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 from ...errors import SARError
-from .devices import DEVICES, budgets_for
+from .devices import DEVICES, budgets_for, find_device, storage_primitives
 
 __all__ = [
     "CONFIG_ENV_VAR", "HLSConfig", "HLSConfigError", "OPTIONS",
@@ -43,6 +45,9 @@ __all__ = [
 CONFIG_ENV_VAR = "SAR_DSL_HLS_CONFIG"
 
 _CONFIG_FILENAME = "hls_config.yaml"
+
+#: Marks keys absent from a mapping in default-comparison lookups.
+_UNSET = object()
 
 #: Ceilings of the pass options these values reach: the byte budgets and
 #: the external-buffer threshold land in `unsigned` pass options, the
@@ -62,6 +67,7 @@ class HLSConfigError(SARError, ValueError):
 #: here because `_resolve_budgets` has to know which keys the two modes
 #: compete over.
 _BUDGET_KEYS = ("bram_bytes", "uram_bytes", "lutram_bytes", "dsp", "ff", "lut")
+_PRIMITIVE_KEYS = ("bram_block_bytes", "uram_block_bytes")
 
 
 @dataclass(frozen=True)
@@ -125,6 +131,16 @@ OPTIONS: Dict[str, _Spec] = {
     "lut":
     _Spec("int",
           "Lookup-table budget, checked against the synthesis report only",
+          minimum=0,
+          maximum=_UINT32_MAX),
+    "bram_block_bytes":
+    _Spec("int",
+          "Bytes in one block-RAM primitive on the target device",
+          minimum=1,
+          maximum=_UINT32_MAX),
+    "uram_block_bytes":
+    _Spec("int",
+          "Bytes in one UltraRAM primitive (0 when unavailable)",
           minimum=0,
           maximum=_UINT32_MAX),
     "interface":
@@ -671,6 +687,7 @@ class HLSConfig(Mapping):
         self._values = dict(values)
         self._provenance = dict(provenance or {})
         self.sources = tuple(sources)
+        self.budget_mode = "shipped"
 
     @classmethod
     def resolve(cls, options=None) -> "HLSConfig":
@@ -695,79 +712,182 @@ class HLSConfig(Mapping):
                 values[key] = None
                 provenance[key] = cls.DERIVED
 
+        overrides = {}
         if path is not None:
             from_file = _read_file(path, origin)
+            # A user file is a base layer like the shipped one: only the
+            # keys it changes are budget-contract statements, so a copy
+            # of the shipped file behaves exactly like the defaults. Its
+            # `part` still counts alongside a changed percentage or
+            # geometry -- those describe that device.
+            changed = {
+                key: value
+                for key, value in from_file.items()
+                if values.get(key, _UNSET) != value
+            }
+            if "part" in from_file and not changed.keys().isdisjoint(
+                {"part", "utilization", *_PRIMITIVE_KEYS}):
+                changed["part"] = from_file["part"]
             values.update(from_file)
             provenance.update({key: str(path) for key in from_file})
             sources.append(str(path))
+            overrides.update(changed)
         for key, value in options.items():
             values[key] = _validate(key, value, "compile options")
             provenance[key] = cls.FROM_OPTIONS
+            overrides[key] = value
         if options:
             sources.append(cls.FROM_OPTIONS)
         config = cls(values, sources, provenance)
-        config._resolve_budgets(options)
+        config._resolve_budgets(overrides)
         return config
 
-    def _resolve_budgets(self, options: Dict[str, object]) -> None:
+    def _resolve_budgets(self, overrides: Dict[str, object]) -> None:
         """Applies the two ways a caller may state the resource budgets.
 
-        The budgets and `part` describe one device, so a caller states one or
-        the other, never both:
+        The budgets and `part` describe one device. A caller either lets the
+        part derive every budget or states a complete target contract:
 
         * `part`, optionally with `utilization`, derives all six from the
-          device table -- the sizing is the device's, and the percentage is
-          how much of it the design may claim;
-        * the six budgets, stated outright, are used as written and describe
-          whatever device the caller has in mind.
-
-        Mixing them is refused rather than ranked. A part says the budgets
-        are the device's, a budget says it is the caller's, and quietly
-        keeping one of those would plan against a device that is partly each
-        -- the mismatch this resolution exists to prevent.
+          device table;
+        * `part` plus all six budgets uses those budgets as written. An
+          unlisted part must also state its BRAM/URAM primitive sizes;
+        * budgets without `part` tighten the shipped target's defaults. This
+          is the compatibility mode used by resource sweeps.
 
         A caller who states neither gets `hls_config.yaml`, whose six values
-        stand on their own.
+        stand on their own. Only keys a layer actually changes count as
+        statements here: a config file restating a default is a no-op.
         """
-        stated = sorted(key for key in _BUDGET_KEYS if key in options)
-        by_part = "part" in options or "utilization" in options
-        if by_part and stated:
+        stated = sorted(key for key in _BUDGET_KEYS if key in overrides)
+        primitives = sorted(key for key in _PRIMITIVE_KEYS if key in overrides)
+        has_part = "part" in overrides
+        if "utilization" in overrides and not has_part:
             raise HLSConfigError(
-                "compile options name both a device ('part') and explicit "
-                f"budgets ({stated}); they are two ways to say the same "
-                "thing. Name the part and let the budgets follow it "
-                "(optionally with 'utilization'), or state all six budgets "
-                "and leave 'part' at its default.")
-        if "utilization" in options and "part" not in options:
-            raise HLSConfigError(
-                "compile options set 'utilization' without a 'part'. The "
+                "HLS configuration sets 'utilization' without a 'part'. The "
                 "percentage scales the budgets a device implies, so it needs "
                 "the device to scale.")
-        if not by_part:
+        if primitives and not has_part:
+            raise HLSConfigError(
+                "HLS configuration states memory primitive sizes without a "
+                "'part'; name the target device as well")
+        if not has_part:
+            if stated:
+                self._require_within_device(
+                    self._values.get("part"), stated,
+                    "resource budget overrides exceed the shipped part")
+            self.budget_mode = "override" if stated else "shipped"
             return
 
         part = self._values["part"]
+        device = find_device(part)
+        if stated and set(stated) != set(_BUDGET_KEYS):
+            missing = sorted(set(_BUDGET_KEYS) - set(stated))
+            raise HLSConfigError(
+                f"part {part!r} is combined with only some resource budgets; "
+                f"also state {missing}, or omit every budget and let the "
+                "device table derive them")
+
+        if stated:
+            if "utilization" in overrides:
+                raise HLSConfigError(
+                    "utilization cannot accompany explicit resource budgets; "
+                    "the budgets are already the usable amounts")
+            if device is None and set(primitives) != set(_PRIMITIVE_KEYS):
+                missing = sorted(set(_PRIMITIVE_KEYS) - set(primitives))
+                raise HLSConfigError(
+                    f"part {part!r} is not in the device table; explicit "
+                    f"budgets also need primitive geometry {missing}")
+            if device is not None:
+                self._require_within_device(
+                    part, _BUDGET_KEYS,
+                    "explicit resource budgets exceed part")
+                self._derive_primitives(part, overrides)
+            self._validate_primitive_contract()
+            self.budget_mode = "explicit"
+            return
+
         budgets = budgets_for(part, float(self._values["utilization"]) / 100.0)
         if not budgets:
             raise HLSConfigError(
                 f"part {part!r} is not in the device table, so its budgets "
-                "cannot be derived. State the six budgets "
-                f"({list(_BUDGET_KEYS)}) for this device instead, or name a "
-                "tabulated part: " + ", ".join(sorted(DEVICES)))
+                "cannot be derived. State all six budgets and both primitive "
+                f"sizes ({list(_PRIMITIVE_KEYS)}), or name a tabulated part: "
+                + ", ".join(sorted(DEVICES)))
         for key, value in budgets.items():
             self._values[key] = _validate(key, value, self.DERIVED)
             self._provenance[key] = self.DERIVED
+        self._derive_primitives(part, overrides)
+        self._validate_primitive_contract()
+        self.budget_mode = "derived"
         if self.DERIVED not in self.sources:
             self.sources = self.sources + (self.DERIVED, )
+
+    def _require_within_device(self, part: str, keys, what: str) -> None:
+        """The budgets named by `keys` must fit the physical device."""
+        physical = budgets_for(part, 1.0)
+        over = {
+            key: (int(self._values[key]), physical[key])
+            for key in keys
+            if key in physical and int(self._values[key]) > physical[key]
+        }
+        if over:
+            detail = ", ".join(f"{key}={actual} (device maximum {maximum})"
+                               for key, (actual,
+                                         maximum) in sorted(over.items()))
+            raise HLSConfigError(f"{what} {part!r}: {detail}")
+
+    def _derive_primitives(self, part: str, overrides) -> None:
+        """BRAM/URAM geometry comes from the device table; a stated value
+        may only restate it -- silently replacing it would report a
+        configuration the user never asked for."""
+        for key, value in zip(_PRIMITIVE_KEYS, storage_primitives(part)):
+            if key in overrides and int(self._values[key]) != value:
+                raise HLSConfigError(
+                    f"{key}={self._values[key]} disagrees with part "
+                    f"{part!r}, whose value is {value}")
+            self._values[key] = value
+            self._provenance[key] = self.DERIVED
+
+    def _validate_primitive_contract(self) -> None:
+        if int(self._values["bram_block_bytes"]) <= 0:
+            raise HLSConfigError("bram_block_bytes must be positive")
+        if (int(self._values["uram_bytes"]) > 0
+                and int(self._values["uram_block_bytes"]) == 0):
+            raise HLSConfigError(
+                "uram_bytes is nonzero but uram_block_bytes is zero")
+
+    def resource_contract(self) -> Dict[str, object]:
+        """Target and resource interpretation recorded in design manifests."""
+        bram_block = int(self._values["bram_block_bytes"])
+        uram_block = int(self._values["uram_block_bytes"])
+        return {
+            "target_part": self._values["part"],
+            "budget_mode": self.budget_mode,
+            "budgets": {
+                key: self._values[key]
+                for key in _BUDGET_KEYS
+            },
+            "primitive_bytes": {
+                "bram": bram_block,
+                "uram": uram_block,
+            },
+            "memory_budget_primitives": {
+                "bram":
+                int(self._values["bram_bytes"]) // bram_block,
+                "uram": (int(self._values["uram_bytes"]) //
+                         uram_block if uram_block else 0),
+            },
+        }
 
     # -- Derived values ------------------------------------------------ #
 
     def adopt(self, derived: Mapping) -> None:
         """Fills the keys still at null with what the compiler decided.
 
-        A value the user pinned wins: `derive` computes what it would have
-        chosen for every key, and this is where the user's choice is
-        allowed to stand instead.
+        A value the user pinned wins: `autotune.plan` computes what it
+        would have chosen for every key, and this is where the user's
+        choice is allowed to stand instead.
         """
         for key, value in derived.items():
             if self._values.get(key) is not None:

@@ -216,11 +216,12 @@ class HLSDesign:
             }
 
         path = output_dir / "design_manifest.json"
+        tables = self.tables_source() if self.has_tables() else None
         path.write_text(
             json.dumps(
                 {
                     "schema_version":
-                    2,
+                    3,
                     "top":
                     self.name,
                     "source_sha256":
@@ -228,6 +229,8 @@ class HLSDesign:
                         self._packaged_source().encode()).hexdigest(),
                     "header_sha256":
                     hashlib.sha256(self.header_source().encode()).hexdigest(),
+                    "tables_sha256": (hashlib.sha256(tables.encode(
+                    )).hexdigest() if tables is not None else None),
                     "generator": {
                         "name": "sar-dsl",
                         "version": __version__,
@@ -251,8 +254,12 @@ class HLSDesign:
                     config,
                     "config_provenance":
                     provenance,
+                    "resource_contract": (self.config.resource_contract(
+                    ) if self.config is not None else None),
                     "optimization_plan":
                     plan_schema,
+                    "retry_trace":
+                    list(metadata.extra.get("hls_retry_trace", ())),
                 },
                 indent=2,
                 sort_keys=True) + "\n")
@@ -268,7 +275,7 @@ class HLSDesign:
         """Writes a self-contained HLS validation package.
 
         `max_bytes` bounds the static arrays declared by the generated
-        harness. Null uses `SAR_DSL_HLS_TESTBENCH_MAX_BYTES` (1 GiB by
+        harness. None uses `SAR_DSL_HLS_TESTBENCH_MAX_BYTES` (1 GiB by
         default); zero explicitly disables the guard for a caller that chose
         a production-scale simulation.
         """

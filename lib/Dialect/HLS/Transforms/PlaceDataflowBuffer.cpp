@@ -39,9 +39,6 @@ struct TierUse {
   uint64_t lutram = 0;
 };
 
-constexpr uint64_t kBramBlockBytes = 4608;  // 36 Kb
-constexpr uint64_t kUramBlockBytes = 36864; // 288 Kb
-
 static uint64_t roundUpTo(uint64_t bytes, uint64_t grain) {
   return ((bytes + grain - 1) / grain) * grain;
 }
@@ -51,10 +48,11 @@ static uint64_t roundUpTo(uint64_t bytes, uint64_t grain) {
 /// same decisions until the iteration limit.
 class Placer {
 public:
-  Placer(unsigned threshold, TierBudget budget, bool rebalanceOnly,
-         bool allowDram)
+  Placer(unsigned threshold, TierBudget budget, uint64_t bramBlockBytes,
+         uint64_t uramBlockBytes, bool rebalanceOnly, bool allowDram)
       : threshold(threshold), budget(budget), rebalanceOnly(rebalanceOnly),
-        allowDram(allowDram) {}
+        allowDram(allowDram), bramBlockBytes(bramBlockBytes),
+        uramBlockBytes(uramBlockBytes) {}
 
   LogicalResult run(func::FuncOp func) {
     // A declaration has no entry block to read arguments or a terminator
@@ -65,8 +63,7 @@ public:
     // Placement retypes values in place, and the only view whose result it
     // knows how to re-infer is `memref.subview`. Any other view-like op
     // would be left disagreeing with its retyped source, so reject it here
-    // by name rather than let the verifier report a puzzling type mismatch
-    // two passes later.
+    // by name so the placement pass reports the unsupported view directly.
     auto invalid = func.walk([&](Operation *op) {
       if (isa<memref::CastOp, memref::ReinterpretCastOp, memref::ExpandShapeOp,
               memref::CollapseShapeOp>(op)) {
@@ -203,18 +200,22 @@ private:
       use.lutram += copies * bytes;
       return MemoryKind::LUTRAM_S2P;
     }
-    uint64_t uramNeed = copies * banks * roundUpTo(bankBytes, kUramBlockBytes);
-    if (bytes >= kUramBlockBytes && fits(budget.uram, use.uram, uramNeed)) {
+    uint64_t uramNeed =
+        uramBlockBytes ? copies * banks * roundUpTo(bankBytes, uramBlockBytes)
+                       : 0;
+    if (uramBlockBytes && bytes >= uramBlockBytes &&
+        fits(budget.uram, use.uram, uramNeed)) {
       use.uram += uramNeed;
       return MemoryKind::URAM_T2P;
     }
-    uint64_t need = copies * banks * roundUpTo(bankBytes, kBramBlockBytes);
+    uint64_t need = copies * banks * roundUpTo(bankBytes, bramBlockBytes);
     if (fits(budget.bram, use.bram, need)) {
       use.bram += need;
       return MemoryKind::BRAM_T2P;
     }
     // Spill small buffers into a whole URAM block when BRAM is exhausted.
-    if (bytes < kUramBlockBytes && fits(budget.uram, use.uram, uramNeed)) {
+    if (uramBlockBytes && bytes < uramBlockBytes &&
+        fits(budget.uram, use.uram, uramNeed)) {
       use.uram += uramNeed;
       return MemoryKind::URAM_T2P;
     }
@@ -244,7 +245,7 @@ private:
         uint64_t banks = std::max<int64_t>(1, getPartitionFactors(type));
         uint64_t bankBytes = (bytes + banks - 1) / banks;
         overflowBytes += (isConstBuffer ? 1 : 2) * banks *
-                         roundUpTo(bankBytes, kBramBlockBytes);
+                         roundUpTo(bankBytes, bramBlockBytes);
       } else if (kind == MemoryKind::DRAM && (isConstBuffer || !allowDram)) {
         // Constant tables and per-iteration scratch cannot stream. The local
         // ap_memory protocol also has no external master through which any
@@ -252,7 +253,7 @@ private:
         uint64_t banks = std::max<int64_t>(1, getPartitionFactors(type));
         uint64_t bankBytes = (bytes + banks - 1) / banks;
         uint64_t cost = (isConstBuffer ? 1 : 2) * banks *
-                        roundUpTo(bankBytes, kBramBlockBytes);
+                        roundUpTo(bankBytes, bramBlockBytes);
         if (isConstBuffer)
           constOverflowBytes += cost;
         else
@@ -273,6 +274,8 @@ private:
   TierBudget budget;
   bool rebalanceOnly;
   bool allowDram;
+  uint64_t bramBlockBytes;
+  uint64_t uramBlockBytes;
 
 public:
   /// Bytes a rebalance could not fit into any tier budget and left at the
@@ -321,21 +324,29 @@ struct PlaceDataflowBuffer
   PlaceDataflowBuffer() = default;
   PlaceDataflowBuffer(unsigned argThreshold, unsigned argBramBytes,
                       unsigned argUramBytes, unsigned argLutramBytes,
-                      unsigned argLutramMaxBytes, bool argRebalanceOnly,
+                      unsigned argLutramMaxBytes, unsigned argBramBlockBytes,
+                      unsigned argUramBlockBytes, bool argRebalanceOnly,
                       bool argAllowDram) {
     threshold = argThreshold;
     bramBytes = argBramBytes;
     uramBytes = argUramBytes;
     lutramBytes = argLutramBytes;
     lutramMaxBytes = argLutramMaxBytes;
+    bramBlockBytes = argBramBlockBytes;
+    uramBlockBytes = argUramBlockBytes;
     rebalanceOnly = argRebalanceOnly;
     allowDram = argAllowDram;
   }
 
   void runOnOperation() override {
     auto func = getOperation();
+    if (bramBlockBytes == 0 || (uramBytes != 0 && uramBlockBytes == 0)) {
+      func.emitError("invalid target memory primitive geometry");
+      return signalPassFailure();
+    }
     TierBudget budget{bramBytes, uramBytes, lutramBytes, lutramMaxBytes};
-    Placer placer(threshold, budget, rebalanceOnly, allowDram);
+    Placer placer(threshold, budget, bramBlockBytes, uramBlockBytes,
+                  rebalanceOnly, allowDram);
     if (failed(placer.run(func)))
       return signalPassFailure();
 
@@ -385,12 +396,11 @@ struct PlaceDataflowBuffer
 };
 } // namespace
 
-std::unique_ptr<Pass>
-sar::createPlaceDataflowBufferPass(unsigned threshold, unsigned bramBytes,
-                                   unsigned uramBytes, unsigned lutramBytes,
-                                   unsigned lutramMaxBytes, bool rebalanceOnly,
-                                   bool allowDram) {
-  return std::make_unique<PlaceDataflowBuffer>(threshold, bramBytes, uramBytes,
-                                               lutramBytes, lutramMaxBytes,
-                                               rebalanceOnly, allowDram);
+std::unique_ptr<Pass> sar::createPlaceDataflowBufferPass(
+    unsigned threshold, unsigned bramBytes, unsigned uramBytes,
+    unsigned lutramBytes, unsigned lutramMaxBytes, unsigned bramBlockBytes,
+    unsigned uramBlockBytes, bool rebalanceOnly, bool allowDram) {
+  return std::make_unique<PlaceDataflowBuffer>(
+      threshold, bramBytes, uramBytes, lutramBytes, lutramMaxBytes,
+      bramBlockBytes, uramBlockBytes, rebalanceOnly, allowDram);
 }

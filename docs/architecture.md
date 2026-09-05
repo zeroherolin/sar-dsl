@@ -60,7 +60,7 @@ The `sar-to-llvm-pipeline` (registered in `sar-opt`) does the entire descent:
 
 The Python launcher allocates result arrays with NumPy and invokes `_mlir_ciface_<kernel>` via ctypes with strided memref descriptors.
 
-Binding FFT/interpolation to a runtime library mirrors how production compilers bind vendor libraries (cuFFT, FFTW): the _pipeline structure_ is the compiler's job; leaf transforms with decades of optimization behind them are not re-derived from loops. The runtime is one file of dependency-free C++ (radix-2/Bluestein FFT in double precision, kernel-selectable resampling, and an affinity-capped reusable thread pool). This pool parallelizes only FFT/interpolation calls; generated loops use the separate OpenMP runtime, as detailed in [backends.md](backends.md#cpu-backend-sarbackendscpu).
+Binding FFT/interpolation to a runtime library mirrors how production compilers bind vendor libraries (cuFFT, FFTW): the _pipeline structure_ is the compiler's job; leaf transforms with decades of optimization behind them are not re-derived from loops. The runtime is one file of dependency-free C++ (radix-2/Bluestein FFT in double precision, kernel-selectable resampling, and an affinity-capped reusable thread pool). This pool parallelizes only FFT/interpolation calls; generated loops use the separate OpenMP runtime, as detailed in [backends.md](backends.md#cpu-backend).
 
 ### 4. DSL vocabulary above IR primitives
 

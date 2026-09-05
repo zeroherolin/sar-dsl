@@ -61,8 +61,8 @@ struct InsertForkNode : public OpRewritePattern<NodeOp> {
 
     auto hasChanged = false;
     for (auto output : node.getOutputs()) {
-      // DRAM buffer is not considered - the dependencies associated with them
-      // are handled later by tokens.
+      // DRAM buffers are not considered - the dependencies associated with
+      // them are handled later by tokens.
       if (isExtBuffer(output))
         continue;
 
@@ -197,8 +197,8 @@ static void forkWideArgFanOut(Block &block) {
     // Legalization rejects every external argument with more than one
     // consumer: a single pointer cannot be read by multiple Vitis dataflow
     // processes. Fork a read-only on-chip argument even when it has only two
-    // consumers; the old `> 2` cutoff left the common two-phase case
-    // serialized (RDA's `tau` input) and made a simpler algorithm slower than
+    // consumers; a `> 2` cutoff would leave the common two-phase case
+    // serialized (RDA's `tau` input) and make a simpler algorithm slower than
     // the more heavily transformed WKA chain. DRAM arguments stay excluded
     // above because copying a full spilled plane merely to recover overlap
     // would exceed the placement budget; those designs must remain ordered.

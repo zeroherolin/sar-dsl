@@ -111,8 +111,8 @@ static void collectBypassNodes(
       if (isa<BlockArgument>(output) && node.getScheduleOp().isDependenceFree())
         continue;
 
-      // DRAM buffer is not considered - the dependencies associated with them
-      // are handled later by tokens.
+      // DRAM buffers are not considered - the dependencies associated with
+      // them are handled later by tokens.
       if (isExtBuffer(output))
         continue;
 

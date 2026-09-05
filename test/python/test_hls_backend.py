@@ -9,7 +9,8 @@ import pytest
 
 import sar
 
-from conftest import REPO_ROOT, requires_hls, run_hls_csim
+from conftest import (FLOAT_TO_INT_EDGE_EXPECTED, FLOAT_TO_INT_EDGE_VALUES,
+                      REPO_ROOT, requires_hls, run_hls_csim)
 
 pytestmark = requires_hls
 
@@ -112,13 +113,25 @@ def test_hls_design_survives_cache_artifact_eviction(tmp_path):
     assert "\n\n\n" not in packaged
     assert "void scale(" in (synthesis_dir / "scale.h").read_text()
     manifest = json.loads((synthesis_dir / "design_manifest.json").read_text())
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
+    assert manifest["tables_sha256"] is None
     assert manifest["top"] == "scale"
     assert manifest["generator"]["backend"] == "hls"
     assert manifest["kernel"]["arguments"][0]["dtype"] == "f32"
     assert manifest["config"]["interface"] == "axi"
+    assert manifest["resource_contract"]["target_part"] == design.config.part
+    assert manifest["resource_contract"]["budget_mode"] == "shipped"
+    assert manifest["resource_contract"]["primitive_bytes"] == {
+        "bram": 4608,
+        "uram": 36864,
+    }
+    assert manifest["resource_contract"]["memory_budget_primitives"] == {
+        "bram": design.config.bram_bytes // 4608,
+        "uram": design.config.uram_bytes // 36864,
+    }
     assert manifest["optimization_plan"]["clock_ns"] == 4.0
     assert manifest["optimization_plan"]["timing_budget_ns"] == 3.5
+    assert manifest["retry_trace"] == []
     assert "max_scratch_arenas" in manifest["optimization_plan"]["values"]
     assert manifest["interfaces"][0]["logical_elements"] == n
     assert manifest["interfaces"][0]["vector_lanes"] == 1
@@ -162,6 +175,8 @@ def test_constant_tables_are_packaged_as_their_own_header(tmp_path):
     assert "kTwiddleSin_64S0[" not in tables.split("static const")[0]
     assert "kTwiddleSin_64S0" in packaged
     assert "static const float kTwiddleSin_64S0" not in packaged
+    table_manifest = json.loads((out / "design_manifest.json").read_text())
+    assert len(table_manifest["tables_sha256"]) == 64
 
 
 def test_manifest_records_the_physical_vector_interface(tmp_path):
@@ -270,6 +285,18 @@ def test_integer_golden_data_must_be_integral(tmp_path):
         design.write_testbench([x], [(x + x).astype(np.float64)], tmp_path)
 
 
+def test_float_to_int_saturation_matches_hls_simulation(tmp_path):
+
+    @sar.func
+    def narrow(x: sar.f64[7]) -> sar.i32[7]:
+        return sar.cast(x, sar.i32)
+
+    design = narrow.compile(backend="hls")
+    design.write_testbench([FLOAT_TO_INT_EDGE_VALUES],
+                           [FLOAT_TO_INT_EDGE_EXPECTED], tmp_path)
+    run_hls_csim(tmp_path, "narrow")
+
+
 def test_testbench_preserves_high_precision_golden_data(tmp_path):
 
     @sar.func
@@ -376,7 +403,6 @@ def test_composed_vocabulary_emits_hls():
 
 def test_testbench_hls_csim_passes(tmp_path):
     """The emitted design reproduces golden data in C-sim through Vitis HLS."""
-    import numpy as np
 
     n = 16
 
@@ -497,7 +523,6 @@ def test_f32_chain_hls_csim_matches_the_cpu_backend(tmp_path):
     computes in the declared width, so this is a real cross-backend
     check, not a self-comparison.
     """
-    import numpy as np
 
     from common.params import synthetic_params
     from common.simulate import single_target_scene
@@ -650,7 +675,6 @@ def test_scratch_is_one_line_wide():
     size -- and it is why the top function stays down to the kernel's own
     arguments instead of growing a port per scratch plane.
     """
-    import re
 
     for n in (64, 256):
 
@@ -698,7 +722,6 @@ def test_partition_factors_stay_synthesizable():
     N registers behind a crossbar, which no device can place. Banks only
     have to cover the accesses in flight.
     """
-    import re
 
     N = 256
 
@@ -783,9 +806,6 @@ def test_broadcast_does_not_materialize_a_plane():
     holding one row of distinct values, plus a pass over it -- so the
     broadcast has to fold into the consumer that reads it.
     """
-    import re
-
-    import numpy as np
 
     N = 256
     axis = np.linspace(-1.0, 1.0, N)
@@ -817,7 +837,6 @@ def test_streaming_passes_keep_full_rows():
     per row into a burst per tile. Burst length is not recoverable later, so
     the row has to survive tiling intact.
     """
-    import re
 
     N = 512
 
@@ -846,7 +865,6 @@ def test_axi_ports_are_shaped_for_bandwidth():
     512-bit bus wastes seven eighths of it, and issues a fresh 16-beat burst
     where the row supports a full-length one.
     """
-    import re
 
     N = 512
 
@@ -1004,7 +1022,7 @@ def test_stream_interface_rejects_nonsequential_access():
         return sar.fft(y, axis=0)
 
     two_ffts.name = "iface_stream_scratch"
-    with pytest.raises(sar.CompilationError,
+    with pytest.raises(sar.HLSConfigError,
                        match="complete monotonic row-major access sweep"):
         two_ffts.compile(backend="hls", options={"interface": "stream"})
 
@@ -1018,7 +1036,7 @@ def test_stream_interface_rejects_square_transpose():
         return sar.transpose(x)
 
     transpose.name = "iface_stream_transpose"
-    with pytest.raises(sar.CompilationError,
+    with pytest.raises(sar.HLSConfigError,
                        match="complete monotonic row-major access sweep"):
         transpose.compile(backend="hls", options={"interface": "stream"})
 
@@ -1056,7 +1074,7 @@ def test_stream_fft_rejection_is_actionable(tmp_path):
         return sar.fft(x, axis=1)
 
     spectrum.name = "iface_stream_tb"
-    with pytest.raises(sar.CompilationError,
+    with pytest.raises(sar.HLSConfigError,
                        match="complete monotonic row-major access sweep"):
         spectrum.compile(backend="hls", options={"interface": "stream"})
 
@@ -1070,7 +1088,6 @@ def test_full_alos_raster_emits():
     budget decision, buffer placement, shared constant tables, and the
     master count.
     """
-    import re
     import sys
 
     sys.path.insert(0, str(REPO_ROOT / "examples"))

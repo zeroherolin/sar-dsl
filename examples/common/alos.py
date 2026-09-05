@@ -19,8 +19,9 @@ def load_raw(path: str) -> np.ndarray:
     bin_path = Path(path)
     if not bin_path.exists():
         raise SystemExit(
-            f"{bin_path} not found -- extract the CEOS product first with "
-            "`python examples/data/extract_alos.py`")
+            f"{bin_path} not found -- download and unpack the ALOS-1 CEOS "
+            "product, then run `python examples/data/extract_alos.py`; see "
+            "examples/README.md#alos-1-stripmap-data")
     expected = SIZE * SIZE * np.dtype(np.complex64).itemsize
     actual = bin_path.stat().st_size
     if actual != expected:
@@ -42,6 +43,8 @@ def save_scene(image: np.ndarray, p: RadarParams, path: str,
     vmax = np.percentile(crop, 99.0)
     norm = np.clip((crop - vmin) / (vmax - vmin + 1e-6), 0.0, 1.0)
 
+    # Slant-range sample spacing projected to ground at ALOS-1's ~38 deg
+    # mid-swath incidence.
     dx_ground = (p.c / (2 * p.fs)) / np.sin(np.radians(38.0))
     aspect = (p.vr / p.prf) / dx_ground
     h, w = norm.shape

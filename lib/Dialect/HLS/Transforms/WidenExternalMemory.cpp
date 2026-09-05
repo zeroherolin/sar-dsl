@@ -46,6 +46,8 @@ using namespace mlir::sar::hls;
 
 namespace {
 
+/// Most scalar fallback adapters a compiler-owned scratch arena may need
+/// before packing it is declined and the arena stays scalar.
 constexpr unsigned kMaxScratchScalarFallbacks = 256;
 
 /// An index expression split into a linear part and the sub-expressions no
@@ -876,7 +878,7 @@ static bool hasOtherMemrefUse(Block *block, Value memref,
 
 /// Groups `accesses` into maximal runs that a single read-modify-write can
 /// serve. A run is only formed when every scalar access to that memref in the
-/// block lands on the same word: otherwise a neighbouring word access could be
+/// block lands on the same word: otherwise a neighboring word access could be
 /// reordered across the merged load or store.
 static SmallVector<SmallVector<Access>>
 groupScalarAccesses(ArrayRef<Access> accesses, unsigned factor) {
@@ -988,6 +990,10 @@ static void scaleMinimumII(AffineForOp from, AffineForOp to, unsigned factor) {
       setLoopDirective(to, /*pipeline=*/true, scale(directive.getTargetII()));
 }
 
+/// Packs a loop by fully unrolling its lanes in MLIR: each selected load
+/// becomes one word load, the body is cloned once per lane with the induction
+/// variable and the extracted lane values substituted, and each selected store
+/// gathers its per-lane values into a single packed word store.
 static LogicalResult
 vectorizeLoop(AffineForOp loop, unsigned factor,
               const DenseSet<Operation *> &selectedAccesses) {
@@ -1212,8 +1218,8 @@ vectorizeLoopCompact(AffineForOp loop, unsigned factor, unsigned computeFactor,
   return success();
 }
 
-/// Coalesce vector read-modify-write updates to one word. Dynamic
-/// scalar stores are first lowered to `load -> vector.insert -> store`; when
+/// Coalesce vector read-modify-write updates to one word. Scalar fallback
+/// stores are first lowered to `load -> vector.insert -> store`; when
 /// several lanes target the same word, retaining that form makes Vitis issue
 /// one memory transaction per lane and raises II by the lane count. Updates may
 /// have unrelated source loads between them, so group them across the block,

@@ -27,6 +27,7 @@ test-lit:                   ## MLIR FileCheck tests
 
 test-python:                ## Python frontend + backend tests
 	PYTHONPATH=python:examples python3 -m pytest test/python -q
+	bash test/test_fetch_llvm_release.sh
 
 examples:                   ## Focus every synthetic example end-to-end
 	cmake -E make_directory "$(ARTIFACT_DIR)/examples"

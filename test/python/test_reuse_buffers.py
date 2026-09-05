@@ -9,6 +9,7 @@ emitter has no way to express.
 
 import re
 import subprocess
+import ctypes
 
 import numpy as np
 
@@ -32,8 +33,8 @@ def _opt(mlir_text: str, *args: str) -> str:
                           check=True).stdout
 
 
-# A mixed-precision chain: a real plane is built and consumed, and only then
-# does a complex plane of half the element count -- the same footprint in
+# A mixed-precision chain: an f32 plane is built and consumed, and only then
+# does an f64 plane of half the element count -- the same footprint in
 # bytes -- come to life. Written as memref IR directly so the test states the
 # lifetimes it means to test rather than depending on what bufferization
 # happens to emit.
@@ -60,10 +61,7 @@ def test_affine_path_never_retypes():
 
 @requires_cpu
 def test_mixed_precision_kernel_is_numerically_unchanged():
-    """The whole point of the conservative side of this pass: sharing a
-    buffer must not change an answer. A chain that mixes an f32 stage with a
-    c64 stage runs through the CPU pipeline, which shares across types, and
-    is checked against numpy."""
+    """Sharing must not change the result of a mixed-precision chain."""
     N = 64
 
     @sar.func
@@ -81,8 +79,9 @@ def test_mixed_precision_kernel_is_numerically_unchanged():
 
 @requires_cpu
 def test_sharing_is_bit_exact_against_disabled_sharing(tmp_path):
-    """Differential gate over the scariest rewrite the pass performs: two
-    buffers of different element types retire into one byte-addressed
+    """Differential test for retyped sharing.
+
+    Two buffers of different element types retire into one byte-addressed
     backing viewed as both. The same module is compiled and executed with
     and without the rewrite, and the results must be bit-identical --
     sharing decides where values live, never what they are, so any
@@ -142,3 +141,70 @@ func.func @diff(%in: memref<64xf32>, %tmp: memref<64xf32>,
         results.append(out.copy())
 
     assert np.array_equal(results[0], results[1])
+
+
+@requires_cpu
+def test_randomized_lifetime_graphs_are_bit_exact(tmp_path):
+    """Deterministic random overlap patterns stress the lifetime scan."""
+    from conftest import compile_split_kernel
+    from sar.runtime import make_descriptor
+
+    for seed in range(4):
+        rng = np.random.default_rng(seed)
+        keep_a_live = bool(rng.integers(0, 2))
+        scales = rng.integers(1, 6, size=4)
+        extra = ("%old = affine.load %a[%i] : memref<64xf64>\n"
+                 "    %mix = arith.addf %v, %old : f64\n"
+                 if keep_a_live else "")
+        source_value = "%mix" if keep_a_live else "%v"
+        module = f"""
+func.func @life(%in: memref<64xf64>, %out: memref<64xf64>) {{
+  %a = memref.alloc() : memref<64xf64>
+  %b = memref.alloc() : memref<64xf64>
+  %c = memref.alloc() : memref<64xf64>
+  %d = memref.alloc() : memref<64xf64>
+  %s0 = arith.constant {float(scales[0])} : f64
+  %s1 = arith.constant {float(scales[1])} : f64
+  %s2 = arith.constant {float(scales[2])} : f64
+  %s3 = arith.constant {float(scales[3])} : f64
+  affine.for %i = 0 to 64 {{
+    %v = affine.load %in[%i] : memref<64xf64>
+    %x = arith.mulf %v, %s0 : f64
+    affine.store %x, %a[%i] : memref<64xf64>
+  }}
+  affine.for %i = 0 to 64 {{
+    %v = affine.load %a[%i] : memref<64xf64>
+    %x = arith.addf %v, %s1 : f64
+    affine.store %x, %b[%i] : memref<64xf64>
+  }}
+  affine.for %i = 0 to 64 {{
+    %v = affine.load %b[%i] : memref<64xf64>
+    {extra}    %x = arith.mulf {source_value}, %s2 : f64
+    affine.store %x, %c[%i] : memref<64xf64>
+  }}
+  affine.for %i = 0 to 64 {{
+    %v = affine.load %c[%i] : memref<64xf64>
+    %x = arith.addf %v, %s3 : f64
+    affine.store %x, %d[%i] : memref<64xf64>
+  }}
+  affine.for %i = 0 to 64 {{
+    %v = affine.load %d[%i] : memref<64xf64>
+    affine.store %v, %out[%i] : memref<64xf64>
+  }}
+  return
+}}
+"""
+        shared = _opt(module,
+                      "--sar-reuse-buffers=min-elements=0 allow-retype=true")
+        assert len(_allocations(shared)) < 4
+        values = rng.standard_normal(64)
+        outputs = []
+        for tag, ir in (("plain", module), ("shared", shared)):
+            work = tmp_path / f"{seed}_{tag}"
+            work.mkdir()
+            _, fn = compile_split_kernel(ir, "life", work)
+            out = np.empty(64)
+            args = [make_descriptor(values), make_descriptor(out)]
+            fn(*[ctypes.byref(arg) for arg in args])
+            outputs.append(out.copy())
+        np.testing.assert_array_equal(outputs[0], outputs[1])

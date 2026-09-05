@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-08-27",
+  "source": {"base_commit": "099d023aef3d93421f2657bb1fd2aea5f7eb79d0", "source_state": "non-release measurement"},
+  "host": {"cpu": "Intel Xeon 6759P-C", "sockets": 2, "physical_cores": 120, "logical_cpus": 240, "numa_nodes": 2},
+  "rda_c128_n2048_median_ms": {
+    "node0_local_1": 1023.72,
+    "node0_local_8": 140.24,
+    "node0_local_32": 57.66,
+    "node0_local_60": 48.48,
+    "both_interleaved_60": 36.54,
+    "both_interleaved_120": 31.13,
+    "node0_remote_60": 51.72,
+    "node0_smt_120": 172.13
+  },
+  "fft_c128_2048x2048_median_ms": {
+    "threads": [1, 8, 32, 60],
+    "numpy": [25.243, 24.463, 23.902, 24.628],
+    "sar_runtime": [44.386, 6.573, 2.045, 1.582],
+    "mkl_dfti": [10.186, 1.336, 0.650, 0.360]
+  },
+  "fft_phase_ifft_median_ms": {
+    "threads": [1, 8, 32, 60],
+    "numpy": [68.831, 65.281, 63.260, 68.154],
+    "sar_runtime": [101.605, 18.579, 8.349, 8.994],
+    "mkl_dfti": [24.828, 7.161, 6.417, 6.633]
+  },
+  "conclusion": "Keep the portable automatic cap at 32. For this host use 60 workers per socket or 120 across both sockets with interleaved memory; avoid one-socket SMT oversubscription. MKL DFTI is 3.1-4.9x faster on isolated FFT leaves."
+}

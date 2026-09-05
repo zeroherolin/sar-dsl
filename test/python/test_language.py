@@ -310,11 +310,25 @@ def test_integer_division_rejects_fractional_and_zero_scalars():
         fractional.to_mlir()
 
     @sar.func
+    def negative_fractional(x: sar.i32[4]) -> sar.i32[4]:
+        return x / -1.5
+
+    with pytest.raises(TraceError, match="integer scalar"):
+        negative_fractional.to_mlir()
+
+    @sar.func
     def zero(x: sar.i32[4]) -> sar.i32[4]:
         return x / 0
 
     with pytest.raises(TraceError, match="nonzero"):
         zero.to_mlir()
+
+    @sar.func
+    def tensor_denominator(x: sar.i32[4], y: sar.i32[4]) -> sar.i32[4]:
+        return x / y
+
+    with pytest.raises(TraceError, match="nonzero integer scalar"):
+        tensor_denominator.to_mlir()
 
 
 @pytest.mark.parametrize("axis", [True, 1.5, "1"])
@@ -346,6 +360,64 @@ def test_unresolvable_annotation_reports_kernel_and_text():
         @sar.func
         def bad(x: "sar.f32[undefined_dim]") -> "sar.f32[4]":  # noqa: F821
             return x
+
+
+def test_postponed_annotations_capture_factory_locals():
+    """Shape names used only by a postponed annotation still resolve."""
+    namespace = {}
+    exec(
+        "from __future__ import annotations\n"
+        "def make_kernel(n):\n"
+        "    @sar.func\n"
+        "    def kernel(x: sar.f32[n]) -> sar.f32[n]:\n"
+        "        return x * 2.0\n"
+        "    return kernel\n", {"sar": sar}, namespace)
+    kernel = namespace["make_kernel"](8)
+    assert "tensor<8xf32>" in kernel.to_mlir()
+
+
+def test_postponed_annotations_prefer_the_kernel_module_globals():
+    """A foreign wrapper's locals must not shadow the module globals the
+    kernel's annotations were written against."""
+    module_ns = {"sar": sar, "N": 4}
+    exec(
+        "from __future__ import annotations\n"
+        "def kernel(x: sar.f32[N]) -> sar.f32[N]:\n"
+        "    return x * 2.0\n", module_ns)
+
+    def wrap(fn):
+        N = 999  # noqa: F841 -- must not leak into the annotation
+        return sar.func(fn)
+
+    kernel = wrap(module_ns["kernel"])
+    assert "tensor<4xf32>" in kernel.to_mlir()
+
+
+def test_integer_parameters_reject_float_truncation():
+    """Integer-valued DSL parameters must not silently truncate floats."""
+
+    @sar.func
+    def broadcast_bad(x: sar.f32[4]) -> sar.f32[2, 4]:
+        return sar.broadcast(x, (2.5, 4), dim=1)
+
+    with pytest.raises(TraceError, match="integer"):
+        broadcast_bad.to_mlir()
+
+    @sar.func
+    def pad_bad(x: sar.f32[4, 4]) -> sar.f32[5, 5]:
+        return sar.pad(x, ((0.5, 1), (0, 0)))
+
+    with pytest.raises(TraceError, match="integer"):
+        pad_bad.to_mlir()
+
+    @sar.func
+    def interp_bad(x: sar.c64[4, 4]) -> sar.c64[4, 4]:
+        positions = sar.broadcast(np.arange(4, dtype=np.float64), (4, 4),
+                                  dim=1)
+        return sar.interp1d(x, positions, taps=4.5)
+
+    with pytest.raises(TraceError, match="integer"):
+        interp_bad.to_mlir()
 
 
 def test_generic_kernel_dtype_errors_are_specific():
@@ -390,6 +462,32 @@ def test_renaming_a_traced_kernel_invalidates_its_ir():
     text = original.to_mlir()
     assert "func.func @renamed" in text
     assert "func.func @original" not in text
+
+
+_INVALID_KERNEL_NAMES = ("with.dot", "with$dollar", "名字", "a-b", "",
+                         "9starts_with_digit")
+
+
+@pytest.mark.parametrize("name", _INVALID_KERNEL_NAMES)
+def test_kernel_names_use_one_portable_abi_identifier(name):
+
+    @sar.func
+    def kernel(x: sar.f32[4]) -> sar.f32[4]:
+        return x
+
+    with pytest.raises(TraceError, match="portable identifier"):
+        kernel.name = name
+
+
+@pytest.mark.parametrize("name", ["sar_rt_fft_2d_c64", "_mlir_ciface_kernel"])
+def test_kernel_names_reject_runtime_abi_prefixes(name):
+
+    @sar.func
+    def kernel(x: sar.f32[4]) -> sar.f32[4]:
+        return x
+
+    with pytest.raises(TraceError, match="reserved runtime ABI prefix"):
+        kernel.name = name
 
 
 def test_explicit_retrace_invalidates_compiled_launchers():

@@ -53,7 +53,8 @@ std::unique_ptr<Pass> createLegalizeDataflowPass();
 std::unique_ptr<Pass> createPlaceDataflowBufferPass(
     unsigned threshold = 1024, unsigned bramBytes = 9907200,
     unsigned uramBytes = 37748736, unsigned lutramBytes = 2883584,
-    unsigned lutramMaxBytes = 64, bool rebalanceOnly = false,
+    unsigned lutramMaxBytes = 64, unsigned bramBlockBytes = 4608,
+    unsigned uramBlockBytes = 36864, bool rebalanceOnly = false,
     bool allowDram = true);
 std::unique_ptr<Pass> createCreateTokenStreamPass();
 std::unique_ptr<Pass> createConvertDataflowToFuncPass();
@@ -86,6 +87,8 @@ std::unique_ptr<Pass> createArrayPartitionPass(unsigned lutramMaxBits = 512,
                                                unsigned lutramBytes = 0,
                                                unsigned bramBytes = 9907200,
                                                unsigned uramBytes = 37748736,
+                                               unsigned bramBlockBytes = 4608,
+                                               unsigned uramBlockBytes = 36864,
                                                unsigned maxFactor = 32);
 std::unique_ptr<Pass> createLoopPipeliningPass(unsigned maxUnrolledOps = 4096,
                                                unsigned maxUnrollFactor = 32);

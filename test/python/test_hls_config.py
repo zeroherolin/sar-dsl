@@ -101,6 +101,13 @@ def test_naming_a_part_derives_every_budget_from_it():
         assert config.provenance[key] == HLSConfig.DERIVED, key
 
 
+def test_part_without_uram_carries_its_primitive_geometry():
+    config = HLSConfig.resolve({"part": "xc7z020-clg400-1"})
+    assert config.uram_bytes == 0
+    assert config.bram_block_bytes == 4608
+    assert config.uram_block_bytes == 0
+
+
 def test_utilization_scales_what_the_part_implies():
     """The percentage is how much of the device the design may claim; the
     sizing itself stays the device's."""
@@ -135,15 +142,66 @@ def test_stated_budgets_are_used_as_written():
         assert config.provenance[key] == HLSConfig.FROM_OPTIONS
 
 
-def test_naming_a_part_and_a_budget_together_is_refused():
-    """The two modes are alternatives, not a ranking.
-
-    A part says the budgets are the device's and a budget says they are the
-    caller's; honouring one of the two would plan against a device that is
-    partly each, which is the mismatch this resolution prevents.
-    """
-    with pytest.raises(HLSConfigError, match="two ways to say the same"):
+def test_naming_a_part_with_partial_budgets_is_refused():
+    """A target plus only part of its resource contract is ambiguous."""
+    with pytest.raises(HLSConfigError, match="only some resource budgets"):
         HLSConfig.resolve({"part": "xczu9eg-ffvb1156-2-e", "bram_bytes": 4096})
+
+
+def test_tabulated_part_accepts_complete_explicit_budgets():
+    stated = {
+        "part": "xczu9eg-ffvb1156-2-e",
+        "bram_bytes": 1 << 20,
+        "uram_bytes": 0,
+        "lutram_bytes": 1 << 16,
+        "dsp": 100,
+        "ff": 1000,
+        "lut": 1000,
+    }
+    config = HLSConfig.resolve(stated)
+    assert config.budget_mode == "explicit"
+    assert config.bram_block_bytes == 4608
+    assert config.uram_block_bytes == 36864
+    for key in ("bram_bytes", "uram_bytes", "lutram_bytes", "dsp", "ff",
+                "lut"):
+        assert config[key] == stated[key]
+
+
+def test_untabulated_part_accepts_a_complete_resource_contract():
+    config = HLSConfig.resolve({
+        "part": "xcvu5p-flva2104-1-e",
+        "bram_bytes": 1 << 20,
+        "uram_bytes": 0,
+        "lutram_bytes": 1 << 16,
+        "dsp": 100,
+        "ff": 1000,
+        "lut": 1000,
+        "bram_block_bytes": 4608,
+        "uram_block_bytes": 36864,
+    })
+    assert config.budget_mode == "explicit"
+    assert config.part == "xcvu5p-flva2104-1-e"
+    assert config.resource_contract()["primitive_bytes"] == {
+        "bram": 4608,
+        "uram": 36864,
+    }
+    assert config.resource_contract()["memory_budget_primitives"] == {
+        "bram": (1 << 20) // 4608,
+        "uram": 0,
+    }
+
+
+def test_untabulated_part_needs_explicit_primitive_geometry():
+    with pytest.raises(HLSConfigError, match="primitive geometry"):
+        HLSConfig.resolve({
+            "part": "xcvu5p-flva2104-1-e",
+            "bram_bytes": 1 << 20,
+            "uram_bytes": 0,
+            "lutram_bytes": 1 << 16,
+            "dsp": 100,
+            "ff": 1000,
+            "lut": 1000,
+        })
 
 
 def test_utilization_without_a_part_is_refused():
@@ -165,6 +223,13 @@ def test_the_shipped_defaults_need_no_options_at_all():
     for key in ("bram_bytes", "uram_bytes", "lutram_bytes", "dsp", "ff",
                 "lut"):
         assert config.provenance[key] == str(shipped_config_path()), key
+
+
+def test_partial_budget_override_keeps_the_shipped_target_explicit():
+    config = HLSConfig.resolve({"bram_bytes": 4096})
+    assert config.budget_mode == "override"
+    assert config.part == "xcvu13p-fhgb2104-2-i"
+    assert config.bram_bytes == 4096
 
 
 def test_resolved_config_reads_as_a_mapping():
@@ -197,6 +262,39 @@ def test_config_file_overrides_the_shipped_defaults(tmp_path):
     # Keys the file leaves out keep the shipped default.
     assert config.uram_bytes == 37748736
     assert str(path) in config.sources
+
+
+def test_a_copy_of_the_shipped_file_behaves_like_the_defaults(tmp_path):
+    """Restated defaults are no-ops: a verbatim copy of hls_config.yaml
+    must resolve exactly like no file at all."""
+    path = tmp_path / "copy.yaml"
+    path.write_text(shipped_config_path().read_text())
+
+    config = HLSConfig.resolve({"config": str(path)})
+    assert config.budget_mode == "shipped"
+    assert config.as_dict() == HLSConfig.resolve().as_dict()
+
+
+def test_config_file_utilization_rescales_its_named_part(tmp_path):
+    """A copy edited to a new percentage keeps its part statement and
+    derives the budgets that part implies."""
+    path = tmp_path / "half.yaml"
+    path.write_text(shipped_config_path().read_text().replace(
+        "utilization: 80", "utilization: 50"))
+
+    config = HLSConfig.resolve({"config": str(path)})
+    assert config.budget_mode == "derived"
+    assert config.bram_bytes == budgets_for(config.part, 0.5)["bram_bytes"]
+
+
+def test_derived_primitive_geometry_rejects_a_disagreeing_override():
+    """Naming a part derives its geometry; a stated size may only restate
+    it, never be silently replaced."""
+    with pytest.raises(HLSConfigError, match="disagrees with part"):
+        HLSConfig.resolve({
+            "part": "xczu9eg-ffvb1156-2-e",
+            "uram_block_bytes": 1,
+        })
 
 
 def test_env_var_names_a_config_file(tmp_path, monkeypatch):
@@ -454,7 +552,7 @@ def recorded_commands(monkeypatch):
     # actually run in is not `sar.backends.hls.compiler`.
     module = sys.modules[sar.get_backend("hls").__module__]
 
-    # A cache hit skips the tools, and with them the point of the test.
+    # Disable cache reads so the test observes the tool commands.
     monkeypatch.setenv("SAR_DSL_DISABLE_CACHE", "1")
     commands = []
     real = module.run_tool
@@ -527,11 +625,81 @@ def test_configuration_reaches_the_tool_options(recorded_commands):
     # The LUT-bank threshold is derived rather than frozen as a pass
     # default, and arrives in bytes: one bus beat (512/8).
     assert "lutram-max-bytes=64" in hls
+    assert "bram-block-bytes=4608" in hls
+    assert "uram-block-bytes=36864" in hls
     assert "array-partition-max-factor=8" in hls
 
     assert "-axi-bus-bits=512" in emit
     assert "-axi-max-burst-length=64" in emit
     assert "-axi-max-outstanding=16" in emit
+
+
+@requires_hls
+def test_explicit_unlisted_target_reaches_tcl_and_manifest(tmp_path):
+
+    @sar.func
+    def scale(x: sar.f32[8]) -> sar.f32[8]:
+        return x * 2.0
+
+    design = scale.compile(backend="hls",
+                           options={
+                               "part": "xcvu5p-flva2104-1-e",
+                               "bram_bytes": 1 << 20,
+                               "uram_bytes": 0,
+                               "lutram_bytes": 1 << 16,
+                               "dsp": 100,
+                               "ff": 1000,
+                               "lut": 1000,
+                               "bram_block_bytes": 4608,
+                               "uram_block_bytes": 36864,
+                           })
+    script = design.write_synthesis_script(tmp_path).read_text()
+    assert "set_part xcvu5p-flva2104-1-e" in script
+    manifest = json.loads((tmp_path / "design_manifest.json").read_text())
+    contract = manifest["resource_contract"]
+    assert contract["target_part"] == "xcvu5p-flva2104-1-e"
+    assert contract["budget_mode"] == "explicit"
+    assert contract["primitive_bytes"]["bram"] == 4608
+
+
+def test_explicit_budgets_cannot_exceed_tabulated_device():
+    with pytest.raises(HLSConfigError, match="exceed part.*device maximum"):
+        HLSConfig.resolve({
+            "part": "xc7z020-clg400-1",
+            "bram_bytes": 1 << 30,
+            "uram_bytes": 0,
+            "lutram_bytes": 1 << 30,
+            "dsp": 10_000,
+            "ff": 10_000_000,
+            "lut": 10_000_000,
+        })
+
+
+def test_default_part_budget_overrides_cannot_exceed_device():
+    with pytest.raises(HLSConfigError,
+                       match="overrides exceed the shipped part"):
+        HLSConfig.resolve({"dsp": 1_000_000})
+
+
+@requires_hls
+@pytest.mark.parametrize("part,uram_block", [
+    ("xc7z020-clg400-1", 0),
+    ("xczu9eg-ffvb1156-2-e", 36864),
+])
+def test_tabulated_family_geometry_reaches_hls_pipeline(
+        part, uram_block, tmp_path):
+
+    @sar.func
+    def scale(x: sar.f32[64]) -> sar.f32[64]:
+        return x * 2.0
+
+    scale.name = "family_geometry"
+    out = scale.dump_pipeline(tmp_path / part,
+                              backend="hls",
+                              options={"part": part})
+    manifest = json.loads((out / "pipeline_manifest.json").read_text())
+    assert manifest["options"]["bram_block_bytes"] == 4608
+    assert manifest["options"]["uram_block_bytes"] == uram_block
 
 
 @requires_hls
@@ -604,9 +772,8 @@ def test_kernel_name_must_also_be_a_cpp_identifier():
     def scale(x: sar.f32[4]) -> sar.f32[4]:
         return x * 2.0
 
-    scale.name = "valid.mlir"
-    with pytest.raises(HLSConfigError, match="valid C\\+\\+ identifier"):
-        scale.compile(backend="hls")
+    with pytest.raises(sar.TraceError, match="portable identifier"):
+        scale.name = "valid.mlir"
 
 
 def _axi_shape(source):
@@ -672,8 +839,7 @@ def test_configured_buffering_bounds_the_outstanding_bursts():
 
 @requires_hls
 def test_env_var_config_reaches_the_emitted_design(tmp_path, monkeypatch):
-    """A project-wide config file is worth nothing if the artifact cache
-    hands back a design compiled against another one."""
+    """A project-wide config file must participate in the artifact key."""
     n = 512
     path = tmp_path / "narrow.yaml"
     path.write_text("axi_bus_bits: 128\n")
@@ -723,11 +889,13 @@ def test_tier_budgets_steer_placement():
     # the block RAM cap is raised to hold what URAM no longer may.
     starved = corner_turn.compile(backend="hls",
                                   options={
-                                      **common, "uram_bytes": 0,
-                                      "bram_bytes": 1 << 26
+                                      **common, "uram_bytes":
+                                      0,
+                                      "bram_bytes":
+                                      budgets_for("xcvu13p-fhgb2104-2-i",
+                                                  1.0)["bram_bytes"]
                                   }).source()
 
-    import re
     from collections import Counter
     a = Counter(re.findall(r"impl=(\w+)", plentiful))
     b = Counter(re.findall(r"impl=(\w+)", starved))

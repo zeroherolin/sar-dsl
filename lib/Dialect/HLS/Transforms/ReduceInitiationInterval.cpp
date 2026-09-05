@@ -68,8 +68,6 @@ static bool findCommutativeChain(Operation *op, AffineWriteOpInterface store,
 /// Moves loop-invariant heads ahead of the carried value in an associative
 /// integer/index chain. This shortens the recurrence without reordering the
 /// heads or changing floating-point evaluation.
-
-/// "opsToMove" contains the operations to be moved along the "chain".
 static bool optimizeCommutativeChain(SmallVectorImpl<Operation *> &headOps,
                                      SmallVectorImpl<Operation *> &chainOps,
                                      PatternRewriter &rewriter) {

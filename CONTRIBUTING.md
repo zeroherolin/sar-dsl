@@ -40,7 +40,6 @@ CI runs the same hooks on pull requests and the main branch.
 - **Tests are mandatory.** Dialect/lowering changes need lit coverage under `test/Dialect` / `test/Conversion`; user-visible behavior needs pytest coverage under `test/python`. Numerical kernels are validated against NumPy references with explicit tolerances. Changes to the Stockham or Bluestein lowering must also be checked numerically on CPU through `--sar-affine-to-llvm-pipeline` (see `test/python/test_hls_flow.py`), since that path is what the HLS backend emits from.
 - **Every backend runs every kernel.** The DSL must not grow a construct that only one backend can lower; `test/python/test_backend_symmetry.py` is the gate.
 - **Folds must be bit-exact.** Rewrites that can change floating-point results (even by one ULP) do not belong in canonicalization.
-- **Keep the [CHANGELOG](CHANGELOG.md) accurate** when user-visible behavior changes.
 
 ## Adding functionality
 

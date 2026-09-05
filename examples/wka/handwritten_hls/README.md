@@ -35,7 +35,7 @@ The design rests on:
 
 At 256 × 256, the C++ result also agrees with the main example's `WKAProcessor` to `2.93e-7` NRMSE (correlation `0.99999999999996`). This cross-check prevents the standalone reference and the main project reference from drifting together unnoticed.
 
-The comparison fixes external and numerical contracts, not internal parallelism. Generated WKA uses eight FFT row lanes; the hand-written baseline uses sixteen while remaining inside the same device budget. That is an intentional microarchitecture choice, reflected in each row's resource count, not a hidden input or precision difference.
+The comparison fixes external and numerical contracts rather than internal parallelism. Generated WKA uses eight FFT row lanes; the hand-written baseline uses sixteen. The resource table includes this microarchitecture difference.
 
 ## Source layout
 
@@ -65,7 +65,7 @@ make reports          # collect XML summaries
 
 `make luts` regenerates `generated/wka_luts.h`. Build products go under `work/`; generated test vectors and report collections go under `reports/`.
 
-The production C-simulation reads the shared `examples/data/alos_raw_16384x16384.bin`. The dataset is intentionally not included; use the [shared extractor](../../data/extract_alos.py) to create it from the ALOS CEOS product.
+The production C-simulation reads the shared `examples/data/alos_raw_16384x16384.bin`. Download and unpack the matching [ALPSRP275140740-L1.0 ALOS-1 product from ASF DAAC](https://datapool.asf.alaska.edu/L1.0/A3/ALPSRP275140740-L1.0.zip), then use the [shared extractor](../../data/extract_alos.py) to create the raster from its CEOS image file. The expected layout and catalog link are in the [examples guide](../../README.md#alos-1-stripmap-data).
 
 ```bash
 python ../../data/extract_alos.py --input <IMG-file> \

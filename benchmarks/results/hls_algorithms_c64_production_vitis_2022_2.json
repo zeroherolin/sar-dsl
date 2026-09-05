@@ -164,6 +164,10 @@
     8192,
     8192
    ],
+   "output_shape": [
+    16384,
+    16384
+   ],
    "dtype": "c64",
    "interface": "axi",
    "fft_parallel_rows": 0,

@@ -30,7 +30,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from algorithms import ALL, LABELS, load  # noqa: E402
-from provenance import environment  # noqa: E402
+from provenance import check_result_preconditions  # noqa: E402
+from provenance import result_environment  # noqa: E402
 
 import sar  # noqa: E402
 
@@ -139,7 +140,10 @@ def main() -> None:
     parser.add_argument("--vitis-hls", default="vitis_hls")
     parser.add_argument("--vitis-timeout", type=float, default=1800.0)
     parser.add_argument("--json", help="write machine-readable results here")
+    parser.add_argument("--allow-dirty", action="store_true")
     args = parser.parse_args()
+    if args.json:
+        check_result_preconditions(args.allow_dirty)
     dtype = sar.c128 if args.dtype == "c128" else sar.c64
 
     if args.keep_dir:
@@ -206,7 +210,7 @@ def main() -> None:
         context.cleanup()
     if args.json:
         payload = {
-            "environment": environment(),
+            "environment": result_environment(args.allow_dirty),
             "benchmark": "cross_backend_accuracy",
             "command": [sys.executable, *sys.argv],
             "scene_size": args.n,

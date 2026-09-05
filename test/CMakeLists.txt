@@ -24,7 +24,7 @@ set_target_properties(check-sar-lit PROPERTIES FOLDER "Tests")
 
 # The Python suite covers the frontend, the backend drivers and the emitted
 # designs, none of which lit reaches. Register it so `check-sar` is the whole
-# story and a lit-only run cannot be mistaken for one.
+# coverage; a lit-only run is reported separately.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
   add_custom_target(check-sar-python

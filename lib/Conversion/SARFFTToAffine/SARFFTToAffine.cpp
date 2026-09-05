@@ -674,13 +674,13 @@ private:
     };
     // Only the transfer blocks bank their element dimension, and only as
     // far as their sweep needs (see `transferBanks`). The butterfly scratch
-    // keeps one bank per lane: a radix-4 stage writes sixteen values per
-    // lane per iteration, so at the unrolled lane count the write demand
-    // exceeds what any cyclic factor can serve from two-port blocks -- the
-    // achieved II of 2 is that density, not a bank conflict. Measured on
-    // the omega-K engine at 1024, banking the scratch as well leaves the II
-    // unchanged and costs 28% more block RAM. The lanes absorb the II
-    // instead.
+    // keeps one bank per lane: a radix-4 stage writes four scalars per
+    // plane per lane each iteration (the matching reads land on the
+    // previous slot), so the writes alone occupy both ports of the bank
+    // for two cycles -- the achieved II of 2 is that density, not a bank
+    // conflict. Measured on the omega-K engine at 1024, banking the
+    // scratch as well leaves the II unchanged and costs 28% more block
+    // RAM. The lanes absorb the II instead.
     // A slow-axis sweep widens over adjacent lines, so complete lane banking
     // is sufficient. Banking its element dimension as well only fragments
     // the line storage without serving a concurrent access.

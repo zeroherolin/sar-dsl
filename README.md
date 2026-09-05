@@ -2,31 +2,153 @@
 
 # SAR-DSL — An MLIR compiler for synthetic aperture radar imaging
 
-[![CI](https://github.com/zeroherolin/sar-dsl/actions/workflows/ci.yml/badge.svg)](https://github.com/zeroherolin/sar-dsl/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml) [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](CMakeLists.txt) [![LLVM/MLIR 22](https://img.shields.io/badge/LLVM%2FMLIR-22-orange.svg)](https://mlir.llvm.org/) [![Backends](https://img.shields.io/badge/backends-cpu%20%7C%20hls-8a2be2.svg)](docs/backends.md) [![Vitis HLS 2022.2](https://img.shields.io/badge/Vitis%20HLS-2022.2-brightgreen.svg)](docs/backends.md) [![Platform](https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey.svg)](#getting-started)
+[![CI](https://github.com/zeroherolin/sar-dsl/actions/workflows/ci.yml/badge.svg)](https://github.com/zeroherolin/sar-dsl/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml) [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](CMakeLists.txt) [![LLVM/MLIR 22](https://img.shields.io/badge/LLVM%2FMLIR-22-orange.svg)](https://mlir.llvm.org/) [![Backends](https://img.shields.io/badge/backends-cpu%20%7C%20hls-8a2be2.svg)](docs/backends.md) [![Vitis HLS 2022.2](https://img.shields.io/badge/Vitis%20HLS-2022.2-brightgreen.svg)](docs/backends.md) [![Platform](https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey.svg)](#build-and-test)
 
-Express complete SAR imaging pipelines in Python with whole-array operations such as FFTs, phase transforms, interpolation, and corner turns, then compile the same statically specialized program to native CPU code or synthesizable Vitis HLS C++.
+Express a complete SAR processing chain in Python and specialize the same program for native CPU execution or synthesizable Vitis HLS C++.
 
-<img src="examples/wka/assets/san_francisco_wka.png" width="72%" alt="San Francisco Bay, ALOS-1 raw echoes focused by the SAR-DSL omega-K kernel"/>
+<img src="examples/wka/assets/san_francisco_wka.png" width="86%" alt="ALOS-1 San Francisco Bay scene focused by the SAR-DSL omega-K example"/>
 
-_San Francisco Bay: a 16384 × 16384 ALOS-1 scene focused by the SAR-DSL omega-K kernel._
+_ALOS-1 San Francisco Bay scene focused by the omega-K chain._
 
 </div>
 
-## Highlights
+## Abstract
 
-- **One language, two backends.** Every public DSL construct lowers through both the native CPU and Vitis HLS paths; backend-specific language operators are prohibited by the symmetry tests.
-- **Signal-processing structure survives tracing.** FFTs, phase transforms, interpolation, reductions, and layout changes remain explicit in MLIR for whole-graph scheduling and memory planning.
-- **Extensible in Python.** `@sar.op` builds reusable operators from the same primitives available to kernels. One definition runs eagerly with NumPy and traces into compiled kernels.
-- **Complete imaging chains.** Four examples exercise the language and both backends end to end:
+SAR-DSL traces whole-array signal-processing programs into a compact `sar` MLIR dialect. FFTs, interpolation, reductions, phase transforms, layout changes, gathers, and compiled loops remain explicit long enough for fusion, memory planning, and target-specific scheduling. The language is backend-neutral: one statically shaped program feeds both the CPU and HLS paths.
 
-| Algorithm | Imaging mode | Main operations |
-| --- | --- | --- |
-| [Omega-K](examples/wka/) | stripmap | matched filtering, Stolt interpolation |
-| [Range-Doppler](examples/rda/) | stripmap | range compression, RCMC |
-| [Chirp Scaling](examples/csa/) | stripmap | phase-only range migration correction |
-| [Polar Format](examples/pfa/) | spotlight | polar resampling, SVA |
+| Layer | Role |
+| --- | --- |
+| Python DSL | NumPy-style tensors, reusable `@sar.op` compositions, static shape and dtype specialization |
+| Shared IR | Domain verification, FFT/interpolation semantics, precision rules, layout and loop contracts |
+| CPU backend | Linalg, bufferization, OpenMP, LLVM, and a reusable FFT/interpolation runtime |
+| HLS backend | Split-complex affine loops, on-chip/external placement, banking, AXI interfaces, and Vitis HLS source generation |
 
-SAR-DSL is a research compiler rather than an FPGA deployment stack. The repository validates native execution, generated C-simulation, and Vitis HLS synthesis; Vivado implementation, board drivers, and on-device benchmarking are outside its scope.
+## Imaging chains
+
+The repository contains four complete chains, each with a SAR-DSL kernel and an independent NumPy reference.
+
+| Algorithm | Collection | Main operations | Example |
+| --- | --- | --- | --- |
+| Omega-K (WKA) | stripmap | range/azimuth FFTs, bulk compression, Stolt interpolation | [WKA](examples/wka/) |
+| Range-Doppler (RDA) | stripmap | range compression, RCMC, azimuth compression | [RDA](examples/rda/) |
+| Chirp Scaling (CSA) | stripmap | FFTs and phase-only range migration correction | [CSA](examples/csa/) |
+| Polar Format (PFA) | spotlight | polar regridding and spatially variant apodization | [PFA](examples/pfa/) |
+
+<div align="center">
+<table width="86%">
+<tr>
+<td align="center" width="50%"><img src="examples/wka/assets/wka_synthetic_512.png" width="100%" alt="Synthetic point-target image focused with omega-K"/><br/><b>Omega-K</b></td>
+<td align="center" width="50%"><img src="examples/rda/assets/rda_synthetic_512.png" width="100%" alt="Synthetic point-target image focused with Range-Doppler"/><br/><b>Range-Doppler</b></td>
+</tr>
+<tr>
+<td align="center" width="50%"><img src="examples/csa/assets/csa_synthetic_512.png" width="100%" alt="Synthetic point-target image focused with Chirp Scaling"/><br/><b>Chirp Scaling</b></td>
+<td align="center" width="50%"><img src="examples/pfa/assets/pfa_synthetic_512.png" width="100%" alt="Synthetic point-target image focused with Polar Format and SVA"/><br/><b>Polar Format + SVA</b></td>
+</tr>
+</table>
+
+_512 × 512 synthetic point-target scenes produced by the checked-in CPU examples._
+</div>
+
+The stripmap kernels also process the same 16384 × 16384 ALOS-1 acquisition used by the independent hand-written WKA reference.
+
+<div align="center">
+<table width="100%">
+<tr>
+<td align="center" width="33%"><img src="examples/wka/assets/san_francisco_wka.png" width="100%" alt="ALOS-1 San Francisco Bay scene focused with omega-K"/><br/><b>Omega-K</b></td>
+<td align="center" width="33%"><img src="examples/rda/assets/san_francisco_rda.png" width="100%" alt="ALOS-1 San Francisco Bay scene focused with Range-Doppler"/><br/><b>Range-Doppler</b></td>
+<td align="center" width="33%"><img src="examples/csa/assets/san_francisco_csa.png" width="100%" alt="ALOS-1 San Francisco Bay scene focused with Chirp Scaling"/><br/><b>Chirp Scaling</b></td>
+</tr>
+</table>
+
+_ALOS-1 San Francisco Bay focused images from the ASF DAAC granule described below._
+</div>
+
+## Compiler architecture
+
+<div align="center">
+<img src="docs/assets/how_it_works.png" width="86%" alt="Compilation flow from Python through the shared SAR MLIR dialect to CPU and Vitis HLS backends"/>
+</div>
+
+The frontend serializes textual MLIR and does not require compiled MLIR Python bindings. `sar-opt` verifies and transforms the module; `sar-translate` emits target source. The CPU and HLS pipelines share the frontend and domain dialect, then diverge at target-specific lowering, memory planning, and scheduling.
+
+See [Architecture](docs/architecture.md) for design rationale and [Dialect reference](docs/dialect.md) for operation and pass contracts.
+
+## Image quality
+
+The examples are checked against NumPy references and point-target metrics. The stripmap chains reproduce the expected Hann response; PFA additionally demonstrates spatially variant apodization.
+
+<div align="center">
+<table width="100%">
+<tr>
+<td width="58%"><img src="benchmarks/assets/cpu_point_target_response.png" width="100%" alt="Point-target impulse-response cuts for the stripmap chains"/></td>
+<td width="42%"><img src="benchmarks/assets/cpu_pfa_sva_response.png" width="100%" alt="Polar Format impulse response before and after spatially variant apodization"/></td>
+</tr>
+</table>
+
+_Left: range and azimuth impulse-response cuts. Right: PFA range response before and after SVA._
+</div>
+
+| Chain | IRW (range / azimuth) | PSLR (range / azimuth) | ISLR (range / azimuth) |
+| --- | ---: | ---: | ---: |
+| Omega-K | 2.06 / 2.06 | −38.4 / −38.4 dB | −29.0 / −31.8 dB |
+| Range-Doppler | 2.06 / 2.07 | −38.8 / −38.4 dB | −26.5 / −31.8 dB |
+| Chirp Scaling | 2.06 / 2.07 | −38.5 / −38.4 dB | −29.0 / −31.8 dB |
+
+The complete quality methodology, tolerances, PFA metrics, and precision comparison are maintained in the [benchmark report](benchmarks/README.md).
+
+## CPU performance
+
+The CPU backend emits native code with fused element-wise and layout loops. The following points are warm end-to-end runs at `c128` precision; compile time is excluded.
+
+<div align="center">
+<table width="100%">
+<tr>
+<td width="50%"><img src="benchmarks/assets/cpu_throughput.png" width="100%" alt="CPU throughput versus scene size"/></td>
+<td width="50%"><img src="benchmarks/assets/cpu_speedup.png" width="100%" alt="CPU speedup over the NumPy reference versus scene size"/></td>
+</tr>
+</table>
+
+_Throughput and speedup are redrawn from the versioned CPU measurement record._
+</div>
+
+| Chain | Input → output | SAR-DSL CPU | NumPy reference | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Omega-K | 16384² → 16384² | 3.684 s | 186.53 s | 50.6× |
+| Range-Doppler | 16384² → 16384² | 3.911 s | 105.00 s | 26.8× |
+| Chirp Scaling | 16384² → 16384² | 2.525 s | 73.43 s | 29.1× |
+| Polar Format | 8192² → 16384² | 3.761 s | 155.43 s | 41.3× |
+
+The portable FFT/interpolation pool remains capped at 32 workers by default. On the reference dual-socket host, topology-aware placement reaches 31.13 ms for a 2048² RDA run at 120 physical workers, while one-socket SMT oversubscription reaches 172.13 ms. The isolated MKL DFTI leaf is 3.1–4.9× faster than the portable runtime; the detailed comparison is in [`cpu_numa_mkl_2026_08_27.json`](benchmarks/results/cpu_numa_mkl_2026_08_27.json).
+
+## HLS synthesis and resource use
+
+The HLS backend emits a self-contained Vitis HLS package. Complex tensors become split real/imaginary planes; FFTs and gathers become affine loops; full-size intermediates may use compiler-managed external scratch arenas while compact tables and line caches remain on chip.
+
+<div align="center">
+<img src="benchmarks/assets/hls_resource_utilization.png" width="86%" alt="HLS production design resource utilization against device budgets"/>
+
+_Synthesized production designs normalized by the configured resource budgets._
+
+<img src="benchmarks/assets/hls_budget_sweep.png" width="86%" alt="HLS resource and interface behavior across on-chip memory budgets"/>
+
+_Compiler-selected strategies across an on-chip budget sweep._
+</div>
+
+Production-scale `c64` AXI designs use the shipped `xcvu13p-fhgb2104-2-i`, a 4 ns target clock, 12.5% uncertainty, and 80% resource budgets. The three stripmap chains use ALOS-1 acquisition geometry; PFA uses its spotlight geometry.
+
+| Design | Input → output | Estimated clock | Latency time | BRAM18K | URAM | DSP | FF | LUT |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Omega-K, generated | 16384² → 16384² | 3.500 ns | 7.305 s | 1,410 | 960 | 2,668 | 767,232 | 860,085 |
+| Omega-K, hand-written | 16384² → 16384² | 3.500 ns | 5.402 s | 672 | 848 | 2,860 | 769,377 | 658,256 |
+| Range-Doppler, generated | 16384² → 16384² | 3.500 ns | 5.790 s | 1,736 | 852 | 1,453 | 686,807 | 697,239 |
+| Chirp Scaling, generated | 16384² → 16384² | 3.627 ns | 4.467 s | 1,736 | 840 | 2,024 | 593,904 | 638,714 |
+| Polar Format, generated | 8192² → 16384² | 3.500 ns | 23.395 s | 65 | 512 | 854 | 292,404 | 420,121 |
+
+All production designs fit the configured resource budgets and the 4 ns board period. CSA is recorded with a 0.127 ns timing shortfall against the 3.5 ns post-uncertainty scheduling goal; timing is reported separately from hard resource-cap violations.
+
+The measured FFT DSE identifies four parallel rows, stage grouping 2, and transfer width 4 as the balanced point for the bounded `c64` probe. The gather DSE shows that a narrow completely banked band can reduce compute II from 4 to 1, but its small `ap_memory` kernels do not model production AXI behavior; production strategy selection remains displacement- and resource-aware.
+
+The full synthesis tables, generated-package contracts, warning counts, DSE records, and provenance are in [benchmarks/](benchmarks/README.md).
 
 ## Quick example
 
@@ -38,181 +160,21 @@ def range_compress(raw, replica):
     spectrum = sar.fft(raw, axis=1) * replica
     return sar.ifft(spectrum, axis=1)
 
-# The first call specializes the kernel and executes it on the CPU.
+# Call-site arrays specialize and execute the kernel on the CPU.
 image = range_compress(raw_np, replica_np)
 
-# The same kernel can be specialized ahead of time for HLS emission.
+# The same graph can be specialized and emitted for HLS.
 design = range_compress.specialize(
     sar.c64[512, 512], sar.c64[512, 512]
 ).compile("hls", options={"interface": "axi"})
-print(design.cpp_path)
+design.write_synthesis_script("hls_project/range_compress")
 ```
 
-Kernels specialize by static shape and dtype. NumPy arrays can be captured as compile-time constants or passed as runtime arguments. See [Defining operators](docs/defining-ops.md).
+Kernels specialize by static shape and dtype. NumPy arrays may be runtime arguments or compile-time constants. See the [Python API](docs/python-api.md) and [operator guide](docs/defining-ops.md) for the language surface.
 
-## Compiler architecture
+## Build and test
 
-<div align="center">
-<img src="docs/assets/how_it_works.png" alt="Compilation flow from a Python SAR kernel through the shared SAR dialect to native CPU code and Vitis HLS C++"/>
-</div>
-
-The Python frontend serializes textual MLIR, avoiding a runtime dependency on the MLIR Python bindings while leaving authoritative verification to `sar-opt`. Both backends consume the same core operations.
-
-The CPU pipeline combines linalg fusion, bufferization, OpenMP, LLVM, and a small FFT/interpolation runtime. The HLS pipeline splits complex values into real planes, emits mixed-radix affine Stockham FFTs and bounded gathers, plans on-chip and external storage, and attaches AXI, partition, pipeline, and storage directives. It emits a declaration header, top-first implementation, testbench, manifest, and Vitis Tcl files without requiring Vitis in the user's environment.
-
-Detailed design rationale and IR contracts are in [Architecture](docs/architecture.md) and [Dialect reference](docs/dialect.md).
-
-## Evaluation
-
-Three questions, in order: does the compiler focus imagery correctly, what does the CPU backend cost against a NumPy implementation of the same algorithm, and does the generated HLS fit a real device. Benchmark runners record raw samples and environment provenance; methodology and complete reference tables are kept in [benchmarks/](benchmarks/).
-
-### Image formation
-
-Each chain focuses the same 512 × 512 synthetic three-target scene, run by the checked-in CPU examples.
-
-<div align="center">
-<table>
-<tr>
-<td align="center" valign="top" width="50%">
-<img src="examples/wka/assets/wka_synthetic_512.png" alt="omega-K focusing result"/><br/>
-<a href="examples/wka/"><b>omega-K (WKA)</b></a><br/>
-<em>exact hyperbolic model, Stolt remapping</em>
-</td>
-<td align="center" valign="top" width="50%">
-<img src="examples/rda/assets/rda_synthetic_512.png" alt="Range-Doppler focusing result"/><br/>
-<a href="examples/rda/"><b>Range-Doppler (RDA)</b></a><br/>
-<em>range-dependent RCMC + azimuth filter</em>
-</td>
-</tr>
-<tr>
-<td align="center" valign="top" width="50%">
-<img src="examples/csa/assets/csa_synthetic_512.png" alt="Chirp Scaling focusing result"/><br/>
-<a href="examples/csa/"><b>Chirp Scaling (CSA)</b></a><br/>
-<em>interpolation-free, phase multiplies only</em>
-</td>
-<td align="center" valign="top" width="50%">
-<img src="examples/pfa/assets/pfa_synthetic_512.png" alt="Polar Format focusing result"/><br/>
-<a href="examples/pfa/"><b>Polar Format (PFA) + SVA</b></a><br/>
-<em>built from Python-defined operators</em>
-</td>
-</tr>
-</table>
-</div>
-
-<div align="center">
-<img src="benchmarks/assets/cpu_point_target_response.png" width="88%" alt="CPU point-target impulse response of the three algorithms">
-
-_Range and azimuth impulse-response cuts for the three stripmap chains, measured with 32× upsampling. The dashed −31.5 dB line is the ideal Hann first-sidelobe reference, not a bound on the complete imaging chain._
-
-</div>
-
-Peak location, IRW, PSLR, and ISLR thresholds are regression-tested against the same NumPy references used for cross-backend accuracy checks.
-
-Polar format is assembled entirely from Python-defined operators, spatially variant apodization among them — it suppresses the uniform-weighting sidelobes without broadening the mainlobe, which no amplitude window can do:
-
-<div align="center">
-<img src="benchmarks/assets/cpu_pfa_sva_response.png" width="58%" alt="CPU PFA range impulse response under uniform weighting and after SVA">
-
-_PFA range cut before and after SVA. The dashed line is the −13.3 dB first sidelobe of uniform weighting._
-
-</div>
-
-### Real data
-
-The three stripmap chains focus the ALOS-1 San Francisco Bay acquisition — 16384 × 16384 raw echoes, the same collection the hand-written HLS reference implements.
-
-<div align="center">
-<table>
-<tr>
-<td align="center" valign="top" width="33%"><img src="examples/wka/assets/san_francisco_wka.png" width="100%" alt="ALOS-1 San Francisco Bay focused by omega-K"/></td>
-<td align="center" valign="top" width="33%"><img src="examples/csa/assets/san_francisco_csa.png" width="100%" alt="ALOS-1 San Francisco Bay focused by Chirp Scaling"/></td>
-<td align="center" valign="top" width="33%"><img src="examples/rda/assets/san_francisco_rda.png" width="100%" alt="ALOS-1 San Francisco Bay focused by Range-Doppler"/></td>
-</tr>
-<tr>
-<td align="center"><b>omega-K</b></td>
-<td align="center"><b>Chirp Scaling</b></td>
-<td align="center"><b>Range-Doppler</b></td>
-</tr>
-</table>
-</div>
-
-Original data © JAXA/METI; the product itself is not redistributed here. See [examples/](examples/) for the extraction step and the per-chain runners.
-
-### CPU backend performance
-
-Warm end-to-end times for the four examples, including every FFT, phase operation, interpolation and corner turn. The performance results below use `c128` precision.
-
-| Algorithm | Input → output | SAR-DSL CPU | NumPy reference | Speedup | Throughput |
-| --- | --: | --: | --: | --: | --: |
-| omega-K (WKA) | 16384² → 16384² | 3.684 s | 186.53 s | 50.6× | 72.87 Msamples/s |
-| Range-Doppler (RDA) | 16384² → 16384² | 3.911 s | 105.00 s | 26.8× | 68.63 Msamples/s |
-| Chirp Scaling (CSA) | 16384² → 16384² | 2.525 s | 73.43 s | 29.1× | 106.31 Msamples/s |
-| Polar Format (PFA) | 8192² → 16384² | 3.761 s | 155.43 s | 41.3× | 17.84 Msamples/s |
-
-<div align="center">
-<table>
-<tr>
-<td align="center" valign="top" width="50%">
-<img src="benchmarks/assets/cpu_speedup.png" width="100%" alt="Speedup of the SAR-DSL CPU backend over the NumPy reference against scene size"/><br/>
-<em>Speedup over NumPy. Fusion removes intermediate planes, so gains generally grow with scene size.</em>
-</td>
-<td align="center" valign="top" width="50%">
-<img src="benchmarks/assets/cpu_throughput.png" width="100%" alt="CPU kernel throughput against scene size, log-log"/><br/>
-<em>Absolute kernel throughput. Compile time is excluded; each point is the best of three warm runs.</em>
-</td>
-</tr>
-</table>
-</div>
-
-Each row is the best of three timed runs after three warm-ups. The reference host has 120 physical cores with two hardware threads each (240 logical CPUs). The toolchain was LLVM 22, Python 3.12.13, and NumPy 2.5.2. Compilation and first-touch allocation are excluded. Full CPU methodology and results are in [benchmarks/](benchmarks/).
-
-### HLS backend synthesis
-
-The reference HLS target is `xcvu13p-fhgb2104-2-i`, with a 4 ns board clock, an explicit 12.5% HLS uncertainty (3.5 ns scheduling budget), paired 256-bit split-complex AXI planes, and 80% device resource budgets.
-
-The stripmap synthesis results below use `c64` precision at the ALOS-1 acquisition geometry -- the collection the hand-written reference implements, so the WKA comparison measures the same problem. PFA uses its spotlight collection geometry and is reported at the same production scale separately.
-
-| Design | Input → output | Target clock | Estimated clock | Latency cycles | Latency time | C-synth time |
-| --- | --: | --: | --: | --: | --: | --: |
-| omega-K, generated | 16384² → 16384² | 4.000 ns | 3.500 ns | 1,826,362,444 | 7.305 s | 702 s |
-| omega-K, hand-written | 16384² → 16384² | 4.000 ns | 3.500 ns | 1,350,448,211 | 5.402 s | 419 s |
-| Range-Doppler, generated | 16384² → 16384² | 4.000 ns | 3.500 ns | 1,447,542,968 | 5.790 s | 578 s |
-| Chirp Scaling, generated | 16384² → 16384² | 4.000 ns | 3.627 ns | 1,116,717,166 | 4.467 s | 451 s |
-| PFA, generated | 8192² → 16384² | 4.000 ns | 3.500 ns | 5,848,664,417 | 23.395 s | 289 s |
-
-Resource counts on the reference VU13P device:
-
-| Design | Input → output | BRAM18K | URAM | DSP | FF | LUT |
-| --- | --: | --: | --: | --: | --: | --: |
-| omega-K, generated | 16384² → 16384² | 1,410 | 960 | 2,668 | 767,232 | 860,085 |
-| omega-K, hand-written | 16384² → 16384² | 672 | 848 | 2,860 | 769,377 | 658,256 |
-| Range-Doppler, generated | 16384² → 16384² | 1,736 | 852 | 1,453 | 686,807 | 697,239 |
-| Chirp Scaling, generated | 16384² → 16384² | 1,736 | 840 | 2,024 | 593,904 | 638,714 |
-| PFA, generated | 8192² → 16384² | 65 | 512 | 854 | 292,404 | 420,121 |
-
-<div align="center">
-<img src="benchmarks/assets/hls_resource_utilization.png" width="92%" alt="HLS utilization of each production design against the device resource budgets, with the hand-written omega-K baseline">
-
-_The same counts as a share of the budget each resource is constrained by. The gray bars are the independent hand-written omega-K implementation, not a fifth algorithm. UltraRAM is the binding tier for the stripmap chains; no design reaches a cap._
-
-</div>
-
-All timing values are HLS estimates, not post-place-and-route closure.
-
-Where a plane lives is the compiler's decision, not a directive the user writes. Scaling the configured BRAM, URAM and LUTRAM caps retunes local storage while the top-level interface remains stable:
-
-<div align="center">
-<img src="benchmarks/assets/hls_budget_sweep.png" width="96%" alt="AXI ports, logical local arrays and external footprint against the configured device memory caps">
-
-_Compiler-selected interfaces and logical storage as the configured device memory caps scale from 10% to 100%. The local-storage panel is emitted-array payload, not synthesized BRAM/URAM primitive utilization._
-
-</div>
-
-Methodology and per-design analysis are in the [benchmark report](benchmarks/README.md#vitis-hls-synthesis-baselines); constraints, source/header/report hashes, and derived strategies are in the [machine-readable summary](benchmarks/results/hls_algorithms_c64_production_vitis_2022_2.json).
-
-## Getting started
-
-The tested host platform is Linux x86-64. Requirements are CMake 3.20+, Ninja, a C++17 compiler, Python 3.10+, and NumPy. Matplotlib is needed only for figures; Vitis HLS is optional.
+The supported development platform is Linux x86-64. Required tools are CMake 3.20+, Ninja, a C++17 compiler, Python 3.10+, and NumPy. Vitis HLS is optional unless generated hardware packages are being simulated or synthesized.
 
 ```bash
 git clone https://github.com/zeroherolin/sar-dsl.git
@@ -220,55 +182,69 @@ cd sar-dsl
 git submodule update --init externals/llvm-project
 python -m pip install numpy matplotlib pytest
 
-make llvm      # build the pinned LLVM/MLIR toolchain
-make build     # build the compiler, runtime, and Python build config
+make llvm
+make build
 export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
-make test      # pytest and lit
+make test
 ```
 
-GitHub Actions uses the matching prebuilt LLVM 22.1.8 release and builds only SAR-DSL; the source build above remains the reproducible local development path.
-
-Frontend tracing and diagnostics can be tested without building LLVM:
+Frontend-only tests do not require LLVM:
 
 ```bash
-PYTHONPATH=python python -m pytest test/python -q
+PYTHONPATH=python python -m pytest test/python -q \
+  -m "not requires_cpu and not requires_hls and not requires_vitis"
 ```
 
-Reproducing the figures above: the imaging and impulse-response figures re-run the chains, while the summary figures redraw the checked-in measurements and need neither Vitis nor the reference host.
+Use `python -m sar doctor` to inspect tool discovery, backend availability, runtime configuration, and the artifact cache.
+
+## ALOS-1 and examples
+
+Each chain has a synthetic point-target example that runs without any external data:
 
 ```bash
-make examples                                   # the four chain images
-PYTHONPATH=python:examples python benchmarks/plot_cpu_impulse_response.py
-python benchmarks/plot_cpu_hls_results.py
+PYTHONPATH=python python examples/wka/run_point_target_cpu.py --n 512
+PYTHONPATH=python python examples/rda/run_point_target_cpu.py --n 512
+PYTHONPATH=python python examples/csa/run_point_target_cpu.py --n 512
+PYTHONPATH=python python examples/pfa/run_point_target_cpu.py --n 512
 ```
+
+The stripmap chains additionally include ALOS-1 CPU and HLS runners; PFA is a spotlight example and uses synthetic collection geometry. The real-data path uses ASF DAAC granule [`ALPSRP275140740-L1.0`](https://datapool.asf.alaska.edu/L1.0/A3/ALPSRP275140740-L1.0.zip), an ALOS PALSAR FBS HH CEOS L1.0 product covering San Francisco Bay. Open the [ASF Data Search record](https://search.asf.alaska.edu/#/?search=ALPSRP275140740-L1.0) for the catalog entry; an Earthdata login may be required. Original data is © JAXA/METI; the archive stays outside the repository under the source provider's data terms.
+
+Download and unpack the archive so `examples/data/ALPSRP275140740-L1.0/IMG-HH-ALPSRP275140740-H1.0__A` is available, extract the 16384 × 16384 complex64 raster once, then run a stripmap chain on it (the full-size scene needs tens of GiB of RAM):
+
+```bash
+unzip ~/Downloads/ALPSRP275140740-L1.0.zip -d examples/data
+PYTHONPATH=python python examples/data/extract_alos.py
+PYTHONPATH=python python examples/wka/run_alos_cpu.py
+```
+
+See [examples/](examples/) for data preparation, HLS package generation, and algorithm-specific notes. The independent [hand-written WKA implementation](examples/wka/handwritten_hls/) is a comparison design, not a compiler dependency.
 
 ## Documentation
 
 | Document | Contents |
 | --- | --- |
 | [Python API](docs/python-api.md) | Public language and compiler API |
-| [MATLAB guide](docs/matlab-users.md) | Indexing, naming, and convention mapping |
+| [Defining operators](docs/defining-ops.md) | `@sar.op`, eager execution, and specialization |
+| [MATLAB guide](docs/matlab-users.md) | Indexing and convention mapping |
 | [Architecture](docs/architecture.md) | Compiler layers and design rationale |
-| [Dialect reference](docs/dialect.md) | Operations, invariants, and passes |
-| [Defining operators](docs/defining-ops.md) | `@sar.op` and specialization |
-| [Backends](docs/backends.md) | CPU, HLS, configuration, and extension API |
-| [Benchmarks](benchmarks/README.md) | Methodology and reference measurements |
-| [Project scope](docs/scope.md) | Supported scope, known limits, and non-goals |
-| [Contributing](CONTRIBUTING.md) | Build, style, and test conventions |
+| [Dialect reference](docs/dialect.md) | Operations, invariants, and pass pipelines |
+| [Backends](docs/backends.md) | CPU/HLS use, configuration, artifacts, and extension API |
+| [Benchmarks](benchmarks/README.md) | Methodology and complete reference measurements |
+| [Project scope](docs/scope.md) | Supported scope and known limits |
+| [Contributing](CONTRIBUTING.md) | Development workflow and repository conventions |
 
 ## Repository layout
 
 ```text
 include/sar/, lib/   dialects, analyses, conversions, and pipelines
-runtime/             CPU runtime with a stable C ABI
+runtime/             native FFT/interpolation runtime and allocation hooks
 tools/               sar-opt, sar-translate, and sar-lsp-server
-python/sar/          Python language, compiler driver, and backends
+python/sar/          Python language, compiler driver, runtime, and backends
 examples/            complete WKA, RDA, CSA, and PFA programs
-benchmarks/          accuracy, quality, performance, and HLS report tools
-test/                MLIR lit tests and Python tests
+benchmarks/          measurement runners, reports, figures, and result data
+test/                MLIR lit tests and Python integration tests
 docs/                architecture, backend, dialect, and API references
-cmake/, scripts/     build configuration and the LLVM bootstrap script
-externals/           pinned llvm-project submodule
 ```
 
 ## Citation
@@ -277,4 +253,4 @@ No archival publication is associated with this repository yet. GitHub exposes t
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The compiler builds on [LLVM/MLIR](https://mlir.llvm.org/). External SAR datasets are not redistributed by this repository.
+MIT — see [LICENSE](LICENSE). The compiler builds on [LLVM/MLIR](https://mlir.llvm.org/). External SAR data is obtained separately from its source provider; the ALOS-1 download and preparation path is documented above.

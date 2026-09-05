@@ -14,7 +14,7 @@ those are not modelled here.
 Usage:
     python benchmarks/run_hls_resources.py [--algs wka rda csa pfa]
                                        [--sizes 512 4096 16384]
-                                       [--budgets 4194304]
+                                       [--budgets 8388608]
                                        [--budget-sweep [--sweep-size 512]
                                         [--sweep-steps 8]]
 """
@@ -30,7 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from algorithms import ALL, LABELS, load  # noqa: E402
 from hls_reports import parse_csynth_bundle, timing_shortfall  # noqa: E402
 from hls_reports import validate_constraints  # noqa: E402
-from provenance import environment  # noqa: E402
+from provenance import check_result_preconditions  # noqa: E402
+from provenance import result_environment  # noqa: E402
 
 from sar.backends.hls.autotune import AUTO_OPTIONS  # noqa: E402
 from sar.backends.hls.config import HLSConfig, HLSConfigError  # noqa: E402
@@ -304,7 +305,10 @@ def main() -> None:
                         nargs="+",
                         help="parse and validate Vitis *_csynth.xml reports")
     parser.add_argument("--json", help="write machine-readable results here")
+    parser.add_argument("--allow-dirty", action="store_true")
     args = parser.parse_args()
+    if args.json:
+        check_result_preconditions(args.allow_dirty)
 
     if args.reports:
         config = HLSConfig.resolve()
@@ -356,7 +360,7 @@ def main() -> None:
             Path(args.json).write_text(
                 json.dumps(
                     {
-                        "environment": environment(),
+                        "environment": result_environment(args.allow_dirty),
                         "benchmark": "vitis_csynth",
                         "command": [Path(sys.executable).name, *sys.argv],
                         "reports": reports,
@@ -386,7 +390,7 @@ def main() -> None:
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "environment": environment(),
+                        "environment": result_environment(args.allow_dirty),
                         "benchmark": "hls_budget_sweep",
                         "size": args.sweep_size,
                         "memory_budget_bytes": _DEFAULT_MEMORY_BYTES,
@@ -420,7 +424,7 @@ def main() -> None:
         Path(args.json).write_text(
             json.dumps(
                 {
-                    "environment": environment(),
+                    "environment": result_environment(args.allow_dirty),
                     "benchmark": "hls_resources",
                     "command": [Path(sys.executable).name, *sys.argv],
                     "results": results,

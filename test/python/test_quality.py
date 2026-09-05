@@ -4,9 +4,10 @@ Locks in the focusing quality measured by `benchmarks/run_cpu_quality.py` so a
 lowering or numerics regression shows up as a failing bound rather than a
 slightly blurrier picture.
 
-Bounds sit roughly 1.5 dB / 0.1 samples below the values measured at
-N = 256, which is tight enough to catch a real regression and loose enough
-to absorb last-bit variation between toolchains. The reference points:
+Bounds carry roughly 1.5 dB / 0.1 samples of margin over the values
+measured at N = 256, which is tight enough to catch a real regression
+and loose enough to absorb last-bit variation between toolchains. The
+reference points:
 
   * Hann theory line is IRW = 1.44 bins / 0.70 = 2.06 samples; the chains
     measure 2.09..2.13.

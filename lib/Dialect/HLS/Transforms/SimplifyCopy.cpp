@@ -113,7 +113,7 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
 
     // If the source buffer has writers dominating the copy and the target
     // buffer has users dominating the copy, the copy cannot be eliminated.
-    // Meanwhile, as long as the target buffer has users dominating the copy,
+    // Meanwhile, as long as the target buffer has writers dominating the copy,
     // return failure.
     if ((hasWriteUsers(sourceDomUsers) && !targetDomUsers.empty()) ||
         hasWriteUsers(targetDomUsers))
@@ -168,7 +168,7 @@ struct SimplifyBufferCopy : public OpRewritePattern<memref::CopyOp> {
         (!targetView || llvm::all_of(sourceUsers, [&](Operation *user) {
           return domInfo.dominates(targetView, user);
         }))) {
-      // If the source buffer has initial value, the value must be pertained
+      // If the source buffer has initial value, the value must be preserved
       // by the target buffer after the replacement, so there are some
       // additional conditions here to check.
       if (sourceBuf.getInitValue()) {

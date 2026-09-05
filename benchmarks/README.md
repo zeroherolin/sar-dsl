@@ -5,6 +5,7 @@
 | `algorithms.py` | Registry of the benchmarked imaging chains (setup, run, reference) |
 | `metrics.py` | Point-target metrics: IRW / PSLR / ISLR (also used by `test/python/test_quality.py`) |
 | `run_cpu_performance.py` | CPU timing and throughput-N curves against the NumPy references; reports cold and warm separately |
+| `run_cpu_fft_baseline.py` | Batched FFT leaf comparison against NumPy pocketfft and optional system MKL DFTI, with explicit thread controls |
 | `run_cpu_hls_accuracy.py` | CPU and generated-design accuracy against the same NumPy reference; `hls_csim` is used when Vitis HLS is installed, otherwise `portable_cpp_sim` |
 | `run_cpu_quality.py` | CPU image-quality table |
 | `run_cpu_precision.py` | CPU single-precision image-quality comparison for all four chains |
@@ -34,6 +35,10 @@ PYTHONPATH=python python3 benchmarks/run_hls_sweep.py \
 PYTHONPATH=python python3 benchmarks/plot_cpu_impulse_response.py
 python3 benchmarks/plot_cpu_hls_results.py
 ```
+
+Runners that write machine-readable measurements refuse a dirty worktree by default. Commit or stash source changes before recording publishable results. For a non-release measurement, pass `--allow-dirty`; the output then records `git_dirty: true` and a `git_diff_sha256` covering tracked diffs and untracked source files.
+
+CPU performance JSON includes every timing sample plus best, mean, median, p95 and sample standard deviation. Environment provenance records the process affinity count alongside the host CPU/thread variables.
 
 ## Precision
 
@@ -122,15 +127,21 @@ The two structures that decide the generated latency are the corner turn and the
 
 #### What the on-chip budget actually buys
 
-The backend buys full-beat transfers first, then line parallelism, and keeps the Stockham stage chain shallow rather than spending memory on stage slots that do not remove external traffic. Stage grouping may use half of the block tiers; lane-parallel line buffers may use five eighths because they remove complete row iterations. Final banking is charged in whole primitives and rebalanced between BRAM and URAM before either hard cap is checked. This is why the 8-lane WKA engine fits the 80% device budget without narrowing its 256-bit per-plane transfers.
+The backend buys full-beat transfers first, then line parallelism, and keeps the Stockham stage chain shallow rather than spending memory on stage slots that do not remove external traffic. Stage grouping may use half of the block tiers; lane-parallel line buffers may use five eighths because they remove complete row iterations. Final banking is charged in whole primitives and rebalanced between BRAM and URAM before either hard cap is checked. The configured AXI maximum is 512 bits; each physical port may be narrower when its contiguous access width requires it, as recorded in the design manifest.
 
-The machine-readable result records warning counts by Vitis diagnostic code. The remaining performance diagnostics are chiefly memory-port II limits in the interpolation and FFT line buffers; RTL dangling-port notices describe unused directions of hierarchical AXI masters, not extra top-level bundles.
+The machine-readable result records warning counts by Vitis diagnostic code.
 
 ![HLS utilization against the device budgets](assets/hls_resource_utilization.png)
 
 The same counts as a share of the budget each resource is constrained by, which is the only common axis the five have: they differ by four orders of magnitude in absolute terms. The gray bars are the hand-written omega-K implementation. UltraRAM binds the stripmap chains -- the compiler places full-size planes there first -- while no design comes near the arithmetic or fabric caps. Redraw it from this file's data with `benchmarks/plot_cpu_hls_results.py`.
 
 Constraints and provenance are in the [`machine-readable summary`](results/hls_algorithms_c64_production_vitis_2022_2.json).
+
+### Design-space exploration
+
+The [bounded FFT synthesis DSE](results/hls_fft_dse_c64_n128_vitis_2022_2.json) characterizes the transform controls: four parallel rows is the balanced point; eight rows saves only 8.6% more latency while raising BRAM/DSP/FF/LUT sharply, full stage unroll adds BRAM without latency benefit, and an eight-element transfer is useful only when its 54% BRAM increase is affordable.
+
+The [interpolation synthesis DSE](results/hls_gather_dse_c128_vitis_2022_2.json) separates the three storage strategies. A narrow, completely bankable band reduces compute II from 4 to 1 and latency by 25%, at higher DSP/LUT cost. Full-row staging did not improve II in the measured cases. These small `ap_memory` kernels characterize local scheduling only; production AXI designs retain their resource- and displacement-aware strategy selection.
 
 ## Throughput
 
@@ -143,6 +154,8 @@ Both CPU summary figures are redrawn from the [machine-readable CPU record](resu
 ![Speedup over the NumPy reference](assets/cpu_speedup.png)
 
 The same CPU runs as a ratio against the NumPy reference implementing the same algorithm. The ratio grows with the raster because elementwise fusion removes whole intermediate planes, which is where the reference spends its bandwidth; below about 512 the chains are short enough that neither side is bandwidth-bound and the ratio is noisy.
+
+The checked-in [CPU NUMA/MKL record](results/cpu_numa_mkl_2026_08_27.json) measures the isolated FFT leaf and a small FFT-phase-IFFT chain. On the reference dual-socket host, MKL DFTI is 3.1–4.9× faster than the SAR runtime on the isolated leaf; the gap narrows to 1.3–4.1× once a separate element-wise phase pass enters the chain. The portable runtime default remains 32 workers: topology-aware tuning reaches 60 workers per socket or 120 across two sockets with interleaved memory, while blindly using 120 SMT threads on one 60-core socket is 3.55× slower than 60 physical-core workers.
 
 ## Image quality
 
@@ -158,7 +171,7 @@ Point-target metrics on a 512 × 512 synthetic scene (Hann tapers matched to the
 
 Far-sidelobe floor: at deep display ranges (-60 dB) the images show faint sidelobe arms at ~-50 dB. This floor is the Fresnel ripple of the synthetic LFM spectrum -- paired echoes bounded by the scene's time-bandwidth product (TBP 179 at n=512; the floor drops with TBP, e.g. below -62 dB at n=4096, and an ideal Hann spectrum measures -130 dB through the same pipeline, so processing adds nothing). Range-Doppler sits ~6 dB above the others (~-43 dB, beaded arms): the residual range-azimuth cross-coupling of the classic no-secondary-range-compression formulation, invariant under interpolator taps (2/4/8/16 measured identical) -- an algorithm property, not a processing artifact.
 
-The stripmap examples also accept a 16384 × 16384 ALOS-1 product and report `metrics.urban_contrast`. The dataset is not redistributed, so real-data wall times and quality values are intentionally not part of the versioned reference table.
+The stripmap examples also accept the 16384 × 16384 ALOS-1 granule (© JAXA/METI); download and prepare it as described in [examples/README.md](../examples/README.md#alos-1-stripmap-data), after which the runners report `metrics.urban_contrast`. The archive stays outside the repository, so real-data wall times and quality values are intentionally not part of the versioned reference table.
 
 ## Backend comparison
 
@@ -216,34 +229,34 @@ To impose one numerical thread limit on both execution mechanisms, set both vari
 
 | Algorithm     | Input edge N |    Warm | NumPy reference | Speedup |
 | ------------- | -----------: | ------: | --------------: | ------: |
-| omega-K       |          128 | 0.004 s |          0.03 s |    7.8x |
-| omega-K       |          256 | 0.003 s |          0.08 s |   24.2x |
-| omega-K       |          512 | 0.022 s |          0.51 s |   23.3x |
-| omega-K       |         1024 | 0.076 s |          0.65 s |    8.5x |
+| omega-K       |          128 | 0.004 s |          0.03 s |    7.5x |
+| omega-K       |          256 | 0.003 s |          0.08 s |   26.7x |
+| omega-K       |          512 | 0.022 s |          0.51 s |   23.2x |
+| omega-K       |         1024 | 0.076 s |          0.65 s |    8.6x |
 | omega-K       |         2048 | 0.181 s |          1.77 s |    9.8x |
 | omega-K       |         4096 | 0.450 s |          7.13 s |   15.8x |
 | omega-K       |         8192 | 1.295 s |         27.81 s |   21.5x |
 | omega-K       |        16384 | 3.684 s |        186.53 s |   50.6x |
-| Range-Doppler |          128 | 0.004 s |          0.03 s |    7.2x |
-| Range-Doppler |          256 | 0.012 s |          0.07 s |    5.3x |
-| Range-Doppler |          512 | 0.041 s |          0.29 s |    6.9x |
+| Range-Doppler |          128 | 0.004 s |          0.03 s |    7.5x |
+| Range-Doppler |          256 | 0.012 s |          0.07 s |    5.8x |
+| Range-Doppler |          512 | 0.041 s |          0.29 s |    7.1x |
 | Range-Doppler |         1024 | 0.124 s |          0.63 s |    5.1x |
 | Range-Doppler |         2048 | 0.150 s |          1.57 s |   10.5x |
 | Range-Doppler |         4096 | 0.525 s |          6.36 s |   12.1x |
 | Range-Doppler |         8192 | 1.326 s |         25.41 s |   19.2x |
 | Range-Doppler |        16384 | 3.911 s |        105.00 s |   26.8x |
-| Chirp Scaling |          128 | 0.002 s |          0.00 s |    1.4x |
-| Chirp Scaling |          256 | 0.005 s |          0.01 s |    2.9x |
-| Chirp Scaling |          512 | 0.008 s |          0.18 s |   23.2x |
+| Chirp Scaling |          128 | 0.002 s |          0.00 s |       — |
+| Chirp Scaling |          256 | 0.005 s |          0.01 s |    2.0x |
+| Chirp Scaling |          512 | 0.008 s |          0.18 s |   22.5x |
 | Chirp Scaling |         1024 | 0.046 s |          0.33 s |    7.2x |
 | Chirp Scaling |         2048 | 0.282 s |          0.87 s |    3.1x |
 | Chirp Scaling |         4096 | 0.336 s |          3.89 s |   11.6x |
 | Chirp Scaling |         8192 | 1.017 s |         16.70 s |   16.4x |
 | Chirp Scaling |        16384 | 2.525 s |         73.43 s |   29.1x |
-| PFA           |          128 | 0.005 s |          0.06 s |   11.3x |
-| PFA           |          256 | 0.015 s |          0.16 s |   10.5x |
-| PFA           |          512 | 0.040 s |          0.44 s |   10.8x |
-| PFA           |         1024 | 0.104 s |          1.49 s |   14.4x |
+| PFA           |          128 | 0.005 s |          0.06 s |   12.0x |
+| PFA           |          256 | 0.015 s |          0.16 s |   10.7x |
+| PFA           |          512 | 0.040 s |          0.44 s |   11.0x |
+| PFA           |         1024 | 0.104 s |          1.49 s |   14.3x |
 | PFA           |         2048 | 0.376 s |          6.06 s |   16.1x |
 | PFA           |         4096 | 0.968 s |         25.50 s |   26.3x |
 | PFA           |         8192 | 3.761 s |        155.43 s |   41.3x |

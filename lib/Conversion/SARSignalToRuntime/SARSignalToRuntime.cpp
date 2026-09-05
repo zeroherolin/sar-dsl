@@ -70,14 +70,25 @@ static MemRefType getDynamicMemRefType(RankedTensorType tensorType) {
 
 /// Ensures a private declaration of the runtime function exists and returns
 /// it. The declaration carries `llvm.emit_c_interface`.
-static func::FuncOp ensureRuntimeDecl(PatternRewriter &rewriter,
-                                      ModuleOp module, StringRef name,
-                                      TypeRange argTypes) {
-  if (auto existing = module.lookupSymbol<func::FuncOp>(name))
+static FailureOr<func::FuncOp> ensureRuntimeDecl(PatternRewriter &rewriter,
+                                                 ModuleOp module,
+                                                 StringRef name,
+                                                 TypeRange argTypes) {
+  auto funcType = rewriter.getFunctionType(argTypes, {});
+  if (Operation *symbol = module.lookupSymbol(name)) {
+    auto existing = dyn_cast<func::FuncOp>(symbol);
+    if (!existing || !existing.isDeclaration() || !existing.isPrivate() ||
+        existing.getFunctionType() != funcType ||
+        !existing->hasAttr("llvm.emit_c_interface")) {
+      symbol->emitError("symbol reserved for the SAR runtime ABI must be a "
+                        "matching private declaration with "
+                        "llvm.emit_c_interface");
+      return failure();
+    }
     return existing;
+  }
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(module.getBody());
-  auto funcType = rewriter.getFunctionType(argTypes, {});
   auto decl = func::FuncOp::create(rewriter, module.getLoc(), name, funcType);
   decl.setPrivate();
   decl->setAttr("llvm.emit_c_interface", rewriter.getUnitAttr());
@@ -138,10 +149,12 @@ struct FFTLikeLowering : OpRewritePattern<FFTOpTy> {
     Value inv =
         arith::ConstantOp::create(rewriter, loc, rewriter.getBoolAttr(inverse));
 
-    auto decl = ensureRuntimeDecl(
+    FailureOr<func::FuncOp> decl = ensureRuntimeDecl(
         rewriter, module, symbol,
         {input.getType(), output.getType(), dim.getType(), inv.getType()});
-    func::CallOp::create(rewriter, loc, decl,
+    if (failed(decl))
+      return failure();
+    func::CallOp::create(rewriter, loc, *decl,
                          ValueRange{input, output, dim, inv});
 
     rewriter.replaceOp(op,
@@ -203,12 +216,14 @@ struct Interp1DLowering : OpRewritePattern<Interp1DOp> {
     Value boundary = arith::ConstantOp::create(
         rewriter, loc, rewriter.getI64IntegerAttr(boundaryId));
 
-    auto decl = ensureRuntimeDecl(rewriter, module, symbol,
-                                  {data.getType(), positions.getType(),
-                                   output.getType(), kernel.getType(),
-                                   taps.getType(), window.getType(),
-                                   beta.getType(), boundary.getType()});
-    func::CallOp::create(rewriter, loc, decl,
+    FailureOr<func::FuncOp> decl = ensureRuntimeDecl(
+        rewriter, module, symbol,
+        {data.getType(), positions.getType(), output.getType(),
+         kernel.getType(), taps.getType(), window.getType(), beta.getType(),
+         boundary.getType()});
+    if (failed(decl))
+      return failure();
+    func::CallOp::create(rewriter, loc, *decl,
                          ValueRange{data, positions, output, kernel, taps,
                                     window, beta, boundary});
 

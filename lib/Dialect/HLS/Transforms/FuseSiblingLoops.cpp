@@ -12,7 +12,9 @@
 //
 // Two nests fuse when they iterate identically and neither writes what the
 // other touches, which is what makes running them interleaved equivalent to
-// running them in sequence.
+// running them in sequence. The one overlap allowed is a pointwise
+// producer/consumer pair whose store and load use the same indices: the
+// consumer then reads the value the same fused iteration just wrote.
 //
 //===----------------------------------------------------------------------===//
 

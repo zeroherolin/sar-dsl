@@ -80,16 +80,16 @@ def PartitionLayoutAttr : HLSAttr<"PartitionLayout",
   let assemblyFormat = "`<` `[` $kinds `]` `,` `[` $factors `]` `>`";
 
   let extraClassDeclaration = [{
-    /// The affine map of "block" partition needs array shape to be inferenced.
-    /// For example, if the partition factor is [2] and the shape of the array
-    /// is [16], the affine map should be (d0) -> (d0 / 8, d0 % 8), where 8 is
-    /// equal to 16 / 2. However, as the shape information is not known at the
-    /// time of attribute construction, we can only encode factor [8] in the
-    /// attribute instead of the actual factor [2]. This method returns the
-    /// actual partition factor with the given array shape.
+    /// The affine map of "block" partition needs the array shape to be
+    /// inferred. For example, if the partition factor is [2] and the shape of
+    /// the array is [16], the affine map should be (d0) -> (d0 / 8, d0 % 8),
+    /// where 8 is equal to 16 / 2. However, as the shape information is not
+    /// known at the time of attribute construction, we can only encode factor
+    /// [8] in the attribute instead of the actual factor [2]. This method
+    /// returns the actual partition factor with the given array shape.
     SmallVector<int64_t> getActualFactors(ArrayRef<int64_t> shape);
 
-    /// This method construct a PartitionLayoutAttr with the given partition
+    /// This method constructs a PartitionLayoutAttr with the given partition
     /// kinds, actual partition factors, and array shape.
     static PartitionLayoutAttr getWithActualFactors(MLIRContext *context,
         ArrayRef<PartitionKind> kinds, ArrayRef<int64_t> actualFactors,

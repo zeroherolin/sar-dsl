@@ -21,7 +21,8 @@ def SARDecomplexify : Pass<"sar-decomplexify", "ModuleOp"> {
     This enables targets without complex-number support -- notably HLS
     C++ emission. Signal and interpolation ops map
     to their split-complex forms: `sar.fft`/`sar.ifft` become
-    `sar.fft_split` and `sar.interp1d` becomes `sar.interp1d_split`.
+    `sar.fft_split`, `sar.interp1d` becomes `sar.interp1d_split`, and
+    `sar.gather2d` becomes `sar.gather2d_split`.
   }];
   let dependentDialects = ["::mlir::func::FuncDialect"];
 }

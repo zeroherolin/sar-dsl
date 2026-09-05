@@ -406,8 +406,8 @@ LogicalResult NodeOp::verify() {
       return emitOpError("node is not scheduled");
 
     for (auto output : getOutputs()) {
-      // DRAM buffer is not considered - the dependencies associated with them
-      // are handled later by tokens.
+      // DRAM buffers are not considered - the dependencies associated with
+      // them are handled later by tokens.
       if (isExtBuffer(output))
         continue;
 
@@ -445,7 +445,7 @@ ScheduleOp NodeOp::getScheduleOp() {
   return (*this)->getParentOfType<ScheduleOp>();
 }
 
-/// Get input taps.
+/// Get and set input taps.
 void NodeOp::setInputTap(unsigned idx, unsigned tap) {
   SmallVector<int32_t> newInputTaps(llvm::map_range(
       getInputTapsAsInt(), [](unsigned a) { return (int32_t)a; }));
@@ -474,7 +474,7 @@ unsigned NodeOp::getNumParams() {
   return getODSOperandIndexAndLength(2).second;
 }
 
-/// Get the type of operand: input, output, or param.
+/// Get the kind of operand: input, output, or param.
 OperandKind NodeOp::getOperandKind(OpOperand &operand) {
   assert(operand.getOwner() == *this && "invalid operand");
   return getOperandKind(operand.getOperandNumber());
@@ -892,7 +892,7 @@ void AffineSelectOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.add<AlwaysTrueOrFalseSelect>(context);
 }
 
-/// Canonicalize an affine if op's conditional (integer set + operands).
+/// Canonicalize an affine select op's conditional (integer set + operands).
 OpFoldResult AffineSelectOp::fold(FoldAdaptor) {
   auto set = getIntegerSet();
   SmallVector<Value, 4> operands(getArgs());
@@ -1092,13 +1092,13 @@ PartitionLayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   return success();
 }
 
-/// The affine map of "block" partition needs array shape to be inferenced. For
-/// example, if the partition factor is [2] and the shape of the array is [16],
-/// the affine map should be (d0) -> (d0 / 8, d0 % 8), where 8 is equal to 16
-/// / 2. However, as the shape information is not known at the time of attribute
-/// construction, only factor [8] can be encoded in the attribute rather than
-/// actual factor [2]. This method returns the actual partition factor with the
-/// given array shape.
+/// The affine map of "block" partition needs the array shape to be inferred.
+/// For example, if the partition factor is [2] and the shape of the array is
+/// [16], the affine map should be (d0) -> (d0 / 8, d0 % 8), where 8 is equal
+/// to 16 / 2. However, as the shape information is not known at the time of
+/// attribute construction, only factor [8] can be encoded in the attribute
+/// rather than actual factor [2]. This method returns the actual partition
+/// factor with the given array shape.
 SmallVector<int64_t>
 PartitionLayoutAttr::getActualFactors(ArrayRef<int64_t> shape) {
   SmallVector<int64_t, 4> actualFactors;
@@ -1111,7 +1111,7 @@ PartitionLayoutAttr::getActualFactors(ArrayRef<int64_t> shape) {
   return actualFactors;
 }
 
-/// This method construct a PartitionLayoutAttr with the given partition kinds,
+/// This method constructs a PartitionLayoutAttr with the given partition kinds,
 /// actual partition factors, and array shape.
 PartitionLayoutAttr PartitionLayoutAttr::getWithActualFactors(
     MLIRContext *context, ArrayRef<PartitionKind> kinds,
@@ -1195,8 +1195,6 @@ TileLayoutAttr hls::getTileLayout(Operation *op) {
 void hls::setTileLayout(Operation *op, TileLayoutAttr tileLayout) {
   op->setAttr("tile_layout", tileLayout);
 }
-TileLayoutAttr getTileLayout(Operation *op);
-void setTileLayout(Operation *op, TileLayoutAttr tileLayout);
 TileLayoutAttr hls::getTileLayout(Value memref) {
   if (auto buffer = findBuffer(memref)) {
     if (auto bufferArg = dyn_cast<BlockArgument>(buffer)) {
@@ -1248,7 +1246,7 @@ void hls::setLoopDirective(Operation *op, bool pipeline, int64_t targetII) {
   setLoopDirective(op, loopDirective);
 }
 
-/// Parrallel and point loop attribute utils.
+/// Parallel and point loop attribute utils.
 void hls::setParallelAttr(Operation *op) {
   op->setAttr("parallel", UnitAttr::get(op->getContext()));
 }

@@ -58,6 +58,7 @@ def save_db_image(image: np.ndarray,
 
 
 def print_targets(targets) -> None:
+    """Prints the simulated target constellation (offsets and RCS)."""
     for t in targets:
         print(f"      target: range {t.range_offset:+9.1f} m, "
               f"azimuth {t.azimuth_offset:+9.1f} m, rcs {t.rcs}")

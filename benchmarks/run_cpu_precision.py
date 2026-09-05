@@ -7,7 +7,7 @@ reports the image-quality metrics side by side. Declared dtypes fix the
 data path on every backend, so this is the number that says whether a
 design can halve its memory and its arithmetic without losing
 resolution. What narrows, and why geometry stays double, is described in
-benchmarks/README.md ("Precision"); the `c128/c64 refs` column reports
+benchmarks/README.md ("Precision"); the `c64/c128 refs` column reports
 textual 2-D complex-type references in the traced IR.
 
 Usage:

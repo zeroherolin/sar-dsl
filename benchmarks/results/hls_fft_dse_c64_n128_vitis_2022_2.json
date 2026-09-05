@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-08-27",
+  "source": {
+    "base_commit": "099d023aef3d93421f2657bb1fd2aea5f7eb79d0",
+    "diff_sha256": "ce221b9902adda4ea506fd2c2b57ed09df2bf4b84a3e18457f1ded2bb03f1d85",
+    "source_state": "identified by base_commit and diff_sha256"
+  },
+  "constraints": {
+    "algorithm": "omega-K",
+    "shape": [128, 128],
+    "dtype": "c64",
+    "geometry": "synthetic",
+    "part": "xcvu13p-fhgb2104-2-i",
+    "clock_ns": 4.0,
+    "timing_budget_ns": 3.5
+  },
+  "tool": {"name": "Vitis HLS", "version": "2022.2"},
+  "designs": [
+    {"fft_parallel_rows": 0, "fft_stage_group": 2, "fft_io_unroll": 4, "estimated_clock_ns": 3.5, "latency_cycles": 468178, "interval_cycles": 76418, "bram18k": 44, "uram": 176, "dsp": 1460, "ff": 188771, "lut": 215840},
+    {"fft_parallel_rows": 4, "fft_stage_group": 2, "fft_io_unroll": 4, "estimated_clock_ns": 3.5, "latency_cycles": 273042, "interval_cycles": 42754, "bram18k": 236, "uram": 176, "dsp": 2060, "ff": 289515, "lut": 297691},
+    {"fft_parallel_rows": 8, "fft_stage_group": 2, "fft_io_unroll": 4, "estimated_clock_ns": 3.5, "latency_cycles": 249586, "interval_cycles": 42754, "bram18k": 428, "uram": 176, "dsp": 2852, "ff": 445963, "lut": 442712},
+    {"fft_parallel_rows": 4, "fft_stage_group": 0, "fft_io_unroll": 4, "estimated_clock_ns": 3.5, "latency_cycles": 273042, "interval_cycles": 42754, "bram18k": 268, "uram": 176, "dsp": 2060, "ff": 289515, "lut": 297307},
+    {"fft_parallel_rows": 4, "fft_stage_group": 2, "fft_io_unroll": 8, "estimated_clock_ns": 3.5, "latency_cycles": 256592, "interval_cycles": 42754, "bram18k": 364, "uram": 176, "dsp": 2060, "ff": 290643, "lut": 314510}
+  ],
+  "conclusion": "rows=4/group=2/io=4 is the balanced point; rows=8 saves 8.6% latency at large area cost, group=0 adds BRAM without latency benefit, and io=8 saves 6.0% latency while increasing BRAM 54.2%."
+}

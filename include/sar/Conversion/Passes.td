@@ -53,10 +53,11 @@ def ConvertSARFFTToAffine : Pass<"convert-sar-fft-to-affine", "ModuleOp"> {
     `fft-stage-group` controls how many consecutive Stockham stages share
     a set of scratch buffers:
       0 (default): every intermediate stage writes its own scratch line,
-        so the log2(N) stages form a chain a dataflow backend can overlap
-        across lines. This is the maximum-throughput, maximum-area point.
-      k > 0: stages are packed into ceil(log2(N)/k) groups drawing from
-        ceil(log2(N)/k)-1 scratch slots, which is what reduces on-chip
+        so the S = ceil(log2(N)/2) radix-4/2 stages form a chain a
+        dataflow backend can overlap across lines. This is the
+        maximum-throughput, maximum-area point.
+      k > 0: stages are packed into ceil(S/k) groups drawing from
+        ceil(S/k)-1 scratch slots, which is what reduces on-chip
         area. Reusing a slot puts a write-after-read edge between the
         stages that share it, so the backend can no longer overlap them:
         area is traded for pipeline depth, not for arithmetic.
@@ -68,7 +69,7 @@ def ConvertSARFFTToAffine : Pass<"convert-sar-fft-to-affine", "ModuleOp"> {
 
     Two slots are the floor whenever more than one stage writes scratch --
     a Stockham butterfly is not an in-place operation -- so k at or above
-    log2(N) saturates at that floor rather than degenerating to one buffer.
+    S saturates at that floor rather than degenerating to one buffer.
     k=1 gives every stage its own slot, which is the same buffer count as
     the full unroll.
   }];

@@ -47,7 +47,7 @@ struct RaiseAffineToCopy
           store.getAffineMap() != load.getAffineMap())
         continue;
 
-      // Make sure the all loops in the band have constant trip count.
+      // Make sure all loops in the band have a constant trip count.
       llvm::SmallDenseMap<Value, unsigned, 4> shapeMap;
       if (llvm::any_of(band, [&](mlir::affine::AffineForOp loop) {
             auto maybeTripCount = getConstantTripCount(loop);

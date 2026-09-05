@@ -48,5 +48,6 @@ class Geometry:
         return data
 
     def demo_targets(self):
+        """A fixed three-target constellation of (x, y) scene positions."""
         n = self.n
         return [(0.0, 0.0), (-n * 0.2, n * 0.15), (n * 0.25, -n * 0.1)]

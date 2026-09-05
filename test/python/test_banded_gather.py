@@ -13,6 +13,7 @@ the banded path enabled (the default) and once with
 
 import numpy as np
 import pytest
+import subprocess
 
 from conftest import requires_cpu
 from conftest import compile_split_kernel as _compile_split_kernel
@@ -238,6 +239,37 @@ def test_nonlinear_constant_positions_still_band(tmp_path):
     oracle = _oracle(re + 1j * im, positions)
     np.testing.assert_allclose(got_re, oracle.real, rtol=1e-9, atol=1e-9)
     np.testing.assert_allclose(got_im, oracle.imag, rtol=1e-9, atol=1e-9)
+
+
+def test_transcendental_constant_positions_still_band(tmp_path):
+    """Constant atan2/sin coordinates fold to an exact displacement band."""
+    n, m = 4, 64
+    axis = _dense(np.arange(m, dtype=np.float64))
+    module = f"""
+func.func @ip(%re: tensor<{n}x{m}xf64>, %im: tensor<{n}x{m}xf64>)
+    -> (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>) {{
+  %axis = sar.constant dense<{axis}> : tensor<{m}xf64>
+  %x = sar.broadcast %axis {{dim = 1 : i64}}
+      : tensor<{m}xf64> -> tensor<{n}x{m}xf64>
+  %one = sar.constant dense<1.0> : tensor<{n}x{m}xf64>
+  %phase = sar.atan2 %one, %one : tensor<{n}x{m}xf64>
+  %wiggle = sar.sin %phase : tensor<{n}x{m}xf64>
+  %pos = sar.add %x, %wiggle : tensor<{n}x{m}xf64>
+  %r, %i = sar.interp1d_split %re, %im, %pos
+      : (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>)
+      -> (tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>)
+  return %r, %i : tensor<{n}x{m}xf64>, tensor<{n}x{m}xf64>
+}}
+"""
+    from sar.compiler.toolchain import find_tool
+    lowered = subprocess.run(
+        [find_tool("sar-opt"), "--convert-sar-interp-to-affine", "-"],
+        input=module,
+        capture_output=True,
+        text=True,
+        check=True).stdout
+    assert 'hls.gather_strategy = "band"' in lowered
+    assert "sar.interp1d_split" not in lowered
 
 
 @pytest.mark.parametrize("boundary", ["edge", "reflect"])

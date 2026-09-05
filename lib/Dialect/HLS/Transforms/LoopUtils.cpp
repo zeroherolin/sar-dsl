@@ -95,7 +95,7 @@ AffineForOp sar::getLoopBandFromInnermost(AffineForOp forOp,
 
 /// Collect all loop bands in the "block" and return them in "bands". If
 /// "allowHavingChilds" is true, loop bands containing more than 1 other loop
-/// bands are also collected. Otherwise, only loop bands that contains no child
+/// bands are also collected. Otherwise, only loop bands that contain no child
 /// loops are collected.
 void sar::getLoopBands(Block &block, AffineLoopBands &bands,
                        bool allowHavingChilds) {

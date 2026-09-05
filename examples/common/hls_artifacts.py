@@ -48,7 +48,7 @@ def emit_alos_artifacts(algorithm: str,
                         options: Mapping | None = None) -> dict:
     """Emits one ALOS-geometry design and its matching validation package.
 
-    `options` is passed directly to `compile(backend="hls")`. If it is null,
+    `options` is passed directly to `compile(backend="hls")`. If it is None,
     the backend uses the shipped or project-level HLS configuration unchanged.
     The output directory contains only artifacts for `<algorithm>_alos` at
     `n x n`: declarations, implementation, optional ROM tables, manifest,

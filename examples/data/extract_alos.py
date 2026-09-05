@@ -4,6 +4,9 @@
 Reads a block of azimuth lines, removes the DC bias of the 8-bit I/Q
 samples, zero-pads the range dimension to a power of two and writes a
 complex64 binary consumable by `run_alos_cpu.py`.
+
+The default input path matches ASF DAAC granule ALPSRP275140740-L1.0;
+download and unpack that product as described in `examples/README.md`.
 """
 
 import os

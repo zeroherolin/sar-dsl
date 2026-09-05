@@ -12,6 +12,7 @@ value and fills only what was left at null.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
@@ -31,7 +32,8 @@ __all__ = [
     "fft_io_unroll", "fft_parallel_rows", "interp_banded_gather",
     "interp_cache_copies", "interp_complete_bank_max_elements",
     "interp_full_row_max_bytes", "fuse_sibling_sweeps", "loop_unroll_budget",
-    "kernel_facts_from_json", "loop_tile_size", "lutram_max_bytes", "plan",
+    "cached_kernel_facts", "cached_performance_plan", "kernel_facts_from_json",
+    "kernel_facts_to_dict", "loop_tile_size", "lutram_max_bytes", "plan",
     "max_scratch_arenas", "measure_kernel", "reuse_min_elements",
     "should_share_buffers", "storage_min_elements", "streaming_threshold",
     "transpose_block_bytes", "transform_lane_storage_ceiling"
@@ -183,6 +185,8 @@ class KernelFacts:
     gather_ops: int = 0
     #: On-chip sliding gather buffers proven by affine lowering.
     banded_gathers: int = 0
+    full_row_gathers: int = 0
+    direct_gathers: int = 0
     #: Total operations and memory/arithmetic pressure in the measured IR.
     operations: int = 0
     loads: int = 0
@@ -206,6 +210,26 @@ class PerformancePlan:
     on_chip_bytes: int
     memory_accesses: int
     operation_count: int
+
+    def to_dict(self) -> Dict[str, object]:
+        """The one JSON shape plan caches and decision records use."""
+        return {
+            "values": dict(self.values),
+            "clock_ns": self.clock_ns,
+            "timing_budget_ns": self.timing_budget_ns,
+            "on_chip_bytes": self.on_chip_bytes,
+            "memory_accesses": self.memory_accesses,
+            "operation_count": self.operation_count,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, object]) -> "PerformancePlan":
+        return cls(values=dict(value["values"]),
+                   clock_ns=float(value["clock_ns"]),
+                   timing_budget_ns=float(value["timing_budget_ns"]),
+                   on_chip_bytes=int(value["on_chip_bytes"]),
+                   memory_accesses=int(value["memory_accesses"]),
+                   operation_count=int(value["operation_count"]))
 
 
 def kernel_facts_from_json(text: str) -> KernelFacts:
@@ -232,6 +256,8 @@ def kernel_facts_from_json(text: str) -> KernelFacts:
                                                [values["element_bytes"]])),
         gather_ops=int(values.get("gathers", 0)),
         banded_gathers=int(values.get("banded_gathers", 0)),
+        full_row_gathers=int(values.get("full_row_gathers", 0)),
+        direct_gathers=int(values.get("direct_gathers", 0)),
         operations=int(values.get("operations", 0)),
         loads=int(values.get("loads", 0)),
         stores=int(values.get("stores", 0)),
@@ -242,6 +268,46 @@ def kernel_facts_from_json(text: str) -> KernelFacts:
     )
 
 
+def kernel_facts_to_dict(facts: KernelFacts) -> Dict[str, object]:
+    """The one cache-file shape `kernel_facts_from_json` reads back."""
+    return {
+        "plane_elements":
+        facts.plane_elements,
+        "element_bytes":
+        facts.element_bytes,
+        "transforms":
+        facts.transforms,
+        "transposes":
+        facts.transposes,
+        "buffers":
+        facts.buffers,
+        "element_bytes_set":
+        facts.element_bytes_set,
+        "gathers":
+        facts.gather_ops,
+        "banded_gathers":
+        facts.banded_gathers,
+        "full_row_gathers":
+        facts.full_row_gathers,
+        "direct_gathers":
+        facts.direct_gathers,
+        "operations":
+        facts.operations,
+        "loads":
+        facts.loads,
+        "stores":
+        facts.stores,
+        "expensive_ops":
+        facts.expensive_ops,
+        "calls":
+        facts.calls,
+        "max_fanout":
+        facts.max_fanout,
+        "transform_strided": (facts.transform_strided
+                              or (False, ) * len(facts.transforms)),
+    }
+
+
 def measure_kernel(module_text: str) -> KernelFacts:
     """Parses MLIR with the compiler and returns structured strategy facts."""
     output = run_tool(
@@ -249,6 +315,49 @@ def measure_kernel(module_text: str) -> KernelFacts:
         [find_tool("sar-translate"), "--sar-emit-kernel-facts", "-"],
         input_text=module_text)
     return kernel_facts_from_json(output)
+
+
+def cached_kernel_facts(cache, filename: str, module_text: str) -> KernelFacts:
+    """Structured kernel facts through the compilation artifact cache.
+
+    The stored JSON names a digest of the IR it was measured from, so a
+    cache entry whose IR was rewritten (a retry rung, an interrupted
+    compile) recomputes instead of serving facts for different IR."""
+    digest = hashlib.sha256(module_text.encode()).hexdigest()
+    cached = cache.read_if_cached(filename)
+    if cached is not None:
+        try:
+            if json.loads(cached).get("module_sha256") == digest:
+                return kernel_facts_from_json(cached)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        cache.path(filename).unlink(missing_ok=True)
+    facts = measure_kernel(module_text)
+    payload = kernel_facts_to_dict(facts)
+    payload["module_sha256"] = digest
+    text = json.dumps(payload, sort_keys=True)
+    cache.write_text(filename, text)
+    # Parse what was stored: warm and cold compiles then agree exactly.
+    return kernel_facts_from_json(text)
+
+
+def cached_performance_plan(
+        cache,
+        filename: str,
+        config,
+        facts: KernelFacts,
+        metadata=None,
+        lowered_facts: Optional[KernelFacts] = None) -> PerformancePlan:
+    """Performance plan through the same content-addressed artifact cache."""
+    cached = cache.read_if_cached(filename)
+    if cached is not None:
+        try:
+            return PerformancePlan.from_dict(json.loads(cached))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            cache.path(filename).unlink(missing_ok=True)
+    result = plan(config, facts, metadata, lowered_facts)
+    cache.write_text(filename, json.dumps(result.to_dict(), sort_keys=True))
+    return result
 
 
 # ---------------------------------------------------------------------- #
@@ -797,7 +906,7 @@ def plan(config,
         "the placement decision needs the metadata and the lowered IR together"
     budget = config.on_chip_bytes()
     transform_budget = int(config.bram_bytes) + int(config.uram_bytes)
-    primitives = storage_primitives(config.part)
+    primitives = (int(config.bram_block_bytes), int(config.uram_block_bytes))
     timing_budget = config.effective_clock_ns()
     model_io, model_lanes = _transform_engine(facts, config, transform_budget,
                                               timing_budget, primitives)

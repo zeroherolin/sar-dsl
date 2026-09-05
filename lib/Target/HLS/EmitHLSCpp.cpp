@@ -97,7 +97,7 @@ static AxiShape getAxiShape(MemRefType type) {
   return {widenBits, burstBeats, outstanding};
 }
 
-Type peelAxiType(Type type) {
+static Type peelAxiType(Type type) {
   if (auto axiType = dyn_cast<AxiType>(type))
     return axiType.getElementType();
   return type;
@@ -837,6 +837,9 @@ public:
     os << ")";
   }
 
+  /// Emits `expr` in infix form. A negated right-hand side folds into unary
+  /// minus or subtraction (`x * -1` as `-x`, `x + -3` as `x - 3`, and
+  /// `x + y * -1` as `x - y`) so the generated C++ reads naturally.
   void emitAffineBinary(AffineBinaryOpExpr expr, const char *syntax) {
     os << "(";
     if (auto constRHS = dyn_cast<AffineConstantExpr>(expr.getRHS())) {
@@ -1312,7 +1315,6 @@ void ModuleEmitter::emitAxiPort(AxiPortOp op) {
       }
     }
   }
-  // An empty line.
   os << "\n";
 }
 
@@ -1387,7 +1389,7 @@ void ModuleEmitter::emitAffineSelect(hls::AffineSelectOp op) {
 
 /// Control flow operation emitters.
 void ModuleEmitter::emitCall(func::CallOp op) {
-  // Handle returned value by the callee.
+  // Handle values returned by the callee.
   for (auto result : op.getResults()) {
     if (!isDeclared(result)) {
       indent();
@@ -2120,7 +2122,7 @@ void ModuleEmitter::emitBroadcast(vector::BroadcastOp op) {
   os << " = ";
   emitValue(op.getSource());
 
-  // Figure out whether each dimision is broadcast or multicast.
+  // Figure out whether each dimension is broadcast or multicast.
   if (auto type = dyn_cast<ShapedType>(op.getSource().getType()))
     for (unsigned dim = 0, e = type.getRank(); dim < e; ++dim) {
       if (type.getDimSize(dim) == 1)
@@ -2136,8 +2138,8 @@ void ModuleEmitter::emitBroadcast(vector::BroadcastOp op) {
 
 /// Memref-related statement emitters.
 template <typename OpType> void ModuleEmitter::emitAlloc(OpType op) {
-  // A declared result indicates that the memref is output of the function, and
-  // has been declared in the function signature.
+  // A declared result indicates that the memref is an output of the function,
+  // and has been declared in the function signature.
   if (isDeclared(op.getResult()))
     return;
 
@@ -2553,19 +2555,18 @@ void ModuleEmitter::emitArrayDirectives(Value memref, bool isInterface,
         emitValue(memref);
         os << " core=" << getVivadoStorageTypeAndImpl(kind);
       }
-      // Emit a new line.
       os << "\n";
     }
   }
 
-  // Emit an empty line.
+  // A trailing blank line separates the pragma block from the code.
   if (emitPragmaFlag)
     os << "\n";
 }
 
 void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
                                            ArrayRef<Value> portList) {
-  // Only top function should emit interface pragmas.
+  // Only the top function should emit interface pragmas.
   if (hasTopFuncAttr(func)) {
     if (auto module = func->getParentOfType<ModuleOp>())
       for (auto helper : module.getOps<func::FuncOp>())
@@ -2658,11 +2659,9 @@ void ModuleEmitter::emitFunctionDirectives(func::FuncOp func,
     if (funcDirect.getPipeline()) {
       indent() << "#pragma HLS pipeline II=" << funcDirect.getTargetInterval()
                << "\n";
-      // An empty line.
       os << "\n";
     } else if (funcDirect.getDataflow()) {
       indent() << "#pragma HLS dataflow\n";
-      // An empty line.
       os << "\n";
     }
   }
@@ -3058,7 +3057,7 @@ void ModuleEmitter::emitFunctionSignature(func::FuncOp func,
     os << ";\n";
 }
 
-/// Declares a loop counter as `int i<n>`, numbered within the function.
+/// Declares a loop counter named `i<n>`, numbered within the function.
 /// Counters read far better as `i0`/`i1` than as entries in the temporary
 /// sequence, and they are the identifiers a reader scans for.
 void ModuleEmitter::nameLoopIV(Value iv) {
@@ -3503,7 +3502,6 @@ void ModuleEmitter::emitFunction(func::FuncOp func) {
     state.nameTable[table] = globalName;
   reduceIndent();
   os << "}\n";
-  // An empty line.
   os << "\n";
 }
 

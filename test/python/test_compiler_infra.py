@@ -22,21 +22,29 @@ def test_cache_key_stable_and_distinct():
     assert a.key == a2.key
     assert a.key != b.key
     assert a.key != opt.key
+    assert len(a.key) == 64
+    for cache in (a, a2, b, opt):
+        cache.close()
 
 
 def test_cache_key_tracks_toolchain(tmp_path, monkeypatch):
     """Rebuilding sar-opt must invalidate cached artifacts: the key mixes in
     a fingerprint of the binary instead of a hand-maintained version."""
     monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
-    fake = tmp_path / "sar-opt"
-    fake.write_text("#!/bin/sh\n")
-    fake.chmod(0o755)
-
     monkeypatch.setattr(cache_module, "_toolchain_fingerprint", lambda: "aaa")
     before = KernelCache("m", "cpu", {}).key
     monkeypatch.setattr(cache_module, "_toolchain_fingerprint", lambda: "bbb")
     after = KernelCache("m", "cpu", {}).key
     assert before != after
+
+
+def test_compilation_error_exposes_structured_diagnostic():
+    error = sar.CompilationError(
+        "lower", ["sar-opt", "-"],
+        'kernel.py:12:3: error: bad tensor shape\n  note: details\n')
+    assert error.location == {"file": "kernel.py", "line": 12, "column": 3}
+    assert error.diagnostic == "bad tensor shape"
+    assert error.as_dict()["stage"] == "lower"
 
 
 def test_cache_key_tracks_python_compiler_strategy(monkeypatch):
@@ -148,6 +156,74 @@ def test_cache_atomic_write(tmp_path, monkeypatch):
     assert not leftovers
 
 
+def test_cache_context_releases_lock_descriptor(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
+    with KernelCache("m", "cpu", {}) as cache:
+        lock = cache._lock
+        assert not lock.closed
+    assert lock.closed
+
+
+def test_cache_stats_and_clear_skip_locked_entries(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
+    active = KernelCache("active", "cpu", {})
+    active.write_text("artifact", "x" * 16)
+    inactive = KernelCache("inactive", "cpu", {})
+    inactive.write_text("artifact", "y" * 32)
+    inactive.close()
+
+    stats = cache_module.cache_stats()
+    assert stats["entries"] == 2
+    assert stats["bytes"] >= 48
+    cleared = cache_module.clear_cache()
+    assert cleared == {
+        "removed": 1,
+        "retained": 1,
+        "root": str(tmp_path),
+    }
+    assert active.dir.exists()
+    assert not inactive.dir.exists()
+    active.close()
+    assert cache_module.clear_cache()["removed"] == 1
+
+
+def test_clear_cache_spares_entry_mid_initialization(tmp_path, monkeypatch):
+    """A fresh directory with no access marker is a KernelCache.__init__
+    in flight (mkdir done, flock not yet held); clear_cache must not
+    rmtree it out from under the constructor."""
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
+    mid_init = tmp_path / ("0" * 64)
+    mid_init.mkdir()
+    cleared = cache_module.clear_cache()
+    assert cleared == {"removed": 0, "retained": 1, "root": str(tmp_path)}
+    assert mid_init.is_dir()
+
+
+def test_cache_init_survives_concurrent_clear(tmp_path, monkeypatch):
+    """clear_cache in another process can remove the entry between our
+    open and flock; __init__ must detect the unlinked .lock inode and
+    recreate the entry instead of writing into a removed directory."""
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
+    real_flock = cache_module.fcntl.flock
+    raced = []
+
+    def racing_flock(fd, op):
+        real_flock(fd, op)
+        if not raced and op == cache_module.fcntl.LOCK_SH:
+            raced.append(True)
+            for entry in tmp_path.iterdir():
+                if entry.is_dir():
+                    __import__("shutil").rmtree(entry)
+
+    monkeypatch.setattr(cache_module.fcntl, "flock", racing_flock)
+    cache = KernelCache("m", "cpu", {})
+    assert raced
+    assert cache.dir.is_dir()
+    cache.write_text("artifact.txt", "ok")
+    assert cache.read_text("artifact.txt") == "ok"
+    cache.close()
+
+
 def test_cache_write_failure_leaves_no_tmp_litter(tmp_path, monkeypatch):
     """A write that fails midway must clean up its temp file, or the
     entry fills with orphaned .tmp files over time."""
@@ -229,9 +305,115 @@ def test_recompilation_hits_cache(tmp_path, monkeypatch):
     np.testing.assert_allclose(first(x), second(x))
 
 
+@requires_hls
+def test_pipeline_dump_exports_ir_facts_and_manifest(tmp_path):
+
+    @sar.func
+    def scale(x: sar.f32[8]) -> sar.f32[8]:
+        return x * 2.0
+
+    out = scale.dump_pipeline(tmp_path, backend="hls")
+    names = {path.name for path in out.iterdir()}
+    assert {
+        "kernel.sar.mlir", "kernel.affine.mlir", "kernel.hls.mlir",
+        "kernel.sar.facts.json", "kernel.affine.facts.json",
+        "pipeline_manifest.json"
+    } <= names
+    manifest = __import__("json").loads(
+        (out / "pipeline_manifest.json").read_text())
+    assert manifest["kernel"] == "scale"
+    assert manifest["backend"] == "hls"
+    assert manifest["stages"] == ["lower", "hls"]
+
+
+@requires_hls
+def test_pipeline_dump_replaces_a_previous_export(tmp_path):
+
+    @sar.func
+    def scale(x: sar.f32[8]) -> sar.f32[8]:
+        return x * 2.0
+
+    out = tmp_path / "pipeline"
+    scale.dump_pipeline(out, backend="hls")
+    (out / "stale.txt").write_text("old export")
+    scale.dump_pipeline(out, backend="cpu")
+    assert not (out / "stale.txt").exists()
+    manifest = __import__("json").loads(
+        (out / "pipeline_manifest.json").read_text())
+    assert manifest["backend"] == "cpu"
+
+
+def test_pipeline_dump_excludes_cache_bookkeeping(tmp_path, monkeypatch):
+    """Every cache entry holds dotfile bookkeeping (.lock, the .accessed
+    LRU marker, possibly crash-leftover .*.tmp scratch files); an export
+    must contain artifacts only."""
+    from sar import compiler
+    from sar.backends import KernelMetadata
+
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path / "cache"))
+    cache = KernelCache("m", "cpu", {})
+    cache.scratch_path("kernel.so").write_text("crashed tool leftover")
+
+    def stage(artifact, metadata, stage_cache):
+        stage_cache.write_text("kernel.stage.txt", artifact)
+        return artifact
+
+    backend_obj = __import__("types").SimpleNamespace(
+        make_launcher=lambda artifact, metadata: artifact)
+    metadata = KernelMetadata(name="k", arg_types=[], result_types=[])
+    monkeypatch.setattr(
+        compiler, "_prepare", lambda kernel, backend, options:
+        (backend_obj, "module", metadata, {
+            "stage": stage
+        }, cache))
+
+    out = compiler.dump_pipeline(object(), tmp_path / "dump")
+    names = {path.name for path in out.iterdir()}
+    assert names == {"kernel.stage.txt", "pipeline_manifest.json"}
+    manifest = __import__("json").loads(
+        (out / "pipeline_manifest.json").read_text())
+    assert manifest["files"] == ["kernel.stage.txt"]
+    assert manifest["stages"] == ["stage"]
+
+
 def test_backend_registry_contents():
     backends = sar.list_backends()
     assert "cpu" in backends and "hls" in backends
+
+
+def test_doctor_reports_tools_backends_and_cache(tmp_path, monkeypatch):
+    from sar import __main__ as cli
+
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
+    data = cli.doctor()
+    assert data["sar_dsl_version"] == sar.__version__
+    assert {"sar-opt", "sar-translate", "mlir-translate", "clang"} <= \
+        set(data["tools"])
+    assert {"cpu", "hls"} <= set(data["backends"])
+    assert data["cache"]["root"] == str(tmp_path)
+
+
+def test_doctor_reports_invalid_tool_override(tmp_path, monkeypatch):
+    from sar import __main__ as cli
+
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("SAR_DSL_TOOL_CLANG", str(tmp_path / "missing"))
+    data = cli.doctor()
+    assert data["tools"]["clang"]["path"] is None
+    assert "does not exist" in data["tools"]["clang"]["error"]
+
+
+def test_doctor_json_cli_is_machine_readable(tmp_path):
+    env = dict(os.environ,
+               PYTHONPATH=str(REPO_ROOT / "python"),
+               SAR_DSL_CACHE_DIR=str(tmp_path))
+    result = subprocess.run([sys.executable, "-m", "sar", "doctor", "--json"],
+                            capture_output=True,
+                            text=True,
+                            env=env,
+                            check=True)
+    data = __import__("json").loads(result.stdout)
+    assert "backends" in data and "cache" in data
 
 
 def test_builtin_backends_are_the_real_modules():
@@ -372,6 +554,55 @@ def test_compile_config_file_changes_are_picked_up(tmp_path):
     second = memo_cfg.compile("hls", options={"config": str(cfg)})
     assert first.name == "first_top"
     assert second.name == "second_top"
+
+
+def test_generic_specializations_are_bounded_and_clearable(monkeypatch):
+    monkeypatch.setenv("SAR_DSL_SPECIALIZATIONS_MAX", "2")
+
+    @sar.func
+    def scale(x):
+        return x * 2.0
+
+    first = scale.specialize(sar.f32[2])
+    scale.specialize(sar.f32[3])
+    scale.specialize(sar.f32[4])
+    assert scale.specialization_stats() == {"variants": 2}
+    assert scale.specialize(sar.f32[2]) is not first  # oldest was evicted
+    scale.clear_specializations()
+    assert scale.specialization_stats() == {"variants": 0}
+
+
+def test_compiled_launcher_memo_is_bounded_and_clearable(monkeypatch):
+    monkeypatch.setenv("SAR_DSL_COMPILED_MAX", "2")
+
+    @sar.func
+    def scale(x: sar.f32[2]) -> sar.f32[2]:
+        return x * 2.0
+
+    from sar import compiler
+    launches = []
+
+    def fake_compile(*args, **kwargs):
+        launches.append(object())
+        return launches[-1]
+
+    monkeypatch.setattr(compiler, "compile", fake_compile)
+    scale.compile("cpu", {"opt_level": 0})
+    scale.compile("cpu", {"opt_level": 1})
+    scale.compile("cpu", {"opt_level": 2})
+    assert scale.compilation_stats() == {"compiled_launchers": 2}
+    scale.clear_compiled()
+    assert scale.compilation_stats() == {"compiled_launchers": 0}
+
+
+def test_operator_constant_array_key_is_a_digest():
+    import sar.language as language
+
+    value = np.arange(1024, dtype=np.float64)
+    frozen = language._freeze_for_key(value)
+    assert frozen[:3] == ("ndarray", value.shape, str(value.dtype))
+    assert len(frozen[3]) == 64
+    assert value.tobytes() not in frozen
 
 
 @requires_cpu

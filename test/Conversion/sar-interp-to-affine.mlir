@@ -23,8 +23,8 @@ func.func @interp(%re: tensor<8x16xf32>, %im: tensor<8x16xf32>,
 
 // The taps of one sample sit at compile-time integer offsets from a single
 // fractional position, so the sinc numerator and the raised-cosine window
-// angle are evaluated once and combined per tap rather than per tap
-// evaluated: three transcendentals for the whole gather, not two per tap.
+// angle are evaluated once and combined per tap rather than evaluated
+// per tap: three transcendentals for the whole gather, not two per tap.
 
 // RUN: sar-opt %s --convert-sar-interp-to-affine \
 // RUN:   | grep -c -E 'math\.(sin|cos)' | FileCheck %s --check-prefix=COUNT

@@ -17,6 +17,14 @@ func.func @fft_bad_dim(%x: tensor<4x8xcomplex<f32>>) -> tensor<4x8xcomplex<f32>>
 
 // -----
 
+func.func @ifft_bad_dim(%x: tensor<4x8xcomplex<f32>>) -> tensor<4x8xcomplex<f32>> {
+  // expected-error @+1 {{dim is out of range for the input rank}}
+  %0 = sar.ifft %x {dim = 2 : i64} : tensor<4x8xcomplex<f32>>
+  return %0 : tensor<4x8xcomplex<f32>>
+}
+
+// -----
+
 func.func @transpose_bad_shape(%x: tensor<4x8xf32>) -> tensor<4x8xf32> {
   // expected-error @+1 {{result shape must be the transpose of the input shape}}
   %0 = sar.transpose %x : tensor<4x8xf32> -> tensor<4x8xf32>
@@ -57,6 +65,14 @@ func.func @real_precision_mismatch(%z: tensor<4xcomplex<f32>>) -> tensor<4xf64> 
 
 // -----
 
+func.func @imag_precision_mismatch(%z: tensor<4xcomplex<f32>>) -> tensor<4xf64> {
+  // expected-error @+1 {{result element type must be the float precision of the input element type}}
+  %0 = sar.imag %z : tensor<4xcomplex<f32>> -> tensor<4xf64>
+  return %0 : tensor<4xf64>
+}
+
+// -----
+
 func.func @complex_precision_mismatch(%re: tensor<4xf32>, %im: tensor<4xf32>)
     -> tensor<4xcomplex<f64>> {
   // expected-error @+1 {{result complex precision must match the plane float type}}
@@ -90,6 +106,14 @@ func.func @reduce_bad_result(%x: tensor<4x8xf64>) -> tensor<8xf64> {
 
 // -----
 
+func.func @argmax_bad_result(%x: tensor<4x8xf64>) -> tensor<8xi64> {
+  // expected-error @+1 {{result must be rank-1 with the size of the kept axis}}
+  %0 = sar.argmax %x {dim = 1 : i64} : tensor<4x8xf64> -> tensor<8xi64>
+  return %0 : tensor<8xi64>
+}
+
+// -----
+
 func.func @slice_out_of_bounds(%x: tensor<4x8xf64>) -> tensor<2x8xf64> {
   // expected-error @+1 {{slice bounds exceed the input along dim 0}}
   %0 = sar.slice %x {offsets = array<i64: 3, 0>, sizes = array<i64: 2, 8>, strides = array<i64: 1, 1>} : tensor<4x8xf64> -> tensor<2x8xf64>
@@ -108,6 +132,19 @@ func.func @dynamic_slice_bad_offset(%x: tensor<4x8xf64>,
 
 // -----
 
+func.func @dynamic_update_too_large(%x: tensor<4x8xf64>,
+                                    %update: tensor<5x8xf64>,
+                                    %offset: tensor<1xi64>)
+    -> tensor<4x8xf64> {
+  // expected-error @+1 {{update exceeds the input along dim 0}}
+  %0 = "sar.dynamic_update_slice"(%x, %update, %offset, %offset)
+      : (tensor<4x8xf64>, tensor<5x8xf64>, tensor<1xi64>, tensor<1xi64>)
+      -> tensor<4x8xf64>
+  return %0 : tensor<4x8xf64>
+}
+
+// -----
+
 func.func @concat_shape_mismatch(%a: tensor<4x8xf64>, %b: tensor<4x6xf64>) -> tensor<8x8xf64> {
   // expected-error @+1 {{operand shapes must match outside dim}}
   %0 = sar.concat %a, %b {dim = 0 : i64} : (tensor<4x8xf64>, tensor<4x6xf64>) -> (tensor<8x8xf64>)
@@ -120,6 +157,22 @@ func.func @pad_bad_result(%x: tensor<4xf64>) -> tensor<5xf64> {
   // expected-error @+1 {{result shape must be the padded input shape}}
   %0 = sar.pad %x {low = array<i64: 2>, high = array<i64: 0>, value = 0.0} : tensor<4xf64> -> tensor<5xf64>
   return %0 : tensor<5xf64>
+}
+
+// -----
+
+func.func @reverse_bad_dim(%x: tensor<4x8xf64>) -> tensor<4x8xf64> {
+  // expected-error @+1 {{dim is out of range for the input rank}}
+  %0 = sar.reverse %x {dim = 2 : i64} : tensor<4x8xf64>
+  return %0 : tensor<4x8xf64>
+}
+
+// -----
+
+func.func @fftshift_bad_dim(%x: tensor<4x8xf64>) -> tensor<4x8xf64> {
+  // expected-error @+1 {{dim is out of range for the input rank}}
+  %0 = sar.fftshift %x {dim = 2 : i64} : tensor<4x8xf64>
+  return %0 : tensor<4x8xf64>
 }
 
 

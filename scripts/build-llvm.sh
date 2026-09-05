@@ -14,9 +14,9 @@ if [[ ! -f "$LLVM_DIR/llvm/CMakeLists.txt" ]]; then
   exit 1
 fi
 
-# clang-tools-extra provides clangd for local editor integration. CI overrides
-# LLVM_PROJECTS to omit it: clang-tidy/clangd are not used to build or test
-# SAR-DSL. The openmp runtime remains required by the CPU backend.
+# clang-tools-extra provides clangd for local editor integration; it is not
+# needed to build or test SAR-DSL, so override LLVM_PROJECTS to omit it for a
+# leaner build. The openmp runtime remains required by the CPU backend.
 cmake_args=(
   -G Ninja
   -S "$LLVM_DIR/llvm"

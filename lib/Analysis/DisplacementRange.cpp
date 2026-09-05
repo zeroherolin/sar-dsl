@@ -188,7 +188,7 @@ static AffineInterval divAI(const AffineInterval &a, const AffineInterval &b) {
 // Constants
 //===----------------------------------------------------------------------===//
 
-/// Plain min/max over every element of a dense attribute.
+/// Coordinate along `axis` of the row-major linear index `linear`.
 static int64_t coordinateAt(int64_t linear, ArrayRef<int64_t> shape,
                             int64_t axis) {
   int64_t stride = 1;
@@ -206,6 +206,8 @@ static bool inSlice(int64_t linear, ArrayRef<int64_t> shape, Slice slice) {
   return coordinate >= slice.begin && coordinate < slice.end;
 }
 
+/// Plain min/max hull over the elements of a dense attribute that fall
+/// inside `slice`.
 static Interval hullOfDenseAttr(ElementsAttr attr, Slice slice) {
   if (!isa<FloatType>(attr.getShapedType().getElementType()))
     return Interval::unbounded();
@@ -452,6 +454,21 @@ struct ConstantFolder {
           return std::nullopt;
       return map(src, [](double a) { return std::sqrt(a); });
     }
+    if (auto o = dyn_cast<CosOp>(op))
+      return map(eval(o.getInput()), [](double a) { return std::cos(a); });
+    if (auto o = dyn_cast<SinOp>(op))
+      return map(eval(o.getInput()), [](double a) { return std::sin(a); });
+    if (auto o = dyn_cast<ExpOp>(op))
+      return map(eval(o.getInput()), [](double a) { return std::exp(a); });
+    if (auto o = dyn_cast<LogOp>(op)) {
+      auto src = eval(o.getInput());
+      if (!src || llvm::any_of(*src, [](double a) { return a <= 0.0; }))
+        return std::nullopt;
+      return map(src, [](double a) { return std::log(a); });
+    }
+    if (auto o = dyn_cast<Atan2Op>(op))
+      return zip(eval(o.getY()), eval(o.getX()),
+                 [](double y, double x) { return std::atan2(y, x); });
     if (auto o = dyn_cast<CastOp>(op)) {
       auto inTy = dyn_cast<RankedTensorType>(o.getInput().getType());
       auto outTy = dyn_cast<RankedTensorType>(o.getResult().getType());
@@ -596,7 +613,8 @@ AffineInterval Analyzer::analyzeOp(Operation *op, int64_t rampAxis,
     return scaleBy(analyze(o.getInput(), rampAxis, slice),
                    o.getScalar().convertToDouble());
 
-  // sar.sqrt -- monotone, so endpoints map, but a ramp does not survive it.
+  // sar.sqrt -- monotone, so endpoints map. A generic ramp does not survive
+  // it; the recognized sqrt(x*x + q) form below is the one exception.
   if (auto o = dyn_cast<SqrtOp>(op)) {
     // Preserve a positive ramp through sqrt(x*x + q) by bounding the
     // residual q / (sqrt(x*x + q) + x). This is a general stable form for

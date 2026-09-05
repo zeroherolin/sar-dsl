@@ -33,6 +33,7 @@ Usage:
 
 import argparse
 import json
+import math
 import statistics
 import sys
 import time
@@ -41,7 +42,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from algorithms import ALL, LABELS, load  # noqa: E402
-from provenance import environment  # noqa: E402
+from provenance import check_result_preconditions  # noqa: E402
+from provenance import result_environment  # noqa: E402
 
 _DEFAULT_SIZES = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 _WARMUP = 3
@@ -58,14 +60,28 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _timing_statistics(times: list) -> dict:
+    """Robust and legacy statistics for a list of wall-clock timings."""
+    ordered = sorted(times)
+    rank = max(0, math.ceil(0.95 * len(ordered)) - 1)
+    return {
+        "best": min(times),
+        "mean": statistics.mean(times),
+        "median": statistics.median(times),
+        "p95": ordered[rank],
+        "stdev": statistics.stdev(times) if len(times) > 1 else 0.0,
+        "samples": times,
+    }
+
+
 def _timed(fn, repeats: int):
-    """Returns (best, mean, samples) for back-to-back calls."""
+    """Returns robust and legacy statistics for back-to-back calls."""
     times = []
     for _ in range(repeats):
         t0 = time.perf_counter()
         fn()
         times.append(time.perf_counter() - t0)
-    return min(times), statistics.mean(times), times
+    return _timing_statistics(times)
 
 
 def throughput_figure(results: list, out_dir=None) -> None:
@@ -160,7 +176,13 @@ def main() -> None:
     parser.add_argument("--json",
                         help="also append the results as JSON lines to this "
                         "file (one object per measured point)")
+    parser.add_argument("--allow-dirty",
+                        action="store_true",
+                        help="permit JSON output from a dirty worktree and "
+                        "record its diff hash")
     args = parser.parse_args()
+    if args.json:
+        check_result_preconditions(args.allow_dirty)
 
     print(f"{'algorithm':>9} {'size':>6} {'compile':>9} {'cold':>9} "
           f"{'run best':>10} {'run mean':>10} {'Msamp/s':>9} {'numpy':>10} "
@@ -205,14 +227,15 @@ def main() -> None:
             for _ in range(_WARMUP - 1):
                 chain.run(kernel)
 
-            best, mean, samples = _timed(lambda: chain.run(kernel),
-                                         args.repeats)
+            timing = _timed(lambda: chain.run(kernel), args.repeats)
+            best, mean = timing["best"], timing["mean"]
             throughput = n * n / best
 
             np_best = None
             if args.numpy:
-                np_best, _, numpy_samples = _timed(chain.run_reference,
-                                                   max(1, args.repeats // 3))
+                numpy_timing = _timed(chain.run_reference,
+                                      max(1, args.repeats // 3))
+                np_best = numpy_timing["best"]
                 np_txt = f"{np_best:9.2f}s"
                 speedup = f"{np_best / best:7.1f}x"
             else:
@@ -230,17 +253,20 @@ def main() -> None:
                      cold_s=cold_s,
                      best_s=best,
                      mean_s=mean,
-                     samples_s=samples,
+                     median_s=timing["median"],
+                     p95_s=timing["p95"],
+                     stdev_s=timing["stdev"],
+                     samples_s=timing["samples"],
                      numpy_s=np_best))
             if args.numpy:
-                results[-1]["numpy_samples_s"] = numpy_samples
+                results[-1]["numpy_samples_s"] = numpy_timing["samples"]
 
     if args.json:
         with open(args.json, "a") as fh:
             fh.write(
                 json.dumps({
                     "type": "environment",
-                    **environment()
+                    **result_environment(args.allow_dirty)
                 }) + "\n")
             for r in results:
                 fh.write(json.dumps({"type": "measurement", **r}) + "\n")

@@ -18,7 +18,7 @@ Whole-array operations for SAR imaging. All operations work on builtin ranked te
 | `sar.conj` | `(complex<t>) -> complex<t>` | complex conjugate |
 | `sar.real` / `sar.imag` | `(complex<t>) -> t` | plane extraction |
 | `sar.complex` | `(t, t) -> complex<t>` | assemble from (re, im) planes |
-| `sar.cast` | `(T) -> U` | float<->float, complex<->complex, float->complex, int<->int, int->float, float->int (truncation) |
+| `sar.cast` | `(T) -> U` | float<->float, complex<->complex, float->complex, int<->int, int->float, float->int (truncate toward zero; saturate out-of-range/±Inf; NaN becomes zero) |
 | `sar.constant` | `() -> T` | dense elements attribute |
 
 ## Reductions

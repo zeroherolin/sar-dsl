@@ -17,14 +17,17 @@ This is a compact map of the public `sar` package. Semantics follow NumPy unless
 | `sar.Kernel` | compiled kernel handle: what an annotated `@sar.func` is, and what specializing an annotation-free one yields |
 | `Kernel.compile(backend=, options=)` | compiles for a backend; returns a callable (cpu) or a design handle (hls) |
 | `Kernel.to_mlir()` | the traced MLIR module text |
+| `Kernel.dump_pipeline(dir, backend=, options=)` | compiles and copies intermediate MLIR, facts, decisions, and a stage manifest for inspection |
 | `GenericKernel.specialize(*types)` | pins an annotation-free `@sar.func` to explicit types, returning a `Kernel` |
+| `GenericKernel.clear_specializations()` / `.specialization_stats()` | drops or inspects in-process shape/dtype variants; disk artifacts are unaffected |
+| `Kernel.clear_compiled()` / `.compilation_stats()` | drops or inspects in-process backend launchers; disk artifacts are unaffected |
 | `sar.constant(value, dtype=, shape=)` | materializes a NumPy array or scalar as a tensor constant |
 
-Inside a kernel, tensors carry NumPy-style sugar: operators (`+`, `*`, comparisons building masks), `abs(x)`, `x ** 2`, `x.T` / `x.transpose()`, `x.real`, `x.conj()` / `x.conjugate()`, reduction and scan methods (`x.sum(axis=)`, `x.max()`, `x.min()`, `x.argmax()`, `x.argmin()`, `x.mean()`, `x.std()`, `x.var()`, `x.cumsum()`), `x.clip()`, `x.round()`, `x.astype(dtype)`, `x.real` / `x.imag`, basic slicing `x[2:6, ::2]`, runtime-offset windows (`x.dynamic_slice()`, `x.dynamic_update_slice()`), and introspection (`x.shape`, `x.dtype`, `x.ndim`, `x.size`, `len(x)`).
+Inside a kernel, tensors carry NumPy-style sugar: operators (`+`, `*`, comparisons building masks), `abs(x)`, `x ** 2`, `x.T` / `x.transpose()`, `x.conj()` / `x.conjugate()`, reduction and scan methods (`x.sum(axis=)`, `x.max()`, `x.min()`, `x.argmax()`, `x.argmin()`, `x.mean()`, `x.std()`, `x.var()`, `x.cumsum()`), `x.clip()`, `x.round()`, `x.astype(dtype)`, `x.real` / `x.imag`, basic slicing `x[2:6, ::2]`, runtime-offset windows (`x.dynamic_slice()`, `x.dynamic_update_slice()`), and introspection (`x.shape`, `x.dtype`, `x.ndim`, `x.size`, `len(x)`).
 
 ## Element-wise operations
 
-`sqrt`, `cos`, `sin`, `exp`, `log`, `log2`, `log10`, `atan2` (NumPy argument order), `hypot`, `sinc`, `absolute`/`abs`, `sign`, `floor`, `ceil`, `round` (half away from zero -- MATLAB, not NumPy), `maximum`, `minimum`, `clip`, `cast`, `where` (exact selection by a mask).
+`sqrt`, `cos`, `sin`, `exp`, `log`, `log2`, `log10`, `atan2` (NumPy argument order), `hypot`, `sinc`, `absolute`/`abs`, `sign`, `floor`, `ceil`, `round` (half away from zero -- MATLAB, not NumPy), `maximum`, `minimum`, `clip`, `cast`, `where` (exact selection by a mask). Float-to-int casts truncate toward zero, saturate out-of-range values and infinities, and map NaN to zero; `floor`/`ceil`/`round` propagate NaN and infinities. `/` on an integer tensor accepts only a nonzero integer scalar; true division involving an integer-tensor denominator is rejected at trace time -- cast first (`x.astype(sar.f32)`), as implicit promotion would silently change the arithmetic.
 
 Complex access: `conj` (alias `conjugate`), `real`, `imag`, `angle`, `make_complex`, `expj` (`exp(jx)` from a float tensor).
 
@@ -64,6 +67,7 @@ Complex access: `conj` (alias `conjugate`), `real`, `imag`, `angle`, `make_compl
 | `HLSDesign.tables_source()`, `.has_tables()`, `.tables_name` | the constant-table header, when the design has one |
 | `HLSDesign.write_testbench(inputs, expected, dir, rtol=1e-4, atol=1e-5, max_bytes=None)` | `<top>.h`/`.cpp` plus `<top>_hls_csim.tcl`, `<top>_portable_cpp_sim.sh`, C-synth/C-RTL scripts, and binary golden data; the portable script is the no-Vitis fallback, and `max_bytes=0` permits an explicitly selected production-scale harness |
 | `HLSDesign.write_synthesis_script(dir)` | `<top>.h`/`.cpp`, manifest, and Vitis HLS csynth script for any interface |
+| `sar.runtime.clear_fft_plan_cache()`, `fft_plan_cache_size()` | clear or inspect immutable CPU FFT plans cached by transform length |
 
 ## Errors and diagnostics
 
@@ -74,7 +78,7 @@ Complex access: `conj` (alias `conjugate`), `real`, `imag`, `angle`, `make_compl
 | `ToolchainError` | a compiler tool is missing or fails to run |
 | `CompilationError` | a pipeline stage rejects the kernel |
 | `LaunchError` | arguments do not match the compiled signature |
-| `HLSConfigError` | an HLS option or config-file value is unknown, mistyped or out of range; also when compile options name both a `part` and explicit resource budgets (also a `ValueError`) |
+| `HLSConfigError` | an HLS option or config-file value is unknown, mistyped or out of range; a target names only part of an explicit resource contract; or the configured interface cannot serve the kernel (`stream` with FFT/transpose/gather) (also a `ValueError`) |
 | `DomainWarning` | suspicious spectral-domain usage (double FFT, centered spectrum into `ifft`, mixed-domain arithmetic) |
 | `PrecisionWarning` | host data widens the kernel's working precision |
 

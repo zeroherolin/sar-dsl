@@ -112,7 +112,8 @@ def ScheduleDataflowNode :
 
   let options = [
     Option<"ignoreViolations", "ignore-violations", "bool",
-           /*default=*/"false", "Ignore multi-consumer or producer violations">
+           /*default=*/"false", "Ignore multi-producer or multi-consumer "
+           "violations">
   ];
 }
 
@@ -209,6 +210,11 @@ def PlaceDataflowBuffer :
            /*default=*/"64",
            "Buffer size, in bytes, at or below which distributed RAM is "
            "preferred (one bus beat at the default 512-bit bus)">,
+    Option<"bramBlockBytes", "bram-block-bytes", "unsigned",
+           /*default=*/"4608", "Bytes in one block-RAM primitive">,
+    Option<"uramBlockBytes", "uram-block-bytes", "unsigned",
+           /*default=*/"36864", "Bytes in one UltraRAM primitive (0 when "
+           "the target has no UltraRAM)">,
     Option<"allowDram", "allow-dram", "bool", /*default=*/"true",
            "Permit buffers that do not fit on chip to spill to external "
            "DRAM; disable for ap_memory interfaces">,
@@ -292,7 +298,8 @@ def FuseSiblingLoops :
   let summary = "Fuse independent affine sweeps with identical iteration";
   let description = [{
     Merges adjacent perfect affine loop nests when they have identical bounds
-    and no cross-loop memory dependence. Shared read-only expressions then
+    and no cross-loop memory dependence beyond a pointwise producer/consumer
+    pair whose store and load indices agree. Shared read-only expressions then
     become common subexpressions, allowing split real/imaginary phase outputs
     to share trigonometric and coordinate arithmetic. With
     `preserve-dataflow-roles`, a public-result writer is kept separate from a
@@ -378,12 +385,12 @@ def LowerCopyToAffine : Pass<"hls-lower-copy-to-affine", "func::FuncOp"> {
     "mlir::func::FuncDialect",
     "mlir::memref::MemRefDialect"];
 
-  let summary = "Convert copy and assign to affine loops";
+  let summary = "Convert memref copy ops to affine loops";
   let constructor = "mlir::sar::createLowerCopyToAffinePass()";
 
   let options = [
     Option<"internalCopyOnly", "internal-copy-only", "bool",
-           /*default=*/"false", "only convert copy between internal buffers">
+           /*default=*/"false", "Only convert copies between internal buffers">
   ];
 }
 
@@ -493,6 +500,11 @@ def ArrayPartition : Pass<"hls-array-partition", "ModuleOp"> {
            "Final block RAM budget in bytes, checked after banking">,
     Option<"uramBytes", "uram-bytes", "unsigned", /*default=*/"37748736",
            "Final UltraRAM budget in bytes, checked after banking">,
+    Option<"bramBlockBytes", "bram-block-bytes", "unsigned",
+           /*default=*/"4608", "Bytes in one block-RAM primitive">,
+    Option<"uramBlockBytes", "uram-block-bytes", "unsigned",
+           /*default=*/"36864", "Bytes in one UltraRAM primitive (0 when "
+           "the target has no UltraRAM)">,
     Option<"maxFactor", "max-factor", "unsigned", /*default=*/"32",
            "Positive number: the largest array partition factor to apply">
   ];
@@ -518,7 +530,7 @@ def LoopPipelining : Pass<"hls-loop-pipelining", "func::FuncOp"> {
 
   let options = [
     Option<"pipelineLevel", "pipeline-level", "unsigned", /*default=*/"0",
-           "Positive number: loop level to be pipelined (from innermost)">,
+           "Loop level to be pipelined (0 = innermost)">,
     Option<"targetII", "target-ii", "unsigned", /*default=*/"1",
            "Positive number: the targeted II to achieve">,
     Option<"maxUnrolledOps", "max-unrolled-ops", "unsigned",

@@ -175,7 +175,7 @@ static auto getUsersExcept(Value buffer, OperandKind kind, NodeOp except) {
   return nodes;
 }
 
-/// Get the consumer/producer nodes of the given buffer expect the given node.
+/// Get the consumer/producer nodes of the given buffer except the given node.
 SmallVector<NodeOp> sar::getConsumersExcept(Value buffer, NodeOp except) {
   return getUsersExcept(buffer, OperandKind::INPUT, except);
 }
@@ -218,9 +218,8 @@ static hls::BufferLikeInterface findBufferOp(Value memref) {
   return hls::BufferLikeInterface();
 }
 
-/// Get the depth of a buffer or stream channel. Note that only if the defining
-/// operation of the buffer is not a BufferOp or stream types, the returned
-/// result will be 1.
+/// Get the depth of a buffer or stream channel. Note that the returned result
+/// will be 1 unless the value is stream-typed or backed by a buffer op.
 unsigned sar::getBufferDepth(Value memref) {
   if (auto streamType = dyn_cast<StreamType>(memref.getType())) {
     return streamType.getDepth();
@@ -292,7 +291,7 @@ bool sar::isWritten(OpOperand &use) {
 //===----------------------------------------------------------------------===//
 
 /// Return a pair which indicates whether the if statement is always true or
-/// false, respectively. The returned result is one-hot.
+/// false, respectively. At most one of the two flags is true.
 std::pair<bool, bool> sar::ifAlwaysTrueOrFalse(mlir::affine::AffineIfOp ifOp) {
   auto set = ifOp.getIntegerSet();
   auto operands = SmallVector<Value, 4>(ifOp.getOperands().begin(),
@@ -345,7 +344,7 @@ std::pair<bool, bool> sar::ifAlwaysTrueOrFalse(mlir::affine::AffineIfOp ifOp) {
     }
 
     // Only when all sub-conditions are met, the if statement is always true.
-    // Otherwise, the statement if always false.
+    // Otherwise, the statement is always false.
     if (llvm::all_of(flagList, [&](bool flag) { return flag; }))
       alwaysTrue = true;
     else
@@ -357,7 +356,7 @@ std::pair<bool, bool> sar::ifAlwaysTrueOrFalse(mlir::affine::AffineIfOp ifOp) {
     alwaysFalse = true;
   }
 
-  // Assert only one of the two flags are true.
+  // Assert that at most one of the two flags is true.
   assert((!alwaysTrue || !alwaysFalse) && "unexpected if condition");
   return {alwaysTrue, alwaysFalse};
 }
@@ -417,11 +416,15 @@ void sar::getMemAccessesMap(Block &block, MemAccessesMap &map,
       // Recursively collect memory access operations in each block.
       for (auto &region : op.getRegions())
         for (auto &block : region)
-          getMemAccessesMap(block, map);
+          getMemAccessesMap(block, map, includeVectorTransfer);
     }
   }
 }
 
+/// Whether `a` dominates `b` even when the two live in different regions: `a`
+/// is first hoisted to its ancestor directly under the closest ancestor op
+/// shared with `b`, where the standard dominance query applies. An op nested
+/// within `b` never dominates it.
 bool sar::crossRegionDominates(Operation *a, Operation *b) {
   if (a == b)
     return true;
@@ -469,12 +472,12 @@ sar::getBoundOfAffineMap(AffineMap map, ValueRange operands) {
   SmallVector<int64_t, 4> lbs;
   SmallVector<int64_t, 4> ubs;
   for (auto operand : operands) {
-    // Only if the affine map operands are induction variable, the calculation
+    // Only if the affine map operands are induction variables, the calculation
     // is possible.
     if (!isAffineForInductionVar(operand))
       return std::optional<std::pair<int64_t, int64_t>>();
 
-    // Only if the owner for op of the induction variable has constant bound,
+    // Only if the owner for-op of the induction variable has constant bounds,
     // the calculation is possible.
     auto forOp = getForInductionVarOwner(operand);
     if (!forOp.hasConstantBounds())

@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -29,8 +29,15 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install build matplotlib numpy pytest pre-commit
+      - name: Cache pre-commit hook environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
       - name: Lint and format checks
         run: pre-commit run --all-files --show-diff-on-failure
+      - name: Documentation references
+        run: PYTHONPATH=python python docs/check_references.py
 
       - name: Build and install Python distributions
         run: |
@@ -58,6 +65,8 @@ jobs:
         run: >-
           PYTHONPATH=python python -m pytest test/python -q --maxfail=1
           -m "not requires_cpu and not requires_hls and not requires_vitis"
+      - name: LLVM release script safety
+        run: bash test/test_fetch_llvm_release.sh
 
   # The intermediate supported version runs on nightly and manual workflows;
   # pull requests already cover the minimum and current versions.

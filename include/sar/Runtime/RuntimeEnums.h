@@ -3,11 +3,10 @@
 // Part of the SAR-DSL Project. Licensed under the MIT License.
 //
 // The integer encodings of `sar.interp1d`'s `kernel`, `window` and
-// `boundary` attributes
-// as passed across the runtime C ABI. Included by both the lowering
-// (lib/Conversion/SARSignalToRuntime) and the runtime implementation
-// (runtime/SARRuntime.cpp), which is dependency-free C++ -- so this header
-// stays plain C++ with no MLIR includes.
+// `boundary` attributes as passed across the runtime C ABI. Included by
+// both the lowering (lib/Conversion/SARSignalToRuntime) and the runtime
+// implementation (runtime/SARRuntime.cpp), which is dependency-free C++ --
+// so this header stays plain C++ with no MLIR includes.
 //
 //===----------------------------------------------------------------------===//
 

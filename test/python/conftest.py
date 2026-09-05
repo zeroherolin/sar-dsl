@@ -5,6 +5,7 @@ import shutil
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -12,6 +13,19 @@ sys.path.insert(0, str(REPO_ROOT / "python"))
 sys.path.insert(0, str(REPO_ROOT / "examples"))
 
 import sar  # noqa: E402
+
+#: Float-to-int cast saturation golden data. The CPU and HLS backend
+#: tests both assert exactly these edges so the backends cannot diverge.
+FLOAT_TO_INT_EDGE_VALUES = np.array(
+    [np.nan, -np.inf, np.inf, -1e100, 1e100, -3.75, 3.75])
+FLOAT_TO_INT_EDGE_EXPECTED = np.array([
+    0,
+    np.iinfo(np.int32).min,
+    np.iinfo(np.int32).max,
+    np.iinfo(np.int32).min,
+    np.iinfo(np.int32).max, -3, 3
+],
+                                      dtype=np.int32)
 
 
 def _backend_available(name: str) -> bool:
@@ -95,8 +109,9 @@ def compile_split_kernel(mlir_text: str,
                          name: str,
                          tmp_path,
                          pipeline: str = "--sar-affine-to-llvm-pipeline"):
-    """Compiles a module through the split-complex affine path into a
-    shared library and returns the `_mlir_ciface_<name>` symbol."""
+    """Compiles a module through the split-complex affine path and
+    returns the loaded library with its `_mlir_ciface_<name>` symbol.
+    Keep the library handle alive for as long as the symbol is used."""
     import ctypes
     import subprocess
 
@@ -133,7 +148,6 @@ def compile_split_kernel(mlir_text: str,
 
 def run_split(fn, inputs, out_shapes, dtype):
     """Invokes a split-complex C interface function."""
-    import numpy as np
 
     from sar.runtime import make_descriptor
     import ctypes

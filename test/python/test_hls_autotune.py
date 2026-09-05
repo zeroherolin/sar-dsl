@@ -45,11 +45,15 @@ def test_structured_kernel_facts_parser():
         '{"plane_elements":64,"element_bytes":4,"transposes":2,'
         '"element_bytes_set":[4,8],'
         '"transforms":[[8,4]],"transform_strided":[true],'
+        '"banded_gathers":2,"full_row_gathers":1,"direct_gathers":2,'
         '"buffers":[[64,256]]}')
     assert facts == KernelFacts(64,
                                 4, ((8, 4), ),
                                 2, ((64, 256), ), (4, 8),
                                 0,
+                                2,
+                                1,
+                                2,
                                 transform_strided=(True, ))
 
 
@@ -59,6 +63,60 @@ def test_structured_kernel_facts_reject_mismatched_transform_layouts():
             '{"plane_elements":64,"element_bytes":4,'
             '"transforms":[[8,4]],"transform_strided":[true,false],'
             '"buffers":[]}')
+
+
+def test_kernel_facts_cache_hits_and_recovers_from_corruption(
+        tmp_path, monkeypatch):
+    from sar.compiler.cache import KernelCache
+    from sar.backends.hls import autotune
+
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
+    cache = KernelCache("facts", "hls", {})
+    calls = []
+
+    def measure(text):
+        calls.append(text)
+        return _facts(plane_elements=64, transforms=((8, 4), ))
+
+    monkeypatch.setattr(autotune, "measure_kernel", measure)
+    first = autotune.cached_kernel_facts(cache, "facts.json", "module")
+    second = autotune.cached_kernel_facts(cache, "facts.json", "module")
+    assert first == second
+    assert calls == ["module"]
+
+    cache.path("facts.json").write_text("not json")
+    third = autotune.cached_kernel_facts(cache, "facts.json", "module")
+    assert third == first
+    assert calls == ["module", "module"]
+
+
+def test_performance_plan_cache_hits_and_recovers_from_corruption(
+        tmp_path, monkeypatch):
+    from sar.compiler.cache import KernelCache
+    from sar.backends.hls import autotune
+
+    monkeypatch.setenv("SAR_DSL_CACHE_DIR", str(tmp_path))
+    cache = KernelCache("plan", "hls", {})
+    facts = _facts()
+    config = _cfg()
+    real_plan = autotune.plan
+    calls = []
+
+    def measured(*args, **kwargs):
+        calls.append(1)
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(autotune, "plan", measured)
+    first = autotune.cached_performance_plan(cache, "plan.json", config, facts)
+    second = autotune.cached_performance_plan(cache, "plan.json", config,
+                                              facts)
+    assert first == second
+    assert calls == [1]
+
+    cache.path("plan.json").write_text("not json")
+    third = autotune.cached_performance_plan(cache, "plan.json", config, facts)
+    assert third == first
+    assert calls == [1, 1]
 
 
 def test_tighter_clock_reduces_fft_routing_width():
@@ -883,6 +941,12 @@ def test_over_budget_retries_with_streaming(monkeypatch):
     assert len(calls) == 2, calls
     assert calls[1] < calls[0]
     assert design.config.external_buffer_threshold == calls[1]
+    assert design._metadata.extra["hls_retry_trace"] == [{
+        "reason": "memory",
+        "action": "stream_full_planes",
+        "before": calls[0],
+        "after": calls[1],
+    }]
 
 
 @requires_hls
@@ -931,6 +995,8 @@ def test_over_budget_narrows_the_transform_transfer(monkeypatch):
     # Halved one step at a time, never skipped straight to the floor.
     assert widths == sorted(widths, reverse=True)
     assert design.config.fft_io_unroll == 1
+    assert any(item["action"] == "halve_fft_io_unroll"
+               for item in design._metadata.extra["hls_retry_trace"])
 
 
 @requires_hls

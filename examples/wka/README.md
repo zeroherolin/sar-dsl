@@ -30,34 +30,24 @@ The optional [`handwritten_hls/`](handwritten_hls/) directory implements the sam
 ## Running
 
 ```bash
-# from the repository root, after `make build`
-python examples/wka/run_point_target_cpu.py --n 512          # focus + PNG
-python examples/wka/run_point_target_hls.py --n 256     # design + validation package
+PYTHONPATH=python python examples/wka/run_point_target_cpu.py --n 512
+PYTHONPATH=python python examples/wka/run_point_target_hls.py --n 256
 ```
 
-The CPU runner reports where the brightest target landed and its impulse response; at `--n 512` each target focuses to roughly one resolution cell:
-
-```
-peak at (333, 358), expected (333, 358), error (+0, +0)
-  range: IRW  2.12 samples, PSLR  -31.7 dB, ISLR  -28.6 dB
-azimuth: IRW  2.20 samples, PSLR  -27.1 dB, ISLR  -22.9 dB
-```
-
-The HLS runner writes the validation package into `hls_project/wka/`; its contents are listed in [docs/backends.md](../../docs/backends.md#hls-validation-package). C-sim through Vitis HLS is bit-exact against the NumPy reference (max |err| 0.0 over 16384 samples).
+The CPU runner saves a focused image and reports impulse-response metrics. The HLS runner writes `hls_project/wka/`; package contents are listed in the [backend guide](../../docs/backends.md#generated-package). Numerical results are maintained in the [benchmark report](../../benchmarks/README.md).
 
 ![synthetic point targets](assets/wka_synthetic_512.png)
 
 ## Real data (ALOS-1)
 
 ```bash
-# from the repository root; the dataset is shared by all three algorithms
-python examples/data/extract_alos.py   # CEOS L1.0 -> alos_raw_...bin (2 GiB)
-python examples/wka/run_alos_cpu.py        # tens of GiB of RAM at full size
-python examples/wka/run_alos_hls.py   # emit the artifacts at that geometry
+PYTHONPATH=python python examples/data/extract_alos.py
+PYTHONPATH=python python examples/wka/run_alos_cpu.py
+PYTHONPATH=python python examples/wka/run_alos_hls.py
 ```
 
-The runner reports wall time and urban-area contrast (`benchmarks/metrics.py:urban_contrast`, higher is sharper). The effective radar velocity in `ALOS_PARAMS` is autofocus-calibrated by image-contrast maximization over the urban area. The focused image is committed as `assets/san_francisco_wka.png`; the raw product it is made from is not redistributed here.
+The runner reports wall time and urban-area contrast (`benchmarks/metrics.py:urban_contrast`, higher is sharper). The effective radar velocity in `ALOS_PARAMS` is autofocus-calibrated by image-contrast maximization over the urban area. The focused image is committed as `assets/san_francisco_wka.png`; download and prepare the matching ALOS-1 granule as described in [the examples guide](../README.md#alos-1-stripmap-data).
 
-`run_alos_hls.py` writes one package under `hls_project/wka_alos/`. `wka_alos.h` / `wka_alos.cpp`, its testbench, binary data, manifest, stubs, and C-sim/C-synth/C-RTL scripts plus the portable fallback all describe the same `--n` raster and interface selected by the HLS configuration. The shipped default is AXI; a Python caller can pass different compile options through `emit(...)`.
+`run_alos_hls.py` writes `hls_project/wka_alos/`, specialized to the selected raster and HLS configuration.
 
 Tests (`test/python/test_wka.py`) check numerical equivalence with the reference, point-target focusing, the ALOS parameter set, and HLS C++ emission.

@@ -61,6 +61,8 @@ static LogicalResult emitKernelFacts(Operation *root, llvm::raw_ostream &os) {
   unsigned transposes = 0;
   unsigned gathers = 0;
   unsigned bandedGathers = 0;
+  unsigned fullRowGathers = 0;
+  unsigned directGathers = 0;
   uint64_t operationCount = 0;
   uint64_t loadCount = 0;
   uint64_t storeCount = 0;
@@ -112,11 +114,19 @@ static LogicalResult emitKernelFacts(Operation *root, llvm::raw_ostream &os) {
       ++transposes;
     if (isa<Interp1DOp, Gather2DOp>(op))
       ++gathers;
+    // A dim = 0 interp1d canonicalizes into a dim = 1 interp wrapped in
+    // three transposes (data, positions, result); count those here so the
+    // facts do not depend on whether canonicalization has run yet.
     if (auto interp = dyn_cast<Interp1DOp>(op); interp && interp.getDim() == 0)
       transposes += 3;
 
     if (auto alloc = dyn_cast<memref::AllocOp>(op)) {
       bandedGathers += alloc->hasAttr("hls.banded_gather");
+      if (auto strategy =
+              alloc->getAttrOfType<StringAttr>("hls.gather_strategy")) {
+        fullRowGathers += strategy.getValue() == "full_row";
+        directGathers += strategy.getValue() == "direct";
+      }
       MemRefType type = alloc.getType();
       auto bytes = planeBytes(type.getElementType());
       if (bytes && type.hasStaticShape()) {
@@ -140,6 +150,8 @@ static LogicalResult emitKernelFacts(Operation *root, llvm::raw_ostream &os) {
   }
   os << "],\"transposes\":" << transposes << ",\"gathers\":" << gathers
      << ",\"banded_gathers\":" << bandedGathers
+     << ",\"full_row_gathers\":" << fullRowGathers
+     << ",\"direct_gathers\":" << directGathers
      << ",\"operations\":" << operationCount << ",\"loads\":" << loadCount
      << ",\"stores\":" << storeCount << ",\"expensive_ops\":" << expensiveCount
      << ",\"calls\":" << callCount << ",\"max_fanout\":" << maxFanout

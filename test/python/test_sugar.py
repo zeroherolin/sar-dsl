@@ -151,6 +151,23 @@ def test_sign_propagates_nan():
     np.testing.assert_allclose(kernel(values), np.sign(values), equal_nan=True)
 
 
+def test_floor_ceil_round_define_nonfinite_and_large_inputs():
+    values = np.array(
+        [np.nan, -np.inf, np.inf, -0.0, 0.0, -(2.0**63), 2.0**63, -2.5, 2.5])
+
+    @sar.func
+    def kernel(x):
+        return sar.floor(x), sar.ceil(x), sar.round(x)
+
+    floor, ceil, rounded = kernel(values)
+    np.testing.assert_array_equal(floor, np.floor(values))
+    np.testing.assert_array_equal(ceil, np.ceil(values))
+    expected = np.sign(values) * np.floor(np.abs(values) + 0.5)
+    np.testing.assert_array_equal(rounded, expected)
+    for result in (floor, ceil, rounded):
+        assert np.signbit(result[3])  # preserve negative zero
+
+
 def test_fft_norm_conventions():
     """fft/ifft norm= matches numpy for all three conventions."""
     z = _complex(N, M)
@@ -343,5 +360,5 @@ def test_lambda_kernel_rejected_at_trace_time():
     pointed nowhere near the offending Python.
     """
     with pytest.raises(sar.language.TraceError,
-                       match="not a valid MLIR symbol"):
+                       match="not a portable identifier"):
         sar.func(lambda x: x * 2.0)(np.ones(4, dtype=np.float32))

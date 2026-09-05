@@ -37,7 +37,9 @@ from . import autotune
 from .config import (HLSConfig, HLSConfigError, check_precision,
                      normalize_hls_top_identifier)
 from .design import HLSDesign
-from .devices import bram18_count, uram_count
+from .devices import bram18_count
+from .retry import RetryTrace, decisions as retry_decisions
+from .retry import load as load_retry_decisions
 from ...compiler.toolchain import find_tool, run_tool
 from ...errors import CompilationError, LaunchError, ToolchainError
 
@@ -569,8 +571,8 @@ private:
 
 #: `hls::stream` stand-in. A design with dataflow channels includes this
 #: header, so an empty stub would make the package uncompilable outside
-#: Vitis -- which is the whole point of shipping stubs. Sequential simulation
-#: never blocks, so an unbounded queue is behaviourally exact here.
+#: Vitis. Sequential simulation never blocks, so an unbounded queue is
+#: behaviourally exact here.
 _HLS_STREAM_STUB = _STUB_HEADER + """\
 #include <cassert>
 #include <cstddef>
@@ -700,11 +702,16 @@ def _csynth_script(top, part, clock_ns, config=None) -> str:
         limits = {}
     else:
         limits = {
-            "BRAM_18K": bram18_count(config.bram_bytes),
-            "URAM": uram_count(config.uram_bytes, config.part),
-            "DSP": int(config.dsp),
-            "FF": int(config.ff),
-            "LUT": int(config.lut),
+            "BRAM_18K":
+            bram18_count(config.bram_bytes),
+            "URAM": (int(config.uram_bytes) // int(config.uram_block_bytes)
+                     if int(config.uram_block_bytes) else 0),
+            "DSP":
+            int(config.dsp),
+            "FF":
+            int(config.ff),
+            "LUT":
+            int(config.lut),
         }
     resource_limits = " ".join(f"{name} {limit}"
                                for name, limit in limits.items())
@@ -851,9 +858,26 @@ class Backend(BaseBackend):
         config = metadata.extra["hls_config"]
         # Measured before the cache is consulted: a design served from the
         # cache still has to report the settings it was built with.
-        facts = autotune.measure_kernel(module_text)
+        facts = autotune.cached_kernel_facts(cache, "kernel.sar.facts.json",
+                                             module_text)
         metadata.extra["hls_facts"] = facts
-        performance_plan = autotune.plan(config, facts)
+        if config.interface == "stream" and (facts.transforms
+                                             or facts.transposes
+                                             or facts.gather_ops):
+            features = []
+            if facts.transforms:
+                features.append("FFT")
+            if facts.transposes:
+                features.append("transpose")
+            if facts.gather_ops:
+                features.append("gather/interpolation")
+            raise HLSConfigError(
+                f"interface='stream' requires one complete monotonic "
+                f"row-major access sweep per port; this kernel contains "
+                f"{', '.join(features)}, which requires addressed memory. "
+                "Use interface='axi'.")
+        performance_plan = autotune.cached_performance_plan(
+            cache, "kernel.sar.plan.json", config, facts)
         metadata.extra["hls_performance_plan"] = performance_plan
         config.adopt(performance_plan.values)
 
@@ -903,8 +927,10 @@ class Backend(BaseBackend):
             # sharing nothing, ask the placement rule whether that form keeps
             # its planes on chip, and lower again only when it does not.
             private = lower(autotune.NEVER_SHARE, io_unroll)
-            if not autotune.should_share_buffers(
-                    config, facts, metadata, autotune.measure_kernel(private)):
+            private_facts = autotune.cached_kernel_facts(
+                cache, "kernel.affine.private.facts.json", private)
+            if not autotune.should_share_buffers(config, facts, metadata,
+                                                 private_facts):
                 return private
             decided = autotune.reuse_min_elements(facts)
             cache.write_text("kernel.reuse.txt", str(decided))
@@ -931,12 +957,16 @@ class Backend(BaseBackend):
     @staticmethod
     def _stage_hls_cpp(lowered: str, metadata: KernelMetadata, cache) -> str:
         config = metadata.extra["hls_config"]
+        retry = RetryTrace()
+        metadata.extra["hls_retry_trace"] = retry.items
         # Placement is the one decision that needs the lowered buffers, so
         # it is derived here rather than with the rest -- and, like them,
         # before the cache short-circuits the stage.
-        lowered_facts = autotune.measure_kernel(lowered)
-        performance_plan = autotune.plan(config, metadata.extra["hls_facts"],
-                                         metadata, lowered_facts)
+        lowered_facts = autotune.cached_kernel_facts(
+            cache, "kernel.affine.facts.json", lowered)
+        performance_plan = autotune.cached_performance_plan(
+            cache, "kernel.affine.plan.json", config,
+            metadata.extra["hls_facts"], metadata, lowered_facts)
         # Sharing was settled while lowering, against the unshared IR; the
         # shared IR this stage measures holds fewer buffers and would answer
         # the same question differently.
@@ -999,6 +1029,10 @@ class Backend(BaseBackend):
                            f"uram-bytes={int(config.uram_bytes)} "
                            f"lutram-bytes={int(config.lutram_bytes)} "
                            f"lutram-max-bytes={lutram_max} "
+                           f"bram-block-bytes="
+                           f"{int(config.bram_block_bytes)} "
+                           f"uram-block-bytes="
+                           f"{int(config.uram_block_bytes)} "
                            f"array-partition-max-factor={partition_factor} "
                            f"external-buffer-threshold={threshold}")
                 try:
@@ -1021,6 +1055,8 @@ class Backend(BaseBackend):
                     out, reason = schedule(threshold, factor, module)
                     if reason != "partition" or not derived or factor == 1:
                         return out, reason
+                    retry.record("partition", "halve_array_partition", factor,
+                                 factor // 2)
                     factor //= 2
                     config.repin("array_partition_max_factor", factor)
 
@@ -1045,6 +1081,9 @@ class Backend(BaseBackend):
                     # design that is known to exceed the device by whole
                     # planes.
                     threshold = streamed
+                    retry.record(retry_reason, "stream_full_planes",
+                                 int(config.external_buffer_threshold),
+                                 streamed)
                     retried, retry_reason = schedule_with_banking(
                         streamed, module)
                     if not retry_reason:
@@ -1065,13 +1104,15 @@ class Backend(BaseBackend):
             while (retry_reason and relower is not None and io_unroll > 1 and
                    config.provenance.get("fft_io_unroll") == config.DERIVED):
                 io_unroll //= 2
+                retry.record(retry_reason,
+                             "halve_fft_io_unroll",
+                             after=io_unroll)
                 module = relower(io_unroll)
                 retried, retry_reason = schedule_with_banking(
                     threshold, module)
                 if not retry_reason:
                     scheduled = retried
                     config.repin("fft_io_unroll", io_unroll)
-                    cache.write_text("kernel.affine.mlir", module)
 
             # A deep transform chain can still overflow after its planes have
             # spilled and its transfer has reached scalar width: every FFT
@@ -1084,17 +1125,17 @@ class Backend(BaseBackend):
                    and config.provenance.get("fft_parallel_rows")
                    == config.DERIVED):
                 lanes //= 2
+                retry.record(retry_reason,
+                             "halve_fft_parallel_rows",
+                             after=lanes)
                 config.repin("fft_parallel_rows", lanes)
                 module = relower(io_unroll)
                 retried, retry_reason = schedule_with_banking(
                     threshold, module)
                 if not retry_reason:
                     scheduled = retried
-                    cache.write_text("kernel.affine.mlir", module)
 
-            # Nothing left to trade: the constraints and the kernel are
-            # irreconcilable, and an over-budget design would be permanently
-            # invalid on the device, so none is emitted.
+            # Reject a design when no resource-preserving retry remains.
             if retry_reason:
                 raise HLSConfigError(
                     f"{metadata.name}: the on-chip working set exceeds the "
@@ -1103,6 +1144,44 @@ class Backend(BaseBackend):
                     "full-size planes; "
                     "raise bram_bytes/uram_bytes to match a larger device, "
                     "or shrink the kernel's resident tables")
+
+            # Commit the complete retry state only after one schedule has
+            # succeeded. A later rung may combine streaming, narrower FFT
+            # transfers, fewer rows, and reduced banking; every one of those
+            # values must describe the same affine IR and emitted C++.
+            for key, value in (
+                ("external_buffer_threshold", threshold),
+                ("fft_io_unroll", io_unroll),
+                ("fft_parallel_rows", lanes),
+            ):
+                if (config.provenance.get(key) == config.DERIVED
+                        and int(config[key]) != value):
+                    config.repin(key, value)
+            # Commit retried IR before deriving from it, and only when a
+            # retry actually changed it. The derived facts and plan die
+            # first: an interrupt can leave the entry without them (they
+            # recompute), never holding files that describe other IR --
+            # the digest inside the facts file guards the rest.
+            if module is not lowered:
+                cache.path("kernel.affine.facts.json").unlink(missing_ok=True)
+                cache.path("kernel.affine.plan.json").unlink(missing_ok=True)
+                cache.write_text("kernel.affine.mlir", module)
+            final_facts = autotune.cached_kernel_facts(
+                cache, "kernel.affine.facts.json", module)
+            final_plan = autotune.cached_performance_plan(
+                cache, "kernel.affine.plan.json", config,
+                metadata.extra["hls_facts"], metadata, final_facts)
+            # `external_buffer_threshold` is normally recomputed from the
+            # final buffer set. A retry is an observed placement decision and
+            # therefore takes precedence, as do the other resolved values.
+            for key in final_plan.values:
+                if config[key] is not None:
+                    final_plan.values[key] = config[key]
+            final_plan.values["reuse_buffer_min_elements"] = (
+                metadata.extra["hls_reuse_min_elements"])
+            cache.write_text("kernel.affine.plan.json",
+                             json.dumps(final_plan.to_dict(), sort_keys=True))
+            metadata.extra["hls_performance_plan"] = final_plan
             cache.write_text("kernel.hls.mlir", scheduled)
             # The threshold the shipped design was actually built with
             # (the retry above may have repinned it), persisted beside the
@@ -1111,24 +1190,7 @@ class Backend(BaseBackend):
             # pre-retry estimate.
             cache.write_text(
                 "kernel.hls.decisions.json",
-                json.dumps({
-                    "external_buffer_threshold":
-                    int(config.external_buffer_threshold),
-                    "array_partition_max_factor":
-                    int(config.array_partition_max_factor),
-                    "fft_io_unroll":
-                    int(config.fft_io_unroll),
-                    "fft_parallel_rows":
-                    int(config.fft_parallel_rows),
-                    "performance_plan": {
-                        "clock_ns": performance_plan.clock_ns,
-                        "timing_budget_ns": performance_plan.timing_budget_ns,
-                        "on_chip_bytes": performance_plan.on_chip_bytes,
-                        "memory_accesses": performance_plan.memory_accesses,
-                        "operation_count": performance_plan.operation_count,
-                        "values": performance_plan.values,
-                    },
-                }))
+                json.dumps(retry_decisions(config, final_plan, retry.items)))
 
             return run_tool("sar-emit-hls", [
                 find_tool("sar-translate"), "-hls-emit-hlscpp",
@@ -1142,8 +1204,8 @@ class Backend(BaseBackend):
         decisions = cache.read_if_cached("kernel.hls.decisions.json")
         if decisions is not None:
             try:
-                json.loads(decisions)
-            except (json.JSONDecodeError, TypeError):
+                load_retry_decisions(decisions)
+            except (ValueError, TypeError):
                 cache.path("kernel.hls.cpp").unlink(missing_ok=True)
                 cache.path("kernel.hls.decisions.json").unlink(missing_ok=True)
         cached_stage(cache, "kernel.hls.cpp", build)
@@ -1152,7 +1214,7 @@ class Backend(BaseBackend):
         # same configuration.
         decisions = cache.read_if_cached("kernel.hls.decisions.json")
         if decisions is not None:
-            values = json.loads(decisions)
+            values = load_retry_decisions(decisions)
             threshold = values.get("external_buffer_threshold")
             if (threshold is not None
                     and int(config.external_buffer_threshold) != threshold
@@ -1175,6 +1237,18 @@ class Backend(BaseBackend):
                     and config.provenance.get("fft_parallel_rows")
                     == config.DERIVED):
                 config.repin("fft_parallel_rows", lanes)
+            saved_plan = values.get("performance_plan")
+            if isinstance(saved_plan, dict):
+                try:
+                    metadata.extra["hls_performance_plan"] = \
+                        autotune.PerformancePlan.from_dict(saved_plan)
+                except (KeyError, TypeError, ValueError):
+                    cache.path("kernel.hls.cpp").unlink(missing_ok=True)
+                    cache.path("kernel.hls.decisions.json").unlink(
+                        missing_ok=True)
+                    return Backend._stage_hls_cpp(lowered, metadata, cache)
+            retry.replay(values)
+            metadata.extra["hls_retry_trace"] = retry.items
         return str(cache.path("kernel.hls.cpp"))
 
     # ------------------------------------------------------------------ #

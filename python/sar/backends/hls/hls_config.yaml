@@ -1,10 +1,11 @@
 # Defaults for the reference target. Memory limits are hard compiler caps;
 # DSP/FF/LUT are checked after synthesis.
 #
-# Compile options state the budgets one of two ways, never both:
+# Compile options either derive budgets from a part or state a complete
+# target contract:
 #
 #   options={"part": "xczu9eg-ffvb1156-2-e"}                 # + "utilization"
-#   options={"bram_bytes": ..., "uram_bytes": ..., ...}      # all six
+#   options={"part": "...", "bram_bytes": ..., ...}         # all six
 #
 # The first derives the six from the device table
 # (sar.backends.hls.devices.DEVICES); the second uses them as written. With
@@ -28,6 +29,10 @@ lutram_bytes: 2883584
 dsp: 9830
 ff: 2764800
 lut: 1382400
+
+# Physical memory primitive geometry of the target above.
+bram_block_bytes: 4608   # 36 Kb
+uram_block_bytes: 36864  # 288 Kb
 
 # Interface: ap_memory, axi, or stream
 interface: axi

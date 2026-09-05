@@ -33,7 +33,8 @@ from algorithms import ALL, GEOMETRIES, load  # noqa: E402
 from common.params import ALOS_PARAMS  # noqa: E402
 from hls_reports import parse_csynth_bundle, timing_shortfall  # noqa: E402
 from hls_reports import validate_constraints  # noqa: E402
-from provenance import environment  # noqa: E402
+from provenance import check_result_preconditions  # noqa: E402
+from provenance import result_environment  # noqa: E402
 
 #: Where the hand-written reference keeps its own copy of the acquisition
 #: constants, and how those macros map onto `RadarParams` fields. The
@@ -384,6 +385,9 @@ def _run_job(job: Job, executable: str, timeout_s: float, rss_limit: int,
         if result["failure"] is None:
             result["failure"] = "incomplete"
 
+    if returncode != 0 and result["failure"] is None:
+        result["failure"] = "tool"
+
     _atomic_json(job.project / "result.json", result)
     if returncode == 0 and result["failure"] is None:
         _atomic_json(done, result)
@@ -420,11 +424,14 @@ def _prepare_job(root: Path, executable_version: str, algorithm: str,
     script = design.write_synthesis_script(staging)
     source = (staging / f"{design.name}.cpp").read_bytes()
     header = (staging / f"{design.name}.h").read_bytes()
+    tables_path = staging / f"{design.tables_name}.h"
+    tables = tables_path.read_bytes() if tables_path.is_file() else b""
     tcl = script.read_bytes()
     key_data = json.dumps(
         {
             "source": _sha256(source),
             "header": _sha256(header),
+            "tables": _sha256(tables),
             "tcl": _sha256(tcl),
             "vitis": executable_version,
             "geometry": geometry,
@@ -470,7 +477,12 @@ def main() -> None:
     parser.add_argument("--vitis-hls", default="vitis_hls")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", help="write aggregate summary here")
+    parser.add_argument("--allow-dirty", action="store_true")
     args = parser.parse_args()
+    # The summary JSON is always written (default: <output>/summary.json),
+    # so anything but a dry run needs the source state to be recordable.
+    if not args.dry_run:
+        check_result_preconditions(args.allow_dirty)
 
     # The hand-written reference is ALOS-only, so it is only a valid
     # comparison point for designs built at that geometry.
@@ -558,7 +570,7 @@ def main() -> None:
                 raise
 
     summary = {
-        "environment": environment(),
+        "environment": result_environment(args.allow_dirty),
         "git": _git_provenance(),
         "geometry": args.geometry,
         "vitis_version": version,
